@@ -30,6 +30,7 @@ uniform int tex2_index;
 
 uniform int unfogged;
 uniform int unlit;
+uniform int masked_additive;
 
 uniform int pixel_shader;
 
@@ -228,15 +229,33 @@ void main()
   {
     vec4 texture1 = texture(tex1, vec3(uv1, tex1_index));
     vec4 texture2 = texture(tex2, vec3(uv2, tex2_index));
-    color.rgb = (mesh_color.rgb * texture1.rgb) + (texture2.rgb * texture2.a);
-    color.a = mesh_color.a;
+        if (masked_additive != 0)
+        {
+            float masked_alpha = texture1.a * texture2.a;
+            color.rgb = (mesh_color.rgb * texture1.rgb) * masked_alpha;
+            color.a = mesh_color.a * masked_alpha;
+        }
+        else
+        {
+            color.rgb = (mesh_color.rgb * texture1.rgb) + (texture2.rgb * texture2.a);
+            color.a = mesh_color.a;
+        }
   }
   else if (pixel_shader == 22)   // Combiners_Opaque_AddAlpha_Alpha
   {
     vec4 texture1 = texture(tex1, vec3(uv1, tex1_index));
     vec4 texture2 = texture(tex2, vec3(uv2, tex2_index));
-    color.rgb = (mesh_color.rgb * texture1.rgb) + (texture2.rgb * texture2.a * texture1.a);
-    color.a = mesh_color.a;
+        if (masked_additive != 0)
+        {
+            float masked_alpha = texture2.a * texture1.a;
+            color.rgb = (mesh_color.rgb * texture1.rgb) * masked_alpha;
+            color.a = mesh_color.a * masked_alpha;
+        }
+        else
+        {
+            color.rgb = (mesh_color.rgb * texture1.rgb) + (texture2.rgb * texture2.a * texture1.a);
+            color.a = mesh_color.a;
+        }
   }
 
   if(color.a < alpha_test)

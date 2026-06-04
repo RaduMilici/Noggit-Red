@@ -12,6 +12,7 @@
 
 decltype (TextureManager::_) TextureManager::_;
 decltype (TextureManager::_tex_arrays) TextureManager::_tex_arrays;
+decltype (TextureManager::_raw_textures) TextureManager::_raw_textures;
 
 constexpr unsigned N_ARRAY_TEX = 1;
 
@@ -43,6 +44,31 @@ void TextureManager::unload_all(Noggit::NoggitRenderContext context)
   {
     gl.deleteTextures(static_cast<GLuint>(pair.second.arrays.size()), pair.second.arrays.data());
   }
+}
+
+void TextureManager::register_raw_texture(std::string const& filename, Noggit::NoggitRenderContext context, int width, int height, std::vector<uint32_t> data)
+{
+  if (filename.empty() || width <= 0 || height <= 0 || data.empty())
+  {
+    return;
+  }
+
+  _raw_textures[{BlizzardArchive::ClientData::normalizeFilenameInternal(filename), static_cast<int>(context)}] = {width, height, std::move(data)};
+}
+
+bool TextureManager::load_raw_texture(std::string const& filename, Noggit::NoggitRenderContext context, int& width, int& height, std::map<int, std::vector<uint32_t>>& data)
+{
+  auto found = _raw_textures.find({BlizzardArchive::ClientData::normalizeFilenameInternal(filename), static_cast<int>(context)});
+  if (found == _raw_textures.end())
+  {
+    return false;
+  }
+
+  width = found->second.width;
+  height = found->second.height;
+  data.clear();
+  data.emplace(0, found->second.data);
+  return true;
 }
 
 TexArrayParams& TextureManager::get_tex_array(int width, int height, int mip_level,
@@ -151,7 +177,7 @@ struct BLPHeader
 
 void blp_texture::bind()
 {
-  if (!finished)
+  if (!finished || loading_failed())
   {
     return;
   }
@@ -161,17 +187,42 @@ void blp_texture::bind()
     upload();
   }
 
+  if (!_uploaded)
+  {
+    return;
+  }
+
   gl.bindTexture(GL_TEXTURE_2D_ARRAY, _texture_array);
 }
 
 void blp_texture::uploadToArray(unsigned layer)
 {
-  finishLoading();
+  if (!finished)
+  {
+    try
+    {
+      finishLoading();
+    }
+    catch (...)
+    {
+      error_on_loading();
+      return;
+    }
+  }
+
+  if (loading_failed() || _width <= 0 || _height <= 0)
+  {
+    return;
+  }
 
   int width = _width, height = _height;
 
   if (!_compression_format)
   {
+    if (_data.empty())
+    {
+      return;
+    }
 
     for (int i = 0; i < _data.size(); ++i)
     {
@@ -186,6 +237,11 @@ void blp_texture::uploadToArray(unsigned layer)
   }
   else
   {
+    if (_compressed_data.empty())
+    {
+      return;
+    }
+
     for (int i = 0; i < _compressed_data.size(); ++i)
     {
       gl.compressedTexSubImage3D(GL_TEXTURE_2D_ARRAY, i, 0, 0, layer, width, height, 1, _compression_format.value(), static_cast<GLsizei>(_compressed_data[i].size()), _compressed_data[i].data());
@@ -200,12 +256,17 @@ void blp_texture::uploadToArray(unsigned layer)
 
 void blp_texture::upload()
 {
-  if (!finished)
+  if (!finished || loading_failed())
   {
     return;
   }
 
   if (_uploaded)
+  {
+    return;
+  }
+
+  if (_width <= 0 || _height <= 0)
   {
     return;
   }
@@ -217,6 +278,11 @@ void blp_texture::upload()
 
   if (!_compression_format)
   {
+    if (_data.empty())
+    {
+      return;
+    }
+
     auto& params = TextureManager::get_tex_array( _width, _height, static_cast<int>(_data.size()), _context);
 
     int index_x = params.n_used / n_layers;
@@ -241,6 +307,11 @@ void blp_texture::upload()
   }
   else
   {
+    if (_compressed_data.empty())
+    {
+      return;
+    }
+
     auto& params = TextureManager::get_tex_array(_compression_format.value(), _width, _height, static_cast<int>(_compressed_data.size()), _compressed_data, _context);
 
     int index_x = params.n_used / n_layers;
@@ -396,6 +467,12 @@ blp_texture::blp_texture(BlizzardArchive::Listfile::FileKey const& file_key, Nog
 
 void blp_texture::finishLoading()
 {
+  if (TextureManager::load_raw_texture(_file_key.filepath(), _context, _width, _height, _data))
+  {
+    finished = true;
+    return;
+  }
+
   bool exists = Noggit::Application::NoggitApplication::instance()->clientData()->exists( _file_key.filepath());
   if (!exists)
   {

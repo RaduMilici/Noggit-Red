@@ -26,6 +26,7 @@
 #include <QtCore/QSettings>
 #include <QtCore/QTimer>
 #include <QtWidgets/QDockWidget>
+#include <QtWidgets/QDoubleSpinBox>
 #include <QtWidgets/QLabel>
 #include <QtWidgets/QOpenGLWidget>
 #include <QWidgetAction>
@@ -43,6 +44,10 @@
 
 
 class World;
+class QCheckBox;
+class QLineEdit;
+class QListWidget;
+class QListWidgetItem;
 
 namespace Noggit::Ui::Windows
 {
@@ -159,6 +164,7 @@ public:
   Noggit::BoolToggleProperty _draw_occlusion_boxes = {false};
   Noggit::BoolToggleProperty _game_mode_camera = { false };
   Noggit::BoolToggleProperty _draw_lights_zones = { false };
+  Noggit::BoolToggleProperty _draw_creature_spawns = { false };
   Noggit::BoolToggleProperty _show_detail_info_window = { false };
   Noggit::BoolToggleProperty _show_minimap_window = { false };
 private:
@@ -403,6 +409,7 @@ private:
   Noggit::BoolToggleProperty _show_keybindings_window = {false};
   Noggit::BoolToggleProperty _show_texture_palette_window = {false};
   Noggit::BoolToggleProperty _show_texture_palette_small_window = {false};
+  Noggit::BoolToggleProperty _show_creature_browser = {false};
   Noggit::BoolToggleProperty _showStampPalette{false};
 
   Noggit::Ui::minimap_widget* _minimap;
@@ -442,9 +449,27 @@ private:
 
   QDockWidget* _asset_browser_dock;
   QDockWidget* _node_editor_dock;
+  QDockWidget* _creature_browser_dock;
   QDockWidget* _texture_browser_dock;
   QDockWidget* _texture_picker_dock;
   QDockWidget* _detail_infos_dock;
+
+  QLineEdit* _creature_search_field = nullptr;
+  QCheckBox* _creature_search_all_maps = nullptr;
+  QListWidget* _creature_list_widget = nullptr;
+  QLabel* _creature_browser_status = nullptr;
+
+  QLabel* _creature_editor_info = nullptr;
+  QDoubleSpinBox* _spawn_edit_x = nullptr;
+  QDoubleSpinBox* _spawn_edit_y = nullptr;
+  QDoubleSpinBox* _spawn_edit_z = nullptr;
+  QDoubleSpinBox* _spawn_edit_orientation = nullptr;
+
+  std::optional<std::uint32_t> _selected_creature_spawn_guid;
+  std::optional<std::uint32_t> _hovered_creature_spawn_guid;
+  bool _dragging_creature_spawn = false;
+  std::optional<glm::vec3> _creature_drag_anchor_pos;
+  std::vector<std::pair<std::uint32_t, glm::vec3>> _creature_drag_initial_positions;
 
   Noggit::Ui::Tools::ToolPanel* _tool_panel_dock;
 
@@ -459,6 +484,11 @@ private:
   bool _gl_initialized = false;
   bool _destroying = false;
   bool _needs_redraw = false;
+
+  bool _mod_z_down = false;
+  bool _mod_x_down = false;
+
+  bool event(QEvent* e) override;
 
   unsigned _mmap_async_index = 0;
   unsigned _mmap_render_index = 0;
@@ -482,6 +512,8 @@ private:
   void setupWaterEditorUi();
   void setupVertexPainterUi();
   void setupObjectEditorUi();
+  void setupCreatureEditorUi();
+  void setupCreatureBrowserUi();
   void setupMinimapEditorUi();
   void setupStampUi();
   void setupLightEditorUi();
@@ -500,6 +532,24 @@ private:
   void setupViewMenu();
   void setupHelpMenu();
   void setupHotkeys();
+  void refreshCreatureSpawnOverlay(bool force_reload = false);
+  void updateDatabaseStatus();
+  void rebuildCreatureBrowserList(bool preserve_selection = true);
+  void updateCreatureBrowserStatus(QString const& override_text = QString());
+  std::size_t selectedCreatureSpawnCount() const;
+  void setSelectedCreatureSpawn(std::optional<std::uint32_t> guid, bool update_browser = true);
+  void addCreatureSpawnToSelection(std::uint32_t guid, bool update_browser = true);
+  void selectCreatureSpawnsInArea(QRect const& rect, bool add_to_selection = true);
+  void refreshCreatureEditorKnobs();
+  void setHoveredCreatureSpawn(std::optional<std::uint32_t> guid);
+  std::optional<std::uint32_t> findCreatureSpawnAtCursor() const;
+  void updateCreatureSpawnHover(QPoint const& global_pos);
+  bool tryStartCreatureSpawnDrag();
+  void translateSelectedCreatureSpawns(glm::vec3 const& delta);
+  void updateSelectedCreatureSpawnPosition(glm::vec3 const& pos);
+  void showSelectedCreatureSpawnMenu(QPoint const& global_pos);
+  void saveDirtyCreatureSpawns();
+  void jumpToCreatureListItem(QListWidgetItem* item);
 
   QWidget* _overlay_widget;
 };

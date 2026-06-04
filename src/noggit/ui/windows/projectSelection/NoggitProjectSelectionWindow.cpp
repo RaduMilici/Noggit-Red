@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <QString>
 #include <QFile>
+#include <QTimer>
 #include <noggit/ui/FontNoggit.hpp>
 
 #include "ui_NoggitProjectSelectionWindow.h"
@@ -112,16 +113,19 @@ NoggitProjectSelectionWindow::NoggitProjectSelectionWindow(Noggit::Application::
                        return;
                      }
 
-                     Noggit::Application::NoggitApplication::instance()->setClientData(project_to_launch->ClientData);
+                     QTimer::singleShot(0, this, [this, project_to_launch]
+                     {
+                       Noggit::Application::NoggitApplication::instance()->setClientData(project_to_launch->ClientData);
 
-                     Noggit::Project::CurrentProject::initialize(project_to_launch.get());
+                       Noggit::Project::CurrentProject::initialize(project_to_launch.get());
 
-                     _project_selection_page = std::make_unique<Noggit::Ui::Windows::NoggitWindow>(
-                         _noggit_application->getConfiguration(),
-                         project_to_launch);
-                     _project_selection_page->showMaximized();
+                       _project_selection_page = std::make_unique<Noggit::Ui::Windows::NoggitWindow>(
+                           _noggit_application->getConfiguration(),
+                           project_to_launch);
+                       _project_selection_page->showMaximized();
 
-                     close();
+                       close();
+                     });
                    }
   );
 
@@ -132,14 +136,17 @@ NoggitProjectSelectionWindow::NoggitProjectSelectionWindow(Noggit::Application::
                      if (!selected_project)
                        return;
 
-                     Noggit::Project::CurrentProject::initialize(selected_project.get());
+                     QTimer::singleShot(0, this, [this, selected_project]
+                     {
+                       Noggit::Project::CurrentProject::initialize(selected_project.get());
 
-                     _project_selection_page = std::make_unique<Noggit::Ui::Windows::NoggitWindow>(
-                         _noggit_application->getConfiguration(),
-                         selected_project);
-                         _project_selection_page->showMaximized();
+                       _project_selection_page = std::make_unique<Noggit::Ui::Windows::NoggitWindow>(
+                           _noggit_application->getConfiguration(),
+                           selected_project);
+                       _project_selection_page->showMaximized();
 
-                     close();
+                       close();
+                     });
                    }
   );
 

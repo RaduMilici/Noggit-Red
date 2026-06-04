@@ -216,7 +216,7 @@ namespace Noggit
 
 
 #ifdef USE_MYSQL_UID_STORAGE
-      ui->MySQL_box->setChecked (_settings->value ("project/mysql/enabled").toBool());
+  ui->MySQL_box->setChecked(true);
 
       auto server_str = _settings->value("project/mysql/server", "127.0.0.1").toString();
       auto user_str = _settings->value("project/mysql/user", "127.0.0.1").toString();

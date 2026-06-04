@@ -74,21 +74,22 @@ ProcedureSelector::ProcedureSelector(QWidget *parent)
 
   QMenu::connect(menu, &QMenu::aboutToShow, [=] { search_text->setFocus(); });
 
-  QTreeView::connect(tree->selectionModel(), &QItemSelectionModel::selectionChanged
-      ,[=] (const QItemSelection& selected, const QItemSelection& deselected)
+  QTreeView::connect(tree, &QTreeView::activated,
+      [=] (const QModelIndex& index)
                      {
-                         for (auto index : selected.indexes())
-                         {
-                           auto path = model->filePath(index);
-                           auto text = QDir("./scripts/").relativeFilePath(path);
-                           search_button->setText(text);
-                           search_button->adjustSize();
+                       if (!index.isValid() || model->isDir(index))
+                       {
+                         return;
+                       }
 
-                           emit entry_updated(text);
+                       auto path = model->filePath(index);
+                       auto text = QDir("./scripts/").relativeFilePath(path);
+                       search_button->setText(text);
+                       search_button->adjustSize();
 
-                           menu->close();
-                           break;
-                         }
+                       emit entry_updated(text);
+
+                       menu->close();
                      }
   );
 

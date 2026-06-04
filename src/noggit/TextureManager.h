@@ -77,8 +77,8 @@ struct blp_texture : public AsyncObject
 private:
   bool _uploaded = false;
 
-  int _width;
-  int _height;
+  int _width = 0;
+  int _height = 0;
 
   Noggit::NoggitRenderContext _context;
 
@@ -104,13 +104,23 @@ class TextureManager
 public:
   static void report();
   static void unload_all(Noggit::NoggitRenderContext context);
+  static void register_raw_texture(std::string const& filename, Noggit::NoggitRenderContext context, int width, int height, std::vector<uint32_t> data);
   static TexArrayParams& get_tex_array(int width, int height, int mip_level, Noggit::NoggitRenderContext context);
   static TexArrayParams& get_tex_array(GLint compression, int width, int height, int mip_level, std::map<int, std::vector<uint8_t>>& comp_data, Noggit::NoggitRenderContext context);
 
 private:
   friend struct scoped_blp_texture_reference;
+  friend struct blp_texture;
+  struct raw_texture_data
+  {
+    int width = 0;
+    int height = 0;
+    std::vector<uint32_t> data;
+  };
+  static bool load_raw_texture(std::string const& filename, Noggit::NoggitRenderContext context, int& width, int& height, std::map<int, std::vector<uint32_t>>& data);
   static Noggit::AsyncObjectMultimap<blp_texture> _;
   static std::array<std::unordered_map<std::tuple<GLint, int, int, int>, TexArrayParams, tuple_hash>, 7> _tex_arrays;
+  static std::map<std::pair<std::string, int>, raw_texture_data> _raw_textures;
 
 };
 

@@ -355,9 +355,20 @@ struct DefaultVectorWidget
     {
       auto array = value.toArray();
 
+      if (array.size() < SIZE)
+      {
+        return;
+      }
+
       for (int i = 0; i < SIZE; ++i)
       {
-        static_cast<QDoubleSpinBox*>(widget->layout()->itemAt(i)->widget())->setValue(array[i].toDouble());
+        auto item = widget->layout()->itemAt(i);
+        if (!item || !item->widget())
+        {
+          return;
+        }
+
+        static_cast<QDoubleSpinBox*>(item->widget())->setValue(array[i].toDouble());
       }
     }
 
@@ -377,9 +388,20 @@ struct DefaultVectorWidget
     {
       QJsonArray array = json_obj[name.c_str()].toArray();
 
+      if (array.size() < SIZE)
+      {
+        return;
+      }
+
       for (int i = 0; i < SIZE; ++i)
       {
-        static_cast<QDoubleSpinBox*>(widget->layout()->itemAt(i)->widget())->setValue(array[i].toDouble());
+        auto item = widget->layout()->itemAt(i);
+        if (!item || !item->widget())
+        {
+          return;
+        }
+
+        static_cast<QDoubleSpinBox*>(item->widget())->setValue(array[i].toDouble());
       }
     }
 };
@@ -412,6 +434,12 @@ struct DefaultColorWidget
     static void setValue(QWidget* widget, QJsonValue& value)
     {
       auto array = value.toArray();
+
+      if (array.size() < 4)
+      {
+        return;
+      }
+
       QColor color = QColor::fromRgbF(array[0].toDouble(), array[1].toDouble(), array[2].toDouble(), array[3].toDouble());
       static_cast<color_widgets::ColorSelector*>(widget)->setColor(color);
     }
@@ -432,6 +460,12 @@ struct DefaultColorWidget
     static void fromJson(QWidget* widget, const QJsonObject& json_obj, const std::string& name)
     {
       QJsonArray array = json_obj[name.c_str()].toArray();
+
+      if (array.size() < 4)
+      {
+        return;
+      }
+
       QColor color = QColor::fromRgbF(array[0].toDouble(), array[1].toDouble(), array[2].toDouble(), array[3].toDouble());
       static_cast<color_widgets::ColorSelector*>(widget)->setColor(color);
     }

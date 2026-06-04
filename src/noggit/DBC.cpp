@@ -6,6 +6,29 @@
 #include <blizzard-archive-library/include/ClientData.hpp>
 #include <string>
 
+namespace
+{
+  std::string classicMapNameFromField(MapDB::Record const& rec, std::size_t field)
+  {
+    if (field > 0)
+    {
+      auto shifted_preferred = std::string(rec.getLocalizedString(field - 1, 0));
+      if (!shifted_preferred.empty())
+        return shifted_preferred;
+
+      auto shifted_fallback = std::string(rec.getLocalizedString(field - 1));
+      if (!shifted_fallback.empty())
+        return shifted_fallback;
+    }
+
+    auto preferred = std::string(rec.getLocalizedString(field, 0));
+    if (!preferred.empty())
+      return preferred;
+
+    return std::string(rec.getLocalizedString(field));
+  }
+}
+
 AreaDB gAreaDB;
 MapDB gMapDB;
 LoadingScreensDB gLoadingScreensDB;
@@ -22,6 +45,10 @@ SoundAmbienceDB gSoundAmbienceDB;
 ZoneMusicDB gZoneMusicDB;
 ZoneIntroMusicTableDB gZoneIntroMusicTableDB;
 SoundEntriesDB gSoundEntriesDB;
+CreatureDisplayInfoDB gCreatureDisplayInfoDB;
+CreatureDisplayInfoExtraDB gCreatureDisplayInfoExtraDB;
+CreatureModelDataDB gCreatureModelDataDB;
+ItemDisplayInfoDB gItemDisplayInfoDB;
 WMOAreaTableDB gWMOAreaTableDB;
 
 void OpenDBs(std::shared_ptr<BlizzardArchive::ClientData> clientData)
@@ -42,6 +69,24 @@ void OpenDBs(std::shared_ptr<BlizzardArchive::ClientData> clientData)
   gZoneMusicDB.open(clientData);
   gZoneIntroMusicTableDB.open(clientData);
   gSoundEntriesDB.open(clientData);
+  gCreatureDisplayInfoDB.open(clientData);
+  try
+  {
+    gCreatureDisplayInfoExtraDB.open(clientData);
+  }
+  catch (std::exception const& e)
+  {
+    LogError << "Failed to open CreatureDisplayInfoExtra.dbc: " << e.what() << std::endl;
+  }
+  gCreatureModelDataDB.open(clientData);
+  try
+  {
+    gItemDisplayInfoDB.open(clientData);
+  }
+  catch (std::exception const& e)
+  {
+    LogError << "Failed to open ItemDisplayInfo.dbc: " << e.what() << std::endl;
+  }
   gWMOAreaTableDB.open(clientData);
 }
 
@@ -120,7 +165,11 @@ std::string MapDB::getMapName(int pMapID)
   try
   {
     MapDB::Record rec = gMapDB.getByID(pMapID);
-    mapName = std::string(rec.getLocalizedString(MapDB::Name));
+    mapName = classicMapNameFromField(rec, MapDB::Name);
+    if (mapName.empty())
+    {
+      mapName = std::string(rec.getString(MapDB::InternalName));
+    }
   }
   catch (MapDB::NotFound)
   {
@@ -163,9 +212,9 @@ int LiquidTypeDB::getLiquidType(int pID)
   try
   {
     LiquidTypeDB::Record rec = gLiquidTypeDB.getByID(pID);
-    type = rec.getUInt(LiquidTypeDB::Type);
+    type = gLiquidTypeDB.getFieldCount() > LiquidTypeDB::Type ? rec.getUInt(LiquidTypeDB::Type) : 0;
   }
-  catch (LiquidTypeDB::NotFound)
+  catch (DBCFile::NotFound const&)
   {
     type = 0;
   }
@@ -174,13 +223,17 @@ int LiquidTypeDB::getLiquidType(int pID)
 
 std::string  LiquidTypeDB::getLiquidName(int pID)
 {
-  std::string type = "";
+  std::string type = "Unknown type";
   try
   {
     LiquidTypeDB::Record rec = gLiquidTypeDB.getByID(pID);
-    type = std::string(rec.getString(LiquidTypeDB::Name));
+    std::string name = rec.getString(LiquidTypeDB::Name);
+    if (!name.empty())
+    {
+      type = name;
+    }
   }
-  catch (MapDB::NotFound)
+  catch (DBCFile::NotFound const&)
   {
     type = "Unknown type";
   }

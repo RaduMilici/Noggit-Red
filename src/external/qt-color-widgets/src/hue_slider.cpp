@@ -22,6 +22,8 @@
  */
 #include "qt-color-widgets/hue_slider.hpp"
 
+#include "../../../noggit/Log.h"
+
 namespace color_widgets {
 
 class HueSlider::Private
@@ -63,11 +65,17 @@ public:
 HueSlider::HueSlider(QWidget *parent) :
     GradientSlider(parent), p(new Private(this))
 {
+    LogDebug << "qt-color-widgets HueSlider ctor parent='"
+             << (parent ? parent->metaObject()->className() : "<null>")
+             << "'" << std::endl;
 }
 
 HueSlider::HueSlider(Qt::Orientation orientation, QWidget *parent) :
     GradientSlider(orientation, parent), p(new Private(this))
 {
+    LogDebug << "qt-color-widgets HueSlider ctor orientation parent='"
+             << (parent ? parent->metaObject()->className() : "<null>")
+             << "'" << std::endl;
 }
 
 HueSlider::~HueSlider()

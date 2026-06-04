@@ -290,9 +290,11 @@ struct mclq
   float max_height;
   mclq_vertex vertices[9 * 9];
   mclq_tile tiles[8 * 8];
-  std::uint32_t n_flowvs;
-  mclq_flowvs flowvs[2]; // always 2 regardless of the n_flowvs value
 };
+
+static_assert(sizeof(mclq_vertex) == 8, "MCLQ vertices must match the client layout");
+static_assert(sizeof(mclq_tile) == 1, "MCLQ tile flags must match the client layout");
+static_assert(sizeof(mclq) == 720, "MCLQ payload must match the Vanilla/TBC legacy liquid layout");
 
 struct MPHD
 {

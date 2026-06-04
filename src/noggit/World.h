@@ -7,6 +7,7 @@
 #include <noggit/rendering/CursorRender.hpp>
 #include <noggit/Misc.h>
 #include <noggit/Model.h> // ModelManager
+#include <noggit/ModelInstance.h>
 #include <noggit/Selection.h>
 #include <noggit/Sky.h> // Skies, OutdoorLighting, OutdoorLightStats
 #include <noggit/WMO.h> // WMOManager
@@ -55,6 +56,29 @@ using StripType = uint16_t;
 class World
 {
   friend class Noggit::Rendering::WorldRender;
+
+public:
+  struct CreatureSpawnOverlay
+  {
+    std::uint32_t guid = 0;
+    std::uint32_t entry = 0;
+    std::uint32_t display_id = 0;
+    std::string name;
+    glm::vec3 pos = glm::vec3(0.0f);
+    glm::vec3 original_pos = glm::vec3(0.0f);
+    float orientation = 0.0f;
+    float original_orientation = 0.0f;
+    bool hovered = false;
+    bool selected = false;
+    bool dirty = false;
+    std::optional<ModelInstance> model_instance;
+
+    CreatureSpawnOverlay() = default;
+    CreatureSpawnOverlay(CreatureSpawnOverlay&&) noexcept = default;
+    CreatureSpawnOverlay& operator=(CreatureSpawnOverlay&&) noexcept = default;
+    CreatureSpawnOverlay(CreatureSpawnOverlay const&) = delete;
+    CreatureSpawnOverlay& operator=(CreatureSpawnOverlay const&) = delete;
+  };
 
 protected:
   std::vector<selection_type> _current_selection;
@@ -326,8 +350,11 @@ public:
   void unload_every_model_and_wmo_instance();
 
 	static bool IsEditableWorld(BlizzardDatabaseLib::Structures::BlizzardDatabaseRow& record);
+  static bool IsEditableWorld(DBCFile::Record const& record);
 
     static bool IsWMOWorld(BlizzardDatabaseLib::Structures::BlizzardDatabaseRow& record);
+
+  static bool IsWMOWorld(DBCFile::Record const& record);
 
   void clearHeight(glm::vec3 const& pos);
   void clearAllModelsOnADT(TileIndex const& tile);
@@ -401,6 +428,20 @@ public:
   void remove_selection_group(selection_group* group);
 
   void clear_selection_groups();
+  bool reloadCreatureSpawns();
+  void ensureCreatureSpawnsLoaded();
+  void clearCreatureSpawns();
+  void setDrawCreatureSpawns(bool state) { _draw_creature_spawns = state; }
+  bool drawCreatureSpawns() const { return _draw_creature_spawns; }
+  bool hasCreatureSpawnsLoaded() const { return _creature_spawns_loaded; }
+  std::size_t creatureSpawnCount() const { return _creature_spawns.size(); }
+  std::size_t creatureSpawnModelCount() const;
+  std::size_t dirtyCreatureSpawnCount() const;
+  std::string const& creatureSpawnStatus() const { return _creature_spawn_status; }
+  std::vector<CreatureSpawnOverlay>& creatureSpawns() { return _creature_spawns; }
+  std::vector<CreatureSpawnOverlay> const& creatureSpawns() const { return _creature_spawns; }
+  CreatureSpawnOverlay* findCreatureSpawn(std::uint32_t guid);
+  CreatureSpawnOverlay const* findCreatureSpawn(std::uint32_t guid) const;
 
 protected:
   // void update_models_by_filename();
@@ -418,6 +459,11 @@ protected:
   QSettings* _settings;
 
   Noggit::NoggitRenderContext _context;
+  bool _draw_creature_spawns = false;
+  bool _creature_spawns_loaded = false;
+  bool _creature_spawns_load_attempted = false;
+  std::string _creature_spawn_status;
+  std::vector<CreatureSpawnOverlay> _creature_spawns;
 
   std::array<std::pair<std::pair<int, int>, MapTile*>, 64 * 64 > _loaded_tiles_buffer;
 

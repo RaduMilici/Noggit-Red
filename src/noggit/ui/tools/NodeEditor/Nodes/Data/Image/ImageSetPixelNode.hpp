@@ -22,6 +22,7 @@ namespace Noggit
         Q_OBJECT
 
         public:
+            static QString Name() { return "Image :: SetPixel"; }
             ImageSetPixelNode();
             void compute() override;
             NodeValidationState validate() override;

@@ -55,9 +55,17 @@ public:
     }
     const char *getString(size_t field) const
     {
-      assert(field < file.fieldCount);
-      size_t stringOffset = getUInt(field);
-      assert(stringOffset < file.stringSize);
+      if (field >= file.fieldCount || file.stringTable.empty())
+      {
+        return "";
+      }
+
+      size_t stringOffset = *reinterpret_cast<unsigned int*>(offset + field * 4);
+      if (stringOffset >= file.stringTable.size())
+      {
+        return "";
+      }
+
       return file.stringTable.data() + stringOffset;
     }
     const char *getLocalizedString(size_t field, int locale = -1) const
@@ -65,18 +73,35 @@ public:
       int loc = locale;
       if (locale == -1)
       {
-        assert(field < file.fieldCount - 8);
+        if (field >= file.fieldCount)
+        {
+          return "";
+        }
+
         for (loc = 0; loc < 15; loc++)
         {
+          if (field + loc >= file.fieldCount)
+          {
+            return "";
+          }
+
           size_t stringOffset = getUInt(field + loc);
           if (stringOffset != 0)
             break;
         }
       }
 
-      assert(field + loc < file.fieldCount);
-      size_t stringOffset = getUInt(field + loc);
-      assert(stringOffset < file.stringSize);
+      if (loc < 0 || field + loc >= file.fieldCount || file.stringTable.empty())
+      {
+        return "";
+      }
+
+      size_t stringOffset = *reinterpret_cast<unsigned int*>(offset + (field + loc) * 4);
+      if (stringOffset >= file.stringTable.size())
+      {
+        return "";
+      }
+
       return file.stringTable.data() + stringOffset;
     }
 

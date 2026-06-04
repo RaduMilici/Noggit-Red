@@ -20,7 +20,7 @@ struct LiquidChunkInstanceDataUniformBlock
   uint subchunks_1;
   uint subchunks_2;
   uint n_tex_frames;
-  uint _pad1;
+  uint shadow_chunk_index;
   uint _pad2;
   uint _pad3;
   uint _pad4;
@@ -55,6 +55,8 @@ flat out uint tex_array;
 flat out uint type;
 flat out vec2 anim_uv;
 flat out int tex_frame;
+flat out uint shadow_chunk_index;
+out vec2 shadow_uv;
 
 bool hasSubchunk(uint x, uint z, uint subchunks_first, uint subchunks_second)
 {
@@ -103,6 +105,8 @@ void main()
   type = params.type;
   tex_frame = get_texture_frame(int(params.n_tex_frames));
   anim_uv = vec2(params.anim_u, params.anim_v);
+  shadow_chunk_index = params.shadow_chunk_index;
+  shadow_uv = vec2(position.x / CHUNKSIZE, position.y / CHUNKSIZE);
 
   if(use_transform == 1)
   {

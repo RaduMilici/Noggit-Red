@@ -6,14 +6,294 @@
 #include <noggit/ModelManager.h> // ModelManager
 #include <noggit/Sky.h>
 #include <noggit/World.h>
+#include <noggit/application/NoggitApplication.hpp>
 #include <opengl/shader.hpp>
+#include <ClientFile.hpp>
 #include <glm/glm.hpp>
 
 #include <algorithm>
 #include <string>
 #include <array>
+#include <cstring>
 
 const float skymul = 36.0f;
+
+namespace
+{
+  struct RawDBC
+  {
+    bool valid = false;
+    std::uint32_t record_count = 0;
+    std::uint32_t field_count = 0;
+    std::uint32_t record_size = 0;
+    std::uint32_t string_size = 0;
+    std::vector<std::uint32_t> records;
+    std::vector<char> strings;
+
+    std::uint32_t word(std::size_t row, std::size_t field) const
+    {
+      return records[row * field_count + field];
+    }
+
+    float number(std::size_t row, std::size_t field) const
+    {
+      float value = 0.f;
+      std::uint32_t raw = word(row, field);
+      std::memcpy(&value, &raw, sizeof(value));
+      return value;
+    }
+
+    const char* string(std::size_t row, std::size_t field) const
+    {
+      std::uint32_t offset = word(row, field);
+      return offset < strings.size() ? strings.data() + offset : "";
+    }
+  };
+
+  RawDBC load_raw_dbc(char const* filename)
+  {
+    RawDBC dbc;
+    BlizzardArchive::ClientFile file(filename, Noggit::Application::NoggitApplication::instance()->clientData());
+    if (file.isEof() || file.getSize() < 20)
+    {
+      return dbc;
+    }
+
+    char magic[4] = {};
+    file.read(magic, 4);
+    if (std::memcmp(magic, "WDBC", 4) != 0)
+    {
+      return dbc;
+    }
+
+    file.read(&dbc.record_count, 4);
+    file.read(&dbc.field_count, 4);
+    file.read(&dbc.record_size, 4);
+    file.read(&dbc.string_size, 4);
+    if (dbc.field_count == 0 || dbc.record_size != dbc.field_count * 4)
+    {
+      return dbc;
+    }
+
+    dbc.records.resize(static_cast<std::size_t>(dbc.record_count) * dbc.field_count);
+    file.read(dbc.records.data(), dbc.records.size() * sizeof(std::uint32_t));
+    dbc.strings.resize(dbc.string_size);
+    file.read(dbc.strings.data(), dbc.strings.size());
+    dbc.valid = true;
+    return dbc;
+  }
+
+  int find_raw_row_by_id(RawDBC const& dbc, std::uint32_t id)
+  {
+    if (!dbc.valid || dbc.field_count == 0)
+    {
+      return -1;
+    }
+
+    for (std::size_t row = 0; row < dbc.record_count; ++row)
+    {
+      if (dbc.word(row, 0) == id)
+      {
+        return static_cast<int>(row);
+      }
+    }
+
+    return -1;
+  }
+
+  void fill_raw_sky_color_bands(SkyParam* param, std::uint32_t param_id, RawDBC const& light_int_band)
+  {
+    int light_int_start = static_cast<int>(param_id) * NUM_SkyColorNames - 17;
+
+    for (int color_index = 0; color_index < NUM_SkyColorNames; ++color_index)
+    {
+      int row = find_raw_row_by_id(light_int_band, static_cast<std::uint32_t>(light_int_start + color_index));
+      if (row < 0 || light_int_band.field_count <= LightIntBandDB::Values)
+      {
+        param->mmin[color_index] = -1;
+        continue;
+      }
+
+      std::uint32_t entries = std::min<std::uint32_t>(light_int_band.word(row, LightIntBandDB::Entries), 16);
+      if (entries == 0)
+      {
+        param->mmin[color_index] = -1;
+        continue;
+      }
+
+      param->mmin[color_index] = static_cast<int>(light_int_band.word(row, LightIntBandDB::Times));
+      for (std::uint32_t entry = 0; entry < entries; ++entry)
+      {
+        param->colorRows[color_index].emplace_back(static_cast<int>(light_int_band.word(row, LightIntBandDB::Times + entry))
+                                                  , static_cast<int>(light_int_band.word(row, LightIntBandDB::Values + entry)));
+      }
+    }
+  }
+
+  void fill_raw_sky_float_bands(SkyParam* param, std::uint32_t param_id, RawDBC const& light_float_band)
+  {
+    int light_float_start = static_cast<int>(param_id) * NUM_SkyFloatParamsNames - 5;
+
+    for (int float_index = 0; float_index < NUM_SkyFloatParamsNames; ++float_index)
+    {
+      int row = find_raw_row_by_id(light_float_band, static_cast<std::uint32_t>(light_float_start + float_index));
+      if (row < 0 || light_float_band.field_count <= LightFloatBandDB::Values)
+      {
+        param->mmin_float[float_index] = -1;
+        continue;
+      }
+
+      std::uint32_t entries = std::min<std::uint32_t>(light_float_band.word(row, LightFloatBandDB::Entries), 16);
+      if (entries == 0)
+      {
+        param->mmin_float[float_index] = -1;
+        continue;
+      }
+
+      param->mmin_float[float_index] = static_cast<int>(light_float_band.word(row, LightFloatBandDB::Times));
+      for (std::uint32_t entry = 0; entry < entries; ++entry)
+      {
+        param->floatParams[float_index].emplace_back(static_cast<int>(light_float_band.word(row, LightFloatBandDB::Times + entry))
+                                                    , light_float_band.number(row, LightFloatBandDB::Values + entry));
+      }
+    }
+  }
+
+  SkyParam* make_raw_sky_param(std::uint32_t param_id, RawDBC const& light_params, RawDBC const& light_skybox, RawDBC const& light_int_band, RawDBC const& light_float_band, Noggit::NoggitRenderContext context)
+  {
+    auto* param = new SkyParam(0, context);
+    param->Id = static_cast<int>(param_id);
+    fill_raw_sky_color_bands(param, param_id, light_int_band);
+    fill_raw_sky_float_bands(param, param_id, light_float_band);
+
+    int row = find_raw_row_by_id(light_params, param_id);
+    if (row < 0)
+    {
+      return param;
+    }
+
+    param->set_highlight_sky(light_params.field_count > 1 && light_params.word(row, 1) != 0);
+
+    bool const classic_light_params = light_params.field_count == 9;
+    std::size_t const glow_field = classic_light_params ? 3 : LightParamsDB::glow;
+    std::size_t const river_shallow_field = classic_light_params ? 4 : LightParamsDB::water_shallow_alpha;
+    std::size_t const river_deep_field = classic_light_params ? 5 : LightParamsDB::water_deep_alpha;
+    std::size_t const ocean_shallow_field = classic_light_params ? 6 : LightParamsDB::ocean_shallow_alpha;
+    std::size_t const ocean_deep_field = classic_light_params ? 7 : LightParamsDB::ocean_deep_alpha;
+
+    if (light_params.field_count > glow_field)
+      param->set_glow(light_params.number(row, glow_field));
+    if (light_params.field_count > river_shallow_field)
+      param->set_river_shallow_alpha(light_params.number(row, river_shallow_field));
+    if (light_params.field_count > river_deep_field)
+      param->set_river_deep_alpha(light_params.number(row, river_deep_field));
+    if (light_params.field_count > ocean_shallow_field)
+      param->set_ocean_shallow_alpha(light_params.number(row, ocean_shallow_field));
+    if (light_params.field_count > ocean_deep_field)
+      param->set_ocean_deep_alpha(light_params.number(row, ocean_deep_field));
+
+    if (light_params.field_count > 2)
+    {
+      int skybox_row = find_raw_row_by_id(light_skybox, light_params.word(row, 2));
+      if (skybox_row >= 0 && light_skybox.field_count > 1)
+      {
+        const char* filename = light_skybox.string(skybox_row, 1);
+        if (filename && *filename)
+        {
+          param->skybox.emplace(filename, context);
+        }
+      }
+    }
+
+    return param;
+  }
+
+  glm::vec3 default_sky_color(int row)
+  {
+    switch (row)
+    {
+      case LIGHT_GLOBAL_DIFFUSE:
+        return {0.82f, 0.78f, 0.70f};
+      case LIGHT_GLOBAL_AMBIENT:
+        return {0.45f, 0.50f, 0.55f};
+      case SKY_COLOR_0:
+        return {0.22f, 0.40f, 0.72f};
+      case SKY_COLOR_1:
+        return {0.35f, 0.55f, 0.82f};
+      case SKY_COLOR_2:
+      case SKY_COLOR_3:
+        return {0.54f, 0.68f, 0.88f};
+      case SKY_COLOR_4:
+      case FOG_COLOR:
+        return {0.70f, 0.78f, 0.86f};
+      case SHADOW_OPACITY:
+        return {0.35f, 0.35f, 0.35f};
+      case SUN_COLOR:
+      case SUN_HALO_COLOR:
+        return {1.0f, 0.90f, 0.72f};
+      case CLOUD_EDGE_COLOR:
+      case CLOUD_COLOR:
+        return {0.80f, 0.82f, 0.85f};
+      case OCEAN_COLOR_LIGHT:
+      case RIVER_COLOR_LIGHT:
+        return {0.22f, 0.45f, 0.55f};
+      case OCEAN_COLOR_DARK:
+      case RIVER_COLOR_DARK:
+        return {0.04f, 0.18f, 0.28f};
+      default:
+        return {0.65f, 0.65f, 0.65f};
+    }
+  }
+
+  bool drawable_model_instance(ModelInstance& model)
+  {
+    return model.model->finishedLoading() && !model.model->loading_failed();
+  }
+
+  SkyParam* active_sky_param(Sky& sky)
+  {
+    if (sky.curr_sky_param < 0 || sky.curr_sky_param >= NUM_SkyParamsNames)
+    {
+      return nullptr;
+    }
+
+    return sky.skyParams[sky.curr_sky_param];
+  }
+
+  SkyParam const* active_sky_param(Sky const& sky)
+  {
+    if (sky.curr_sky_param < 0 || sky.curr_sky_param >= NUM_SkyParamsNames)
+    {
+      return nullptr;
+    }
+
+    return sky.skyParams[sky.curr_sky_param];
+  }
+
+  SkyParam* drawable_skybox_param(Sky& sky)
+  {
+    SkyParam* current = active_sky_param(sky);
+    if (current && current->skybox && drawable_model_instance(current->skybox.value()))
+    {
+      return current;
+    }
+
+    return nullptr;
+  }
+
+  float default_sky_float_param(int row)
+  {
+    switch (row)
+    {
+      case FOG_DISTANCE:
+        return 18000.0f;
+      case FOG_MULTIPLIER:
+        return 0.25f;
+      default:
+        return 0.0f;
+    }
+  }
+}
 
 SkyColor::SkyColor(int t, int col)
 {
@@ -34,9 +314,6 @@ SkyParam::SkyParam(int paramId, Noggit::NoggitRenderContext context)
 {
     Id = paramId;
 
-    if (paramId == 0)
-        return; // don't initialise entry
-
     for (int i = 0; i < 36; ++i)
     {
         mmin[i] = -2;
@@ -46,6 +323,9 @@ SkyParam::SkyParam(int paramId, Noggit::NoggitRenderContext context)
     {
         mmin_float[i] = -2;
     }
+
+    if (paramId == 0)
+      return; // don't initialise entry
 
     // int light_param_0 = data->getInt(LightDB::DataIDs);
     int light_int_start = paramId * NUM_SkyColorNames - 17;
@@ -187,7 +467,16 @@ Sky::Sky(DBCFile::Iterator data, Noggit::NoggitRenderContext context)
   // int light_param_0 = data->getInt(LightDB::DataIDs);
   // int light_int_start = light_param_0 * NUM_SkyColorNames - 17;
 
-  for (int i = 0; i < NUM_SkyParamsNames; ++i)
+    for (int i = 0; i < NUM_SkyParamsNames; ++i)
+    {
+      skyParams[i] = nullptr;
+    }
+
+    size_t const available_sky_params = gLightDB.getFieldCount() > LightDB::DataIDs
+                      ? std::min<size_t>(NUM_SkyParamsNames, gLightDB.getFieldCount() - LightDB::DataIDs)
+                      : 0;
+
+    for (size_t i = 0; i < available_sky_params; ++i)
   {
       int sky_param_id = data->getInt(LightDB::DataIDs + i);
       if (sky_param_id == 0)
@@ -197,7 +486,7 @@ Sky::Sky(DBCFile::Iterator data, Noggit::NoggitRenderContext context)
       }
 
       SkyParam* sky_param = new SkyParam(sky_param_id, _context);
-      skyParams[i] = sky_param;
+        skyParams[i] = sky_param;
   }
 
   // for (int i = 0; i < NUM_SkyColorNames; ++i)
@@ -311,12 +600,31 @@ Sky::Sky(DBCFile::Iterator data, Noggit::NoggitRenderContext context)
   // }
 }
 
+Sky::Sky(int id, glm::vec3 const& position, float inner_radius, float outer_radius, std::vector<SkyParam*> params, Noggit::NoggitRenderContext context)
+: _context(context)
+, _selected(false)
+{
+  Id = id;
+  pos = position;
+  r1 = inner_radius;
+  r2 = outer_radius;
+  global = (pos.x == 0.0f && pos.y == 0.0f && pos.z == 0.0f);
+  weight = 0.f;
+  is_new_record = false;
+  std::memset(name, 0, sizeof(name));
+
+  for (int i = 0; i < NUM_SkyParamsNames; ++i)
+  {
+    skyParams[i] = i < params.size() ? params[i] : nullptr;
+  }
+}
+
 float Sky::floatParamFor(int r, int t) const
 {
-  auto sky_param = skyParams[curr_sky_param];
-  if (sky_param->mmin_float[r]<0)
+  auto sky_param = active_sky_param(*this);
+  if (!sky_param || r < 0 || r >= NUM_SkyFloatParamsNames || sky_param->mmin_float[r] < 0 || sky_param->floatParams[r].empty())
   {
-    return 0.0;
+    return default_sky_float_param(r);
   }
   float c1, c2;
   int t1, t2;
@@ -361,10 +669,10 @@ float Sky::floatParamFor(int r, int t) const
 
 glm::vec3 Sky::colorFor(int r, int t) const
 {
-  auto sky_param = skyParams[curr_sky_param];
-  if (sky_param->mmin[r]<0)
+  auto sky_param = active_sky_param(*this);
+  if (!sky_param || r < 0 || r >= NUM_SkyColorNames || sky_param->mmin[r] < 0 || sky_param->colorRows[r].empty())
   {
-    return glm::vec3(0, 0, 0);
+    return default_sky_color(r);
   }
   glm::vec3 c1, c2;
   int t1, t2;
@@ -438,6 +746,11 @@ Skies::Skies(unsigned int mapid, Noggit::NoggitRenderContext context)
   : stars (ModelInstance("Environments\\Stars\\Stars.mdx", context))
   , _context(context)
 {
+  for (int color_index = 0; color_index < NUM_SkyColorNames; ++color_index)
+  {
+    color_set[color_index] = default_sky_color(color_index);
+  }
+
   bool has_global = false;
   for (DBCFile::Iterator i = gLightDB.begin(); i != gLightDB.end(); ++i)
   {
@@ -466,9 +779,93 @@ Skies::Skies(unsigned int mapid, Noggit::NoggitRenderContext context)
     }
   }
 
+  if (numSkies == 0)
+  {
+    RawDBC light = load_raw_dbc("DBFilesClient\\Light.dbc");
+    RawDBC light_params = load_raw_dbc("DBFilesClient\\LightParams.dbc");
+    RawDBC light_skybox = load_raw_dbc("DBFilesClient\\LightSkybox.dbc");
+    RawDBC light_int_band = load_raw_dbc("DBFilesClient\\LightIntBand.dbc");
+    RawDBC light_float_band = load_raw_dbc("DBFilesClient\\LightFloatBand.dbc");
+    std::vector<std::size_t> fallback_rows;
+
+    if (light.valid && light.field_count > LightDB::DataIDs)
+    {
+      std::size_t const available_sky_params = std::min<std::size_t>(NUM_SkyParamsNames, light.field_count - LightDB::DataIDs);
+      for (std::size_t row = 0; row < light.record_count; ++row)
+      {
+        if (light.word(row, LightDB::Map) != mapid)
+        {
+          if (light.word(row, LightDB::ID) == 1)
+          {
+            fallback_rows.push_back(row);
+          }
+          continue;
+        }
+
+        std::vector<SkyParam*> params;
+        for (std::size_t param_index = 0; param_index < available_sky_params; ++param_index)
+        {
+          std::uint32_t param_id = light.word(row, LightDB::DataIDs + param_index);
+          params.push_back(param_id ? make_raw_sky_param(param_id, light_params, light_skybox, light_int_band, light_float_band, _context) : nullptr);
+        }
+
+        Sky sky(static_cast<int>(light.word(row, LightDB::ID))
+                , glm::vec3(light.number(row, LightDB::PositionX) / skymul, light.number(row, LightDB::PositionY) / skymul, light.number(row, LightDB::PositionZ) / skymul)
+                , light.number(row, LightDB::RadiusInner) / skymul
+                , light.number(row, LightDB::RadiusOuter) / skymul
+                , params
+                , _context);
+        if (sky.pos == glm::vec3(0, 0, 0))
+        {
+          has_global = true;
+        }
+        skies.push_back(sky);
+        numSkies++;
+      }
+
+      if (numSkies == 0 && !fallback_rows.empty())
+      {
+        std::size_t row = fallback_rows.front();
+        std::vector<SkyParam*> params;
+        for (std::size_t param_index = 0; param_index < available_sky_params; ++param_index)
+        {
+          std::uint32_t param_id = light.word(row, LightDB::DataIDs + param_index);
+          params.push_back(param_id ? make_raw_sky_param(param_id, light_params, light_skybox, light_int_band, light_float_band, _context) : nullptr);
+        }
+        skies.emplace_back(static_cast<int>(light.word(row, LightDB::ID))
+                           , glm::vec3(0.f, 0.f, 0.f)
+                           , 0.f
+                           , 0.f
+                           , params
+                           , _context);
+        numSkies++;
+        has_global = true;
+      }
+
+      LogError << "Turtle sky: raw DBC fallback Light records " << light.record_count
+               << ", int bands " << light_int_band.record_count
+               << ", float bands " << light_float_band.record_count
+               << ", loaded " << numSkies << " for map " << mapid << std::endl;
+    }
+  }
+
   // sort skies from smallest to largest; global last.
   // smaller skies will have precedence when calculating weights to achieve smooth transitions etc.
   std::sort(skies.begin(), skies.end());
+  
+  int skies_with_skyboxes = 0;
+  for (Sky& sky : skies)
+  {
+    if (drawable_skybox_param(sky))
+    {
+      skies_with_skyboxes++;
+    }
+  }
+
+  LogError << "Turtle sky: map " << mapid << " loaded " << numSkies
+           << " light rows, " << skies_with_skyboxes << " with drawable skyboxes" << std::endl;
+
+  _need_color_buffer_update = true;
 }
 
 Sky* Skies::findSkyWeights(glm::vec3 pos)
@@ -481,6 +878,23 @@ Sky* Skies::findSkyWeights(glm::vec3 pos)
     {
       default_sky = &sky;
       break;
+    }
+  }
+
+  if (_area_light_id > 0)
+  {
+    for (auto& sky : skies)
+    {
+      sky.weight = 0.f;
+    }
+
+    for (auto& sky : skies)
+    {
+      if (sky.Id == _area_light_id)
+      {
+        sky.weight = 1.f;
+        return default_sky ? default_sky : &sky;
+      }
     }
   }
 
@@ -557,6 +971,15 @@ void Skies::setCurrentParam(int param_id)
     }
 }
 
+void Skies::setAreaLightId(int light_id)
+{
+  if (_area_light_id != light_id)
+  {
+    _area_light_id = light_id;
+    _last_time = -1;
+  }
+}
+
 void Skies::update_sky_colors(glm::vec3 pos, int time)
 {
   if (numSkies == 0 || (_last_time == time && _last_pos == pos))
@@ -576,12 +999,15 @@ void Skies::update_sky_colors(glm::vec3 pos, int time)
     _fog_distance = default_sky->floatParamFor(0, time);
     _fog_multiplier = default_sky->floatParamFor(1, time);
 
-    auto default_sky_param = default_sky->skyParams[default_sky->curr_sky_param];
-    _river_shallow_alpha = default_sky_param->river_shallow_alpha();
-    _river_deep_alpha = default_sky_param->river_deep_alpha();
-    _ocean_shallow_alpha = default_sky_param->ocean_shallow_alpha();
-    _ocean_deep_alpha = default_sky_param->ocean_deep_alpha();
-    _glow = default_sky_param->glow();
+    auto default_sky_param = active_sky_param(*default_sky);
+    if (default_sky_param)
+    {
+      _river_shallow_alpha = default_sky_param->river_shallow_alpha();
+      _river_deep_alpha = default_sky_param->river_deep_alpha();
+      _ocean_shallow_alpha = default_sky_param->ocean_shallow_alpha();
+      _ocean_deep_alpha = default_sky_param->ocean_deep_alpha();
+      _glow = default_sky_param->glow();
+    }
 
   }
   else
@@ -627,12 +1053,16 @@ void Skies::update_sky_colors(glm::vec3 pos, int time)
       _fog_multiplier = (_fog_multiplier * (1.0f - sky.weight)) + (sky.floatParamFor(1, time) * sky.weight);
       // sky.skyParams[sky.curr_sky_param]->river_shallow_alpha(); // new
       // sky.skyParams[sky.curr_sky_param].river_shallow_alpha(); // old
-      _river_shallow_alpha = (_river_shallow_alpha * (1.0f - sky.weight)) + (sky.skyParams[sky.curr_sky_param]->river_shallow_alpha() * sky.weight);
-      _river_deep_alpha = (_river_deep_alpha * (1.0f - sky.weight)) + (sky.skyParams[sky.curr_sky_param]->river_deep_alpha() * sky.weight);
-      _ocean_shallow_alpha = (_ocean_shallow_alpha * (1.0f - sky.weight)) + (sky.skyParams[sky.curr_sky_param]->ocean_shallow_alpha() * sky.weight);
-      _ocean_deep_alpha = (_ocean_deep_alpha * (1.0f - sky.weight)) + (sky.skyParams[sky.curr_sky_param]->ocean_deep_alpha() * sky.weight);
+      auto sky_param = active_sky_param(sky);
+      if (sky_param)
+      {
+        _river_shallow_alpha = (_river_shallow_alpha * (1.0f - sky.weight)) + (sky_param->river_shallow_alpha() * sky.weight);
+        _river_deep_alpha = (_river_deep_alpha * (1.0f - sky.weight)) + (sky_param->river_deep_alpha() * sky.weight);
+        _ocean_shallow_alpha = (_ocean_shallow_alpha * (1.0f - sky.weight)) + (sky_param->ocean_shallow_alpha() * sky.weight);
+        _ocean_deep_alpha = (_ocean_deep_alpha * (1.0f - sky.weight)) + (sky_param->ocean_deep_alpha() * sky.weight);
 
-      _glow = (_glow * (1.0f - sky.weight)) + (sky.skyParams[sky.curr_sky_param]->glow() * sky.weight);
+        _glow = (_glow * (1.0f - sky.weight)) + (sky_param->glow() * sky.weight);
+      }
     }
 
   }
@@ -669,7 +1099,31 @@ bool Skies::draw(glm::mat4x4 const& model_view
 {
   if (numSkies == 0)
   {
-    return false;
+    if (!_uploaded)
+    {
+      upload();
+    }
+
+    if (_need_color_buffer_update)
+    {
+      update_color_buffer();
+    }
+
+    OpenGL::Scoped::use_program shader {*_program.get()};
+
+    if(_need_vao_update)
+    {
+      update_vao(shader);
+    }
+
+    OpenGL::Scoped::vao_binder const _ (_vao);
+
+    shader.uniform("model_view_projection", projection * model_view);
+    shader.uniform("camera_pos", glm::vec3(camera_pos.x, camera_pos.y, camera_pos.z));
+
+    gl.drawElements(GL_TRIANGLES, _indices_count, GL_UNSIGNED_SHORT, nullptr);
+
+    return true;
   }
 
   if (!_uploaded)
@@ -703,11 +1157,12 @@ bool Skies::draw(glm::mat4x4 const& model_view
   bool has_skybox = false;
   for (Sky& sky : skies)
   {
-    if (sky.weight > 0.f && sky.skybox)
+    SkyParam* sky_param = drawable_skybox_param(sky);
+    if (sky.weight > 0.f && sky_param && sky_param->skybox)
     {
       has_skybox = true;
 
-      auto& model = sky.skybox.value();
+      auto& model = sky_param->skybox.value();
       model.model->trans = sky.weight;
       model.pos = camera_pos;
       model.scale = 0.1f;
@@ -725,6 +1180,7 @@ bool Skies::draw(glm::mat4x4 const& model_view
       m2_shader.uniform("unlit",  static_cast<int>(model_render_state.unlit));
       m2_shader.uniform("tex_unit_lookup_1", 0);
       m2_shader.uniform("tex_unit_lookup_2", 0);
+      m2_shader.uniform("masked_additive", 0);
       m2_shader.uniform("pixel_shader", 0);
 
       model.model->renderer()->draw(model_view, model, m2_shader, model_render_state, frustum, 1000000, camera_pos, animtime, display_mode::in_3D);
@@ -750,6 +1206,7 @@ bool Skies::draw(glm::mat4x4 const& model_view
     m2_shader.uniform("unlit",  static_cast<int>(model_render_state.unlit));
     m2_shader.uniform("tex_unit_lookup_1", 0);
     m2_shader.uniform("tex_unit_lookup_2", 0);
+    m2_shader.uniform("masked_additive", 0);
     m2_shader.uniform("pixel_shader", 0);
 
     stars.model->renderer()->draw(model_view, stars, m2_shader, model_render_state, frustum, 1000000, camera_pos, animtime, display_mode::in_3D);

@@ -296,15 +296,42 @@ MapChunk::MapChunk(MapTile* maintile, BlizzardArchive::ClientFile* f, bool bigAl
     f->seek(base + header.ofsLiquid);
 
     f->read(&fourcc, 4);
-    f->seekRelative(4); // ignore the size here, the valid size is in the header
+    f->read(&size, 4);
 
     assert(fourcc == 'MCLQ');
 
-    int layer_count = (header.sizeLiquid - 8) / sizeof(mclq);
-    std::vector<mclq> layers(layer_count);
-    f->read(layers.data(), sizeof(mclq)*layer_count);
+    std::size_t const header_payload_size = header.sizeLiquid > 8 ? header.sizeLiquid - 8 : 0;
+    std::size_t payload_size = size ? size : header_payload_size;
+    if (payload_size < sizeof(mclq) && header_payload_size >= sizeof(mclq))
+    {
+      payload_size = header_payload_size;
+    }
 
-    mt->Water.getChunk(px, py)->from_mclq(layers);
+    if (payload_size < sizeof(mclq))
+    {
+      LogError << "Invalid short MCLQ chunk tile " << mt->index.x << "," << mt->index.z
+               << " chunk " << px << "," << py
+               << " payload " << payload_size
+               << " expected at least " << sizeof(mclq) << std::endl;
+    }
+    else
+    {
+      std::vector<mclq> layers(1);
+      f->read(layers.data(), sizeof(mclq));
+
+      static int logged_mclq_chunks = 0;
+      if (logged_mclq_chunks < 40)
+      {
+        LogError << "Turtle water: MCLQ chunk tile " << mt->index.x << "," << mt->index.z
+                 << " chunk " << px << "," << py
+                 << " payload " << payload_size
+                 << " trailing " << (payload_size - sizeof(mclq)) << std::endl;
+        logged_mclq_chunks++;
+      }
+
+      mt->Water.getChunk(px, py)->from_mclq(layers);
+    }
+
     // remove the liquid flags as it'll be saved as MH2O
     header_flags.value &= ~(0xF << 2);
   }

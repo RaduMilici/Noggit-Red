@@ -100,6 +100,8 @@ namespace OpenGL
     bool z_buffered = false;
     bool unfogged = false;
     bool unlit = false;
+    bool masked_additive = false;
+    bool allow_lightray_model = true;
     std::array<GLuint, 2> tex_arrays;
     std::array<GLuint, 2> tex_indices;
     std::array<GLint, 2> tex_unit_lookups;

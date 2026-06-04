@@ -55,7 +55,7 @@ namespace Noggit::Ui::Widget
 
     auto instance_type = QString("Unknown");
     if (_map_data.map_type_id == 0)
-      instance_type = QString("Continent");
+      instance_type = QString("World");
     if (_map_data.map_type_id == 1)
       instance_type = QString("Dungeon");
     if (_map_data.map_type_id == 2)

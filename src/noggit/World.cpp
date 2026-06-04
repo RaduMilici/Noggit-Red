@@ -21,6 +21,9 @@
 #include <noggit/project/CurrentProject.hpp>
 #include <noggit/ActionManager.hpp>
 #include <external/tracy/Tracy.hpp>
+#ifdef USE_MYSQL_UID_STORAGE
+#include <mysql/mysql.h>
+#endif
 #include <QByteArray>
 #include <QImage>
 #include <algorithm>
@@ -38,11 +41,301 @@
 #include <glm/gtc/quaternion.hpp>
 #include <glm/gtx/quaternion.hpp>
 
+#ifdef USE_MYSQL_UID_STORAGE
+namespace mysql
+{
+  std::vector<CreatureSpawnRecord> getCreatureSpawns(std::size_t mapID, std::string* error);
+}
+#endif
+
+namespace
+{
+  constexpr std::size_t max_logged_creature_model_failures = 8;
+
+  enum class CreatureModelPathStatus
+  {
+    Success,
+    MissingDisplayId,
+    MissingDisplayInfo,
+    MissingModelInfo,
+    EmptyModelName
+  };
+
+  struct CreatureModelPathResult
+  {
+    CreatureModelPathStatus status = CreatureModelPathStatus::MissingDisplayId;
+    std::string path;
+  };
+
+  std::string normalize_model_filename(std::string filename)
+  {
+    filename = BlizzardArchive::ClientData::normalizeFilenameInternal(std::move(filename));
+
+    std::size_t found;
+    if ((found = filename.rfind(".mdx")) != std::string::npos)
+    {
+      filename.replace(found, 4, ".m2");
+    }
+    else if ((found = filename.rfind(".mdl")) != std::string::npos)
+    {
+      filename.replace(found, 4, ".m2");
+    }
+    else if (filename.rfind('.') == std::string::npos)
+    {
+      filename += ".m2";
+    }
+
+    return filename;
+  }
+
+  std::string normalize_texture_filename(std::string filename)
+  {
+    if (filename.empty())
+    {
+      return filename;
+    }
+
+    filename = BlizzardArchive::ClientData::normalizeFilenameInternal(std::move(filename));
+    if (filename.rfind('.') == std::string::npos)
+    {
+      filename += ".blp";
+    }
+
+    return filename;
+  }
+
+  std::string normalize_baked_creature_texture_filename(std::string filename)
+  {
+    if (filename.empty())
+    {
+      return filename;
+    }
+
+    std::string lower = BlizzardArchive::ClientData::normalizeFilenameInternal(filename);
+    // Any bare filename (no path separator) belongs in bakednpctextures ΓÇö
+    // this covers both "creaturedisplayextra-xxx.blp" and MD5-hash names.
+    if (lower.find('/') == std::string::npos && lower.find('\\') == std::string::npos)
+    {
+      filename = "textures\\bakednpctextures\\" + filename;
+    }
+
+    return normalize_texture_filename(std::move(filename));
+  }
+
+  glm::vec3 server_to_client_position(float server_x, float server_y, float server_z, bool global_wmo_map)
+  {
+    if (global_wmo_map)
+    {
+      return {-server_y, server_z, -server_x};
+    }
+
+    return {ZEROPOINT - server_y, server_z, ZEROPOINT - server_x};
+  }
+
+  float server_to_client_orientation(float orientation)
+  {
+    return glm::degrees(orientation) - 180.0f;
+  }
+
+  std::vector<std::pair<std::size_t, std::string>> resolve_creature_texture_overrides(std::uint32_t display_id)
+  {
+    if (!display_id)
+    {
+      return {};
+    }
+
+    try
+    {
+      auto display = gCreatureDisplayInfoDB.getByID(display_id);
+      constexpr std::array<std::pair<std::size_t, std::size_t>, 6> slot_fields = {{
+        {1, CreatureDisplayInfoDB::TextureVariation1},
+        {2, CreatureDisplayInfoDB::TextureVariation2},
+        {3, CreatureDisplayInfoDB::TextureVariation3},
+        {11, CreatureDisplayInfoDB::TextureVariation1},
+        {12, CreatureDisplayInfoDB::TextureVariation2},
+        {13, CreatureDisplayInfoDB::TextureVariation3},
+      }};
+
+      // Classic DBC stores short texture names (e.g. "DireWolf") with no path.
+      // Resolve the model directory so we can build the full archive path.
+      std::string model_dir;
+      try
+      {
+        auto model_id = display.getUInt(CreatureDisplayInfoDB::ModelID);
+        auto model = gCreatureModelDataDB.getByID(model_id);
+        auto model_path = normalize_model_filename(model.getString(CreatureModelDataDB::ModelName));
+        auto sep = model_path.rfind('/');
+        if (sep != std::string::npos)
+        {
+          model_dir = model_path.substr(0, sep + 1);
+        }
+      }
+      catch (...) {}
+
+      std::vector<std::pair<std::size_t, std::string>> overrides;
+      overrides.reserve(slot_fields.size());
+      bool has_explicit_texture_variation = false;
+
+      for (auto const& slot_field : slot_fields)
+      {
+        auto texture = normalize_texture_filename(display.getString(slot_field.second));
+        if (!texture.empty())
+        {
+          has_explicit_texture_variation = true;
+          // No slash ΓåÆ Classic short name; prepend model directory.
+          if (!model_dir.empty() && texture.find('/') == std::string::npos)
+          {
+            texture = model_dir + texture;
+          }
+          overrides.emplace_back(slot_field.first, std::move(texture));
+        }
+      }
+
+      auto extra_display_id = display.getUInt(CreatureDisplayInfoDB::ExtendedDisplayInfoID);
+      if (extra_display_id)
+      {
+        try
+        {
+          auto display_extra = gCreatureDisplayInfoExtraDB.getByID(extra_display_id);
+          if (!has_explicit_texture_variation)
+          {
+            auto baked_texture = normalize_baked_creature_texture_filename(display_extra.getString(CreatureDisplayInfoExtraDB::BakedTexture));
+            auto* client = Noggit::Application::NoggitApplication::instance()->clientData();
+            if (!baked_texture.empty() && client->exists(baked_texture))
+            {
+              overrides.emplace_back(1, std::move(baked_texture));
+            }
+            else
+            {
+              // Baked texture not available (hash-named runtime textures are not shipped in MPQ).
+              // Fall back to the character's base skin texture derived from CDIExtra fields.
+              auto race_id = display_extra.getUInt(CreatureDisplayInfoExtraDB::DisplayRaceID);
+              auto sex_id  = display_extra.getUInt(CreatureDisplayInfoExtraDB::DisplaySexID);
+              auto skin_id = display_extra.getUInt(CreatureDisplayInfoExtraDB::SkinID);
+
+              std::string race_name;
+              switch (race_id)
+              {
+                case  1: race_name = "Human";    break;
+                case  2: race_name = "Orc";      break;
+                case  3: race_name = "Dwarf";    break;
+                case  4: race_name = "NightElf"; break;
+                case  5: race_name = "Scourge";  break;
+                case  6: race_name = "Tauren";   break;
+                case  7: race_name = "Gnome";    break;
+                case  8: race_name = "Troll";    break;
+                case 10: race_name = "BloodElf"; break;
+                case 11: race_name = "Draenei";  break;
+                default: break;
+              }
+              std::string const sex_name = (sex_id == 0) ? "Male" : "Female";
+
+              if (!race_name.empty())
+              {
+                std::string skin_pad = (skin_id < 10 ? "0" : "") + std::to_string(skin_id);
+                std::string skin_path = "Character/" + race_name + "/" + sex_name + "/"
+                  + race_name + sex_name + "Skin00_" + skin_pad + ".blp";
+                if (!client->exists(skin_path))
+                {
+                  // Specific skin not found; try default skin 0 as fallback.
+                  skin_path = "Character/" + race_name + "/" + sex_name + "/"
+                    + race_name + sex_name + "Skin00_00.blp";
+                }
+                if (client->exists(skin_path))
+                {
+                  overrides.emplace_back(1, normalize_texture_filename(std::move(skin_path)));
+                }
+              }
+            }
+          }
+        }
+        catch (DBCFile::NotFound const&)
+        {
+        }
+      }
+
+      return overrides;
+    }
+    catch (DBCFile::NotFound const&)
+    {
+      return {};
+    }
+  }
+
+  CreatureModelPathResult resolve_creature_model_path(std::uint32_t display_id)
+  {
+    if (!display_id)
+    {
+      return {};
+    }
+
+    try
+    {
+      auto display = gCreatureDisplayInfoDB.getByID(display_id);
+      auto model_id = display.getUInt(CreatureDisplayInfoDB::ModelID);
+      if (!model_id)
+      {
+        return {CreatureModelPathStatus::MissingModelInfo, {}};
+      }
+
+      try
+      {
+        auto model = gCreatureModelDataDB.getByID(model_id);
+        auto model_name = normalize_model_filename(model.getString(CreatureModelDataDB::ModelName));
+        if (model_name.empty())
+        {
+          return {CreatureModelPathStatus::EmptyModelName, {}};
+        }
+
+        return {CreatureModelPathStatus::Success, std::move(model_name)};
+      }
+      catch (DBCFile::NotFound const&)
+      {
+        return {CreatureModelPathStatus::MissingModelInfo, {}};
+      }
+    }
+    catch (DBCFile::NotFound const&)
+    {
+      return {CreatureModelPathStatus::MissingDisplayInfo, {}};
+    }
+  }
+
+  float resolve_creature_model_scale(std::uint32_t display_id)
+  {
+    if (!display_id)
+    {
+      return 1.0f;
+    }
+
+    try
+    {
+      auto display = gCreatureDisplayInfoDB.getByID(display_id);
+      auto model_id = display.getUInt(CreatureDisplayInfoDB::ModelID);
+      auto model = gCreatureModelDataDB.getByID(model_id);
+
+      float model_scale = model.getFloat(CreatureModelDataDB::ModelScale);
+      float scale = model_scale > 0.0f ? model_scale : 1.0f;
+      return std::clamp(scale, ModelInstance::min_scale(), ModelInstance::max_scale());
+    }
+    catch (DBCFile::NotFound const&)
+    {
+      return 1.0f;
+    }
+  }
+}
+
 
 bool World::IsEditableWorld(BlizzardDatabaseLib::Structures::BlizzardDatabaseRow& record)
 {
   ZoneScoped;
-  std::string lMapName = record.Columns["Directory"].Value;
+  auto directory_column = record.Columns.find("Directory");
+  if (directory_column == record.Columns.end() || directory_column->second.Value.empty())
+  {
+    Log << "World " << record.RecordId << ": missing Directory column in Map.dbc row, skipping." << std::endl;
+    return false;
+  }
+
+  std::string lMapName = directory_column->second.Value;
 
   std::stringstream ssfilename;
   ssfilename << "World\\Maps\\" << lMapName << "\\" << lMapName << ".wdt";
@@ -76,15 +369,81 @@ bool World::IsEditableWorld(BlizzardDatabaseLib::Structures::BlizzardDatabaseRow
   return false;
 }
 
+bool World::IsEditableWorld(DBCFile::Record const& record)
+{
+  ZoneScoped;
+
+  std::string lMapName = record.getString(MapDB::InternalName);
+  if (lMapName.empty())
+    return false;
+
+  std::stringstream ssfilename;
+  ssfilename << "World\\Maps\\" << lMapName << "\\" << lMapName << ".wdt";
+
+  if (!Noggit::Application::NoggitApplication::instance()->clientData()->exists(ssfilename.str()))
+  {
+    Log << "World " << record.getUInt(MapDB::MapID) << ": " << lMapName << " has no WDT file!" << std::endl;
+    return false;
+  }
+
+  BlizzardArchive::ClientFile mf(ssfilename.str(), Noggit::Application::NoggitApplication::instance()->clientData());
+
+  if (mf.isEof())
+    return false;
+
+  const char* lPointer = reinterpret_cast<const char*>(mf.getPointer());
+
+  const int lFlags = *(reinterpret_cast<const int*>(lPointer + 8 + 4 + 8));
+  if (lFlags & 1)
+    return true;
+
+  const int* lData = reinterpret_cast<const int*>(lPointer + 8 + 4 + 8 + 0x20 + 8);
+  for (int i = 0; i < 8192; i += 2)
+  {
+    if (lData[i] & 1)
+      return true;
+  }
+
+  return false;
+}
+
 bool World::IsWMOWorld(BlizzardDatabaseLib::Structures::BlizzardDatabaseRow& record)
 {
     ZoneScoped;
-    std::string lMapName = record.Columns["Directory"].Value;
+    auto directory_column = record.Columns.find("Directory");
+    if (directory_column == record.Columns.end() || directory_column->second.Value.empty())
+      return false;
+
+    std::string lMapName = directory_column->second.Value;
 
     std::stringstream ssfilename;
     ssfilename << "World\\Maps\\" << lMapName << "\\" << lMapName << ".wdt";
 
     BlizzardArchive::ClientFile mf(ssfilename.str(), Noggit::Application::NoggitApplication::instance()->clientData());
+
+    const char* lPointer = reinterpret_cast<const char*>(mf.getPointer());
+
+    const int lFlags = *(reinterpret_cast<const int*>(lPointer + 8 + 4 + 8));
+    if (lFlags & 1)
+        return true;
+
+    return false;
+}
+
+bool World::IsWMOWorld(DBCFile::Record const& record)
+{
+    ZoneScoped;
+
+    std::string lMapName = record.getString(MapDB::InternalName);
+    if (lMapName.empty())
+      return false;
+
+    std::stringstream ssfilename;
+    ssfilename << "World\\Maps\\" << lMapName << "\\" << lMapName << ".wdt";
+
+    BlizzardArchive::ClientFile mf(ssfilename.str(), Noggit::Application::NoggitApplication::instance()->clientData());
+    if (mf.isEof())
+      return false;
 
     const char* lPointer = reinterpret_cast<const char*>(mf.getPointer());
 
@@ -112,6 +471,183 @@ World::World(const std::string& name, int map_id, Noggit::NoggitRenderContext co
 {
   LogDebug << "Loading world \"" << name << "\"." << std::endl;
   _loaded_tiles_buffer[0] = std::make_pair<std::pair<int, int>, MapTile*>(std::make_pair(0, 0), nullptr);
+  _creature_spawn_status = "Creature spawns inactive";
+}
+
+bool World::reloadCreatureSpawns()
+{
+  _creature_spawns_load_attempted = true;
+  clearCreatureSpawns();
+
+#ifdef USE_MYSQL_UID_STORAGE
+  std::string error;
+  auto rows = mysql::getCreatureSpawns(mapIndex._map_id, &error);
+  if (!error.empty())
+  {
+    _creature_spawn_status = "Creature spawn load failed: " + error;
+    return false;
+  }
+
+  LogDebug << "Creature spawn DBC stats: CreatureDisplayInfo records=" << gCreatureDisplayInfoDB.getRecordCount()
+           << ", CreatureModelData records=" << gCreatureModelDataDB.getRecordCount() << std::endl;
+
+  _creature_spawns.reserve(rows.size());
+  std::size_t resolved_models = 0;
+  std::size_t missing_display_id = 0;
+  std::size_t missing_display_info = 0;
+  std::size_t missing_model_info = 0;
+  std::size_t empty_model_name = 0;
+  std::size_t model_construct_failures = 0;
+  std::size_t logged_failures = 0;
+
+  for (auto const& row : rows)
+  {
+    CreatureSpawnOverlay spawn;
+    spawn.guid = row.guid;
+    spawn.entry = row.entry;
+    spawn.display_id = row.display_id;
+    spawn.name = row.name;
+    spawn.pos = server_to_client_position(row.position_x,
+              row.position_y,
+              row.position_z,
+              mapIndex.hasAGlobalWMO());
+    spawn.original_pos = spawn.pos;
+    spawn.orientation = server_to_client_orientation(row.orientation);
+    spawn.original_orientation = spawn.orientation;
+
+    if (spawn.display_id)
+    {
+      auto const model_result = resolve_creature_model_path(spawn.display_id);
+      if (model_result.status == CreatureModelPathStatus::Success)
+      {
+        try
+        {
+          BlizzardArchive::Listfile::FileKey const file_key(model_result.path);
+          spawn.model_instance.emplace(file_key, _context);
+          spawn.model_instance->pos   = spawn.pos;
+          spawn.model_instance->dir   = glm::vec3(0.0f, spawn.orientation, 0.0f);
+          float template_scale = row.template_scale > 0.0f ? row.template_scale : 1.0f;
+          float model_scale = resolve_creature_model_scale(spawn.display_id);
+          spawn.model_instance->scale = std::clamp(template_scale * model_scale,
+                                                   ModelInstance::min_scale(),
+                                                   ModelInstance::max_scale());
+          spawn.model_instance->updateTransformMatrix();
+
+          auto const overrides = resolve_creature_texture_overrides(spawn.display_id);
+          for (auto const& ov : overrides)
+          {
+            spawn.model_instance->setReplaceTexture(ov.first, ov.second);
+            // Also set model-level replacement: instanced draw passes nullptr for ModelInstance,
+            // so model-level _replaceTextures is the fallback used by bindTexture.
+            auto& replace_map = spawn.model_instance->model.get()->_replaceTextures;
+            replace_map.erase(ov.first);
+            replace_map.emplace(std::piecewise_construct,
+                                std::forward_as_tuple(ov.first),
+                                std::forward_as_tuple(ov.second, _context));
+          }
+
+          ++resolved_models;
+        }
+        catch (std::exception const& ex)
+        {
+          ++model_construct_failures;
+          if (logged_failures < max_logged_creature_model_failures)
+          {
+            LogDebug << "Creature spawn model load failed: guid=" << spawn.guid
+                     << " display_id=" << spawn.display_id
+                     << " path=" << model_result.path
+                     << " error=" << ex.what() << std::endl;
+            ++logged_failures;
+          }
+        }
+      }
+      else
+      {
+        switch (model_result.status)
+        {
+          case CreatureModelPathStatus::MissingDisplayInfo: ++missing_display_info; break;
+          case CreatureModelPathStatus::MissingModelInfo:   ++missing_model_info;   break;
+          case CreatureModelPathStatus::EmptyModelName:     ++empty_model_name;     break;
+          default:                                          ++missing_display_id;   break;
+        }
+      }
+    }
+    else
+    {
+      ++missing_display_id;
+    }
+
+    _creature_spawns.emplace_back(std::move(spawn));
+  }
+
+  _creature_spawns_loaded = true;
+  _creature_spawn_status = "Creature spawns loaded: " + std::to_string(_creature_spawns.size())
+                         + " (models: " + std::to_string(resolved_models)
+                         + ", noDisplayId: " + std::to_string(missing_display_id)
+                         + ", noDisplayInfo: " + std::to_string(missing_display_info)
+                         + ", noModelInfo: " + std::to_string(missing_model_info)
+                         + ", emptyModelName: " + std::to_string(empty_model_name)
+                         + ", modelCreateFail: " + std::to_string(model_construct_failures) + ")";
+  LogDebug << _creature_spawn_status << std::endl;
+  return true;
+#else
+  _creature_spawn_status = "Creature spawns unavailable: build without MySQL support";
+  return false;
+#endif
+}
+
+void World::clearCreatureSpawns()
+{
+  _creature_spawns.clear();
+  _creature_spawns_loaded = false;
+}
+
+void World::ensureCreatureSpawnsLoaded()
+{
+  if (!_creature_spawns_loaded && !_creature_spawns_load_attempted)
+  {
+    reloadCreatureSpawns();
+  }
+}
+
+std::size_t World::creatureSpawnModelCount() const
+{
+  return static_cast<std::size_t>(std::count_if(_creature_spawns.begin(), _creature_spawns.end(),
+    [](CreatureSpawnOverlay const& spawn)
+    {
+      return spawn.model_instance.has_value();
+    }));
+}
+
+std::size_t World::dirtyCreatureSpawnCount() const
+{
+  return static_cast<std::size_t>(std::count_if(_creature_spawns.begin(), _creature_spawns.end(),
+    [](CreatureSpawnOverlay const& spawn)
+    {
+      return spawn.dirty;
+    }));
+}
+
+World::CreatureSpawnOverlay* World::findCreatureSpawn(std::uint32_t guid)
+{
+  auto it = std::find_if(_creature_spawns.begin(), _creature_spawns.end(),
+    [guid](CreatureSpawnOverlay const& spawn)
+    {
+      return spawn.guid == guid;
+    });
+
+  return it != _creature_spawns.end() ? &*it : nullptr;
+}
+
+World::CreatureSpawnOverlay const* World::findCreatureSpawn(std::uint32_t guid) const
+{
+  auto it = std::find_if(_creature_spawns.begin(), _creature_spawns.end(),
+    [guid](CreatureSpawnOverlay const& spawn)
+    {
+      return spawn.guid == guid;
+    });
+
+  return it != _creature_spawns.end() ? &*it : nullptr;
 }
 
 void World::LoadSavedSelectionGroups()
@@ -1016,7 +1552,14 @@ bool World::isInIndoorWmoGroup(std::array<glm::vec3, 2> obj_bounds, glm::mat4x4 
                     {
                         // must call getGroupExtent() to initialize wmo_instance.group_extents
                         // TODO : clear group extents to free memory ?
-                        auto& group_extents = wmo_instance.getGroupExtents().at(i);
+                      auto const& all_group_extents = wmo_instance.getGroupExtents();
+                      auto group_extents_it = all_group_extents.find(i);
+                      if (group_extents_it == all_group_extents.end())
+                      {
+                        continue;
+                      }
+
+                      auto& group_extents = group_extents_it->second;
 
                         // TODO : do a precise calculation instead of using axis aligned bounding boxes.
                         bool aabb_test = obj_bounds[1].x >= group_extents.first.x

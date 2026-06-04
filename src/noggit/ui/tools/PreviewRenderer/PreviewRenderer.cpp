@@ -233,6 +233,7 @@ void PreviewRenderer::draw()
     m2_shader.uniform("unlit", static_cast<int>(model_render_state.unlit));
     m2_shader.uniform("tex_unit_lookup_1", 0);
     m2_shader.uniform("tex_unit_lookup_2", 0);
+    m2_shader.uniform("masked_additive", 0);
     m2_shader.uniform("pixel_shader", 0);
 
     std::vector<ModelInstance*> instance{ nullptr };

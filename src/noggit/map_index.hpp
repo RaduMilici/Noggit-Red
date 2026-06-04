@@ -154,7 +154,7 @@ public:
   auto loaded_tiles()
   {
     return tiles<false>
-      ([] (TileIndex const&, MapTile* tile) { return !!tile && tile->finishedLoading(); });
+      ([] (TileIndex const&, MapTile* tile) { return !!tile && tile->finishedLoading() && !tile->loading_failed(); });
   }
 
   auto tiles_in_range (glm::vec3 const& pos, float radius)
@@ -162,7 +162,7 @@ public:
     return tiles<true>
       ( [this, pos, radius] (TileIndex const& index, MapTile*)
         {
-          return hasTile(index) && misc::getShortestDist
+          return hasTile(index) && !tileLoadFailed(index) && misc::getShortestDist
             (pos.x, pos.z, index.x * TILESIZE, index.z * TILESIZE, TILESIZE) <= radius;
         }
       );
@@ -176,7 +176,7 @@ public:
     return tiles<true>
       ( [this, pos, radius, l_chunk, r_chunk] (TileIndex const& index, MapTile*)
         {
-          if (!hasTile(index) || radius == 0.f)
+          if (!hasTile(index) || tileLoadFailed(index) || radius == 0.f)
             return false;
 
           glm::vec2 l_tile{index.x * TILESIZE, index.z * TILESIZE};
@@ -215,6 +215,7 @@ public:
 
   bool hasAGlobalWMO();
   bool hasTile(const TileIndex& index) const;
+  bool tileLoadFailed(const TileIndex& tile) const;
   bool tileAwaitingLoading(const TileIndex& tile) const;
   bool tileLoaded(const TileIndex& tile) const;
 

@@ -10,6 +10,7 @@
 #include <noggit/ui/Checkbox.hpp>
 #include <noggit/ui/CurrentTexture.h>
 #include <noggit/ui/texture_swapper.hpp>
+#include <noggit/ui/tools/UiCommon/expanderwidget.h>
 #include <util/qt/overload.hpp>
 
 #include <QtWidgets/QFormLayout>

@@ -8,10 +8,12 @@
 #include <noggit/ModelManager.h>
 #include <noggit/Selection.h>
 #include <noggit/SceneObject.hpp>
+#include <noggit/TextureManager.h>
 #include <noggit/rendering/Primitives.hpp>
 #include <noggit/TileIndex.hpp>
 #include <noggit/tool_enums.hpp>
 #include <opengl/shader.fwd.hpp>
+#include <map>
 #include <optional>
 #include <cstdint>
 
@@ -40,7 +42,7 @@ public:
                          , ENTRY_MDDF const*d, Noggit::NoggitRenderContext context);
 
   ModelInstance(ModelInstance const& other) = default;
-  ModelInstance& operator= (ModelInstance const& other) = default;
+  ModelInstance& operator= (ModelInstance const& other);
 
   ModelInstance (ModelInstance&& other)
     : SceneObject(other._type, other._context)
@@ -48,6 +50,7 @@ public:
     , light_color (other.light_color)
     , size_cat (other.size_cat)
     , _need_recalc_extents(other._need_recalc_extents)
+    , _forced_anim_id(other._forced_anim_id)
   {
     pos = other.pos;
     dir = other.dir;
@@ -69,6 +72,7 @@ public:
     std::swap (scale, other.scale);
     std::swap (size_cat, other.size_cat);
     std::swap (_need_recalc_extents, other._need_recalc_extents);
+    std::swap (_forced_anim_id, other._forced_anim_id);
     std::swap (extents, other.extents);
     std::swap(_transform_mat_inverted, other._transform_mat_inverted);
     std::swap(_context, other._context);
@@ -104,15 +108,25 @@ public:
   [[nodiscard]]
   AsyncObject* instance_model() const override { return model.get(); };
 
+  void setReplaceTexture(std::size_t texture_type, std::string const& filename);
+
+  [[nodiscard]]
+  std::map<std::size_t, scoped_blp_texture_reference> const& replaceTextures() const { return _replace_textures; }
+
   void updateDetails(Noggit::Ui::detail_infos* detail_widget) override;
 
   [[nodiscard]]
   std::uint32_t gpuTransformUid() const { return _gpu_transform_uid; }
 
+  void setForcedAnimationId(int anim_id) { _forced_anim_id = anim_id; }
+  [[nodiscard]] int forcedAnimationId() const { return _forced_anim_id; }
+
 protected:
   bool _need_recalc_extents = true;
   bool _need_gpu_transform_update = true;
   std::uint32_t _gpu_transform_uid;
+  int _forced_anim_id = -1;
+  std::map<std::size_t, scoped_blp_texture_reference> _replace_textures;
 
 };
 
@@ -127,7 +141,7 @@ public:
       , Noggit::NoggitRenderContext context );
 
   wmo_doodad_instance(wmo_doodad_instance const& other)
-  : ModelInstance(other.model->file_key(), other._context)
+  : ModelInstance(other)
   , doodad_orientation(other.doodad_orientation)
   , world_pos(other.world_pos)
   , _need_matrix_update(other._need_matrix_update)

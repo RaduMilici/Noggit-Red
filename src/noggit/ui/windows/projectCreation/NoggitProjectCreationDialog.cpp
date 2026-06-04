@@ -15,7 +15,7 @@ NoggitProjectCreationDialog::NoggitProjectCreationDialog(ProjectInformation& pro
 
   ui->setupUi(this);
 
-  QIcon icon = QIcon(":/icon-wrath");
+  QIcon icon = QIcon(":/icon-classic");
   ui->expansion_icon->setPixmap(icon.pixmap(QSize(32, 32)));
   ui->expansion_icon->setObjectName("icon");
   ui->expansion_icon->setStyleSheet("QLabel#icon { padding: 0px }");
@@ -25,7 +25,9 @@ NoggitProjectCreationDialog::NoggitProjectCreationDialog(ProjectInformation& pro
                      auto version_selected = ui->project_expansion->currentText().toStdString();
 
                      QIcon icon;
-                     if (version_selected == "Wrath Of The Lich King")
+                     if (version_selected == "Turtle WoW" || version_selected == "Vanilla")
+                       icon = QIcon(":/icon-classic");
+                     else if (version_selected == "Wrath Of The Lich King")
                        icon = QIcon(":/icon-wrath");
                      else if (version_selected == "Shadowlands")
                        icon = QIcon(":/icon-shadow");

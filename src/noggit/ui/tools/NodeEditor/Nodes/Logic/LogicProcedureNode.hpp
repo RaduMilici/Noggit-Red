@@ -26,6 +26,7 @@ namespace Noggit
         Q_OBJECT
 
         public:
+            static QString Name() { return "Logic :: Procedure"; }
             LogicProcedureNode();
             void compute() override;
             NodeValidationState validate() override;

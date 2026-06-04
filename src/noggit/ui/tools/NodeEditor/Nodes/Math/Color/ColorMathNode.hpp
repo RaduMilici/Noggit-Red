@@ -23,6 +23,7 @@ namespace Noggit
         Q_OBJECT
 
         public:
+            static QString Name() { return "Color :: Math"; }
             ColorMathNode();
             void compute() override;
             QJsonObject save() const override;

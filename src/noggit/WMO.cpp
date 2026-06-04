@@ -351,6 +351,10 @@ void WMO::waitForChildrenLoaded()
   for (auto& doodad : modelis)
   {
     doodad.model->wait_until_loaded();
+    if (doodad.model->loading_failed())
+    {
+      continue;
+    }
     doodad.model->waitForChildrenLoaded();
   }
 }
@@ -1080,12 +1084,24 @@ bool WMOGroup::is_visible( glm::mat4x4 const& transform
                          , display_mode display
                          ) const
 {
-    glm::vec3 pos = transform * glm::vec4(center, 0);
+  std::array<glm::vec3, 8> world_corners =
+  {
+    transform * glm::vec4(BoundingBoxMin.x, BoundingBoxMin.y, BoundingBoxMin.z, 1.0f),
+    transform * glm::vec4(BoundingBoxMin.x, BoundingBoxMin.y, BoundingBoxMax.z, 1.0f),
+    transform * glm::vec4(BoundingBoxMin.x, BoundingBoxMax.y, BoundingBoxMin.z, 1.0f),
+    transform * glm::vec4(BoundingBoxMin.x, BoundingBoxMax.y, BoundingBoxMax.z, 1.0f),
+    transform * glm::vec4(BoundingBoxMax.x, BoundingBoxMin.y, BoundingBoxMin.z, 1.0f),
+    transform * glm::vec4(BoundingBoxMax.x, BoundingBoxMin.y, BoundingBoxMax.z, 1.0f),
+    transform * glm::vec4(BoundingBoxMax.x, BoundingBoxMax.y, BoundingBoxMin.z, 1.0f),
+    transform * glm::vec4(BoundingBoxMax.x, BoundingBoxMax.y, BoundingBoxMax.z, 1.0f)
+  };
 
-  if (!frustum.intersects(pos + BoundingBoxMin, pos + BoundingBoxMax))
+  if (!frustum.intersects(world_corners))
   {
     return false;
   }
+
+  glm::vec3 pos = transform * glm::vec4(center, 1);
 
   float dist = display == display_mode::in_3D
     ? glm::distance(pos, camera) - rad

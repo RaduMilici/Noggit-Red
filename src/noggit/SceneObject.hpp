@@ -5,6 +5,7 @@
 
 #include <glm/mat4x4.hpp>
 #include <math/ray.hpp>
+#include <noggit/MapHeaders.h>
 #include <noggit/Selection.h>
 #include <noggit/ContextObject.hpp>
 #include <cstdint>

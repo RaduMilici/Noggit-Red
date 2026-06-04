@@ -5,6 +5,7 @@
 #include <noggit/tool_enums.hpp>
 #include <noggit/World.h>
 #include <noggit/MapView.h>
+#include <noggit/ui/tools/UiCommon/expanderwidget.h>
 #include <util/qt/overload.hpp>
 
 #include <QtWidgets/QFormLayout>

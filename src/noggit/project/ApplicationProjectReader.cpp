@@ -84,6 +84,11 @@ namespace Noggit::Project
               auto client_version = project_client_configuration["ClientVersion"].toString().toStdString();
 
               auto client_version_enum = Noggit::Project::ProjectVersion::WOTLK;
+              if (client_version == std::string("Turtle WoW") || client_version == std::string("Vanilla"))
+              {
+                client_version_enum = Noggit::Project::ProjectVersion::CLASSIC;
+              }
+
               if (client_version == std::string("Shadowlands"))
               {
                 client_version_enum = Noggit::Project::ProjectVersion::SL;

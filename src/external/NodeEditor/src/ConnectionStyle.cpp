@@ -71,7 +71,8 @@ setConnectionStyle(QString jsonText)
         for (auto it = colorArray.begin(); it != colorArray.end(); ++it) { \
           rgb.push_back((*it).toInt()); \
         } \
-        variable = QColor(rgb[0], rgb[1], rgb[2]); \
+        if (rgb.size() >= 3) \
+          variable = QColor(rgb[0], rgb[1], rgb[2]); \
       } else { \
         variable = QColor(valueRef.toString()); \
       } \

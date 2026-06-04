@@ -408,6 +408,75 @@ void Square::setup_buffers()
 
   }
 
+  void Circle::draw(glm::mat4x4 const& mvp
+                  , glm::vec3 const& pos
+                  , glm::vec4 const& color
+                  , float radius)
+  {
+    if (!_buffers_are_setup)
+      setup_buffers();
+
+    OpenGL::Scoped::use_program shader {*_program.get()};
+    shader.uniform("model_view_projection", mvp);
+    shader.uniform("origin", glm::vec3(pos.x, pos.y, pos.z));
+    shader.uniform("radius", radius);
+    shader.uniform("inclination", 0.f);
+    shader.uniform("orientation", 0.f);
+    shader.uniform("color", color);
+
+    OpenGL::Scoped::vao_binder const _ (_vao[0]);
+    gl.drawElements(GL_TRIANGLE_STRIP, _indices_vbo, _indice_count, GL_UNSIGNED_SHORT, nullptr);
+  }
+
+  void Circle::setup_buffers()
+  {
+    _vao.upload();
+    _buffers.upload();
+
+    std::vector<glm::vec3> vertices;
+    vertices.reserve((N_SEGMENTS + 1) * 2);
+    std::vector<std::uint16_t> indices;
+    indices.reserve((N_SEGMENTS + 1) * 2);
+    float const inner_radius = 0.14f;
+
+    for (int i = 0; i <= N_SEGMENTS; ++i)
+    {
+      float angle = glm::two_pi<float>() * i / float(N_SEGMENTS);
+      float x = std::cos(angle);
+      float z = std::sin(angle);
+      vertices.push_back({x, 0.f, z});
+      vertices.push_back({x * inner_radius, 0.f, z * inner_radius});
+      indices.push_back(static_cast<std::uint16_t>(i * 2));
+      indices.push_back(static_cast<std::uint16_t>(i * 2 + 1));
+    }
+    _indice_count = static_cast<int>(indices.size());
+
+    _program.reset(new OpenGL::program({{ GL_VERTEX_SHADER,   OpenGL::shader::src_from_qrc("circle_vs") }
+                       ,{ GL_FRAGMENT_SHADER, OpenGL::shader::src_from_qrc("circle_fs") }}));
+
+    gl.bufferData<GL_ARRAY_BUFFER, glm::vec3>(_vertices_vbo, vertices, GL_STATIC_DRAW);
+    gl.bufferData<GL_ELEMENT_ARRAY_BUFFER, std::uint16_t>(_indices_vbo, indices, GL_STATIC_DRAW);
+
+    OpenGL::Scoped::index_buffer_manual_binder indices_binder (_indices_vbo);
+    OpenGL::Scoped::use_program sp (*_program.get());
+    {
+      OpenGL::Scoped::vao_binder const _ (_vao[0]);
+      OpenGL::Scoped::buffer_binder<GL_ARRAY_BUFFER> const vb (_vertices_vbo);
+      sp.attrib("position", 3, GL_FLOAT, GL_FALSE, 0, 0);
+      indices_binder.bind();
+    }
+
+    _buffers_are_setup = true;
+  }
+
+  void Circle::unload()
+  {
+    _vao.unload();
+    _buffers.unload();
+    _program.reset();
+    _buffers_are_setup = false;
+  }
+
   /*void Cylinder::draw(glm::mat4x4 const& mvp, glm::vec3 const& pos, const glm::vec4 color, float radius, int precision, World* world, int height)
   {
       if (!_buffers_are_setup)

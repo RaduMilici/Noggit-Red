@@ -25,10 +25,80 @@
 #include <cassert>
 #include <list>
 #include <map>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
 #include <limits>
+
+namespace
+{
+  std::string normalize_adt_model_filename(std::string filename)
+  {
+    filename = BlizzardArchive::ClientData::normalizeFilenameInternal(std::move(filename));
+
+    auto const marker = filename.find(".m2/");
+    if (marker == std::string::npos)
+    {
+      return filename;
+    }
+
+    auto const name_start = filename.rfind('/', marker);
+    auto const folder_name = filename.substr(name_start == std::string::npos ? 0 : name_start + 1,
+                                             marker - (name_start == std::string::npos ? 0 : name_start + 1));
+    if (filename.substr(marker + 4) == folder_name + ".m2")
+    {
+      filename.erase(marker + 3);
+    }
+
+    return filename;
+  }
+
+  bool readADTChunkHeader(BlizzardArchive::ClientFile& file, std::uint32_t absolute_offset,
+                          std::uint32_t expected_fourcc, char const* chunk_name,
+                          std::uint32_t* size)
+  {
+    if (absolute_offset + 8 > file.getSize())
+    {
+      LogError << "ADT chunk " << chunk_name << " offset " << absolute_offset
+               << " is outside file size " << file.getSize() << "." << std::endl;
+      return false;
+    }
+
+    std::uint32_t fourcc = 0;
+    file.seek(absolute_offset);
+    file.read(&fourcc, 4);
+    file.read(size, 4);
+
+    if (fourcc != expected_fourcc)
+    {
+      LogError << "Expected ADT chunk " << chunk_name << " at offset " << absolute_offset
+               << ", got fourcc 0x" << std::hex << fourcc << std::dec << "." << std::endl;
+      return false;
+    }
+
+    return true;
+  }
+
+  std::optional<std::uint32_t> readOptionalADTChunkHeader(BlizzardArchive::ClientFile& file,
+                                                          std::uint32_t relative_offset,
+                                                          std::uint32_t expected_fourcc,
+                                                          char const* chunk_name)
+  {
+    if (!relative_offset)
+    {
+      return std::nullopt;
+    }
+
+    std::uint32_t size = 0;
+    if (!readADTChunkHeader(file, relative_offset + 0x14, expected_fourcc, chunk_name, &size))
+    {
+      return std::nullopt;
+    }
+
+    return size;
+  }
+}
 
 
 MapTile::MapTile( int pX
@@ -89,6 +159,10 @@ void MapTile::waitForChildrenLoaded()
   for (auto& instance : object_instances)
   {
     instance.first->wait_until_loaded();
+    if (instance.first->loading_failed())
+    {
+      continue;
+    }
     instance.first->waitForChildrenLoaded();
   }
 
@@ -109,6 +183,12 @@ void MapTile::finishLoading()
   
   if (finished)
     return;
+
+  auto abort_loading = [&] ()
+  {
+    _tile_is_being_reloaded = false;
+    error_on_loading();
+  };
 
   BlizzardArchive::ClientFile theFile(_file_key, Noggit::Application::NoggitApplication::instance()->clientData());
 
@@ -134,14 +214,27 @@ void MapTile::finishLoading()
   theFile.seekRelative(4);
   theFile.read(&version, 4);
 
-  assert(fourcc == 'MVER' && version == 18);
+  if (fourcc != 'MVER' || version != 18)
+  {
+    char fourcc_text[5] = {};
+    std::memcpy(fourcc_text, &fourcc, 4);
+    LogError << "ADT \"" << _file_key.stringRepr() << "\" has unsupported MVER fourcc='" << fourcc_text
+             << "' version=" << version << ". Aborting tile load." << std::endl;
+    abort_loading();
+    return;
+  }
 
   // - MHDR ----------------------------------------------
 
   theFile.read(&fourcc, 4);
   theFile.seekRelative(4);
 
-  assert(fourcc == 'MHDR');
+  if (fourcc != 'MHDR')
+  {
+    LogError << "ADT \"" << _file_key.stringRepr() << "\" is missing MHDR. Aborting tile load." << std::endl;
+    abort_loading();
+    return;
+  }
 
   theFile.read(&Header, sizeof(MHDR));
 
@@ -149,11 +242,12 @@ void MapTile::finishLoading()
 
   // - MCIN ----------------------------------------------
 
-  theFile.seek(Header.mcin + 0x14);
-  theFile.read(&fourcc, 4);
-  theFile.seekRelative(4);
-
-  assert(fourcc == 'MCIN');
+  if (!readADTChunkHeader(theFile, Header.mcin + 0x14, 'MCIN', "MCIN", &size))
+  {
+    LogError << "ADT \"" << _file_key.stringRepr() << "\" is missing a readable MCIN. Aborting tile load." << std::endl;
+    abort_loading();
+    return;
+  }
 
   for (int i = 0; i < 256; ++i)
   {
@@ -165,12 +259,15 @@ void MapTile::finishLoading()
 
   if (_load_textures)
   {
-    theFile.seek(Header.mtex + 0x14);
-    theFile.read(&fourcc, 4);
-    theFile.read(&size, 4);
+    if (!readADTChunkHeader(theFile, Header.mtex + 0x14, 'MTEX', "MTEX", &size))
+    {
+      LogError << "ADT \"" << _file_key.stringRepr() << "\" has no readable MTEX; loading terrain without textures." << std::endl;
+      _load_textures = false;
+    }
+  }
 
-    assert(fourcc == 'MTEX');
-
+  if (_load_textures)
+  {
     {
       char const* lCurPos = reinterpret_cast<char const*>(theFile.getPointer());
       char const* lEnd = lCurPos + size;
@@ -186,31 +283,37 @@ void MapTile::finishLoading()
   {
     // - MMDX ----------------------------------------------
 
-    theFile.seek(Header.mmdx + 0x14);
-    theFile.read(&fourcc, 4);
-    theFile.read(&size, 4);
+    if (!readADTChunkHeader(theFile, Header.mmdx + 0x14, 'MMDX', "MMDX", &size))
+    {
+      LogError << "ADT \"" << _file_key.stringRepr() << "\" has no readable MMDX; loading terrain without model instances." << std::endl;
+      _load_models = false;
+    }
+  }
 
-    assert(fourcc == 'MMDX');
-
+  if (_load_models)
+  {
     {
       char const* lCurPos = reinterpret_cast<char const*>(theFile.getPointer());
       char const* lEnd = lCurPos + size;
 
       while (lCurPos < lEnd)
       {
-        mModelFilenames.push_back(BlizzardArchive::ClientData::normalizeFilenameInternal(std::string(lCurPos)));
+        mModelFilenames.push_back(normalize_adt_model_filename(std::string(lCurPos)));
         lCurPos += strlen(lCurPos) + 1;
       }
     }
 
     // - MWMO ----------------------------------------------
 
-    theFile.seek(Header.mwmo + 0x14);
-    theFile.read(&fourcc, 4);
-    theFile.read(&size, 4);
+    if (!readADTChunkHeader(theFile, Header.mwmo + 0x14, 'MWMO', "MWMO", &size))
+    {
+      LogError << "ADT \"" << _file_key.stringRepr() << "\" has no readable MWMO; loading terrain without WMO instances." << std::endl;
+      _load_models = false;
+    }
+  }
 
-    assert(fourcc == 'MWMO');
-
+  if (_load_models)
+  {
     {
       char const* lCurPos = reinterpret_cast<char const*>(theFile.getPointer());
       char const* lEnd = lCurPos + size;
@@ -224,12 +327,15 @@ void MapTile::finishLoading()
 
     // - MDDF ----------------------------------------------
 
-    theFile.seek(Header.mddf + 0x14);
-    theFile.read(&fourcc, 4);
-    theFile.read(&size, 4);
+    if (!readADTChunkHeader(theFile, Header.mddf + 0x14, 'MDDF', "MDDF", &size))
+    {
+      LogError << "ADT \"" << _file_key.stringRepr() << "\" has no readable MDDF; loading terrain without M2 instances." << std::endl;
+      _load_models = false;
+    }
+  }
 
-    assert(fourcc == 'MDDF');
-
+  if (_load_models)
+  {
     ENTRY_MDDF const* mddf_ptr = reinterpret_cast<ENTRY_MDDF const*>(theFile.getPointer());
     for (unsigned int i = 0; i < size / sizeof(ENTRY_MDDF); ++i)
     {
@@ -238,12 +344,15 @@ void MapTile::finishLoading()
 
     // - MODF ----------------------------------------------
 
-    theFile.seek(Header.modf + 0x14);
-    theFile.read(&fourcc, 4);
-    theFile.read(&size, 4);
+    if (!readADTChunkHeader(theFile, Header.modf + 0x14, 'MODF', "MODF", &size))
+    {
+      LogError << "ADT \"" << _file_key.stringRepr() << "\" has no readable MODF; loading terrain without WMO instances." << std::endl;
+      _load_models = false;
+    }
+  }
 
-    assert(fourcc == 'MODF');
-
+  if (_load_models)
+  {
     ENTRY_MODF const* modf_ptr = reinterpret_cast<ENTRY_MODF const*>(theFile.getPointer());
     for (unsigned int i = 0; i < size / sizeof(ENTRY_MODF); ++i)
     {
@@ -257,43 +366,42 @@ void MapTile::finishLoading()
 
   // - MH2O ----------------------------------------------
   if (Header.mh2o != 0) {
-    theFile.seek(Header.mh2o + 0x14);
-    theFile.read(&fourcc, 4);
-    theFile.read(&size, 4);
-
     int ofsW = Header.mh2o + 0x14 + 0x8;
-    assert(fourcc == 'MH2O');
-
-    Water.readFromFile(theFile, ofsW);
+    if (readOptionalADTChunkHeader(theFile, Header.mh2o, 'MH2O', "MH2O"))
+    {
+      Water.readFromFile(theFile, ofsW);
+    }
   }
 
   // - MFBO ----------------------------------------------
 
   if (mFlags & 1)
   {
-    theFile.seek(Header.mfbo + 0x14);
-    theFile.read(&fourcc, 4);
-    theFile.read(&size, 4);
-
-    assert(fourcc == 'MFBO');
-
-    int16_t mMaximum[9], mMinimum[9];
-    theFile.read(mMaximum, sizeof(mMaximum));
-    theFile.read(mMinimum, sizeof(mMinimum));
-
-    const float xPositions[] = { this->xbase, this->xbase + 266.0f, this->xbase + 533.0f };
-    const float yPositions[] = { this->zbase, this->zbase + 266.0f, this->zbase + 533.0f };
-
-    for (int y = 0; y < 3; y++)
+    if (!readOptionalADTChunkHeader(theFile, Header.mfbo, 'MFBO', "MFBO"))
     {
-      for (int x = 0; x < 3; x++)
-      {
-        int pos = x + y * 3;
-        // fix bug with old noggit version inverting values
-        auto&& z{ std::minmax (mMinimum[pos], mMaximum[pos]) };
+      LogError << "ADT \"" << _file_key.stringRepr() << "\" sets MFBO flag but has no readable MFBO chunk." << std::endl;
+    }
+    else
+    {
 
-        mMinimumValues[pos] = { xPositions[x], static_cast<float>(z.first), yPositions[y] };
-        mMaximumValues[pos] = { xPositions[x], static_cast<float>(z.second), yPositions[y] };
+      int16_t mMaximum[9], mMinimum[9];
+      theFile.read(mMaximum, sizeof(mMaximum));
+      theFile.read(mMinimum, sizeof(mMinimum));
+
+      const float xPositions[] = { this->xbase, this->xbase + 266.0f, this->xbase + 533.0f };
+      const float yPositions[] = { this->zbase, this->zbase + 266.0f, this->zbase + 533.0f };
+
+      for (int y = 0; y < 3; y++)
+      {
+        for (int x = 0; x < 3; x++)
+        {
+          int pos = x + y * 3;
+          // fix bug with old noggit version inverting values
+          auto&& z{ std::minmax (mMinimum[pos], mMaximum[pos]) };
+
+          mMinimumValues[pos] = { xPositions[x], static_cast<float>(z.first), yPositions[y] };
+          mMaximumValues[pos] = { xPositions[x], static_cast<float>(z.second), yPositions[y] };
+        }
       }
     }
   }

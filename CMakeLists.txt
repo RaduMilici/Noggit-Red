@@ -6,7 +6,8 @@
 # ░███  ░░█████ ░░███     ███ ░░███  ░░███ ░░███  ░░███  ░███     ░███        ░███    ░███  ░███ ░   █ ░███    ███
 # █████  ░░█████ ░░░███████░   ░░█████████  ░░█████████  █████    █████       █████   █████ ██████████ ██████████
 #░░░░░    ░░░░░    ░░░░░░░      ░░░░░░░░░    ░░░░░░░░░  ░░░░░    ░░░░░       ░░░░░   ░░░░░ ░░░░░░░░░░ ░░░░░░░░░░
-CMAKE_MINIMUM_REQUIRED(VERSION 3.3)
+CMAKE_MINIMUM_REQUIRED(VERSION 3.10)
+SET(CMAKE_POLICY_VERSION_MINIMUM 3.5)
 CMAKE_POLICY(SET CMP0057 NEW) # "Support new IN_LIST if() operator."
 SET(CMAKE_CXX_STANDARD 20)
 SET(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -87,7 +88,7 @@ SET(LIBARY_OUTPUT_PATH bin)
 SET(EXTERNAL_SOURCE_DIR src/external)
 set_property(GLOBAL PROPERTY USE_FOLDERS ON)
 
-OPTION(USE_SQL "Enable sql uid save ? (require mysql installed)" OFF)
+OPTION(USE_SQL "Enable sql uid save ? (require mysql installed)" ON)
 OPTION(VALIDATE_OPENGL_PROGRAMS "Validate Opengl programs" OFF)
 
 IF(VALIDATE_OPENGL_PROGRAMS)
@@ -112,21 +113,31 @@ FIND_PACKAGE(FastNoise2 REQUIRED)
 FIND_PACKAGE(Sol2 REQUIRED)
 FIND_PACKAGE(Qt5 COMPONENTS Widgets OpenGL OpenGLExtensions Network Xml Multimedia REQUIRED)
 
-IF(USE_SQL)
-  FIND_LIBRARY(MYSQL_LIBRARY NAMES libmysql
-              HINTS "${CMAKE_SOURCE_DIR}/../Noggit3libs/mysql")
-  FIND_LIBRARY(MYSQLCPPCONN_LIBRARY NAMES mysqlcppconn
-              HINTS "${CMAKE_SOURCE_DIR}/../Noggit3libs/mysql/connector")
-  FIND_PATH(MYSQLCPPCONN_INCLUDE NAMES cppconn/driver.h
-              HINTS "${CMAKE_SOURCE_DIR}/../Noggit3libs/mysql/connector")
+SET(NOGGIT_MYSQL_SEARCH_ROOTS
+  "${CMAKE_SOURCE_DIR}/../Noggit3libs/mysql"
+  "${CMAKE_SOURCE_DIR}/../../../tortoise-wow/dep/windows"
+  "${CMAKE_SOURCE_DIR}/../../../tortoise-wow/dep"
+  "${CMAKE_SOURCE_DIR}/../../../TurtleWow 1180/mariadb-10.3.39-winx64"
+)
 
-  IF(MYSQL_LIBRARY AND MYSQLCPPCONN_LIBRARY AND MYSQLCPPCONN_INCLUDE)
+IF(USE_SQL)
+  FIND_LIBRARY(MYSQL_LIBRARY NAMES libmysql mariadb libmariadb
+              HINTS ${NOGGIT_MYSQL_SEARCH_ROOTS}
+              PATH_SUFFIXES lib lib/x64_release windows/lib/x64_release)
+  FIND_FILE(MYSQL_RUNTIME_LIBRARY NAMES libmysql.dll libmySQL.dll
+              HINTS ${NOGGIT_MYSQL_SEARCH_ROOTS}
+              PATH_SUFFIXES bin lib/x64_release windows/lib/x64_release)
+  FIND_PATH(MYSQL_INCLUDE_DIR NAMES mysql.h
+              HINTS ${NOGGIT_MYSQL_SEARCH_ROOTS}
+              PATH_SUFFIXES include/mysql windows/include/mysql)
+
+  IF(MYSQL_LIBRARY AND MYSQL_INCLUDE_DIR)
     ADD_DEFINITIONS(-DUSE_MYSQL_UID_STORAGE)
     SET (mysql_sources src/mysql/mysql.cpp)
     SET (mysql_headers src/mysql/mysql.h)
     SOURCE_GROUP("mysql"  FILES ${mysql_sources} ${mysql_headers})
   ELSE()
-    MESSAGE(FATAL_ERROR "MySQL lib or connector not found")
+    MESSAGE(FATAL_ERROR "MySQL C API library or headers not found")
   ENDIF()
 ENDIF()
 
@@ -363,7 +374,7 @@ add_custom_command(TARGET noggit POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_directory
         "${PROJECT_SOURCE_DIR}/dist/themes"
         $<TARGET_FILE_DIR:noggit>/themes
-        COMMAND ${CMAKE_COMMAND} -E remove -f 
+  COMMAND ${CMAKE_COMMAND} -E rm -rf
         $<TARGET_FILE_DIR:noggit>/themes/.git)
 
 #add distribution definitions
@@ -371,7 +382,7 @@ add_custom_command(TARGET noggit POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_directory
         "${PROJECT_SOURCE_DIR}/dist/listfile"
         $<TARGET_FILE_DIR:noggit>
-        COMMAND ${CMAKE_COMMAND} -E remove -f 
+  COMMAND ${CMAKE_COMMAND} -E rm -rf
         $<TARGET_FILE_DIR:noggit>/.git )
 
 #add distribution listfile
@@ -379,7 +390,7 @@ add_custom_command(TARGET noggit POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_directory
         "${PROJECT_SOURCE_DIR}/dist/definitions"
         $<TARGET_FILE_DIR:noggit>/definitions
-        COMMAND ${CMAKE_COMMAND} -E remove -f 
+  COMMAND ${CMAKE_COMMAND} -E rm -rf
         $<TARGET_FILE_DIR:noggit>/definitions/.git)
 
 # deploy for Qt on Windows
@@ -431,9 +442,16 @@ IF(APPLE)
   TARGET_LINK_LIBRARIES (noggit "-framework Cocoa" "-framework AppKit" "-framework Foundation")
 ENDIF()
 
-IF(MYSQL_LIBRARY AND MYSQLCPPCONN_LIBRARY AND MYSQLCPPCONN_INCLUDE)
-  TARGET_LINK_LIBRARIES(noggit ${MYSQL_LIBRARY} ${MYSQLCPPCONN_LIBRARY})
-  TARGET_INCLUDE_DIRECTORIES(noggit SYSTEM PRIVATE ${MYSQLCPPCONN_INCLUDE})
+IF(MYSQL_LIBRARY AND MYSQL_INCLUDE_DIR)
+  TARGET_LINK_LIBRARIES(noggit ${MYSQL_LIBRARY})
+  TARGET_INCLUDE_DIRECTORIES(noggit SYSTEM PRIVATE ${MYSQL_INCLUDE_DIR})
+
+  IF(WIN32 AND MYSQL_RUNTIME_LIBRARY)
+    ADD_CUSTOM_COMMAND(TARGET noggit POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different
+              "${MYSQL_RUNTIME_LIBRARY}"
+              "$<TARGET_FILE_DIR:noggit>/libmysql.dll")
+  ENDIF()
 ENDIF()
 
 IF(NOGGIT_LOGTOCONSOLE AND WIN32)

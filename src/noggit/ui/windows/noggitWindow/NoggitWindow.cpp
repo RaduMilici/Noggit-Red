@@ -51,33 +51,95 @@
 
 namespace Noggit::Ui::Windows
 {
+  void NoggitWindow::ensureSettingsWindow()
+  {
+    if (_settings)
+      return;
+
+    LogDebug << "NoggitWindow::ensureSettingsWindow begin" << std::endl;
+    _settings = new settings(this);
+    connect(_settings, &settings::saved, [this]()
+    {
+      if (_map_view)
+        _map_view->onSettingsSave();
+    });
+    LogDebug << "NoggitWindow::ensureSettingsWindow end" << std::endl;
+  }
+
+  void NoggitWindow::ensureAboutWindow()
+  {
+    if (_about)
+      return;
+
+    LogDebug << "NoggitWindow::ensureAboutWindow begin" << std::endl;
+    _about = new about(this);
+    LogDebug << "NoggitWindow::ensureAboutWindow end" << std::endl;
+  }
+
+  void NoggitWindow::ensureMapCreationWizard()
+  {
+    if (_map_creation_wizard)
+      return;
+
+    LogDebug << "NoggitWindow::ensureMapCreationWizard begin" << std::endl;
+
+    _map_creation_wizard = new Noggit::Ui::Tools::MapCreationWizard::Ui::MapCreationWizard(_project, _map_creation_wizard_host);
+
+    auto host_layout = qobject_cast<QVBoxLayout*>(_map_creation_wizard_host->layout());
+    if (!host_layout)
+    {
+      host_layout = new QVBoxLayout(_map_creation_wizard_host);
+      host_layout->setContentsMargins(0, 0, 0, 0);
+    }
+
+    host_layout->addWidget(_map_creation_wizard);
+
+    _map_wizard_connection = connect(_map_creation_wizard,
+                                     &Noggit::Ui::Tools::MapCreationWizard::Ui::MapCreationWizard::map_dbc_updated, [=]
+                                     {
+                                       _buildMapListComponent->buildMapList(this);
+                                     }
+    );
+
+    LogDebug << "NoggitWindow::ensureMapCreationWizard end" << std::endl;
+  }
+
   NoggitWindow::NoggitWindow(std::shared_ptr<Noggit::Application::NoggitApplicationConfiguration> application,
                              std::shared_ptr<Noggit::Project::NoggitProject> project)
       : QMainWindow(nullptr)
       , _null_widget(new QWidget(this))
       , _applicationConfiguration(application)
       , _project(project)
+      , _minimap(nullptr)
+      , _settings(nullptr)
+      , _about(nullptr)
+      , _map_view(nullptr)
+      , _stack_widget(nullptr)
+      , _map_creation_wizard(nullptr)
+      , _continents_table(nullptr)
+      , _right_side(nullptr)
   {
+    LogDebug << "NoggitWindow ctor begin" << std::endl;
 
     std::stringstream title;
     title << "Noggit - " << STRPRODUCTVER;
     setWindowTitle(QString::fromStdString(title.str()));
     setWindowIcon(QIcon(":/icon"));
 
-    if (project->projectVersion == Project::ProjectVersion::WOTLK)
+    if (project->projectVersion == Project::ProjectVersion::CLASSIC
+        || project->projectVersion == Project::ProjectVersion::WOTLK)
     {
       OpenDBs(project->ClientData);
     }
+    LogDebug << "NoggitWindow ctor after OpenDBs" << std::endl;
 
     setCentralWidget(_null_widget);
 
     // The default value is AnimatedDocks | AllowTabbedDocks.
     setDockOptions(AnimatedDocks | AllowNestedDocks | AllowTabbedDocks | GroupedDragging);
 
-    _about = new about(this);
-    _settings = new settings(this);
-
     _menuBar = menuBar();
+    LogDebug << "NoggitWindow ctor after menuBar" << std::endl;
 
     QSettings settings;
 
@@ -96,6 +158,7 @@ namespace Noggit::Ui::Windows
     auto settings_action(file_menu->addAction("Settings"));
     QObject::connect(settings_action, &QAction::triggered, [&]
                      {
+                       ensureSettingsWindow();
                        _settings->show();
                      }
     );
@@ -103,6 +166,7 @@ namespace Noggit::Ui::Windows
     auto about_action(file_menu->addAction("About"));
     QObject::connect(about_action, &QAction::triggered, [&]
                      {
+                       ensureAboutWindow();
                        _about->show();
                      }
     );
@@ -115,10 +179,13 @@ namespace Noggit::Ui::Windows
     );
 
     _menuBar->adjustSize();
+    LogDebug << "NoggitWindow ctor after menu setup" << std::endl;
 
     _buildMapListComponent = std::make_unique<Component::BuildMapListComponent>();
+    LogDebug << "NoggitWindow ctor before buildMenu" << std::endl;
 
     buildMenu();
+    LogDebug << "NoggitWindow ctor after buildMenu" << std::endl;
   }
 
   void NoggitWindow::check_uid_then_enter_map
@@ -176,6 +243,7 @@ namespace Noggit::Ui::Windows
                            bool from_bookmark
   )
   {
+      LogDebug << "NoggitWindow::enterMapAt begin" << std::endl;
       if (_world->mapIndex.hasAGlobalWMO())
       {
           // enter at mdoel's position
@@ -198,17 +266,19 @@ namespace Noggit::Ui::Windows
       }
 
 
-    _map_creation_wizard->destroyFakeWorld();
+    if (_map_creation_wizard)
+      _map_creation_wizard->destroyFakeWorld();
+  LogDebug << "NoggitWindow::enterMapAt before MapView ctor" << std::endl;
     _map_view = (new MapView(camera_yaw, camera_pitch, pos, this, _project, std::move(_world), uid_fix, from_bookmark));
+  LogDebug << "NoggitWindow::enterMapAt after MapView ctor" << std::endl;
     connect(_map_view, &MapView::uid_fix_failed, [this]()
     { promptUidFixFailure(); });
-    connect(_settings, &settings::saved, [this]()
-    { if (_map_view) _map_view->onSettingsSave(); });
 
     _stack_widget->addWidget(_map_view);
     _stack_widget->setCurrentIndex(1);
 
     map_loaded = true;
+    LogDebug << "NoggitWindow::enterMapAt end" << std::endl;
 
   }
 
@@ -241,7 +311,7 @@ namespace Noggit::Ui::Windows
               item_widget->setHidden(true);
           }
 
-          if (!(widget->wmo_map() == wmo_maps))
+            if (!wmo_maps && widget->wmo_map())
           {
               item_widget->setHidden(true);
           }
@@ -256,18 +326,48 @@ namespace Noggit::Ui::Windows
 
     auto table = _project->ClientDatabase->LoadTable("Map", readFileAsIMemStream);
     auto record = table.Record(map_id);
-
-    _world = std::make_unique<World>(record.Columns["Directory"].Value, map_id, Noggit::NoggitRenderContext::MAP_VIEW);
-    _minimap->world(_world.get());
+    auto directory_itr = record.Columns.find("Directory");
+    if (directory_itr != record.Columns.end() && !directory_itr->second.Value.empty())
+    {
+      _world = std::make_unique<World>(directory_itr->second.Value, map_id, Noggit::NoggitRenderContext::MAP_VIEW);
+      _minimap->world(_world.get());
+      _project->ClientDatabase->UnloadTable("Map");
+      return;
+    }
 
     _project->ClientDatabase->UnloadTable("Map");
 
-    emit mapSelected(map_id);
+    if (gMapDB.getRecordCount() > 0)
+    {
+      try
+      {
+        auto dbc_record = gMapDB.getByID(map_id);
+        _world = std::make_unique<World>(dbc_record.getString(MapDB::InternalName), map_id, Noggit::NoggitRenderContext::MAP_VIEW);
+        _minimap->world(_world.get());
+      }
+      catch (DBCFile::NotFound const&)
+      {
+      }
+    }
+  }
 
+  void NoggitWindow::jumpToMapPosition(int map_id,
+                                       glm::vec3 pos,
+                                       math::degrees camera_pitch,
+                                       math::degrees camera_yaw,
+                                       bool from_bookmark)
+  {
+    if (!_world || _world->getMapID() != static_cast<unsigned int>(map_id))
+    {
+      loadMap(map_id);
+    }
+
+    check_uid_then_enter_map(pos, camera_pitch, camera_yaw, from_bookmark);
   }
 
   void NoggitWindow::buildMenu()
   {
+    LogDebug << "NoggitWindow::buildMenu begin" << std::endl;
     _stack_widget = new StackedWidget(this);
     _stack_widget->setAutoResize(true);
 
@@ -368,8 +468,9 @@ namespace Noggit::Ui::Windows
     entry_points_tabs->addTab(bookmarks_table, "Bookmarks");
     entry_points_tabs->setFixedWidth(310);
     layout->addWidget(entry_points_tabs);
-
+    LogDebug << "NoggitWindow::buildMenu before buildMapList" << std::endl;
     _buildMapListComponent->buildMapList(this);
+    LogDebug << "NoggitWindow::buildMenu after buildMapList" << std::endl;
 
     qulonglong bookmark_index(0);
     for (auto entry: _project->Bookmarks)
@@ -412,6 +513,7 @@ namespace Noggit::Ui::Windows
 
     _minimap = new minimap_widget(this);
     _minimap->draw_boundaries(true);
+    LogDebug << "NoggitWindow::buildMenu after minimap" << std::endl;
     //_minimap->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Preferred);
 
     QObject::connect(_minimap, &minimap_widget::map_clicked, [this](::glm::vec3 const& pos)
@@ -424,6 +526,7 @@ namespace Noggit::Ui::Windows
     );
 
     _right_side = new QTabWidget(this);
+    LogDebug << "NoggitWindow::buildMenu after right_side" << std::endl;
 
     auto minimap_holder = new QScrollArea(this);
     minimap_holder->setWidgetResizable(true);
@@ -432,23 +535,25 @@ namespace Noggit::Ui::Windows
 
     _right_side->addTab(minimap_holder, "Enter map");
     minimap_holder->setAccessibleName("main_menu_minimap_holder");
+    LogDebug << "NoggitWindow::buildMenu after enter-map tab" << std::endl;
 
-    _map_creation_wizard = new Noggit::Ui::Tools::MapCreationWizard::Ui::MapCreationWizard(_project, this);
-
-    _map_wizard_connection = connect(_map_creation_wizard,
-                                     &Noggit::Ui::Tools::MapCreationWizard::Ui::MapCreationWizard::map_dbc_updated, [=]
-                                     {
-                                       _buildMapListComponent->buildMapList(this);
-                                     }
-    );
-
-    _right_side->addTab(_map_creation_wizard, "Edit map");
+    _map_creation_wizard_host = new QWidget(this);
+    auto map_creation_wizard_host_layout = new QVBoxLayout(_map_creation_wizard_host);
+    map_creation_wizard_host_layout->setContentsMargins(0, 0, 0, 0);
+    _right_side->addTab(_map_creation_wizard_host, "Edit map");
+    connect(_right_side, qOverload<int>(&QTabWidget::currentChanged), this, [this](int index)
+    {
+      if (index == 1)
+        ensureMapCreationWizard();
+    });
+    LogDebug << "NoggitWindow::buildMenu after edit-map tab" << std::endl;
 
     layout->addWidget(_right_side);
 
     connect(add_btn, &QPushButton::clicked
         , [&]()
         {
+            ensureMapCreationWizard();
             _right_side->setCurrentIndex(1);
             _map_creation_wizard->addNewMap();
         });
@@ -456,6 +561,7 @@ namespace Noggit::Ui::Windows
     //setCentralWidget (_stack_widget);
 
     _minimap->adjustSize();
+    LogDebug << "NoggitWindow::buildMenu end" << std::endl;
   }
 
   void NoggitWindow::closeEvent(QCloseEvent* event)

@@ -2,6 +2,8 @@
 
 #include "RecentProjectsComponent.hpp"
 
+#include <noggit/ui/FontAwesome.hpp>
+
 #include <QList>
 #include <filesystem>
 #include <QDesktopServices>

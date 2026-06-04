@@ -367,6 +367,11 @@ MapTile* MapIndex::loadTile(const TileIndex& tile, bool reloading, bool load_mod
     return nullptr;
   }
 
+  if (tileLoadFailed(tile))
+  {
+    return nullptr;
+  }
+
   if (tileLoaded(tile) || tileAwaitingLoading(tile))
   {
     return mTiles[tile.z][tile.x].tile.get();
@@ -540,6 +545,11 @@ bool MapIndex::hasTile(const TileIndex& tile) const
   return tile.is_valid() && (mTiles[tile.z][tile.x].flags & 1);
 }
 
+bool MapIndex::tileLoadFailed(const TileIndex& tile) const
+{
+  return hasTile(tile) && mTiles[tile.z][tile.x].tile && mTiles[tile.z][tile.x].tile->loading_failed();
+}
+
 bool MapIndex::tileAwaitingLoading(const TileIndex& tile) const
 {
   return hasTile(tile) && mTiles[tile.z][tile.x].tile && !mTiles[tile.z][tile.x].tile->finishedLoading();
@@ -547,7 +557,7 @@ bool MapIndex::tileAwaitingLoading(const TileIndex& tile) const
 
 bool MapIndex::tileLoaded(const TileIndex& tile) const
 {
-  return hasTile(tile) && mTiles[tile.z][tile.x].tile && mTiles[tile.z][tile.x].tile->finishedLoading();
+  return hasTile(tile) && mTiles[tile.z][tile.x].tile && mTiles[tile.z][tile.x].tile->finishedLoading() && !mTiles[tile.z][tile.x].tile->loading_failed();
 }
 
 bool MapIndex::hasAdt()
@@ -576,6 +586,11 @@ MapTile* MapIndex::getTileAbove(MapTile* tile) const
   MapTile* tile_above = mTiles[tile->index.z - 1][tile->index.x].tile.get();
   tile_above->wait_until_loaded();
 
+  if (tile_above->loading_failed())
+  {
+    return nullptr;
+  }
+
   return tile_above;
 }
 
@@ -589,6 +604,11 @@ MapTile* MapIndex::getTileLeft(MapTile* tile) const
 
   MapTile* tile_left = mTiles[tile->index.z][tile->index.x - 1].tile.get();
   tile_left->wait_until_loaded();
+
+  if (tile_left->loading_failed())
+  {
+    return nullptr;
+  }
 
   return tile_left;
 }

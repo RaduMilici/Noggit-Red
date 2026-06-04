@@ -3,12 +3,42 @@
 #include "ModelRender.hpp"
 #include <noggit/Model.h>
 #include <noggit/ModelInstance.h>
+#include <noggit/Log.h>
 #include <external/tracy/Tracy.hpp>
 #include <math/bounding_box.hpp>
 #include <noggit/Misc.h>
+#include <fstream>
 
 
 using namespace Noggit::Rendering;
+
+namespace
+{
+  bool is_classic_creature_or_character_model(Model const* model)
+  {
+    if (!model || !model->usesClassicLayout() || !model->file_key().hasFilepath())
+    {
+      return false;
+    }
+
+    auto const& path = model->file_key().filepath();
+    return path.starts_with("creature/") || path.starts_with("character/");
+  }
+
+  bool is_masked_lightray_model(Model const* model)
+  {
+    return model
+      && model->file_key().hasFilepath()
+      && model->file_key().filepath() == "world/nodxt/generic/passivedoodads/volumetriclights/lightray_dusty_01.m2";
+  }
+
+  bool uses_masked_lightray_additive(Model const* model, ModelRenderPass const& pass, uint16_t blend_mode)
+  {
+    return is_masked_lightray_model(model)
+      && blend_mode == static_cast<uint16_t>(M2Blend::Add)
+      && pass.texture_count == 2;
+  }
+}
 
 ModelRender::ModelRender(Model* model)
 : _model(model)
@@ -134,7 +164,7 @@ void ModelRender::draw(glm::mat4x4 const& model_view
 
   for (ModelRenderPass& p : _render_passes)
   {
-    if (p.prepareDraw(m2_shader, _model, model_render_state))
+    if (p.prepareDraw(m2_shader, _model, &instance, model_render_state))
     {
       gl.drawElements(GL_TRIANGLES, p.index_count, GL_UNSIGNED_SHORT, reinterpret_cast<void*>(p.index_start * sizeof(GLushort)));
       p.afterDraw();
@@ -231,10 +261,10 @@ void ModelRender::draw(glm::mat4x4 const& model_view
 
     for (ModelRenderPass& p : _render_passes)
     {
-      if (p.prepareDraw(m2_shader, _model, model_render_state))
+      if (p.prepareDraw(m2_shader, _model, nullptr, model_render_state))
       {
         gl.drawElementsInstanced(GL_TRIANGLES, p.index_count, GL_UNSIGNED_SHORT, reinterpret_cast<void*>(p.index_start * sizeof(GLushort)), static_cast<GLsizei>(instances.size()));
-        //p.after_draw();
+        p.afterDraw();
       }
     }
   }
@@ -318,6 +348,20 @@ void ModelRender::fixShaderIdBlendOverride()
     int shader = 0;
     bool blend_mode_override = (_model->header.Flags & 8);
 
+    if (is_masked_lightray_model(_model)
+        && pass.renderflag_index < _model->_render_flags.size())
+    {
+      uint16_t const blend = _model->_render_flags[pass.renderflag_index].blend;
+      if (blend == static_cast<uint16_t>(M2Blend::Add))
+      {
+        if (pass.texture_count == 2)
+        {
+          pass.shader_id = 0x8002;
+          continue;
+        }
+      }
+    }
+
     // fuckporting check
     if (pass.texture_coord_combo_index + pass.texture_count - 1 >= _model->_texture_unit_lookup.size())
     {
@@ -386,6 +430,22 @@ void ModelRender::fixShaderIdBlendOverride()
 
 void ModelRender::fixShaderIDLayer()
 {
+  // Classic M2 models don't use the WotLK layering/merging system.
+  // Applying it drops render passes that share a renderflag_index (e.g. most
+  // body-part geosets on character models), leaving only holes.  Just assign
+  // texture/animation indices directly and return.
+  if (_model->_uses_classic_layout)
+  {
+    for (auto& pass : _render_passes)
+    {
+      pass.textures[0]      = pass.texture_combo_index;
+      pass.textures[1]      = pass.texture_count > 1 ? pass.texture_combo_index + 1 : 0;
+      pass.uv_animations[0] = pass.animation_combo_index;
+      pass.uv_animations[1] = pass.texture_count > 1 ? pass.animation_combo_index + 1 : 0;
+    }
+    return;
+  }
+
   int non_layered_count = 0;
 
   for (auto const& pass : _render_passes)
@@ -423,6 +483,11 @@ void ModelRender::fixShaderIDLayer()
           pass.shader_id &= 0xFF8F;
         }
 
+        first_pass = &pass;
+      }
+
+      if (!first_pass)
+      {
         first_pass = &pass;
       }
 
@@ -725,6 +790,19 @@ void ModelRender::initRenderPasses(ModelView const* view, ModelTexUnit const* te
   for (size_t j = 0; j<view->n_texture_unit; j++)
   {
     size_t geoset = tex_unit[j].submesh;
+    bool const classic_static = _model->_uses_classic_layout;
+
+    if (geoset >= view->n_submesh
+        || tex_unit[j].renderflag_index >= _model->_render_flags.size()
+        || tex_unit[j].texture_count == 0
+        || tex_unit[j].texture_count > 2
+        || tex_unit[j].texture_combo_index >= _model->_texture_lookup.size()
+        || tex_unit[j].texture_count > _model->_texture_lookup.size() - tex_unit[j].texture_combo_index
+        || (!classic_static && tex_unit[j].transparency_combo_index != 0xFFFF && tex_unit[j].transparency_combo_index >= _model->_transparency_lookup.size()))
+    {
+      LogError << "Skipping invalid model render pass " << j << " for " << _model->file_key().stringRepr() << std::endl;
+      continue;
+    }
 
     ModelRenderPass pass(tex_unit[j], _model);
     pass.ordering_thingy = model_geosets[geoset].BoundingBox[0].x;
@@ -769,9 +847,16 @@ ModelRenderPass::ModelRenderPass(ModelTexUnit const& tex_unit, Model* m)
 {
 }
 
-bool ModelRenderPass::prepareDraw(OpenGL::Scoped::use_program& m2_shader, Model *m, OpenGL::M2RenderState& model_render_state)
+bool ModelRenderPass::prepareDraw(OpenGL::Scoped::use_program& m2_shader, Model *m, ModelInstance const* instance, OpenGL::M2RenderState& model_render_state)
 {
-  if (!m->showGeosets[submesh] || !pixel_shader)
+  if (submesh >= m->showGeosets.size()
+      || renderflag_index >= m->_render_flags.size()
+      || (!m->_uses_classic_layout && !pixel_shader))
+  {
+    return false;
+  }
+
+  if (is_masked_lightray_model(m) && !model_render_state.allow_lightray_model)
   {
     return false;
   }
@@ -783,8 +868,13 @@ bool ModelRenderPass::prepareDraw(OpenGL::Scoped::use_program& m2_shader, Model 
 
   auto const& renderflag(m->_render_flags[renderflag_index]);
 
+  if (m->_uses_classic_layout && !pixel_shader)
+  {
+    pixel_shader = ModelPixelShader::Combiners_Opaque;
+  }
+
   // emissive colors
-  if (color_index != -1 && m->_colors[color_index].color.uses(0))
+  if (color_index != -1 && static_cast<size_t>(color_index) < m->_colors.size() && m->_colors[color_index].color.uses(0))
   {
     ::glm::vec3 c (m->_colors[color_index].color.getValue (0, m->_anim_time, m->_global_animtime));
     if (m->_colors[color_index].opacity.uses (m->_current_anim_seq))
@@ -800,10 +890,14 @@ bool ModelRenderPass::prepareDraw(OpenGL::Scoped::use_program& m2_shader, Model 
   // opacity
   if (transparency_combo_index != 0xFFFF && transparency_combo_index < m->_transparency_lookup.size())
   {
-    auto& transparency (m->_transparency[m->_transparency_lookup[transparency_combo_index]].trans);
-    if (transparency.uses (0))
+    auto transparency_index = m->_transparency_lookup[transparency_combo_index];
+    if (transparency_index < m->_transparency.size())
     {
-      mesh_color.w = mesh_color.w * transparency.getValue(0, m->_anim_time, m->_global_animtime);
+      auto& transparency (m->_transparency[transparency_index].trans);
+      if (transparency.uses (0))
+      {
+        mesh_color.w = mesh_color.w * transparency.getValue(0, m->_anim_time, m->_global_animtime);
+      }
     }
   }
 
@@ -813,10 +907,12 @@ bool ModelRenderPass::prepareDraw(OpenGL::Scoped::use_program& m2_shader, Model 
     return false;
   }
 
+  uint16_t effective_blend = renderflag.blend;
+  bool const masked_additive = uses_masked_lightray_additive(m, *this, effective_blend);
 
-  if (model_render_state.blend != renderflag.blend)
+  if (model_render_state.blend != effective_blend)
   {
-    switch (static_cast<M2Blend>(renderflag.blend))
+    switch (static_cast<M2Blend>(effective_blend))
     {
       default:
       case M2Blend::Opaque:
@@ -845,13 +941,21 @@ bool ModelRenderPass::prepareDraw(OpenGL::Scoped::use_program& m2_shader, Model 
         break;
     }
 
-    m2_shader.uniform("blend_mode", static_cast<int>(renderflag.blend));
-    model_render_state.blend = renderflag.blend;
+    m2_shader.uniform("blend_mode", static_cast<int>(effective_blend));
+    model_render_state.blend = effective_blend;
   }
 
-  if (model_render_state.backface_cull != !renderflag.flags.two_sided)
+  if (model_render_state.masked_additive != masked_additive)
   {
-    if (renderflag.flags.two_sided)
+    m2_shader.uniform("masked_additive", static_cast<int>(masked_additive));
+    model_render_state.masked_additive = masked_additive;
+  }
+
+  bool const classic_alpha_pass = m->_uses_classic_layout && effective_blend != static_cast<uint16_t>(M2Blend::Opaque);
+  bool const backface_cull = !renderflag.flags.two_sided && !classic_alpha_pass;
+  if (model_render_state.backface_cull != backface_cull)
+  {
+    if (!backface_cull)
     {
       gl.disable(GL_CULL_FACE);
     }
@@ -860,7 +964,7 @@ bool ModelRenderPass::prepareDraw(OpenGL::Scoped::use_program& m2_shader, Model 
       gl.enable(GL_CULL_FACE);
     }
 
-    model_render_state.backface_cull = !renderflag.flags.two_sided;
+    model_render_state.backface_cull = backface_cull;
   }
 
   if (model_render_state.z_buffered != renderflag.flags.z_buffered)
@@ -891,10 +995,16 @@ bool ModelRenderPass::prepareDraw(OpenGL::Scoped::use_program& m2_shader, Model 
 
   if (texture_count > 1)
   {
-    bindTexture(1, m, model_render_state, m2_shader);
+    if (!bindTexture(1, m, instance, model_render_state, m2_shader))
+    {
+      return false;
+    }
   }
 
-  bindTexture(0, m, model_render_state, m2_shader);
+  if (!bindTexture(0, m, instance, model_render_state, m2_shader))
+  {
+    return false;
+  }
 
   GLint tu1 = static_cast<GLint>(tu_lookups[0]), tu2 = static_cast<GLint>(tu_lookups[1]);
 
@@ -910,16 +1020,24 @@ bool ModelRenderPass::prepareDraw(OpenGL::Scoped::use_program& m2_shader, Model 
     model_render_state.tex_unit_lookups[1] = tu2;
   }
 
-  int16_t tex_anim_lookup = m->_texture_animation_lookups[uv_animations[0]];
+  int16_t tex_anim_lookup = -1;
+  if (uv_animations[0] < m->_texture_animation_lookups.size())
+  {
+    tex_anim_lookup = m->_texture_animation_lookups[uv_animations[0]];
+  }
   static const glm::mat4x4 unit(glm::mat4x4(1));
 
-  if (tex_anim_lookup != -1)
+  if (tex_anim_lookup != -1 && static_cast<size_t>(tex_anim_lookup) < m->_texture_animations.size())
   {
     m2_shader.uniform("tex_matrix_1", m->_texture_animations[tex_anim_lookup].mat);
     if (texture_count > 1)
     {
-      tex_anim_lookup = m->_texture_animation_lookups[uv_animations[1]];
-      if (tex_anim_lookup != -1)
+      tex_anim_lookup = -1;
+      if (uv_animations[1] < m->_texture_animation_lookups.size())
+      {
+        tex_anim_lookup = m->_texture_animation_lookups[uv_animations[1]];
+      }
+      if (tex_anim_lookup != -1 && static_cast<size_t>(tex_anim_lookup) < m->_texture_animations.size())
       {
         m2_shader.uniform("tex_matrix_2", m->_texture_animations[tex_anim_lookup].mat);
       }
@@ -953,71 +1071,85 @@ void ModelRenderPass::afterDraw()
   gl.blendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 }
 
-void ModelRenderPass::bindTexture(size_t index, Model* m, OpenGL::M2RenderState& model_render_state, OpenGL::Scoped::use_program& m2_shader)
+bool ModelRenderPass::bindTexture(size_t index, Model* m, ModelInstance const* instance, OpenGL::M2RenderState& model_render_state, OpenGL::Scoped::use_program& m2_shader)
 {
+  if (index >= texture_count || textures[index] >= m->_texture_lookup.size())
+  {
+    return false;
+  }
 
   uint16_t tex = m->_texture_lookup[textures[index]];
 
-  if (m->_specialTextures[tex] == -1)
+  if (tex >= m->_specialTextures.size() || tex >= m->_textures.size())
   {
-    auto& texture = m->_textures[tex];
-    texture->upload();
-    GLuint tex_array = texture->texture_array();
-    int tex_index = texture->array_index();
-
-    gl.activeTexture(static_cast<GLenum>(GL_TEXTURE0 + index + 1));
-    gl.bindTexture(GL_TEXTURE_2D_ARRAY, tex_array);
-    /*
-    if (model_render_state.tex_arrays[index] != tex_array)
-    {
-      gl.activeTexture(GL_TEXTURE0 + index + 1);
-      gl.bindTexture(GL_TEXTURE_2D_ARRAY, tex_array);
-      model_render_state.tex_arrays[index] = tex_array;
-    }
-
-
-    if (model_render_state.tex_indices[index] != tex_index)
-    {
-      m2_shader.uniform(index ? "tex2_index" : "tex1_index", tex_index);
-      model_render_state.tex_indices[index] = tex_index;
-    }
-
-          */
-
-    m2_shader.uniform(index ? "tex2_index" : "tex1_index", tex_index);
-    model_render_state.tex_indices[index] = tex_index;
-
+    return false;
   }
-  else
+
+  scoped_blp_texture_reference const* selected_texture = nullptr;
+
+  if (m->_specialTextures[tex] != -1)
   {
-    auto& texture = m->_replaceTextures.at (m->_specialTextures[tex]);
-    texture->upload();
-    GLuint tex_array = texture->texture_array();
-    int tex_index = texture->array_index();
-
-    gl.activeTexture(static_cast<GLenum>(GL_TEXTURE0 + index + 1));
-    gl.bindTexture(GL_TEXTURE_2D_ARRAY, tex_array);
-
-    /*
-    if (model_render_state.tex_arrays[index] != tex_array)
+    if (instance)
     {
-      gl.activeTexture(GL_TEXTURE0 + index + 1);
-      gl.bindTexture(GL_TEXTURE_2D_ARRAY, tex_array);
-      model_render_state.tex_arrays[index] = tex_array;
+      auto const& instance_replacements = instance->replaceTextures();
+      auto instance_replacement = instance_replacements.find(m->_specialTextures[tex]);
+      if (instance_replacement != instance_replacements.end())
+      {
+        selected_texture = &instance_replacement->second;
+      }
     }
 
-    if (model_render_state.tex_indices[index] != tex_index)
+    if (!selected_texture)
     {
-      m2_shader.uniform(index ? "tex2_index" : "tex1_index", tex_index);
-      model_render_state.tex_indices[index] = tex_index;
+      auto replacement = m->_replaceTextures.find(m->_specialTextures[tex]);
+      if (replacement != m->_replaceTextures.end())
+      {
+        selected_texture = &replacement->second;
+      }
     }
-
-          */
-
-    m2_shader.uniform(index ? "tex2_index" : "tex1_index", tex_index);
-    model_render_state.tex_indices[index] = tex_index;
-
   }
+
+  if (!selected_texture)
+  {
+    selected_texture = &m->_textures[tex];
+  }
+
+  // If the selected override hasn't loaded or failed, fall back to the model's
+  // placeholder (black.blp) so the creature renders black instead of vanishing.
+  if (selected_texture != &m->_textures[tex])
+  {
+    auto& override_tex = *selected_texture;
+    if (!override_tex->finishedLoading() || override_tex->loading_failed())
+    {
+      selected_texture = &m->_textures[tex];
+    }
+  }
+
+  auto& texture = *selected_texture;
+  if (!texture->finishedLoading() && is_classic_creature_or_character_model(m))
+  {
+    texture->wait_until_loaded();
+  }
+
+  if (!texture->finishedLoading() || texture->loading_failed())
+  {
+    return false;
+  }
+
+  texture->upload();
+  if (!texture->is_uploaded())
+  {
+    return false;
+  }
+
+  GLuint tex_array = texture->texture_array();
+  int tex_index = texture->array_index();
+
+  gl.activeTexture(static_cast<GLenum>(GL_TEXTURE0 + index + 1));
+  gl.bindTexture(GL_TEXTURE_2D_ARRAY, tex_array);
+  m2_shader.uniform(index ? "tex2_index" : "tex1_index", tex_index);
+  model_render_state.tex_indices[index] = tex_index;
+  return true;
 }
 
 void ModelRenderPass::initUVTypes(Model* m)

@@ -17,6 +17,7 @@
 #include <QFileInfo>
 #include <QString>
 #include <QDir>
+#include "../../../noggit/Log.h"
 
 #include "Node.hpp"
 #include "NodeGraphicsObject.hpp"
@@ -213,10 +214,12 @@ Node&
 FlowScene::
 createNode(std::unique_ptr<NodeDataModel> && dataModel)
 {
+  auto const modelName = dataModel ? dataModel->name() : QString("<null>");
   auto node = detail::make_unique<Node>(std::move(dataModel));
 
   connect(node.get(), &Node::requestConnectionRemove, this, &FlowScene::deleteConnection);
 
+  LogDebug << "NodeEditor FlowScene::createNode model='" << modelName.toStdString() << "'" << std::endl;
   auto ngo  = detail::make_unique<NodeGraphicsObject>(*this, *node);
 
   node->setGraphicsObject(std::move(ngo));
@@ -247,6 +250,7 @@ restoreNode(QJsonObject const& nodeJson)
 
   connect(node.get(), &Node::requestConnectionRemove, this, &FlowScene::deleteConnection);
 
+  LogDebug << "NodeEditor FlowScene::restoreNode model='" << modelName.toStdString() << "'" << std::endl;
   auto ngo  = detail::make_unique<NodeGraphicsObject>(*this, *node);
   node->setGraphicsObject(std::move(ngo));
 
@@ -644,6 +648,10 @@ loadFromMemory(const QByteArray& data)
 void FlowScene::loadFromMemory(const QJsonObject& data)
 {
    QJsonArray nodesJsonArray = data["nodes"].toArray();
+
+  LogDebug << "NodeEditor FlowScene::loadFromMemory restoring nodes="
+        << nodesJsonArray.count() << " connections="
+        << data["connections"].toArray().count() << std::endl;
 
    std::vector<Node*> nodes_restored;
    nodes_restored.reserve(nodesJsonArray.count());

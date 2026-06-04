@@ -1,7 +1,9 @@
 // This file is part of Noggit3, licensed under GNU General Public License (version 3).
 
 #include "LiquidRender.hpp"
+#include <noggit/Log.h>
 #include <noggit/MapTile.h>
+#include <noggit/rendering/TileRender.hpp>
 
 using namespace Noggit::Rendering;
 
@@ -22,6 +24,13 @@ void LiquidRender::draw(math::frustum const& frustum
 {
   if (!_map_tile->Water.hasData())
   {
+    static int logged_empty_water_tiles = 0;
+    if (logged_empty_water_tiles < 20)
+    {
+      LogError << "Turtle water: draw skipped, tile has no water data "
+               << _map_tile->index.x << "," << _map_tile->index.z << std::endl;
+      logged_empty_water_tiles++;
+    }
     return;
   }
 
@@ -29,6 +38,9 @@ void LiquidRender::draw(math::frustum const& frustum
   static std::vector<int> samplers_upload_buf {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1};
 
   updateLayerData(tex_manager);
+
+  gl.activeTexture(GL_TEXTURE1);
+  gl.bindTexture(GL_TEXTURE_2D_ARRAY, _map_tile->renderer()->shadowmapTexture());
 
   if (_map_tile->Water._extents_changed)
   {
@@ -78,6 +90,17 @@ void LiquidRender::updateLayerData(LiquidTextureManager* tex_manager)
 {
   tsl::robin_map<unsigned, std::tuple<GLuint, glm::vec2, int, unsigned>> const& tex_frames = tex_manager->getTextureFrames();
 
+  if (tex_frames.empty())
+  {
+    static bool logged_empty_texture_profiles = false;
+    if (!logged_empty_texture_profiles)
+    {
+      LogError << "Turtle water: no liquid texture profiles uploaded" << std::endl;
+      logged_empty_texture_profiles = true;
+    }
+    return;
+  }
+
   // create opengl resources if needed
   if (_need_buffer_update)
   {
@@ -121,7 +144,20 @@ void LiquidRender::updateLayerData(LiquidTextureManager* tex_manager)
           auto& layer_params = _render_layers[layer_counter];
 
           // fill per-chunk data
-          std::tuple<GLuint, glm::vec2, int, unsigned> const& tex_profile = tex_frames.at(layer.liquidID());
+          auto tex_profile_it = tex_frames.find(layer.liquidID());
+          if (tex_profile_it == tex_frames.end())
+          {
+            static int logged_missing_liquid_profiles = 0;
+            if (logged_missing_liquid_profiles < 40)
+            {
+              LogError << "Turtle water: missing liquid profile " << layer.liquidID()
+                       << ", using fallback profile " << tex_frames.begin()->first << std::endl;
+              logged_missing_liquid_profiles++;
+            }
+            tex_profile_it = tex_frames.begin();
+          }
+
+          std::tuple<GLuint, glm::vec2, int, unsigned> const& tex_profile = tex_profile_it->second;
           OpenGL::LiquidChunkInstanceDataUniformBlock& params_data = layer_params.chunk_data[n_chunks];
 
           params_data.xbase = layer.getChunk()->xbase;
@@ -154,6 +190,7 @@ void LiquidRender::updateLayerData(LiquidTextureManager* tex_manager)
 
           params_data.subchunks_1 = subchunks & 0xFF'FF'FF'FF;
           params_data.subchunks_2 = subchunks >> 32;
+          params_data._pad1 = static_cast<unsigned>(x * 16 + z);
 
           // fill vertex data
           auto& vertices = layer.getVertices();
@@ -196,6 +233,16 @@ void LiquidRender::updateLayerData(LiquidTextureManager* tex_manager)
       {
         auto& layer_params = _render_layers[layer_counter];
         layer_params.n_used_chunks = static_cast<unsigned int>(n_chunks);
+
+        static int logged_render_layers = 0;
+        if (logged_render_layers < 40)
+        {
+          LogError << "Turtle water: render layer " << layer_counter << " tile "
+                   << _map_tile->index.x << "," << _map_tile->index.z
+                   << " chunks " << n_chunks
+                   << " samplers " << layer_params.texture_samplers.size() << std::endl;
+          logged_render_layers++;
+        }
 
         gl.bindTexture(GL_TEXTURE_2D_ARRAY, layer_params.vertex_data_tex);
         gl.bindBuffer(GL_UNIFORM_BUFFER, layer_params.chunk_data_buf);

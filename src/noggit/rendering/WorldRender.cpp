@@ -3,6 +3,7 @@
 #include "WorldRender.hpp"
 #include <external/tracy/Tracy.hpp>
 #include <math/frustum.hpp>
+#include <noggit/Log.h>
 #include <noggit/World.h>
 #include <external/PNG2BLP/Png2Blp.h>
 #include <noggit/DBC.h>
@@ -11,7 +12,22 @@
 #include <QDir>
 #include <QBuffer>
 
+#include <algorithm>
+
 using namespace Noggit::Rendering;
+
+namespace
+{
+  bool is_too_dark(glm::vec3 const& color, float minimum)
+  {
+    return color.x + color.y + color.z < minimum;
+  }
+
+  glm::vec3 ensure_min_light(glm::vec3 color, glm::vec3 const& fallback, float minimum)
+  {
+    return is_too_dark(color, minimum) ? fallback : color;
+  }
+}
 
 WorldRender::WorldRender(World* world)
 : BaseRender()
@@ -294,7 +310,8 @@ void WorldRender::draw (glm::mat4x4 const& model_view
             , show_unpaintable_chunks
             , draw_paintability_overlay
             , terrainMode == editing_mode::minimap
-              && minimap_render_settings->selected_tiles.at(64 * tile->index.x + tile->index.z)
+              && 64 * tile->index.x + tile->index.z < minimap_render_settings->selected_tiles.size()
+              && minimap_render_settings->selected_tiles[64 * tile->index.x + tile->index.z]
         );
 
         _world->_n_rendered_tiles++;
@@ -612,8 +629,10 @@ void WorldRender::draw (glm::mat4x4 const& model_view
   }
 
   bool draw_doodads_wmo = draw_wmo && draw_wmo_doodads;
+  bool draw_creature_spawns = !minimap_render && _world->drawCreatureSpawns();
+  constexpr float creature_spawn_draw_distance = 650.0f;
   // M2s / models
-  if (draw_models || draw_doodads_wmo || (minimap_render && minimap_render_settings->use_filters))
+  if (draw_models || draw_doodads_wmo || draw_creature_spawns || (minimap_render && minimap_render_settings->use_filters))
   {
     ZoneScopedN("World::draw() : Draw M2s");
 
@@ -621,6 +640,50 @@ void WorldRender::draw (glm::mat4x4 const& model_view
     {
       ModelManager::resetAnim();
     }
+
+    if (draw_doodads_wmo)
+    {
+      ZoneScopedN("World::draw() : Inject visible WMO doodads");
+      for (auto* wmo_instance : wmos_to_draw)
+      {
+        auto doodads = wmo_instance->get_visible_doodads(frustum, _cull_distance, camera_pos, draw_hidden_models, display);
+        for (auto* doodad : doodads)
+        {
+          if (!doodad)
+          {
+            continue;
+          }
+
+          doodad->ensureExtents();
+          if (!doodad->model->finishedLoading() || doodad->model->loading_failed())
+          {
+            continue;
+          }
+
+          models_to_draw[doodad->model.get()].push_back(doodad->transformMatrix());
+        }
+      }
+    }
+
+    // Inject creature spawn M2 models into the draw batch
+    if (draw_creature_spawns)
+    {
+      ZoneScopedN("World::draw() : Inject creature spawn models");
+      for (auto& spawn : _world->creatureSpawns())
+      {
+        if (glm::distance(camera_pos, spawn.pos) > creature_spawn_draw_distance)
+        {
+          continue;
+        }
+
+        if (!spawn.model_instance.has_value()) continue;
+        auto& mi = *spawn.model_instance;
+        mi.ensureExtents();
+        if (!mi.model->finishedLoading()) continue;
+        models_to_draw[mi.model.get()].push_back(mi.transformMatrix());
+      }
+    }
+
     /*
     if (_world->need_model_updates)
     {
@@ -739,7 +802,6 @@ void WorldRender::draw (glm::mat4x4 const& model_view
     gl.enable(GL_CULL_FACE);
     gl.depthMask(GL_TRUE);
 
-
     // unsigned int wmos_todraw_count = wmos_to_draw.size();
     // unsigned int models_todraw_count = models_to_draw.size();
     _world->_n_rendered_objects += wmos_to_draw.size();
@@ -766,6 +828,96 @@ void WorldRender::draw (glm::mat4x4 const& model_view
 
         m2_box_shader.uniform("color", color);
         it.first->renderer()->drawBox(m2_box_shader, it.second);
+      }
+    }
+
+    if (!minimap_render)
+    {
+      _world->ensureCreatureSpawnsLoaded();
+    }
+
+    if (draw_creature_spawns && !_world->creatureSpawns().empty())
+    {
+      ZoneScopedN("World::draw() : Draw creature spawn markers");
+      OpenGL::Scoped::bool_setter<GL_CULL_FACE, GL_FALSE> const disable_cull_face;
+      OpenGL::Scoped::bool_setter<GL_BLEND, GL_TRUE> const enable_blend;
+      OpenGL::Scoped::depth_mask_setter<GL_FALSE> const no_depth_write;
+      static bool logged_creature_marker_stats = false;
+      std::size_t nearby_spawns = 0;
+      float closest_distance = 999999999.0f;
+      std::uint32_t closest_guid = 0;
+      glm::vec3 closest_pos = glm::vec3(0.0f);
+
+      struct MarkerData { glm::vec3 pos; glm::vec4 color; float radius; };
+      std::vector<MarkerData> markers;
+      markers.reserve(512);
+
+      for (auto const& spawn : _world->creatureSpawns())
+      {
+        float distance = glm::distance(camera_pos, spawn.pos);
+        if (distance < closest_distance)
+        {
+          closest_distance = distance;
+          closest_guid = spawn.guid;
+          closest_pos = spawn.pos;
+        }
+        if (distance > creature_spawn_draw_distance) continue;
+        ++nearby_spawns;
+
+        // Derive circle radius from the model's bounding sphere so it scales
+        // with the creature's actual size.  Fall back to a small default when
+        // the model hasn't loaded yet.
+        float model_rad = 0.5f;
+        if (spawn.model_instance.has_value())
+        {
+          auto const& mi = spawn.model_instance.value();
+          if (mi.model.get() && mi.model->finishedLoading() && !mi.model->loading_failed())
+            model_rad = mi.model->rad * mi.scale;
+        }
+        float ring_radius = std::max(0.25f, model_rad * 0.55f);
+
+        glm::vec4 color = spawn.selected ? glm::vec4(0.2f, 1.0f,  0.35f, 1.0f)
+            : spawn.hovered  ? glm::vec4(0.2f, 0.9f,  1.0f,  1.0f)
+            : spawn.dirty    ? glm::vec4(1.0f, 0.9f,  0.15f, 1.0f)
+                 : glm::vec4(1.0f, 0.55f, 0.08f, 1.0f);
+        // Sit just above the spawn's ground position so the circle hugs the
+        // terrain / object surface without clipping through it.
+        glm::vec3 ground_pos = spawn.pos + glm::vec3(0.0f, 0.05f, 0.0f);
+        markers.push_back({ground_pos, color, ring_radius});
+      }
+
+      gl.blendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+      gl.enable(GL_DEPTH_TEST);
+
+      // Pass 1: visible pixels (normal depth, full alpha)
+      gl.depthFunc(GL_LEQUAL);
+      for (auto const& m : markers)
+        _circle_render.draw(mvp, m.pos, m.color, m.radius);
+
+      // Pass 2: occluded pixels (behind terrain, 10% alpha)
+      gl.depthFunc(GL_GREATER);
+      for (auto const& m : markers)
+      {
+        glm::vec4 c = m.color;
+        c.a *= 0.1f;
+        _circle_render.draw(mvp, m.pos, c, m.radius);
+      }
+
+      // Restore depth function
+      gl.depthFunc(GL_LEQUAL);
+
+      if (!logged_creature_marker_stats)
+      {
+        LogDebug << "Creature spawn marker draw: total=" << _world->creatureSpawns().size()
+                 << ", nearby=" << nearby_spawns
+                 << ", drawn=" << markers.size()
+                 << ", markerDistance=" << creature_spawn_draw_distance
+                 << ", camera={" << camera_pos.x << ", " << camera_pos.y << ", " << camera_pos.z << "}"
+                 << ", closestGuid=" << closest_guid
+                 << ", closestDistance=" << closest_distance
+                 << ", closestPos={" << closest_pos.x << ", " << closest_pos.y << ", " << closest_pos.z << "}"
+                 << std::endl;
+        logged_creature_marker_stats = true;
       }
     }
 
@@ -824,6 +976,7 @@ void WorldRender::draw (glm::mat4x4 const& model_view
     OpenGL::Scoped::use_program water_shader {*_liquid_program.get()};
     water_shader.uniform("camera", glm::vec3(camera_pos.x, camera_pos.y, camera_pos.z));
     water_shader.uniform("animtime", _world->animtime);
+    water_shader.uniform("draw_shadows", _terrain_params_ubo_data.draw_shadows);
 
 
     if (draw_wmo || _world->mapIndex.hasAGlobalWMO())
@@ -1213,6 +1366,7 @@ void WorldRender::upload()
     liquid_render.bind_uniform_block("lighting", 1);
     liquid_render.bind_uniform_block("liquid_layers_params", 4);
     liquid_render.uniform("vertex_data", 0);
+    liquid_render.uniform("shadowmap", 1);
     liquid_render.uniform("texture_samplers", samplers);
 
   }
@@ -1252,6 +1406,7 @@ void WorldRender::unload()
   _sphere_render.unload();
   _square_render.unload();
   _line_render.unload();
+  _circle_render.unload();
   _horizon_render.reset();
 
   _liquid_texture_manager.unload();
@@ -1283,6 +1438,23 @@ void WorldRender::updateLightingUniformBlock(bool draw_fog, glm::vec3 const& cam
 
   int daytime = static_cast<int>(_world->time) % 2880;
 
+  int area_light_id = 0;
+  try
+  {
+    unsigned int area_id = _world->getAreaID(camera_pos);
+    if (area_id != static_cast<unsigned int>(-1)
+        && gAreaDB.getFieldCount() > AreaDB::LightId
+        && gAreaDB.CheckIfIdExists(area_id))
+    {
+      area_light_id = gAreaDB.getByID(area_id).getInt(AreaDB::LightId);
+    }
+  }
+  catch (...)
+  {
+    area_light_id = 0;
+  }
+
+  _skies->setAreaLightId(area_light_id);
   _skies->update_sky_colors(camera_pos, daytime);
   _outdoor_light_stats = _outdoor_lighting->getLightStats(static_cast<int>(_world->time));
 
@@ -1294,9 +1466,20 @@ void WorldRender::updateLightingUniformBlock(bool draw_fog, glm::vec3 const& cam
   glm::vec3 river_color_light = _skies->color_set[RIVER_COLOR_LIGHT];
   glm::vec3 river_color_dark = _skies->color_set[RIVER_COLOR_DARK];
 
+  diffuse = ensure_min_light(diffuse, {0.82f, 0.78f, 0.70f}, 0.20f);
+  ambient = ensure_min_light(ambient, {0.45f, 0.50f, 0.55f}, 0.20f);
+  fog_color = ensure_min_light(fog_color, {0.70f, 0.78f, 0.86f}, 0.10f);
 
-  _lighting_ubo_data.DiffuseColor_FogStart = {diffuse.x,diffuse.y,diffuse.z, _skies->fog_distance_start()};
-  _lighting_ubo_data.AmbientColor_FogEnd = {ambient.x,ambient.y,ambient.z, _skies->fog_distance_end()};
+  float fog_start = _skies->fog_distance_start();
+  float fog_end = _skies->fog_distance_end();
+  if (fog_end <= 1.0f)
+  {
+    fog_start = 0.25f;
+    fog_end = 500.0f;
+  }
+
+  _lighting_ubo_data.DiffuseColor_FogStart = {diffuse.x,diffuse.y,diffuse.z, fog_start};
+  _lighting_ubo_data.AmbientColor_FogEnd = {ambient.x,ambient.y,ambient.z, fog_end};
   _lighting_ubo_data.FogColor_FogOn = {fog_color.x,fog_color.y,fog_color.z, static_cast<float>(draw_fog)};
   _lighting_ubo_data.LightDir_FogRate = {_outdoor_light_stats.dayDir.x, _outdoor_light_stats.dayDir.y, _outdoor_light_stats.dayDir.z, _skies->fogRate()};
   _lighting_ubo_data.OceanColorLight = { ocean_color_light.x,ocean_color_light.y,ocean_color_light.z, _skies->ocean_shallow_alpha()};
@@ -1476,7 +1659,7 @@ void WorldRender::setupChunkBuffers()
 
   {
     OpenGL::Scoped::buffer_binder<GL_ELEMENT_ARRAY_BUFFER> const _ (_mapchunk_index);
-    gl.bufferData (GL_ELEMENT_ARRAY_BUFFER, (768 + 192) * sizeof(std::uint16_t), indices.data(), GL_STATIC_DRAW);
+    gl.bufferData (GL_ELEMENT_ARRAY_BUFFER, (768 + 192) * sizeof(std::uint16_t), static_cast<void const*>(indices.data()), GL_STATIC_DRAW);
   }
 
   // tex coords
@@ -1599,7 +1782,6 @@ void WorldRender::drawMinimap ( MapTile *tile
   if (mTile)
   {
     mTile->wait_until_loaded();
-    mTile->waitForChildrenLoaded();
 
   }
 

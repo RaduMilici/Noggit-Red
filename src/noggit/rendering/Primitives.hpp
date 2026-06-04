@@ -178,4 +178,30 @@ namespace Noggit::Rendering::Primitives
       std::unique_ptr<OpenGL::program> _program;
   };
 
+  // Flat thick ring drawn in the XZ plane.
+  // Uses the same square_vs / square_fs shaders as Square.
+  class Circle
+  {
+  public:
+    void draw(glm::mat4x4 const& mvp
+             , glm::vec3 const& pos
+             , glm::vec4 const& color
+             , float radius
+             );
+    void unload();
+
+  private:
+    static constexpr int N_SEGMENTS = 64;
+    bool _buffers_are_setup = false;
+    void setup_buffers();
+
+    int _indice_count = 0;
+
+    OpenGL::Scoped::deferred_upload_vertex_arrays<1> _vao;
+    OpenGL::Scoped::deferred_upload_buffers<2> _buffers;
+    GLuint const& _vertices_vbo = _buffers[0];
+    GLuint const& _indices_vbo = _buffers[1];
+    std::unique_ptr<OpenGL::program> _program;
+  };
+
 }

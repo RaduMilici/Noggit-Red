@@ -3,6 +3,7 @@
 #include <noggit/World.h>
 #include <noggit/MapView.h>
 #include <noggit/ui/ShaderTool.hpp>
+#include <noggit/ui/tools/UiCommon/expanderwidget.h>
 #include <util/qt/overload.hpp>
 #include <noggit/ui/FontAwesome.hpp>
 
@@ -52,15 +53,52 @@ namespace Noggit
 
       layout->addRow(_speed_slider);
 
-      color_picker = new color_widgets::ColorSelector (this);
-      color_picker->setDisplayMode (color_widgets::ColorSelector::NoAlpha);
-      color_picker->setColor (QColor::fromRgbF (_color.x, _color.y, _color.z, _color.w));
-      color_picker->setMinimumHeight(25);
+      _color_controls_container = new QWidget(this);
+      auto color_controls_layout = new QVBoxLayout(_color_controls_container);
+      color_controls_layout->setContentsMargins(0, 0, 0, 0);
+      color_controls_layout->setSpacing(0);
+      layout->addRow(_color_controls_container);
 
+      _use_image_colors = new QCheckBox(this);
+      _use_image_colors->setChecked(true);
+      layout->addRow("Use image colors", _use_image_colors);
+
+      _image_mask_group = new Noggit::Ui::Tools::ImageMaskSelector(map_view, this);
+      _image_mask_group->setContinuousActionName("Paint");
+      _image_mask_group->setBrushModeVisible(parent == map_view);
+      _image_mask_group->setSizePolicy(QSizePolicy(QSizePolicy::Preferred, QSizePolicy::Maximum));
+      _mask_image = _image_mask_group->getPixmap()->toImage();
+      // layout->addRow(_image_mask_group);
+
+      auto* customBrushBox = new ExpanderWidget(this);
+      customBrushBox->setExpanderTitle("Custom Brush");
+      customBrushBox->addPage(_image_mask_group);
+      customBrushBox->setExpanded(false);
+      layout->addRow(customBrushBox);
+
+      QObject::connect(_slide_saturation, &color_widgets::GradientSlider::valueChanged, this, &ShaderTool::set_hsv);
+      QObject::connect(_slide_value, &color_widgets::GradientSlider::valueChanged, this, &ShaderTool::set_hsv);
+
+      setMinimumWidth(250);
+      setMaximumWidth(250);
+    }
+
+    void ShaderTool::ensureColorControls()
+    {
+      if (_color_controls_initialized)
+        return;
+
+      auto layout = new QFormLayout(_color_controls_container);
+      layout->setContentsMargins(0, 0, 0, 0);
+
+      color_picker = new color_widgets::ColorSelector(this);
+      color_picker->setDisplayMode(color_widgets::ColorSelector::NoAlpha);
+      color_picker->setColor(QColor::fromRgbF(_color.x, _color.y, _color.z, _color.w));
+      color_picker->setMinimumHeight(25);
       layout->addRow("Color:", color_picker);
 
       color_wheel = new color_widgets::ColorWheel(this);
-      color_wheel->setColor (QColor::fromRgbF (_color.x, _color.y, _color.z, _color.w));
+      color_wheel->setColor(QColor::fromRgbF(_color.x, _color.y, _color.z, _color.w));
       color_wheel->setMinimumSize(QSize(200, 200));
       layout->addRow(color_wheel);
 
@@ -79,7 +117,6 @@ namespace Noggit
       _slide_saturation->setRange(0, 255);
       layout->addRow(_slide_saturation);
 
-
       _spin_value = new QSpinBox(this);
       _spin_value->setRange(0, 255);
       layout->addRow("Value:", _spin_value);
@@ -88,31 +125,13 @@ namespace Noggit
       _slide_value->setRange(0, 255);
       layout->addRow(_slide_value);
 
-      _use_image_colors = new QCheckBox(this);
-      _use_image_colors->setChecked(true);
-      layout->addRow("Use image colors", _use_image_colors);
-
       _color_palette = new color_widgets::ColorListWidget(this);
       _color_palette->setSizePolicy(QSizePolicy(QSizePolicy::Preferred, QSizePolicy::Preferred));
       layout->addRow(_color_palette);
 
-      auto info_label (new QLabel("Drag&Drop colors to select.", this));
+      auto info_label = new QLabel("Drag&Drop colors to select.", this);
       info_label->setAlignment(Qt::AlignCenter | Qt::AlignTop);
-
       layout->addRow(info_label);
-
-      _image_mask_group = new Noggit::Ui::Tools::ImageMaskSelector(map_view, this);
-      _image_mask_group->setContinuousActionName("Paint");
-      _image_mask_group->setBrushModeVisible(parent == map_view);
-      _image_mask_group->setSizePolicy(QSizePolicy(QSizePolicy::Preferred, QSizePolicy::Maximum));
-      _mask_image = _image_mask_group->getPixmap()->toImage();
-      // layout->addRow(_image_mask_group);
-
-      auto* customBrushBox = new ExpanderWidget(this);
-      customBrushBox->setExpanderTitle("Custom Brush");
-      customBrushBox->addPage(_image_mask_group);
-      customBrushBox->setExpanded(false);
-      layout->addRow(customBrushBox);
 
       QObject::connect(_slide_saturation, &color_widgets::GradientSlider::valueChanged, this, &ShaderTool::set_hsv);
       QObject::connect(_slide_value, &color_widgets::GradientSlider::valueChanged, this, &ShaderTool::set_hsv);
@@ -129,41 +148,37 @@ namespace Noggit
       QObject::connect(color_wheel, &color_widgets::ColorWheel::colorSelected, this, &ShaderTool::update_color_widgets);
       QObject::connect(color_picker, &color_widgets::ColorSelector::colorChanged, this, &ShaderTool::update_color_widgets);
 
+      connect(_color_palette, &color_widgets::ColorListWidget::color_added,
+              [this]()
+              {
+                _color_palette->setColorAt(_color_palette->colors().length() - 1, color_wheel->color());
+              });
 
-      connect ( _color_palette, &color_widgets::ColorListWidget::color_added
-              , [&] ()
-                {
-                  _color_palette->setColorAt(_color_palette->colors().length() - 1, color_wheel->color());
-                }
-              );
+      connect(color_picker, &color_widgets::ColorSelector::colorChanged,
+              [this](QColor new_color)
+              {
+                QSignalBlocker const blocker(color_wheel);
+                color_wheel->setColor(new_color);
+                _color.x = new_color.redF();
+                _color.y = new_color.greenF();
+                _color.z = new_color.blueF();
+                _color.w = 1.0f;
+              });
 
-      connect ( color_picker, &color_widgets::ColorSelector::colorChanged
-              , [this] (QColor new_color)
-                {
-                  QSignalBlocker const blocker (color_wheel);
-                  color_wheel->setColor(new_color);
-                  _color.x = new_color.redF();
-                  _color.y = new_color.greenF();
-                  _color.z = new_color.blueF();
-                  _color.w = 1.0f;
-                }
-              );
-
-
-      connect (color_wheel, &color_widgets::ColorWheel::colorChanged,
-               [this](QColor color)
-               {
+      connect(color_wheel, &color_widgets::ColorWheel::colorChanged,
+              [this](QColor color)
+              {
                 color_picker->setColor(color);
+              });
 
-               });
+      _color_controls_initialized = true;
+      update_color_widgets();
+    }
 
-
-      connect (_image_mask_group, &Noggit::Ui::Tools::ImageMaskSelector::rotationUpdated, this, &ShaderTool::updateMaskImage);
-      connect (_radius_slider, &Noggit::Ui::Tools::UiCommon::ExtendedSlider::valueChanged, this, &ShaderTool::updateMaskImage);
-      connect(_image_mask_group, &Noggit::Ui::Tools::ImageMaskSelector::pixmapUpdated, this, &ShaderTool::updateMaskImage);
-
-      setMinimumWidth(250);
-      setMaximumWidth(250);
+    void ShaderTool::showEvent(QShowEvent* event)
+    {
+      ensureColorControls();
+      QWidget::showEvent(event);
     }
 
     void ShaderTool::changeShader
@@ -204,6 +219,8 @@ namespace Noggit
     {
       glm::vec3 color = world->pickShaderColor(pos);
 
+      ensureColorControls();
+
       QColor new_color;
       new_color.setRgbF(color.x * 0.5, color.y * 0.5, color.z * 0.5);
       color_wheel->setColor(new_color);
@@ -212,11 +229,15 @@ namespace Noggit
 
     void ShaderTool::addColorToPalette()
     {
+      ensureColorControls();
       _color_palette->append();
     }
 
     void ShaderTool::set_hsv()
     {
+      if (!_color_controls_initialized)
+        return;
+
       if (!signalsBlocked())
       {
         color_wheel->setColor(QColor::fromHsv(
@@ -230,6 +251,9 @@ namespace Noggit
 
     void ShaderTool::update_color_widgets()
     {
+      if (!_color_controls_initialized)
+        return;
+
       bool blocked = signalsBlocked();
       blockSignals(true);
       Q_FOREACH(QWidget * w, findChildren<QWidget*>())
@@ -284,9 +308,9 @@ namespace Noggit
 
       json["radius"] = _radius_slider->rawValue();
       json["speed"] = _speed_slider->rawValue();
-      json["color_r"] = color_picker->color().redF();
-      json["color_g"] = color_picker->color().greenF();
-      json["color_b"] = color_picker->color().blueF();
+      json["color_r"] = _color.x;
+      json["color_g"] = _color.y;
+      json["color_b"] = _color.z;
 
       json["mask_enabled"] = _image_mask_group->isEnabled();
       json["brush_mode"] = _image_mask_group->getBrushMode();
@@ -303,7 +327,15 @@ namespace Noggit
     {
       _radius_slider->setValue(json["radius"].toDouble());
       _speed_slider->setValue(json["speed"].toDouble());
-      color_picker->setColor(QColor(color_picker->color().redF(), color_picker->color().greenF(), color_picker->color().blueF()));
+      _color.x = json["color_r"].toDouble(_color.x);
+      _color.y = json["color_g"].toDouble(_color.y);
+      _color.z = json["color_b"].toDouble(_color.z);
+      _color.w = 1.0f;
+
+      if (_color_controls_initialized)
+      {
+        color_picker->setColor(QColor::fromRgbF(_color.x, _color.y, _color.z, _color.w));
+      }
 
       _image_mask_group->setEnabled(json["mask_enabled"].toBool());
       _image_mask_group->setBrushMode(json["brush_mode"].toInt());

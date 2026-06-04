@@ -375,6 +375,11 @@
            </property>
            <item>
             <property name="text">
+             <string>Turtle WoW</string>
+            </property>
+           </item>
+           <item>
+            <property name="text">
              <string>Wrath Of The Lich King</string>
             </property>
            </item>

@@ -29,6 +29,7 @@ namespace Noggit::Rendering
 {
   class ModelRender;
   struct ModelRenderPass;
+  class WorldRender;
 }
 
 
@@ -128,11 +129,22 @@ class Model : public AsyncObject
 {
   friend class Noggit::Rendering::ModelRender;
   friend struct Noggit::Rendering::ModelRenderPass;
+  friend class Noggit::Rendering::WorldRender;
 
 public:
   template<typename T>
   static std::vector<T> M2Array(BlizzardArchive::ClientFile const& f, uint32_t offset, uint32_t count)
   {
+    if (!count)
+    {
+      return {};
+    }
+
+    if (offset >= f.getSize() || count > (f.getSize() - offset) / sizeof(T))
+    {
+      return {};
+    }
+
     T const* start = reinterpret_cast<T const*>(f.getBuffer() + offset);
     return std::vector<T>(start, start + count);
   }
@@ -167,6 +179,10 @@ public:
 
   [[nodiscard]]
   Noggit::Rendering::ModelRender* renderer() { return &_renderer; }
+
+  [[nodiscard]] bool usesClassicLayout() const { return _uses_classic_layout; }
+  [[nodiscard]] bool supportsTrackAnimations() const { return !_uses_classic_layout && !_animations_seq_per_id.empty(); }
+  [[nodiscard]] bool hasAnimationId(int anim_id) const;
 
   // ===============================
   // Toggles
@@ -207,7 +223,17 @@ public:
   std::optional<FakeGeometry> _fake_geometry;
 
 private:
+  struct ClassicStaticBone
+  {
+    std::uint32_t flags = 0;
+    int parent = -1;
+    glm::vec3 pivot = {};
+  };
+
   bool _per_instance_animation;
+  bool _uses_classic_layout = false;
+  uint32_t _embedded_view_offset = 0;
+  std::vector<ClassicStaticBone> _classic_static_bones;
   int _current_anim_seq;
   int _anim_time;
   int _global_animtime;
@@ -217,6 +243,8 @@ private:
   void initCommon(const BlizzardArchive::ClientFile& f);
   bool isAnimated(const BlizzardArchive::ClientFile& f);
   void initAnimated(const BlizzardArchive::ClientFile& f);
+  bool initClassicStaticBones(const BlizzardArchive::ClientFile& f);
+  void calcClassicStaticBones(glm::mat4x4 const& model_view);
 
   void animate(glm::mat4x4 const& model_view, int anim_id, int anim_time);
   void calcBones(glm::mat4x4 const& model_view, int anim, int time, int animation_time);
@@ -250,6 +278,7 @@ private:
   // ===============================
   std::vector<ModelColor> _colors;
   std::vector<ModelTransparency> _transparency;
+  std::vector<float> _classic_transparency_values;
   std::vector<int16_t> _transparency_lookup;
   std::vector<ModelLight> _lights;
 

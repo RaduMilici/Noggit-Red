@@ -79,6 +79,8 @@ private:
     /// Disconnect from dialog update
     void disconnect_dialog();
 
+    void ensureDialog();
+
     class Private;
     Private * const p;
 

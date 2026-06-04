@@ -14,6 +14,8 @@ layout (std140) uniform lighting
 };
 
 uniform float animtime;
+uniform int draw_shadows;
+uniform sampler2DArray shadowmap;
 uniform sampler2DArray texture_samplers[14] ;
 
 in float depth_;
@@ -23,6 +25,8 @@ flat in uint tex_array;
 flat in uint type;
 flat in vec2 anim_uv;
 flat in int tex_frame;
+flat in uint shadow_chunk_index;
+in vec2 shadow_uv;
 
 out vec4 out_color;
 
@@ -111,8 +115,21 @@ void main()
               : mix (RiverColorLight, RiverColorDark, depth_)
               ;
 
-    //clamp shouldn't be needed
-    out_color = vec4 (clamp(texel + lerp, 0.0, 1.0).rgb, lerp.a);
+    vec3 normal = vec3(0.0, 1.0, 0.0);
+    float nDotL = clamp(dot(normal, -normalize(LightDir_FogRate.xyz)), 0.0, 1.0);
+    vec3 skyColor = AmbientColor_FogEnd.xyz * 1.10000002;
+    vec3 groundColor = AmbientColor_FogEnd.xyz * 0.699999988;
+    vec3 ambient = mix(groundColor, skyColor, 0.5 + (0.5 * nDotL));
+    vec3 diffuse = DiffuseColor_FogStart.xyz * nDotL;
+
+    vec3 base_color = mix(lerp.rgb, texel.rgb, 0.35);
+    out_color = vec4(clamp(base_color * (ambient + diffuse), 0.0, 1.0), lerp.a);
+
+    if (draw_shadows != 0)
+    {
+      float shadow_alpha = texture(shadowmap, vec3(shadow_uv, shadow_chunk_index)).r;
+      out_color.rgb *= 1.0 - shadow_alpha;
+    }
   }
 
   if (FogColor_FogOn.w != 0)

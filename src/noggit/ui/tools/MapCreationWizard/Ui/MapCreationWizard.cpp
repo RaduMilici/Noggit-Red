@@ -32,6 +32,45 @@
 
 using namespace Noggit::Ui::Tools::MapCreationWizard::Ui;
 
+namespace
+{
+  bool isUsableDisplayString(std::string const& value)
+  {
+    return !value.empty() && value.size() < 1024;
+  }
+
+  std::string localizedColumnValueOrDefault(BlizzardDatabaseLib::Structures::BlizzardDatabaseRow& record,
+                                            std::string const& column_name,
+                                            std::string const& default_value)
+  {
+    auto itr = record.Columns.find(column_name);
+    if (itr == record.Columns.end())
+      return default_value;
+
+    for (auto const& value: itr->second.Values)
+    {
+      if (isUsableDisplayString(value))
+        return value;
+    }
+
+    if (isUsableDisplayString(itr->second.Value))
+      return itr->second.Value;
+
+    return default_value;
+  }
+
+  std::string columnValueOrDefault(BlizzardDatabaseLib::Structures::BlizzardDatabaseRow& record,
+                                   std::string const& column_name,
+                                   std::string const& default_value)
+  {
+    auto itr = record.Columns.find(column_name);
+    if (itr == record.Columns.end() || itr->second.Value.empty())
+      return default_value;
+
+    return itr->second.Value;
+  }
+}
+
 MapCreationWizard::MapCreationWizard(std::shared_ptr<Project::NoggitProject> project, QWidget* parent) : Noggit::Ui::widget(parent), _project(project)
 {
   auto layout = new QHBoxLayout(this);
@@ -86,8 +125,10 @@ MapCreationWizard::MapCreationWizard(std::shared_ptr<Project::NoggitProject> pro
       auto record = iterator.Next();
 
       int map_id =  record.RecordId;
-      std::string name = record.Columns["MapName_lang"].Value;
-      int area_type = std::stoi(record.Columns["InstanceType"].Value);
+    auto name = localizedColumnValueOrDefault(record, "MapName_lang", columnValueOrDefault(record, "Directory", ""));
+    if (name.empty())
+      name = "Map " + std::to_string(map_id);
+    int area_type = std::stoi(columnValueOrDefault(record, "InstanceType", "0"));
 
       if (area_type < 0 || area_type > 4 || !World::IsEditableWorld(record))
           continue;
@@ -414,18 +455,19 @@ void MapCreationWizard::selectMap(int map_id)
     delete _world;
   }
 
-  auto directoryName = record.Columns["Directory"].Value;
-  auto instanceType = record.Columns["InstanceType"].Value;
+  auto directoryName = columnValueOrDefault(record, "Directory", "");
+  auto instanceType = columnValueOrDefault(record, "InstanceType", "0");
 
-  auto areaTableId = record.Columns["AreaTableID"].Value;
-  auto loadingScreenId = record.Columns["LoadingScreenID"].Value;
-  auto minimapIconScale = record.Columns["MinimapIconScale"].Value;
-  auto corpseMapId = record.Columns["CorpseMapID"].Value;
-  auto corpseCoords = record.Columns["Corpse"].Values;
-  auto expansionId = record.Columns["ExpansionID"].Value;
-  auto maxPlayers = record.Columns["MaxPlayers"].Value;
-  auto timeOffset = record.Columns["TimeOffset"].Value;
-  auto raidOffset = record.Columns["RaidOffset"].Value;
+  auto areaTableId = columnValueOrDefault(record, "AreaTableID", "0");
+  auto loadingScreenId = columnValueOrDefault(record, "LoadingScreenID", "0");
+  auto minimapIconScale = columnValueOrDefault(record, "MinimapIconScale", "1.0");
+  auto corpseMapId = columnValueOrDefault(record, "CorpseMapID", "-1");
+  auto corpse_itr = record.Columns.find("Corpse");
+  auto corpseCoords = corpse_itr == record.Columns.end() ? std::vector<std::string>() : corpse_itr->second.Values;
+  auto expansionId = columnValueOrDefault(record, "ExpansionID", "0");
+  auto maxPlayers = columnValueOrDefault(record, "MaxPlayers", "0");
+  auto timeOffset = columnValueOrDefault(record, "TimeOffset", "-1");
+  auto raidOffset = columnValueOrDefault(record, "RaidOffset", "0");
 
   _world = new World(directoryName, map_id, Noggit::NoggitRenderContext::MAP_VIEW);
 
@@ -478,7 +520,7 @@ void MapCreationWizard::selectMap(int map_id)
     }
   }
 
-  if(corpseCoords.size() > 0)
+  if(corpseCoords.size() > 1)
   {
       _corpse_x->setValue(std::atoi(corpseCoords[0].c_str()));
       _corpse_y->setValue(std::atoi(corpseCoords[1].c_str()));
@@ -492,6 +534,13 @@ void MapCreationWizard::selectMap(int map_id)
   _max_players->setValue(std::atoi(maxPlayers.c_str()));
 
   _project->ClientDatabase->UnloadTable("Map");
+
+  if (_project->projectVersion == Project::ProjectVersion::CLASSIC)
+  {
+    QSignalBlocker const difficulty_type_blocker(_difficulty_type);
+    _difficulty_type->clear();
+    return;
+  }
 
   auto difficulty_table = _project->ClientDatabase->LoadTable("MapDifficulty", readFileAsIMemStream);
 
@@ -523,6 +572,9 @@ void MapCreationWizard::selectMapDifficulty()
 {
     if (!_difficulty_type->count())
         return;
+
+  if (_project->projectVersion == Project::ProjectVersion::CLASSIC)
+    return;
 
     auto selected_difficulty_id = _difficulty_type->itemData(_difficulty_type->currentIndex()).toInt();
     if (!selected_difficulty_id)
@@ -860,19 +912,27 @@ void LocaleDBCEntry::fill(DBCFile::Record& record, size_t field)
 
 void LocaleDBCEntry::fill(BlizzardDatabaseLib::Structures::BlizzardDatabaseRow& record, std::string columnName)
 {
-    auto columnValues = record.Columns[columnName].Values;
-    auto columnFlagsValue = record.Columns[columnName + "_flags"].Value;
+  auto column_itr = record.Columns.find(columnName);
+  auto flags_itr = record.Columns.find(columnName + "_flags");
+  auto const emptyValues = std::vector<std::string>();
+  auto const& columnValues = column_itr == record.Columns.end() ? emptyValues : column_itr->second.Values;
+  auto columnFlagsValue = flags_itr == record.Columns.end() ? std::string("0") : flags_itr->second.Value;
+
+  clear();
 
     if(columnValues.size() == 0)
     {
-        auto singleValue = record.Columns[columnName].Value;
-        setValue(singleValue, 0);
+    auto singleValue = column_itr == record.Columns.end() ? std::string() : record.Columns[columnName].Value;
+    if (isUsableDisplayString(singleValue))
+      setValue(singleValue, 0);
     }
     else
     {
-        for (int loc = 0; loc < 16; ++loc)
+    auto localeCount = std::min<int>(static_cast<int>(columnValues.size()), 16);
+    for (int loc = 0; loc < localeCount; ++loc)
         {
-            setValue(columnValues[loc], loc);
+      if (isUsableDisplayString(columnValues[loc]))
+        setValue(columnValues[loc], loc);
         }
     }
 

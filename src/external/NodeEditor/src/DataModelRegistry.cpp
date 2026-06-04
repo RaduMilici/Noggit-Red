@@ -19,6 +19,45 @@ create(QString const &modelName)
     return it->second();
   }
 
+  RegisteredModelCreatorsMap::value_type const* deferredEntry = nullptr;
+  RegisteredModelsCategoryMap::value_type const* deferredCategory = nullptr;
+  std::unique_ptr<NodeDataModel> resolvedModel;
+
+  for (auto const& entry : _registeredItemCreators)
+  {
+    if (!entry.first.startsWith(QStringLiteral("__lazy__::")))
+    {
+      continue;
+    }
+
+    auto candidate = entry.second();
+    if (!candidate || candidate->name() != modelName)
+    {
+      continue;
+    }
+
+    deferredEntry = &entry;
+
+    auto categoryIt = _registeredModelsCategory.find(entry.first);
+    if (categoryIt != _registeredModelsCategory.end())
+    {
+      deferredCategory = &(*categoryIt);
+    }
+
+    resolvedModel = std::move(candidate);
+    break;
+  }
+
+  if (deferredEntry)
+  {
+    _registeredItemCreators[modelName] = deferredEntry->second;
+    if (deferredCategory)
+    {
+      _registeredModelsCategory[modelName] = deferredCategory->second;
+    }
+    return resolvedModel;
+  }
+
   return nullptr;
 }
 

@@ -1,6 +1,7 @@
 #include "SoundEntryPlayer.h"
 
 #include <noggit/DBC.h>
+#include <noggit/ui/FontAwesome.hpp>
 #include <noggit/Log.h>
 #include <noggit/Misc.h>
 #include <ClientFile.hpp>

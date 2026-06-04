@@ -23,6 +23,7 @@ namespace Noggit
       add_tool_icon(editing_mode::water, tr("Water Editor"), FontNoggit::TOOL_WATER_EDITOR);
       add_tool_icon(editing_mode::mccv, tr("Vertex Painter"), FontNoggit::TOOL_VERTEX_PAINT);
       add_tool_icon(editing_mode::object, tr("Object Editor"), FontNoggit::TOOL_OBJECT_EDITOR);
+      add_tool_icon(editing_mode::creature, tr("Creature Editor"), FontNoggit::TOOL_OBJECT_EDITOR);
       add_tool_icon(editing_mode::minimap, tr("Minimap Editor"), FontNoggit::TOOL_MINIMAP_EDITOR);
       add_tool_icon(editing_mode::stamp, tr("Stamp Mode"), FontNoggit::TOOL_STAMP);
       add_tool_icon(editing_mode::light, tr("Light Editor"), FontNoggit::TOOL_LIGHT);

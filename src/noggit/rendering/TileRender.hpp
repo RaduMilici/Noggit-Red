@@ -43,6 +43,9 @@ namespace Noggit::Rendering
     void initChunkData(MapChunk* chunk);
 
     [[nodiscard]]
+    GLuint shadowmapTexture() const { return _shadowmap_tex; }
+
+    [[nodiscard]]
     unsigned objectsFrustumCullTest() const { return _objects_frustum_cull_test; };
     void setObjectsFrustumCullTest(unsigned state) { _objects_frustum_cull_test = state; };
 

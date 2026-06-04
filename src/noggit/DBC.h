@@ -277,6 +277,88 @@ public:
     static const size_t soundEntriesAdvancedID = 29;        // int
 };
 
+  class CreatureDisplayInfoDB : public DBCFile
+  {
+  public:
+    CreatureDisplayInfoDB() :
+      DBCFile("DBFilesClient\\CreatureDisplayInfo.dbc")
+    { }
+
+    static const size_t ID = 0;
+    static const size_t ModelID = 1;
+    static const size_t ExtendedDisplayInfoID = 3;
+    static const size_t CreatureModelScale = 4;
+    static const size_t CreatureModelAlpha = 5;
+    static const size_t TextureVariation1 = 6;
+    static const size_t TextureVariation2 = 7;
+    static const size_t TextureVariation3 = 8;
+  };
+
+  class CreatureDisplayInfoExtraDB : public DBCFile
+  {
+  public:
+    CreatureDisplayInfoExtraDB() :
+      DBCFile("DBFilesClient\\CreatureDisplayInfoExtra.dbc")
+    { }
+
+    static const size_t ID = 0;
+    static const size_t DisplayRaceID = 1;
+    static const size_t DisplaySexID = 2;
+    static const size_t SkinID = 3;
+    static const size_t FaceID = 4;
+    static const size_t HairStyleID = 5;
+    static const size_t HairColorID = 6;
+    static const size_t FacialHairID = 7;
+    static const size_t HeadDisplayID = 8;
+    static const size_t ShouldersDisplayID = 9;
+    static const size_t ShirtDisplayID = 10;
+    static const size_t ChestDisplayID = 11;
+    static const size_t BeltDisplayID = 12;
+    static const size_t LegsDisplayID = 13;
+    static const size_t BootsDisplayID = 14;
+    static const size_t BracersDisplayID = 15;
+    static const size_t GlovesDisplayID = 16;
+    static const size_t TabardDisplayID = 17;
+    // field 18: BakeName (string) = baked composite NPC texture
+    static const size_t BakedTexture = 18;
+  };
+
+  class CreatureModelDataDB : public DBCFile
+  {
+  public:
+    CreatureModelDataDB() :
+      DBCFile("DBFilesClient\\CreatureModelData.dbc")
+    { }
+
+    static const size_t ID = 0;
+    static const size_t Flags = 1;
+    static const size_t ModelName = 2;
+    static const size_t SizeClass = 3;
+    static const size_t ModelScale = 4;
+  };
+
+  class ItemDisplayInfoDB : public DBCFile
+  {
+  public:
+    ItemDisplayInfoDB() :
+      DBCFile("DBFilesClient\\ItemDisplayInfo.dbc")
+    { }
+
+    static const size_t ID = 0;
+    static const size_t ModelName1 = 1;
+    static const size_t ModelName2 = 2;
+    static const size_t ModelTexture1 = 3;
+    static const size_t ModelTexture2 = 4;
+    static const size_t TextureUpperArm = 14;
+    static const size_t TextureLowerArm = 15;
+    static const size_t TextureHands = 16;
+    static const size_t TextureUpperChest = 17;
+    static const size_t TextureLowerChest = 18;
+    static const size_t TextureUpperLeg = 19;
+    static const size_t TextureLowerLeg = 20;
+    static const size_t TextureFoot = 21;
+  };
+
 class WMOAreaTableDB : public DBCFile
 {
 public:
@@ -342,5 +424,9 @@ extern SoundAmbienceDB gSoundAmbienceDB;
 extern ZoneMusicDB gZoneMusicDB;
 extern ZoneIntroMusicTableDB gZoneIntroMusicTableDB;
 extern SoundEntriesDB gSoundEntriesDB;
+extern CreatureDisplayInfoDB gCreatureDisplayInfoDB;
+extern CreatureDisplayInfoExtraDB gCreatureDisplayInfoExtraDB;
+extern CreatureModelDataDB gCreatureModelDataDB;
+extern ItemDisplayInfoDB gItemDisplayInfoDB;
 extern WMOAreaTableDB gWMOAreaTableDB;
 extern GameObjectDisplayInfoDB gGameObjectDisplayInfoDB;

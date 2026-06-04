@@ -20,12 +20,30 @@ void WMOGroupRender::upload()
   std::size_t batch_counter = 0;
   for (auto& batch : _wmo_group->_batches)
   {
-    WMOMaterial const& mat (_wmo_group->wmo->materials.at (batch.texture));
+    if (batch.texture >= _wmo_group->wmo->materials.size())
+    {
+      batch_counter++;
+      continue;
+    }
 
-    auto& tex1 = _wmo_group->wmo->textures.at(mat.texture1);
+    WMOMaterial const& mat (_wmo_group->wmo->materials[batch.texture]);
+
+    if (mat.texture1 >= _wmo_group->wmo->textures.size())
+    {
+      batch_counter++;
+      continue;
+    }
+
+    auto& tex1 = _wmo_group->wmo->textures[mat.texture1];
 
     tex1->wait_until_loaded();
     tex1->upload();
+
+    if (!tex1->is_uploaded())
+    {
+      batch_counter++;
+      continue;
+    }
 
     std::uint32_t tex_array0 = tex1->texture_array();
     std::uint32_t array_index0 = tex1->array_index();
@@ -36,9 +54,21 @@ void WMOGroupRender::upload()
 
     if (use_tex2)
     {
-      auto& tex2 = _wmo_group->wmo->textures.at(mat.texture2);
+      if (mat.texture2 >= _wmo_group->wmo->textures.size())
+      {
+        batch_counter++;
+        continue;
+      }
+
+      auto& tex2 = _wmo_group->wmo->textures[mat.texture2];
       tex2->wait_until_loaded();
       tex2->upload();
+
+      if (!tex2->is_uploaded())
+      {
+        batch_counter++;
+        continue;
+      }
 
       tex_array1 = tex2->texture_array();
       array_index1 = tex2->array_index();
@@ -64,9 +94,21 @@ void WMOGroupRender::upload()
   batch_counter = 0;
   for (auto& batch : _wmo_group->_batches)
   {
-    WMOMaterial& mat = _wmo_group->wmo->materials.at(batch.texture);
+    if (batch.texture >= _wmo_group->wmo->materials.size() || !_render_batches[batch_counter].tex_array0)
+    {
+      batch_counter++;
+      continue;
+    }
+
+    WMOMaterial& mat = _wmo_group->wmo->materials[batch.texture];
     bool backface_cull = !mat.flags.unculled;
     bool use_tex2 = mat.shader == 6 || mat.shader == 5 || mat.shader == 3;
+
+    if (use_tex2 && !_render_batches[batch_counter].tex_array1)
+    {
+      batch_counter++;
+      continue;
+    }
 
     bool create_draw_call = false;
     if (draw_call && draw_call->backface_cull == backface_cull && batch.index_start == draw_call->index_start + draw_call->index_count)
@@ -354,7 +396,14 @@ void WMOGroupRender::initRenderBatches()
       flags |= WMORenderBatchFlags::eWMOBatch_HasMOCV;
     }
 
-    WMOMaterial const& mat (_wmo_group->wmo->materials.at (batch.texture));
+    if (batch.texture >= _wmo_group->wmo->materials.size())
+    {
+      _render_batches[batch_counter] = WMORenderBatch{0, 0, 0, 0, 0, 0, 0, 0};
+      batch_counter++;
+      continue;
+    }
+
+    WMOMaterial const& mat (_wmo_group->wmo->materials[batch.texture]);
 
     if (mat.flags.unlit)
     {

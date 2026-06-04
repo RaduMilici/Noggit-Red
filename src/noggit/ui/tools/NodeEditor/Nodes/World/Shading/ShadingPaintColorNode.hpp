@@ -21,6 +21,7 @@ namespace Noggit
     Q_OBJECT
 
     public:
+      static QString Name() { return "Shading :: PaintColor"; }
       ShadingPaintColorNode();
       void compute() override;
     };

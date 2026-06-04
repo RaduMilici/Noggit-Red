@@ -25,43 +25,46 @@ void ChunkWater::from_mclq(std::vector<mclq>& layers)
   if (!Render.has_value()) Render.emplace();
   for (mclq& liquid : layers)
   {
-    std::uint8_t mclq_liquid_type = 0;
+    int liquid_id = 1;
+    bool has_visible_liquid = false;
 
     for (int z = 0; z < 8; ++z)
     {
       for (int x = 0; x < 8; ++x)
       {
         mclq_tile const& tile = liquid.tiles[z * 8 + x];
+        std::uint8_t raw_tile = *reinterpret_cast<std::uint8_t const*>(&tile);
+        std::uint8_t liquid_type = raw_tile & 0x0F;
+        bool const visible = liquid_type != 0x0F && liquid_type != 0x08;
 
         misc::bit_or(Render.value().fishable, x, z, tile.fishable);
         misc::bit_or(Render.value().fatigue, x, z, tile.fatigue);
 
-        if (!tile.dont_render)
+        if (visible)
         {
-          mclq_liquid_type = tile.liquid_type;
+          has_visible_liquid = true;
+          if (liquid_type == 6)
+          {
+            liquid_id = 3;
+          }
+          else if (liquid_type == 3 && liquid_id != 3)
+          {
+            liquid_id = 4;
+          }
+          else if (liquid_type == 1 && liquid_id == 1)
+          {
+            liquid_id = 2;
+          }
         }
       }
     }
 
-    switch (mclq_liquid_type)
+    if (!has_visible_liquid)
     {
-      case 1:
-        _layers.emplace_back(this, pos, liquid, 2);
-        break;
-      case 3:
-        _layers.emplace_back(this, pos, liquid, 4);
-        break;
-      case 4:
-        _layers.emplace_back(this, pos, liquid, 1);
-        break;
-      case 6:
-        _layers.emplace_back(this, pos, liquid, (_use_mclq_green_lava ? 15 : 3));
-
-        break;
-      default:
-        LogError << "Invalid/unhandled MCLQ liquid type" << std::endl;
-        break;
+      continue;
     }
+
+    _layers.emplace_back(this, pos, liquid, liquid_id);
     _water_tile->tagUpdate();
   }
   update_layers();

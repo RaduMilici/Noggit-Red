@@ -8,6 +8,7 @@
 #include <blizzard-archive-library/include/Exception.hpp>
 #include <blizzard-database-library/include/BlizzardDatabase.h>
 #include <noggit/application/Configuration/NoggitApplicationConfiguration.hpp>
+#include <noggit/Log.h>
 #include <noggit/ui/windows/downloadFileDialog/DownloadFileDialog.h>
 #include <QJsonDocument>
 #include <QMessageBox>
@@ -35,7 +36,7 @@ namespace Noggit::Project
 {
   enum class ProjectVersion
   {
-    VANILLA,
+    CLASSIC,
     BC,
     WOTLK,
     CATA,
@@ -50,6 +51,8 @@ namespace Noggit::Project
   {
     static ProjectVersion mapToEnumVersion(std::string const& projectVersion)
     {
+      if (projectVersion == "Turtle WoW" || projectVersion == "Vanilla")
+        return ProjectVersion::CLASSIC;
       if (projectVersion == "Wrath Of The Lich King")
         return ProjectVersion::WOTLK;
       if (projectVersion == "Shadowlands")
@@ -60,6 +63,8 @@ namespace Noggit::Project
 
     static std::string MapToStringVersion(ProjectVersion const& projectVersion)
     {
+      if (projectVersion == ProjectVersion::CLASSIC)
+        return std::string("Turtle WoW");
       if (projectVersion == ProjectVersion::WOTLK)
         return std::string("Wrath Of The Lich King");
       if (projectVersion == ProjectVersion::SL)
@@ -262,6 +267,13 @@ namespace Noggit::Project
       BlizzardDatabaseLib::Structures::Build client_build("3.3.5.12340");
       auto client_archive_version = BlizzardArchive::ClientVersion::WOTLK;
       auto client_archive_locale = BlizzardArchive::Locale::AUTO;
+      if (project->projectVersion == ProjectVersion::CLASSIC)
+      {
+        client_archive_version = BlizzardArchive::ClientVersion::CLASSIC;
+        client_build = BlizzardDatabaseLib::Structures::Build("1.12.1.5875");
+        client_archive_locale = BlizzardArchive::Locale::AUTO;
+      }
+
       if (project->projectVersion == ProjectVersion::SL)
       {
         client_archive_version = BlizzardArchive::ClientVersion::SL;
@@ -282,6 +294,13 @@ namespace Noggit::Project
       {
         project->ClientData = std::make_shared<BlizzardArchive::ClientData>(
             project->ClientPath, client_archive_version, client_archive_locale, project_path.generic_string());
+
+        LogDebug << "ApplicationProject::loadProject project_path='" << project->ProjectPath
+                 << "' client_path='" << project->ClientPath
+                 << "' project_version=" << static_cast<int>(project->projectVersion)
+                 << "' requested_archive_version=" << static_cast<int>(client_archive_version)
+                 << "' resolved_archive_version=" << static_cast<int>(project->ClientData->version())
+                 << std::endl;
       }
       catch (BlizzardArchive::Exceptions::Locale::LocaleNotFoundError&)
       {

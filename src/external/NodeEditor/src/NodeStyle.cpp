@@ -31,6 +31,7 @@ NodeStyle()
 NodeStyle::
 NodeStyle(QString jsonText)
 {
+  loadJsonFile(":DefaultStyle.json");
   loadJsonText(jsonText);
 }
 
@@ -56,25 +57,33 @@ setNodeStyle(QString jsonText)
   #define NODE_STYLE_CHECK_UNDEFINED_VALUE(v, variable)
 #endif
 
+#define NODE_VALUE_EXISTS(v) \
+  (v.type() != QJsonValue::Undefined && \
+   v.type() != QJsonValue::Null)
+
 #define NODE_STYLE_READ_COLOR(values, variable)  { \
     auto valueRef = values[#variable]; \
     NODE_STYLE_CHECK_UNDEFINED_VALUE(valueRef, variable) \
-    if (valueRef.isArray()) { \
-      auto colorArray = valueRef.toArray(); \
-      std::vector<int> rgb; rgb.reserve(3); \
-      for (auto it = colorArray.begin(); it != colorArray.end(); ++it) { \
-        rgb.push_back((*it).toInt()); \
+    if (NODE_VALUE_EXISTS(valueRef)) { \
+      if (valueRef.isArray()) { \
+        auto colorArray = valueRef.toArray(); \
+        std::vector<int> rgb; rgb.reserve(3); \
+        for (auto it = colorArray.begin(); it != colorArray.end(); ++it) { \
+          rgb.push_back((*it).toInt()); \
+        } \
+        if (rgb.size() >= 3) \
+          variable = QColor(rgb[0], rgb[1], rgb[2]); \
+      } else { \
+        variable = QColor(valueRef.toString()); \
       } \
-      variable = QColor(rgb[0], rgb[1], rgb[2]); \
-    } else { \
-      variable = QColor(valueRef.toString()); \
     } \
 }
 
 #define NODE_STYLE_READ_FLOAT(values, variable)  { \
     auto valueRef = values[#variable]; \
     NODE_STYLE_CHECK_UNDEFINED_VALUE(valueRef, variable) \
-    variable = valueRef.toDouble(); \
+    if (NODE_VALUE_EXISTS(valueRef)) \
+      variable = valueRef.toDouble(); \
 }
 
 void

@@ -123,8 +123,8 @@ vec3 apply_lighting(vec3 material)
   }
   else
   {
-    ambient_term = ambient_color;
-    diffuse_term = vec3(0.0);
+    ambient_term = max(ambient_color, AmbientColor_FogEnd.xyz * 0.20);
+    diffuse_term = DiffuseColor_FogStart.xyz * 0.12;
   }
 
   // apply world lighting

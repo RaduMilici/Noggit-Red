@@ -7,6 +7,7 @@
 #include <QtWidgets/QDoubleSpinBox>
 #include <QtWidgets/QSlider>
 #include <QtWidgets/QWidget>
+#include <QtGui/QShowEvent>
 
 #include <qt-color-widgets/color_selector.hpp>
 #include <qt-color-widgets/color_wheel.hpp>
@@ -56,6 +57,8 @@ namespace Noggit
       void fromJSON(QJsonObject const& json);
 
     private:
+      void ensureColorControls();
+
       glm::vec4 _color;
 
       Noggit::Ui::Tools::UiCommon::ExtendedSlider* _radius_slider;
@@ -66,12 +69,15 @@ namespace Noggit
 
       QCheckBox* _use_image_colors;
 
-      color_widgets::ColorSelector* color_picker;
-      color_widgets::ColorWheel* color_wheel;
-      color_widgets::HueSlider* _slide_hue;
-      color_widgets::GradientSlider* _slide_saturation;
-      color_widgets::GradientSlider* _slide_value;
-      color_widgets::ColorListWidget* _color_palette;
+      QWidget* _color_controls_container = nullptr;
+      bool _color_controls_initialized = false;
+
+      color_widgets::ColorSelector* color_picker = nullptr;
+      color_widgets::ColorWheel* color_wheel = nullptr;
+      color_widgets::HueSlider* _slide_hue = nullptr;
+      color_widgets::GradientSlider* _slide_saturation = nullptr;
+      color_widgets::GradientSlider* _slide_value = nullptr;
+      color_widgets::ColorListWidget* _color_palette = nullptr;
 
       Noggit::Ui::Tools::ImageMaskSelector* _image_mask_group;
       QImage _mask_image;
@@ -80,6 +86,9 @@ namespace Noggit
     public Q_SLOTS:
       void set_hsv();
       void update_color_widgets();
+
+    protected:
+      void showEvent(QShowEvent* event) override;
 
     };
   }

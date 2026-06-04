@@ -23,6 +23,10 @@ auto write(std::ostream& stream, T const& val) -> void
 
 DBCFile::DBCFile(const std::string& _filename)
   : filename(_filename)
+  , recordSize(0)
+  , recordCount(0)
+  , fieldCount(0)
+  , stringSize(0)
 {}
 
 void DBCFile::open(std::shared_ptr<BlizzardArchive::ClientData> clientData)

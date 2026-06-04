@@ -76,9 +76,9 @@ namespace Noggit::Rendering
     std::optional<ModelPixelShader> pixel_shader;
 
 
-    bool prepareDraw(OpenGL::Scoped::use_program& m2_shader, Model *m, OpenGL::M2RenderState& model_render_state);
+    bool prepareDraw(OpenGL::Scoped::use_program& m2_shader, Model *m, ModelInstance const* instance, OpenGL::M2RenderState& model_render_state);
     void afterDraw();
-    void bindTexture(size_t index, Model* m, OpenGL::M2RenderState& model_render_state, OpenGL::Scoped::use_program& m2_shader);
+    bool bindTexture(size_t index, Model* m, ModelInstance const* instance, OpenGL::M2RenderState& model_render_state, OpenGL::Scoped::use_program& m2_shader);
     void initUVTypes(Model* m);
 
     bool operator< (const ModelRenderPass &m) const

@@ -51,6 +51,7 @@ liquid_layer::liquid_layer(ChunkWater* chunk, glm::vec3 const& base, float heigh
 
 liquid_layer::liquid_layer(ChunkWater* chunk, glm::vec3 const& base, mclq& liquid, int liquid_id)
   : _liquid_id(liquid_id)
+  , _liquid_vertex_format(0)
   , _minimum(liquid.min_height)
   , _maximum(liquid.max_height)
   , _subchunks(0)
@@ -66,7 +67,10 @@ liquid_layer::liquid_layer(ChunkWater* chunk, glm::vec3 const& base, mclq& liqui
   {
     for (int x = 0; x < 8; ++x)
     {
-      misc::set_bit(_subchunks, x, z, !liquid.tiles[z * 8 + x].dont_render);
+      mclq_tile const& tile = liquid.tiles[z * 8 + x];
+      std::uint8_t raw_tile = *reinterpret_cast<std::uint8_t const*>(&tile);
+      std::uint8_t liquid_type = raw_tile & 0x0F;
+      misc::set_bit(_subchunks, x, z, liquid_type != 0x0F && liquid_type != 0x08);
     }
   }
 
@@ -381,6 +385,7 @@ void liquid_layer::save(sExtendableArray& adt, int base_pos, int& info_pos, int&
 void liquid_layer::changeLiquidID(int id)
 {
   _liquid_id = id;
+  _liquid_vertex_format = (_liquid_id == 3 || _liquid_id == 4 || _liquid_id == 21) ? 1 : 0;
 
   try
   {

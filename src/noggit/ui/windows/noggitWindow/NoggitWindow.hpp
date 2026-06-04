@@ -39,6 +39,11 @@ namespace Noggit::Ui::Windows
 
       void promptExit(QCloseEvent* event);
       void promptUidFixFailure();
+      void jumpToMapPosition(int map_id,
+                             glm::vec3 pos,
+                             math::degrees camera_pitch = math::degrees(30.f),
+                             math::degrees camera_yaw = math::degrees(90.f),
+                             bool from_bookmark = false);
 
       QMenuBar* _menuBar;
 
@@ -89,8 +94,12 @@ namespace Noggit::Ui::Windows
       QTabWidget* _right_side;
 
       void applyFilterSearch(const QString& name, int type, int expansion, bool wmo_maps);
+      void ensureMapCreationWizard();
+      void ensureSettingsWindow();
+      void ensureAboutWindow();
 
       std::unique_ptr<World> _world;
+      QWidget* _map_creation_wizard_host = nullptr;
 
       bool map_loaded = false;
 

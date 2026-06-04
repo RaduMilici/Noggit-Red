@@ -5,6 +5,7 @@
 #include <functional>
 #include <unordered_map>
 #include <vector>
+#include <typeinfo>
 
 #include <QtCore/QString>
 
@@ -137,7 +138,7 @@ private:
   typename std::enable_if< !HasStaticMethodName<ModelType>::value>::type
   registerModelImpl(RegistryItemCreator creator, QString const &category )
   {
-    const QString name = creator()->name();
+    const QString name = QStringLiteral("__lazy__::") + QString::fromLatin1(typeid(ModelType).name());
     if (_registeredItemCreators.count(name) == 0)
     {
       _registeredItemCreators[name] = std::move(creator);

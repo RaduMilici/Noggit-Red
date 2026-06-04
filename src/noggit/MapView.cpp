@@ -69,9 +69,18 @@
 #include <QtCore/QTimer>
 #include <QtGui/QMouseEvent>
 #include <QtWidgets/QApplication>
+#include <QtWidgets/QCheckBox>
+#include <QtWidgets/QHBoxLayout>
+#include <QtWidgets/QLineEdit>
+#include <QtWidgets/QListWidget>
+#include <QtWidgets/QMenu>
 #include <QtWidgets/QMenuBar>
+#include <QtWidgets/QDoubleSpinBox>
+#include <QtWidgets/QFormLayout>
 #include <QtWidgets/QPushButton>
 #include <QtWidgets/QStatusBar>
+#include <QtWidgets/QToolTip>
+#include <QtWidgets/QVBoxLayout>
 #include <QWidgetAction>
 #include <QSurfaceFormat>
 #include <QMessageBox>
@@ -79,9 +88,12 @@
 #include <QScrollBar>
 #include <QDateTime>
 #include <QCursor>
+#include <QDir>
+#include <QFile>
 #include <QFileDialog>
 #include <QProgressDialog>
 #include <QClipboard>
+#include <QTextStream>
 
 #include <algorithm>
 #include <cmath>
@@ -91,6 +103,42 @@
 
 #include <vector>
 #include <random>
+
+namespace
+{
+  glm::vec3 server_to_client_creature_position(float server_x, float server_y, float server_z, bool global_wmo_map)
+  {
+    if (global_wmo_map)
+    {
+      return {-server_y, server_z, -server_x};
+    }
+
+    return {ZEROPOINT - server_y, server_z, ZEROPOINT - server_x};
+  }
+
+  glm::vec3 client_to_server_creature_position(glm::vec3 const& client_pos, bool global_wmo_map)
+  {
+    if (global_wmo_map)
+    {
+      return {-client_pos.z, -client_pos.x, client_pos.y};
+    }
+
+    return {ZEROPOINT - client_pos.z, ZEROPOINT - client_pos.x, client_pos.y};
+  }
+
+  float client_to_server_creature_orientation(float client_orientation)
+  {
+    auto orientation = glm::radians(client_orientation + 180.0f);
+    auto full_rotation = glm::two_pi<float>();
+    orientation = std::fmod(orientation, full_rotation);
+    if (orientation < 0.0f)
+    {
+      orientation += full_rotation;
+    }
+
+    return orientation;
+  }
+}
 
 
 /* Some ugly macros we use */
@@ -308,6 +356,15 @@ void MapView::set_editing_mode(editing_mode mode)
         _world->renderer()->getTerrainParamsUniformBlock()->draw_selection_overlay = true;
         _minimap->use_selection(minimapTool->getSelectedTiles());
         break;
+      case editing_mode::creature:
+        if (!_world->hasCreatureSpawnsLoaded())
+        {
+          _world->reloadCreatureSpawns();
+        }
+        _world->setDrawCreatureSpawns(true);
+        rebuildCreatureBrowserList(true);
+        updateDatabaseStatus();
+        break;
       default:
         break;
     }
@@ -340,6 +397,9 @@ void MapView::setToolPropertyWidgetVisibility(editing_mode mode)
     _asset_browser_dock->setVisible(!ui_hidden && _settings->value("map_view/asset_browser", false).toBool());
     _object_palette_dock->setVisible(!ui_hidden && _settings->value("map_view/object_palette", false).toBool());
     _viewport_overlay_ui->gizmoBar->setVisible(!ui_hidden);
+    break;
+  case editing_mode::creature:
+    _creature_browser_dock->setVisible(!ui_hidden);
     break;
   case editing_mode::paint:
     _texture_browser_dock->setVisible(!ui_hidden && _settings->value("map_view/texture_browser", false).toBool());
@@ -882,6 +942,176 @@ void MapView::setupObjectEditorUi()
           });
 
 }
+
+void MapView::setupCreatureEditorUi()
+{
+  auto container = new QWidget(this);
+  auto layout = new QVBoxLayout(container);
+  layout->setContentsMargins(6, 6, 6, 6);
+
+  auto hint = new QLabel("Left click: select/drag spawn\nShift+click or shift-drag: multi-select\nUse 'Export SQL' to persist", container);
+  hint->setWordWrap(true);
+  layout->addWidget(hint);
+
+  _creature_editor_info = new QLabel("No spawn selected", container);
+  _creature_editor_info->setWordWrap(true);
+  _creature_editor_info->setStyleSheet("font-style: italic; color: #888; padding: 2px 0;");
+  layout->addWidget(_creature_editor_info);
+
+  auto make_spin = [&](double lo, double hi, double step) {
+    auto* sb = new QDoubleSpinBox(container);
+    sb->setRange(lo, hi);
+    sb->setDecimals(3);
+    sb->setSingleStep(step);
+    sb->setEnabled(false);
+    return sb;
+  };
+
+  _spawn_edit_x           = make_spin(-20000.0, 20000.0, 0.1);
+  _spawn_edit_y           = make_spin(  -500.0,  5000.0, 0.1);
+  _spawn_edit_z           = make_spin(-20000.0, 20000.0, 0.1);
+  _spawn_edit_orientation = make_spin(     0.0,   360.0, 1.0);
+  _spawn_edit_orientation->setWrapping(true);
+  _spawn_edit_orientation->setSuffix(QString::fromUtf8("\xc2\xb0"));  // ┬░
+
+  auto form = new QFormLayout();
+  form->setContentsMargins(0, 4, 0, 0);
+  form->setSpacing(3);
+  form->addRow("X:", _spawn_edit_x);
+  form->addRow("Y (height):", _spawn_edit_y);
+  form->addRow("Z:", _spawn_edit_z);
+  form->addRow("Orientation:", _spawn_edit_orientation);
+  layout->addLayout(form);
+  layout->addStretch();
+
+  auto on_change = [this](double) {
+    if (!_selected_creature_spawn_guid)
+      return;
+    auto* spawn = _world->findCreatureSpawn(*_selected_creature_spawn_guid);
+    if (!spawn)
+      return;
+
+    spawn->pos = glm::vec3(
+      static_cast<float>(_spawn_edit_x->value()),
+      static_cast<float>(_spawn_edit_y->value()),
+      static_cast<float>(_spawn_edit_z->value()));
+    spawn->orientation = static_cast<float>(glm::radians(_spawn_edit_orientation->value()));
+    spawn->dirty = glm::distance(spawn->pos, spawn->original_pos) > 0.01f
+                || std::abs(spawn->orientation - spawn->original_orientation) > 0.01f;
+
+    if (spawn->model_instance)
+    {
+      spawn->model_instance->pos = spawn->pos;
+      spawn->model_instance->dir = glm::vec3(0.0f, spawn->orientation, 0.0f);
+      spawn->model_instance->recalcExtents();
+    }
+
+    updateDatabaseStatus();
+    rebuildCreatureBrowserList(true);
+    _needs_redraw = true;
+  };
+
+  connect(_spawn_edit_x,           qOverload<double>(&QDoubleSpinBox::valueChanged), on_change);
+  connect(_spawn_edit_y,           qOverload<double>(&QDoubleSpinBox::valueChanged), on_change);
+  connect(_spawn_edit_z,           qOverload<double>(&QDoubleSpinBox::valueChanged), on_change);
+  connect(_spawn_edit_orientation, qOverload<double>(&QDoubleSpinBox::valueChanged), on_change);
+
+  _tool_panel_dock->registerTool("Creature Editor", container);
+}
+
+void MapView::setupCreatureBrowserUi()
+{
+  _creature_browser_dock = new QDockWidget("Creature Browser", this);
+  _creature_browser_dock->setFeatures(QDockWidget::DockWidgetMovable
+                                      | QDockWidget::DockWidgetFloatable
+                                      | QDockWidget::DockWidgetClosable);
+  _creature_browser_dock->setAllowedAreas(Qt::LeftDockWidgetArea | Qt::RightDockWidgetArea | Qt::BottomDockWidgetArea);
+  _main_window->addDockWidget(Qt::RightDockWidgetArea, _creature_browser_dock);
+  connect(this, &QObject::destroyed, _creature_browser_dock, &QObject::deleteLater);
+
+  auto container = new QWidget(this);
+  auto layout = new QVBoxLayout(container);
+  layout->setContentsMargins(6, 6, 6, 6);
+
+  _creature_search_field = new QLineEdit(container);
+  _creature_search_field->setPlaceholderText("Search by creature name, guid, or entry");
+  layout->addWidget(_creature_search_field);
+
+  _creature_search_all_maps = new QCheckBox("Search all maps", container);
+  layout->addWidget(_creature_search_all_maps);
+
+  _creature_list_widget = new QListWidget(container);
+  _creature_list_widget->setSelectionMode(QAbstractItemView::SingleSelection);
+  layout->addWidget(_creature_list_widget, 1);
+
+  auto button_row = new QHBoxLayout();
+  auto reload_button = new QPushButton("Reload", container);
+  auto save_button = new QPushButton("Export SQL", container);
+  auto revert_button = new QPushButton("Discard Pending", container);
+  button_row->addWidget(reload_button);
+  button_row->addWidget(save_button);
+  button_row->addWidget(revert_button);
+  layout->addLayout(button_row);
+
+  _creature_browser_status = new QLabel(container);
+  _creature_browser_status->setWordWrap(true);
+  layout->addWidget(_creature_browser_status);
+
+  _creature_browser_dock->setWidget(container);
+  _creature_browser_dock->setVisible(_settings->value("map_view/creature_browser", false).toBool());
+
+  connect(_creature_browser_dock, &QDockWidget::visibilityChanged,
+          [this](bool visible)
+          {
+            if (ui_hidden)
+              return;
+
+            _settings->setValue("map_view/creature_browser", visible);
+            _settings->sync();
+          });
+
+  connect(&_show_creature_browser, &Noggit::BoolToggleProperty::changed,
+          [this](bool visible)
+          {
+            if (!ui_hidden && _creature_browser_dock)
+            {
+              _creature_browser_dock->setVisible(visible);
+            }
+          });
+  connect(_creature_browser_dock, &QDockWidget::visibilityChanged,
+          &_show_creature_browser, &Noggit::BoolToggleProperty::set);
+
+  connect(_creature_search_field, &QLineEdit::textChanged,
+          [this]()
+          {
+            rebuildCreatureBrowserList(true);
+          });
+  connect(_creature_search_all_maps, &QCheckBox::toggled,
+          [this]()
+          {
+            rebuildCreatureBrowserList(false);
+          });
+  connect(_creature_list_widget, &QListWidget::itemClicked,
+          this, &MapView::jumpToCreatureListItem);
+  connect(reload_button, &QPushButton::clicked,
+          [this]()
+          {
+            refreshCreatureSpawnOverlay(true);
+          });
+  connect(save_button, &QPushButton::clicked,
+          [this]()
+          {
+            saveDirtyCreatureSpawns();
+          });
+  connect(revert_button, &QPushButton::clicked,
+          [this]()
+          {
+            refreshCreatureSpawnOverlay(true);
+          });
+
+  updateCreatureBrowserStatus();
+}
+
 void MapView::setupMinimapEditorUi()
 {
   minimapTool = new Noggit::Ui::MinimapCreator(this, _world.get(), this);
@@ -907,9 +1137,7 @@ void MapView::setupChunkManipulatorUi()
 
 void MapView::setupNodeEditor()
 {
-  auto _node_editor = new Noggit::Ui::Tools::NodeEditor::Ui::NodeEditorWidget(this);
   _node_editor_dock = new QDockWidget("Node editor", this);
-  _node_editor_dock->setWidget(_node_editor);
   _node_editor_dock->setAllowedAreas(Qt::BottomDockWidgetArea | Qt::TopDockWidgetArea | Qt::LeftDockWidgetArea);
 
   _main_window->addDockWidget(Qt::LeftDockWidgetArea, _node_editor_dock);
@@ -917,11 +1145,27 @@ void MapView::setupNodeEditor()
                                  | QDockWidget::DockWidgetFloatable
                                  | QDockWidget::DockWidgetClosable);
 
+  auto ensure_node_editor = [this]()
+  {
+    if (_node_editor_dock->widget())
+    {
+      return;
+    }
+
+    auto node_editor = new Noggit::Ui::Tools::NodeEditor::Ui::NodeEditorWidget(this);
+    _node_editor_dock->setWidget(node_editor);
+  };
+
   _node_editor_dock->setVisible(_settings->value ("map_view/node_editor", false).toBool());
 
   connect(_node_editor_dock, &QDockWidget::visibilityChanged,
           [=](bool visible)
           {
+            if (visible)
+            {
+              ensure_node_editor();
+            }
+
             if (ui_hidden)
               return;
 
@@ -1252,6 +1496,9 @@ void MapView::setupAssistMenu()
 {
   auto assist_menu (_main_window->_menuBar->addMenu ("Assist"));
   connect (this, &QObject::destroyed, assist_menu, &QObject::deleteLater);
+
+  ADD_ACTION_NS (assist_menu, "Reload creature spawns", [this] { refreshCreatureSpawnOverlay(true); });
+  ADD_ACTION_NS (assist_menu, "Export creature spawn SQL", [this] { saveDirtyCreatureSpawns(); });
 
   assist_menu->addSeparator();
   assist_menu->addAction(createTextSeparator("Model"));
@@ -1964,6 +2211,7 @@ void MapView::setupViewMenu()
   ADD_TOGGLE_NS (view_menu, "Models with box", _draw_models_with_box);
   //! \todo space+h in object mode
   ADD_TOGGLE_NS (view_menu, "Hidden models", _draw_hidden_models);
+  ADD_TOGGLE_NS (view_menu, "Creature spawns", _draw_creature_spawns);
 
   ADD_TOGGLE_NS(view_menu, "Game Mode", _game_mode_camera);
 
@@ -1975,6 +2223,7 @@ void MapView::setupViewMenu()
   view_menu->addSeparator();
 
   ADD_TOGGLE (view_menu, "Show Node Editor", "Shift+N", _show_node_editor);
+  ADD_TOGGLE_NS (view_menu, "Creature browser", _show_creature_browser);
 
   view_menu->addSeparator();
   view_menu->addAction(createTextSeparator("Minimap"));
@@ -1986,6 +2235,21 @@ void MapView::setupViewMenu()
   ADD_TOGGLE_NS(view_menu, "Show ADT borders", _show_minimap_borders);
 
   ADD_TOGGLE_NS(view_menu, "Show light zones", _show_minimap_skies);
+
+  connect(&_draw_creature_spawns, &Noggit::BoolToggleProperty::changed, [this](bool enabled)
+  {
+    _world->setDrawCreatureSpawns(enabled);
+    _settings->setValue("view/creature_spawns", enabled);
+
+    if (enabled)
+    {
+      refreshCreatureSpawnOverlay(false);
+    }
+    else
+    {
+      updateDatabaseStatus();
+    }
+  });
 
   view_menu->addSeparator();
   view_menu->addAction(createTextSeparator("Windows"));
@@ -2145,6 +2409,765 @@ void MapView::setupHelpMenu()
                 );
 #endif
 
+}
+
+void MapView::refreshCreatureSpawnOverlay(bool force_reload)
+{
+  _world->setDrawCreatureSpawns(_draw_creature_spawns.get());
+
+  if (!_draw_creature_spawns.get())
+  {
+    setSelectedCreatureSpawn(std::nullopt, false);
+    rebuildCreatureBrowserList(false);
+    updateDatabaseStatus();
+    return;
+  }
+
+  if (force_reload || !_world->hasCreatureSpawnsLoaded())
+  {
+    _world->reloadCreatureSpawns();
+    _main_window->statusBar()->showMessage(QString::fromStdString(_world->creatureSpawnStatus()), 5000);
+  }
+
+  rebuildCreatureBrowserList(true);
+  updateDatabaseStatus();
+}
+
+void MapView::updateDatabaseStatus()
+{
+#ifdef USE_MYSQL_UID_STORAGE
+  QStringList parts;
+
+  if (_settings->value("project/mysql/enabled", false).toBool())
+  {
+    parts << QString("MySQL %1:%2")
+                 .arg(_settings->value("project/mysql/server", "127.0.0.1").toString())
+                 .arg(_settings->value("project/mysql/port", 3306).toString());
+  }
+
+  if (_draw_creature_spawns.get())
+  {
+    parts << QString::fromStdString(_world->creatureSpawnStatus());
+
+    std::size_t nearby_spawn_count = 0;
+    float nearest_spawn_distance = std::numeric_limits<float>::max();
+    constexpr float nearby_spawn_radius = 200.0f;
+
+    for (auto const& spawn : _world->creatureSpawns())
+    {
+      float horizontal_distance = glm::distance(glm::vec2(_camera.position.x, _camera.position.z),
+                                                glm::vec2(spawn.pos.x, spawn.pos.z));
+      nearest_spawn_distance = std::min(nearest_spawn_distance, horizontal_distance);
+
+      if (horizontal_distance <= nearby_spawn_radius)
+      {
+        ++nearby_spawn_count;
+      }
+    }
+
+    if (!_world->creatureSpawns().empty())
+    {
+      parts << QString("nearby(%1): %2")
+                   .arg(nearby_spawn_radius, 0, 'f', 0)
+                   .arg(nearby_spawn_count);
+      parts << QString("nearest: %1")
+                   .arg(nearest_spawn_distance, 0, 'f', 1);
+    }
+
+    auto dirty_count = _world->dirtyCreatureSpawnCount();
+    if (dirty_count > 0)
+    {
+      parts << QString("pending edits: %1").arg(dirty_count);
+    }
+  }
+
+  _status_database->setText(parts.join(" | "));
+#else
+  _status_database->clear();
+#endif
+
+  updateCreatureBrowserStatus();
+}
+
+void MapView::rebuildCreatureBrowserList(bool preserve_selection)
+{
+  if (!_creature_list_widget)
+  {
+    return;
+  }
+
+  auto selected_guid = preserve_selection ? _selected_creature_spawn_guid : std::optional<std::uint32_t>();
+  auto search_text = _creature_search_field ? _creature_search_field->text().trimmed() : QString();
+  auto search_lower = search_text.toLower();
+
+  QSignalBlocker blocker(_creature_list_widget);
+  _creature_list_widget->clear();
+
+#ifdef USE_MYSQL_UID_STORAGE
+  if (_creature_search_all_maps && _creature_search_all_maps->isChecked() && !search_text.isEmpty())
+  {
+    std::string error;
+    auto rows = mysql::searchCreatureSpawns(search_text.toStdString(), 500, &error);
+    if (!error.empty())
+    {
+      updateCreatureBrowserStatus(QString::fromStdString(error));
+      return;
+    }
+
+    for (auto const& row : rows)
+    {
+      auto* item = new QListWidgetItem(QString("%1 [entry %2] guid %3 | map %4")
+                                         .arg(QString::fromStdString(row.name.empty() ? std::string("<unnamed>") : row.name))
+                                         .arg(row.entry)
+                                         .arg(row.guid)
+                                         .arg(row.map),
+                                       _creature_list_widget);
+      item->setData(Qt::UserRole, static_cast<qulonglong>(row.guid));
+      item->setData(Qt::UserRole + 1, static_cast<int>(row.map));
+      item->setData(Qt::UserRole + 2, row.position_x);
+      item->setData(Qt::UserRole + 3, row.position_y);
+      item->setData(Qt::UserRole + 4, row.position_z);
+      item->setData(Qt::UserRole + 5, row.orientation);
+      item->setData(Qt::UserRole + 6, false);
+    }
+
+    updateCreatureBrowserStatus(QString("Global search: %1 result(s)").arg(_creature_list_widget->count()));
+    return;
+  }
+#endif
+
+  for (auto const& spawn : _world->creatureSpawns())
+  {
+    auto name = QString::fromStdString(spawn.name.empty() ? std::string("<unnamed>") : spawn.name);
+    auto entry_text = QString::number(spawn.entry);
+    auto guid_text = QString::number(spawn.guid);
+
+    if (!search_lower.isEmpty()
+        && !name.toLower().contains(search_lower)
+        && !entry_text.contains(search_lower)
+        && !guid_text.contains(search_lower))
+    {
+      continue;
+    }
+
+    QString prefix;
+    if (spawn.selected)
+    {
+      prefix += "[selected] ";
+    }
+    if (spawn.dirty)
+    {
+      prefix += "[pending] ";
+    }
+
+    auto* item = new QListWidgetItem(QString("%1%2 [entry %3] guid %4")
+                                       .arg(prefix)
+                                       .arg(name)
+                                       .arg(spawn.entry)
+                                       .arg(spawn.guid),
+                                     _creature_list_widget);
+    item->setData(Qt::UserRole, static_cast<qulonglong>(spawn.guid));
+    item->setData(Qt::UserRole + 1, static_cast<int>(_world->getMapID()));
+    item->setData(Qt::UserRole + 6, true);
+
+    if (selected_guid && *selected_guid == spawn.guid)
+    {
+      _creature_list_widget->setCurrentItem(item);
+    }
+  }
+
+  updateCreatureBrowserStatus();
+}
+
+void MapView::updateCreatureBrowserStatus(QString const& override_text)
+{
+  if (!_creature_browser_status)
+  {
+    return;
+  }
+
+  if (!override_text.isEmpty())
+  {
+    _creature_browser_status->setText(override_text);
+    return;
+  }
+
+  QStringList parts;
+  parts << QString("Current map spawns: %1").arg(_world->creatureSpawnCount());
+  parts << QString("models: %1").arg(_world->creatureSpawnModelCount());
+
+  auto dirty_count = _world->dirtyCreatureSpawnCount();
+  if (dirty_count > 0)
+  {
+    parts << QString("pending edits: %1").arg(dirty_count);
+  }
+
+  auto selected_count = selectedCreatureSpawnCount();
+  if (selected_count > 1)
+  {
+    parts << QString("selected: %1").arg(selected_count);
+  }
+  else if (_selected_creature_spawn_guid)
+  {
+    parts << QString("selected guid: %1").arg(*_selected_creature_spawn_guid);
+  }
+
+  _creature_browser_status->setText(parts.join(" | "));
+}
+
+std::size_t MapView::selectedCreatureSpawnCount() const
+{
+  return static_cast<std::size_t>(std::count_if(_world->creatureSpawns().begin(),
+                                                _world->creatureSpawns().end(),
+    [](World::CreatureSpawnOverlay const& spawn)
+    {
+      return spawn.selected;
+    }));
+}
+
+void MapView::setSelectedCreatureSpawn(std::optional<std::uint32_t> guid, bool update_browser)
+{
+  _selected_creature_spawn_guid = guid;
+
+  for (auto& spawn : _world->creatureSpawns())
+  {
+    spawn.selected = guid && spawn.guid == *guid;
+  }
+
+  if (update_browser)
+  {
+    rebuildCreatureBrowserList(true);
+  }
+  else
+  {
+    updateCreatureBrowserStatus();
+  }
+
+  refreshCreatureEditorKnobs();
+}
+
+void MapView::addCreatureSpawnToSelection(std::uint32_t guid, bool update_browser)
+{
+  bool found = false;
+  for (auto& spawn : _world->creatureSpawns())
+  {
+    if (spawn.guid == guid)
+    {
+      spawn.selected = true;
+      found = true;
+    }
+  }
+
+  if (!found)
+  {
+    return;
+  }
+
+  _selected_creature_spawn_guid = guid;
+
+  if (update_browser)
+  {
+    rebuildCreatureBrowserList(true);
+  }
+  else
+  {
+    updateCreatureBrowserStatus();
+  }
+
+  refreshCreatureEditorKnobs();
+}
+
+void MapView::selectCreatureSpawnsInArea(QRect const& rect, bool add_to_selection)
+{
+  if (!_world->hasCreatureSpawnsLoaded())
+  {
+    return;
+  }
+
+  QRect const normalized_rect = rect.normalized();
+  glm::mat4x4 const mv = model_view();
+  glm::mat4x4 const proj = projection();
+  glm::vec4 const vp(0.0f, 0.0f, float(width()), float(height()));
+
+  if (!add_to_selection)
+  {
+    for (auto& spawn : _world->creatureSpawns())
+    {
+      spawn.selected = false;
+    }
+  }
+
+  std::optional<std::uint32_t> primary_guid = add_to_selection ? _selected_creature_spawn_guid : std::optional<std::uint32_t>();
+
+  for (auto& spawn : _world->creatureSpawns())
+  {
+    glm::vec3 const screen = glm::project(spawn.pos, mv, proj, vp);
+    if (screen.z < 0.0f || screen.z > 1.0f)
+    {
+      continue;
+    }
+
+    QPoint const point(static_cast<int>(std::lround(screen.x)),
+                       static_cast<int>(std::lround(float(height()) - screen.y)));
+    if (!normalized_rect.contains(point))
+    {
+      continue;
+    }
+
+    spawn.selected = true;
+    if (!primary_guid)
+    {
+      primary_guid = spawn.guid;
+    }
+  }
+
+  if (primary_guid)
+  {
+    _selected_creature_spawn_guid = primary_guid;
+  }
+  else if (!add_to_selection)
+  {
+    _selected_creature_spawn_guid = std::optional<std::uint32_t>();
+  }
+
+  rebuildCreatureBrowserList(true);
+  refreshCreatureEditorKnobs();
+  updateDatabaseStatus();
+}
+
+void MapView::refreshCreatureEditorKnobs()
+{
+  if (!_spawn_edit_x)
+    return;
+
+  auto disable_all = [this]() {
+    _creature_editor_info->setText("No spawn selected");
+    _creature_editor_info->setStyleSheet("font-style: italic; color: #888; padding: 2px 0;");
+    for (auto* w : {_spawn_edit_x, _spawn_edit_y, _spawn_edit_z, _spawn_edit_orientation})
+      w->setEnabled(false);
+  };
+
+  if (!_selected_creature_spawn_guid)
+  {
+    disable_all();
+    return;
+  }
+
+  auto selected_count = selectedCreatureSpawnCount();
+  if (selected_count > 1)
+  {
+    _creature_editor_info->setText(QString("%1 creature spawns selected\nPrimary GUID: %2")
+                                     .arg(selected_count)
+                                     .arg(*_selected_creature_spawn_guid));
+    _creature_editor_info->setStyleSheet("font-weight: bold; padding: 2px 0;");
+    for (auto* w : {_spawn_edit_x, _spawn_edit_y, _spawn_edit_z, _spawn_edit_orientation})
+      w->setEnabled(false);
+    return;
+  }
+
+  auto const* spawn = _world->findCreatureSpawn(*_selected_creature_spawn_guid);
+  if (!spawn)
+  {
+    disable_all();
+    return;
+  }
+
+  QString name = QString::fromStdString(spawn->name.empty() ? std::string("<unnamed>") : spawn->name);
+  _creature_editor_info->setText(
+    QString("%1\nGUID: %2  Entry: %3").arg(name).arg(spawn->guid).arg(spawn->entry));
+  _creature_editor_info->setStyleSheet("font-weight: bold; padding: 2px 0;");
+
+  for (auto* w : {_spawn_edit_x, _spawn_edit_y, _spawn_edit_z, _spawn_edit_orientation})
+    w->blockSignals(true);
+
+  _spawn_edit_x->setValue(static_cast<double>(spawn->pos.x));
+  _spawn_edit_y->setValue(static_cast<double>(spawn->pos.y));
+  _spawn_edit_z->setValue(static_cast<double>(spawn->pos.z));
+  _spawn_edit_orientation->setValue(static_cast<double>(glm::degrees(spawn->orientation)));
+
+  for (auto* w : {_spawn_edit_x, _spawn_edit_y, _spawn_edit_z, _spawn_edit_orientation})
+  {
+    w->setEnabled(true);
+    w->blockSignals(false);
+  }
+}
+
+void MapView::setHoveredCreatureSpawn(std::optional<std::uint32_t> guid)
+{
+  if (_hovered_creature_spawn_guid == guid)
+  {
+    return;
+  }
+
+  if (_hovered_creature_spawn_guid)
+  {
+    if (auto* previous = _world->findCreatureSpawn(*_hovered_creature_spawn_guid))
+    {
+      previous->hovered = false;
+    }
+  }
+
+  _hovered_creature_spawn_guid = guid;
+
+  if (_hovered_creature_spawn_guid)
+  {
+    if (auto* current = _world->findCreatureSpawn(*_hovered_creature_spawn_guid))
+    {
+      current->hovered = true;
+    }
+  }
+
+  _needs_redraw = true;
+}
+
+std::optional<std::uint32_t> MapView::findCreatureSpawnAtCursor() const
+{
+  if (!_world->hasCreatureSpawnsLoaded())
+    return std::optional<std::uint32_t>();
+
+  glm::mat4x4 const mv = model_view();
+  glm::mat4x4 const proj = projection();
+  glm::vec4 const vp(0.0f, 0.0f, float(width()), float(height()));
+
+  float const pick_px = 30.0f;
+  float best_dist_px = std::numeric_limits<float>::max();
+  std::optional<std::uint32_t> best_guid;
+
+  for (auto const& spawn : _world->creatureSpawns())
+  {
+    glm::vec3 const screen = glm::project(spawn.pos, mv, proj, vp);
+    if (screen.z < 0.0f || screen.z > 1.0f)
+      continue;
+
+    float const sx = screen.x;
+    float const sy = float(height()) - screen.y;
+    float const dx = sx - float(_last_mouse_pos.x());
+    float const dy = sy - float(_last_mouse_pos.y());
+    float const dist_px = std::sqrt(dx * dx + dy * dy);
+
+    if (dist_px < pick_px && dist_px < best_dist_px)
+    {
+      best_dist_px = dist_px;
+      best_guid = spawn.guid;
+    }
+  }
+
+  return best_guid;
+}
+
+void MapView::updateCreatureSpawnHover(QPoint const& global_pos)
+{
+  if (terrainMode != editing_mode::creature || _dragging_creature_spawn || rightMouse)
+  {
+    setHoveredCreatureSpawn(std::optional<std::uint32_t>());
+    QToolTip::hideText();
+    return;
+  }
+
+  auto hovered_guid = findCreatureSpawnAtCursor();
+  setHoveredCreatureSpawn(hovered_guid);
+
+  if (!hovered_guid)
+  {
+    QToolTip::hideText();
+    return;
+  }
+
+  auto const* spawn = _world->findCreatureSpawn(*hovered_guid);
+  if (!spawn)
+  {
+    QToolTip::hideText();
+    return;
+  }
+
+  QString name = QString::fromStdString(spawn->name.empty() ? std::string("<unnamed>") : spawn->name);
+  QToolTip::showText(global_pos, QString("%1\nGUID: %2\nEntry: %3")
+                               .arg(name)
+                               .arg(spawn->guid)
+                               .arg(spawn->entry), this);
+}
+
+bool MapView::tryStartCreatureSpawnDrag()
+{
+  bool const creature_editor_mode = terrainMode == editing_mode::creature;
+  bool const legacy_object_mode = terrainMode == editing_mode::object && _draw_creature_spawns.get();
+  if ((!creature_editor_mode && !legacy_object_mode) || !_world->hasCreatureSpawnsLoaded())
+  {
+    return false;
+  }
+
+  std::optional<std::uint32_t> best_guid = findCreatureSpawnAtCursor();
+
+  if (!best_guid)
+  {
+    return false;
+  }
+
+  auto const* clicked_spawn = _world->findCreatureSpawn(*best_guid);
+  if (!clicked_spawn)
+  {
+    return false;
+  }
+
+  if (!clicked_spawn->selected || selectedCreatureSpawnCount() <= 1)
+  {
+    setSelectedCreatureSpawn(best_guid);
+  }
+
+  _creature_drag_anchor_pos = _cursor_pos;
+  _creature_drag_initial_positions.clear();
+  for (auto const& spawn : _world->creatureSpawns())
+  {
+    if (spawn.selected)
+    {
+      _creature_drag_initial_positions.emplace_back(spawn.guid, spawn.pos);
+    }
+  }
+
+  _dragging_creature_spawn = true;
+  _main_window->statusBar()->showMessage(QString("Dragging %1 creature spawn(s). Release mouse, then use Export SQL.")
+                                           .arg(_creature_drag_initial_positions.size()), 4000);
+  return true;
+}
+
+void MapView::translateSelectedCreatureSpawns(glm::vec3 const& delta)
+{
+  if (!_selected_creature_spawn_guid)
+  {
+    return;
+  }
+
+  auto apply_position = [](World::CreatureSpawnOverlay& spawn, glm::vec3 const& pos)
+  {
+    spawn.pos = pos;
+    spawn.dirty = glm::distance(spawn.pos, spawn.original_pos) > 0.01f
+               || std::abs(spawn.orientation - spawn.original_orientation) > 0.01f;
+
+    if (spawn.model_instance)
+    {
+      spawn.model_instance->pos = spawn.pos;
+      spawn.model_instance->dir = glm::vec3(0.0f, spawn.orientation, 0.0f);
+      spawn.model_instance->recalcExtents();
+    }
+  };
+
+  bool moved_any = false;
+  for (auto& spawn : _world->creatureSpawns())
+  {
+    if (!spawn.selected)
+    {
+      continue;
+    }
+
+    apply_position(spawn, spawn.pos + delta);
+    moved_any = true;
+  }
+
+  if (!moved_any)
+  {
+    if (auto* spawn = _world->findCreatureSpawn(*_selected_creature_spawn_guid))
+    {
+      apply_position(*spawn, spawn->pos + delta);
+      moved_any = true;
+    }
+  }
+
+  if (!moved_any)
+  {
+    return;
+  }
+
+  updateDatabaseStatus();
+  rebuildCreatureBrowserList(true);
+  refreshCreatureEditorKnobs();
+}
+
+void MapView::updateSelectedCreatureSpawnPosition(glm::vec3 const& pos)
+{
+  if (!_selected_creature_spawn_guid)
+  {
+    return;
+  }
+
+  auto apply_position = [](World::CreatureSpawnOverlay& spawn, glm::vec3 const& new_pos)
+  {
+    spawn.pos = new_pos;
+    spawn.dirty = glm::distance(spawn.pos, spawn.original_pos) > 0.01f
+               || std::abs(spawn.orientation - spawn.original_orientation) > 0.01f;
+
+    if (spawn.model_instance)
+    {
+      spawn.model_instance->pos = spawn.pos;
+      spawn.model_instance->dir = glm::vec3(0.0f, spawn.orientation, 0.0f);
+      spawn.model_instance->recalcExtents();
+    }
+  };
+
+  if (_dragging_creature_spawn && _creature_drag_anchor_pos && !_creature_drag_initial_positions.empty())
+  {
+    glm::vec3 const delta = pos - *_creature_drag_anchor_pos;
+    for (auto const& drag_state : _creature_drag_initial_positions)
+    {
+      auto* spawn = _world->findCreatureSpawn(drag_state.first);
+      if (!spawn)
+      {
+        continue;
+      }
+
+      apply_position(*spawn, drag_state.second + delta);
+    }
+  }
+  else
+  {
+    auto* spawn = _world->findCreatureSpawn(*_selected_creature_spawn_guid);
+    if (!spawn)
+    {
+      return;
+    }
+
+    apply_position(*spawn, pos);
+  }
+
+  updateDatabaseStatus();
+  rebuildCreatureBrowserList(true);
+  refreshCreatureEditorKnobs();
+}
+
+void MapView::showSelectedCreatureSpawnMenu(QPoint const& global_pos)
+{
+  if (!_selected_creature_spawn_guid)
+  {
+    return;
+  }
+
+  auto const* spawn = _world->findCreatureSpawn(*_selected_creature_spawn_guid);
+  if (!spawn)
+  {
+    return;
+  }
+
+  QMenu menu(this);
+  menu.addAction(QString("NPC: %1").arg(QString::fromStdString(spawn->name.empty() ? std::string("<unnamed>") : spawn->name)))->setEnabled(false);
+  menu.addAction(QString("Unique ID: %1").arg(spawn->guid))->setEnabled(false);
+  menu.addAction(QString("Entry: %1").arg(spawn->entry))->setEnabled(false);
+  menu.addAction(QString("Display ID: %1").arg(spawn->display_id))->setEnabled(false);
+  menu.addAction(QString("Position: %1, %2, %3")
+                   .arg(spawn->pos.x, 0, 'f', 2)
+                   .arg(spawn->pos.y, 0, 'f', 2)
+                   .arg(spawn->pos.z, 0, 'f', 2))->setEnabled(false);
+  menu.addSeparator();
+  auto* jump_action = menu.addAction("Center camera here");
+  auto* save_action = menu.addAction("Save pending creature changes");
+  auto* chosen = menu.exec(global_pos);
+
+  if (chosen == jump_action)
+  {
+    move_camera_with_auto_height(spawn->pos);
+  }
+  else if (chosen == save_action)
+  {
+    saveDirtyCreatureSpawns();
+  }
+}
+
+void MapView::saveDirtyCreatureSpawns()
+{
+  auto dirty_count = _world->dirtyCreatureSpawnCount();
+  if (dirty_count == 0)
+  {
+    _main_window->statusBar()->showMessage("No creature spawn changes to export", 4000);
+    updateCreatureBrowserStatus();
+    return;
+  }
+
+  QDir project_dir(QString::fromStdString(Noggit::Project::CurrentProject::get()->ProjectPath));
+  QString export_dir_path = project_dir.filePath("sql_exports/creature_spawns");
+  QDir export_dir(export_dir_path);
+  if (!export_dir.exists() && !project_dir.mkpath("sql_exports/creature_spawns"))
+  {
+    auto message = QString("Failed to create creature SQL export folder: %1").arg(export_dir_path);
+    _main_window->statusBar()->showMessage(message, 6000);
+    updateCreatureBrowserStatus(message);
+    return;
+  }
+
+  QString timestamp = QDateTime::currentDateTime().toString("yyyyMMdd_HHmmss");
+  QString file_name = QString("creature_updates_map%1_%2.sql").arg(_world->getMapID()).arg(timestamp);
+  QString file_path = export_dir.filePath(file_name);
+
+  QFile output(file_path);
+  if (!output.open(QIODevice::WriteOnly | QIODevice::Text | QFile::Truncate))
+  {
+    auto message = QString("Failed to write creature SQL export: %1").arg(file_path);
+    _main_window->statusBar()->showMessage(message, 6000);
+    updateCreatureBrowserStatus(message);
+    return;
+  }
+
+  QTextStream stream(&output);
+  stream.setCodec("UTF-8");
+  stream << "-- Noggit creature spawn update export\n";
+  stream << "-- Map ID: " << _world->getMapID() << "\n";
+  stream << "-- Generated: " << QDateTime::currentDateTime().toString(Qt::ISODate) << "\n";
+  stream << "\n";
+
+  for (auto& spawn : _world->creatureSpawns())
+  {
+    if (!spawn.dirty)
+    {
+      continue;
+    }
+
+    auto server_pos = client_to_server_creature_position(spawn.pos, _world->mapIndex.hasAGlobalWMO());
+    auto server_orientation = client_to_server_creature_orientation(spawn.orientation);
+    stream << "-- GUID " << spawn.guid << " entry " << spawn.entry << " "
+           << QString::fromStdString(spawn.name.empty() ? std::string("<unnamed>") : spawn.name)
+           << "\n";
+    stream << "UPDATE creature\n"
+           << "SET position_x = " << QString::number(server_pos.x, 'f', 6) << ",\n"
+           << "    position_y = " << QString::number(server_pos.y, 'f', 6) << ",\n"
+           << "    position_z = " << QString::number(server_pos.z, 'f', 6) << ",\n"
+           << "    orientation = " << QString::number(server_orientation, 'f', 6) << "\n"
+           << "WHERE guid = " << spawn.guid << ";\n\n";
+
+    spawn.original_pos = spawn.pos;
+    spawn.original_orientation = spawn.orientation;
+    spawn.dirty = false;
+  }
+  output.close();
+
+  updateDatabaseStatus();
+  rebuildCreatureBrowserList(true);
+  _main_window->statusBar()->showMessage(QString("Creature spawn SQL exported: %1").arg(file_path), 7000);
+}
+
+void MapView::jumpToCreatureListItem(QListWidgetItem* item)
+{
+  if (!item)
+  {
+    return;
+  }
+
+  auto guid = static_cast<std::uint32_t>(item->data(Qt::UserRole).toULongLong());
+  auto map_id = item->data(Qt::UserRole + 1).toInt();
+  auto is_current_map_item = item->data(Qt::UserRole + 6).toBool();
+
+  if (is_current_map_item)
+  {
+    setSelectedCreatureSpawn(guid, true);
+    auto const* spawn = _world->findCreatureSpawn(guid);
+    if (spawn)
+    {
+      move_camera_with_auto_height(spawn->pos);
+    }
+    return;
+  }
+
+  glm::vec3 target_pos = server_to_client_creature_position(item->data(Qt::UserRole + 2).toFloat(),
+                                                            item->data(Qt::UserRole + 3).toFloat(),
+                                                            item->data(Qt::UserRole + 4).toFloat(),
+                                                            _world->mapIndex.hasAGlobalWMO());
+  _main_window->jumpToMapPosition(map_id, target_pos, math::degrees(30.f), math::degrees(90.f), false);
 }
 
 void MapView::setupHotkeys()
@@ -2604,6 +3627,7 @@ void MapView::setupMinimap()
 
 void MapView::createGUI()
 {
+  LogDebug << "MapView::createGUI begin" << std::endl;
   // Combined dock
   _tool_panel_dock = new Noggit::Ui::Tools::ToolPanel(this);
   _tool_panel_dock->setFeatures(QDockWidget::DockWidgetMovable
@@ -2617,52 +3641,75 @@ void MapView::createGUI()
   // TODO: fix
 
   setupRaiseLowerUi();
+  LogDebug << "MapView::createGUI setupRaiseLowerUi done" << std::endl;
   setupFlattenBlurUi();
+  LogDebug << "MapView::createGUI setupFlattenBlurUi done" << std::endl;
   setupTexturePainterUi();
+  LogDebug << "MapView::createGUI setupTexturePainterUi done" << std::endl;
   setupHoleCutterUi();
+  LogDebug << "MapView::createGUI setupHoleCutterUi done" << std::endl;
   setupAreaDesignatorUi();
+  LogDebug << "MapView::createGUI setupAreaDesignatorUi done" << std::endl;
   setupFlagUi();
+  LogDebug << "MapView::createGUI setupFlagUi done" << std::endl;
   setupWaterEditorUi();
+  LogDebug << "MapView::createGUI setupWaterEditorUi done" << std::endl;
   setupVertexPainterUi();
+  LogDebug << "MapView::createGUI setupVertexPainterUi done" << std::endl;
   setupObjectEditorUi();
+  LogDebug << "MapView::createGUI setupObjectEditorUi done" << std::endl;
+  setupCreatureEditorUi();
+  LogDebug << "MapView::createGUI setupCreatureEditorUi done" << std::endl;
+  setupCreatureBrowserUi();
+  LogDebug << "MapView::createGUI setupCreatureBrowserUi done" << std::endl;
   setupMinimapEditorUi();
+  LogDebug << "MapView::createGUI setupMinimapEditorUi done" << std::endl;
   setupStampUi();
+  LogDebug << "MapView::createGUI setupStampUi done" << std::endl;
   setupLightEditorUi();
+  LogDebug << "MapView::createGUI setupLightEditorUi done" << std::endl;
   setupChunkManipulatorUi();
+  LogDebug << "MapView::createGUI setupChunkManipulatorUi done" << std::endl;
   setupScriptingUi();
+  LogDebug << "MapView::createGUI setupScriptingUi done" << std::endl;
   // End combined dock
 
   setupViewportOverlay();
+  LogDebug << "MapView::createGUI setupViewportOverlay done" << std::endl;
   setupNodeEditor();
+  LogDebug << "MapView::createGUI setupNodeEditor done" << std::endl;
   setupAssetBrowser();
+  LogDebug << "MapView::createGUI setupAssetBrowser done" << std::endl;
   setupDetailInfos();
+  LogDebug << "MapView::createGUI setupDetailInfos done" << std::endl;
   setupToolbars();
+  LogDebug << "MapView::createGUI setupToolbars done" << std::endl;
   setupKeybindingsGui();
+  LogDebug << "MapView::createGUI setupKeybindingsGui done" << std::endl;
 
   setupMinimap();
+  LogDebug << "MapView::createGUI setupMinimap done" << std::endl;
   setupFileMenu();
+  LogDebug << "MapView::createGUI setupFileMenu done" << std::endl;
   setupEditMenu();
+  LogDebug << "MapView::createGUI setupEditMenu done" << std::endl;
   setupViewMenu();
+  LogDebug << "MapView::createGUI setupViewMenu done" << std::endl;
   setupAssistMenu();
+  LogDebug << "MapView::createGUI setupAssistMenu done" << std::endl;
   setupHelpMenu();
+  LogDebug << "MapView::createGUI setupHelpMenu done" << std::endl;
   setupHotkeys();
+  LogDebug << "MapView::createGUI setupHotkeys done" << std::endl;
 
   connect(_main_window, &Noggit::Ui::Windows::NoggitWindow::exitPromptOpened, this, &MapView::on_exit_prompt);
 
   set_editing_mode (editing_mode::ground);
 
-  // do we need to do this every tick ?
-#ifdef USE_MYSQL_UID_STORAGE
-  if (_settings->value("project/mysql/enabled").toBool())
-  {
-      if (mysql::hasMaxUIDStoredDB(_world->getMapID()))
-      {
-        _status_database->setText("MySQL UID sync enabled: "
-            + _settings->value("project/mysql/server").toString() + ":"
-            + _settings->value("project/mysql/port").toString());
-      }
-  }
-#endif
+  _draw_creature_spawns.set(_settings->value("view/creature_spawns", false).toBool());
+  _show_creature_browser.set(_settings->value("map_view/creature_browser", false).toBool());
+  refreshCreatureSpawnOverlay(false);
+  LogDebug << "MapView::createGUI end" << std::endl;
 }
 
 void MapView::on_exit_prompt()
@@ -2710,6 +3757,7 @@ MapView::MapView( math::degrees camera_yaw0
   , _tablet_manager(Noggit::TabletManager::instance()),
     _project(Project)
 {
+  LogDebug << "MapView::MapView begin" << std::endl;
   setWindowTitle ("Noggit Studio Red - " STRPRODUCTVER);
   setFocusPolicy (Qt::StrongFocus);
   setMouseTracking (true);
@@ -2793,7 +3841,9 @@ MapView::MapView( math::degrees camera_yaw0
 
   _update_every_event_loop.start (_fps_calcul);
   connect(&_update_every_event_loop, &QTimer::timeout,[=]{ _needs_redraw = true; update(); });
+  LogDebug << "MapView::MapView before createGUI" << std::endl;
   createGUI();
+  LogDebug << "MapView::MapView after createGUI" << std::endl;
 }
 
 void MapView::tabletEvent(QTabletEvent* event)
@@ -3325,13 +4375,9 @@ void MapView::paintGL()
   if (!saving_minimap && _world->uid_duplicates_found() && !_uid_duplicate_warning_shown)
   {
     _uid_duplicate_warning_shown = true;
-
-    QMessageBox::critical( this
-        , "UID ALREADY IN USE"
-        , "Please enable 'Always check for max UID', mysql uid store or synchronize your "
-          "uid.ini file if you're sharing the map between several mappers.\n\n"
-          "Use 'Editor > Force uid check on next opening' to fix the issue."
-    );
+    LogError << "Duplicate object UIDs were found while loading this map. "
+             << "Noggit reassigned duplicates for this editor session; run a max UID check before saving shared edits."
+             << std::endl;
   }
 
   FrameMark
@@ -4198,6 +5244,8 @@ void MapView::tick (float dt)
                          + " Rendered objects: " + QString::number(_world->getNumRenderedObjects())
   );
 
+  updateDatabaseStatus();
+
   guiWater->updatePos (_camera.position);
 }
 
@@ -4578,6 +5626,22 @@ void MapView::draw_map()
   _camera_moved_since_last_draw = false;
 }
 
+bool MapView::event(QEvent* e)
+{
+  // Suppress shortcut triggers for Z/X while in creature editor mode so they
+  // can be used as hold-modifiers for arrow-key spawn nudging.
+  if (e->type() == QEvent::ShortcutOverride && terrainMode == editing_mode::creature)
+  {
+    auto* ke = static_cast<QKeyEvent*>(e);
+    if (ke->key() == Qt::Key_Z || ke->key() == Qt::Key_X)
+    {
+      e->accept();
+      return true;
+    }
+  }
+  return QOpenGLWidget::event(e);
+}
+
 void MapView::keyPressEvent (QKeyEvent *event)
 {
   size_t const modifier
@@ -4603,6 +5667,44 @@ void MapView::keyPressEvent (QKeyEvent *event)
 
   if (event->key() == Qt::Key_Space)
     _mod_space_down = true;
+
+  if (event->key() == Qt::Key_Z) _mod_z_down = true;
+  if (event->key() == Qt::Key_X) _mod_x_down = true;
+
+  // ΓöÇΓöÇ Creature spawn keyboard nudge (Z/X + arrow keys) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+  // Z + Left/Right: move X axis  Z + Up/Down: move Y (height)
+  // X + Left/Right: rotate orientation  X + Up/Down: move Z axis (depth)
+  if (terrainMode == editing_mode::creature && _selected_creature_spawn_guid
+      && (_mod_z_down || _mod_x_down))
+  {
+    constexpr float pos_step = 0.5f;        // world units
+
+    bool handled = false;
+    glm::vec3 delta(0.0f);
+
+    if (_mod_z_down && !_mod_x_down)
+    {
+      if      (event->key() == Qt::Key_Left)  { delta.x -= pos_step; handled = true; }
+      else if (event->key() == Qt::Key_Right) { delta.x += pos_step; handled = true; }
+      else if (event->key() == Qt::Key_Up)    { delta.y += pos_step; handled = true; }
+      else if (event->key() == Qt::Key_Down)  { delta.y -= pos_step; handled = true; }
+    }
+    else if (_mod_x_down && !_mod_z_down)
+    {
+      if      (event->key() == Qt::Key_Up)    { delta.z += pos_step; handled = true; }
+      else if (event->key() == Qt::Key_Down)  { delta.z -= pos_step; handled = true; }
+      else if (event->key() == Qt::Key_Left)  { delta.x -= pos_step; handled = true; }
+      else if (event->key() == Qt::Key_Right) { delta.x += pos_step; handled = true; }
+    }
+
+    if (handled)
+    {
+      translateSelectedCreatureSpawns(delta);
+      _needs_redraw = true;
+      return;
+    }
+  }
+  // ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
   checkInputsSettings();
 
@@ -4776,6 +5878,9 @@ void MapView::keyReleaseEvent (QKeyEvent* event)
   if (event->key() == Qt::Key_Space)
     _mod_space_down = false;
 
+  if (event->key() == Qt::Key_Z) _mod_z_down = false;
+  if (event->key() == Qt::Key_X) _mod_x_down = false;
+
   if (_change_operation_mode && event->key() == Qt::Key_Space)
     _change_operation_mode = false;
 
@@ -4856,6 +5961,8 @@ void MapView::checkInputsSettings()
 void MapView::focusOutEvent (QFocusEvent*)
 {
   _mod_alt_down = false;
+  _mod_z_down = false;
+  _mod_x_down = false;
   _mod_ctrl_down = false;
   _mod_shift_down = false;
   _mod_space_down = false;
@@ -4893,6 +6000,25 @@ void MapView::mouseMoveEvent (QMouseEvent* event)
     _camera.add_to_pitch(math::degrees(mousedir * relative_movement.dy() / YSENS));
     _camera_moved_since_last_draw = true;
   }
+
+  if (_dragging_creature_spawn && leftMouse)
+  {
+    updateSelectedCreatureSpawnPosition(_cursor_pos);
+    _last_mouse_pos = event->pos();
+    return;
+  }
+
+  if (leftMouse
+      && terrainMode == editing_mode::creature
+      && _area_selection->isVisible()
+      && _display_mode == display_mode::in_3D
+      && !ImGuizmo::IsUsing())
+  {
+    _needs_redraw = true;
+    _area_selection->setGeometry(QRect(_drag_start_pos, event->pos()).normalized());
+  }
+
+  updateCreatureSpawnHover(event->globalPos());
 
   if (MoveObj)
   {
@@ -5228,8 +6354,30 @@ void MapView::mousePressEvent(QMouseEvent* event)
     break;
   }
 
+  if (leftMouse && terrainMode == editing_mode::creature)
+  {
+      if (_mod_shift_down)
+      {
+        _drag_start_pos = event->pos();
+        _needs_redraw = true;
+        _area_selection->setGeometry(QRect(_drag_start_pos, QSize()));
+        _area_selection->show();
+        return;
+      }
+
+      tryStartCreatureSpawnDrag();
+      _area_selection->hide();
+      return;
+  }
+
   if (leftMouse && ((terrainMode == editing_mode::object || terrainMode == editing_mode::minimap) && !_mod_ctrl_down))
   {
+      if (_mod_shift_down && tryStartCreatureSpawnDrag())
+      {
+        _area_selection->hide();
+        return;
+      }
+
       _drag_start_pos = event->pos();
       _needs_redraw = true;
       _area_selection->setGeometry(QRect(_drag_start_pos, QSize()));
@@ -5319,12 +6467,53 @@ void MapView::mouseReleaseEvent (QMouseEvent* event)
   switch (event->button())
   {
   case Qt::LeftButton:
+    if (_dragging_creature_spawn)
+    {
+      leftMouse = false;
+      _dragging_creature_spawn = false;
+      _creature_drag_anchor_pos = std::optional<glm::vec3>();
+      _creature_drag_initial_positions.clear();
+      updateDatabaseStatus();
+      break;
+    }
+
     leftMouse = false;
 
     if (_display_mode == display_mode::in_2D)
     {
       strafing = 0;
       moving = 0;
+    }
+
+    if (terrainMode == editing_mode::creature)
+    {
+      auto drag_end_pos = event->pos();
+
+      if (_area_selection->isVisible())
+      {
+        if (_drag_start_pos != drag_end_pos && !ImGuizmo::IsUsing())
+        {
+          selectCreatureSpawnsInArea(QRect(_drag_start_pos, drag_end_pos), true);
+        }
+        else if (auto guid = findCreatureSpawnAtCursor())
+        {
+          addCreatureSpawnToSelection(*guid);
+        }
+
+        _area_selection->hide();
+        break;
+      }
+
+      if (auto guid = findCreatureSpawnAtCursor())
+      {
+        setSelectedCreatureSpawn(guid);
+      }
+      else
+      {
+        setSelectedCreatureSpawn(std::optional<std::uint32_t>());
+      }
+
+      break;
     }
 
     if ((terrainMode == editing_mode::object || terrainMode == editing_mode::minimap) && !_mod_ctrl_down)

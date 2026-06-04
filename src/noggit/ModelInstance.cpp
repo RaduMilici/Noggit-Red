@@ -36,6 +36,46 @@ ModelInstance::ModelInstance(BlizzardArchive::Listfile::FileKey const& file_key
   _need_recalc_extents = true;
 }
 
+ModelInstance& ModelInstance::operator=(ModelInstance const& other)
+{
+  if (this == &other)
+  {
+    return *this;
+  }
+
+  model = other.model;
+  light_color = other.light_color;
+  size_cat = other.size_cat;
+  pos = other.pos;
+  dir = other.dir;
+  uid = other.uid;
+  scale = other.scale;
+  extents[0] = other.extents[0];
+  extents[1] = other.extents[1];
+  _transform_mat_inverted = other._transform_mat_inverted;
+  _context = other._context;
+  _need_recalc_extents = other._need_recalc_extents;
+  _need_gpu_transform_update = other._need_gpu_transform_update;
+  _gpu_transform_uid = other._gpu_transform_uid;
+  _forced_anim_id = other._forced_anim_id;
+
+  _replace_textures.clear();
+  for (auto const& pair : other._replace_textures)
+  {
+    _replace_textures.emplace(pair.first, pair.second);
+  }
+
+  return *this;
+}
+
+void ModelInstance::setReplaceTexture(std::size_t texture_type, std::string const& filename)
+{
+  _replace_textures.erase(texture_type);
+  _replace_textures.emplace(std::piecewise_construct,
+                            std::forward_as_tuple(texture_type),
+                            std::forward_as_tuple(filename, _context));
+}
+
 
 void ModelInstance::draw_box (glm::mat4x4 const& model_view
                              , glm::mat4x4 const& projection
@@ -281,7 +321,7 @@ wmo_doodad_instance::wmo_doodad_instance(BlizzardArchive::Listfile::FileKey cons
   pos = glm::vec3(ff[0], ff[2], -ff[1]);
 
   f->read(ff, 16);
-  doodad_orientation = glm::quat (-ff[0], -ff[2], ff[1], ff[3]);
+  doodad_orientation = glm::quat(ff[3], ff[0], ff[2], -ff[1]);
 
   f->read(&scale, 4);
 
@@ -306,7 +346,7 @@ void wmo_doodad_instance::update_transform_matrix_wmo(WMOInstance* wmo)
     return;
   }  
 
-  world_pos = wmo->transformMatrix() * glm::vec4(pos,0);
+  world_pos = wmo->transformMatrix() * glm::vec4(pos,1);
 
   auto m2_mat = glm::mat4x4(1);
   m2_mat = glm::translate(m2_mat, pos);
@@ -318,6 +358,7 @@ void wmo_doodad_instance::update_transform_matrix_wmo(WMOInstance* wmo)
     wmo->transformMatrix() * m2_mat
   );
 
+  _transform_mat = mat;
   _transform_mat_inverted = glm::inverse(mat);
 
   // to compute the size category (used in culling)

@@ -76,13 +76,13 @@ public:
     void set_ocean_deep_alpha(float alpha) { _ocean_deep_alpha = alpha; }
 
 private:
-    bool _highlight_sky;
-    float _river_shallow_alpha;
-    float _river_deep_alpha;
-    float _ocean_shallow_alpha;
-    float _ocean_deep_alpha;
+  bool _highlight_sky = false;
+  float _river_shallow_alpha = 0.6f;
+  float _river_deep_alpha = 1.0f;
+  float _ocean_shallow_alpha = 0.6f;
+  float _ocean_deep_alpha = 1.0f;
 
-    float _glow;
+  float _glow = 0.0f;
 
     Noggit::NoggitRenderContext _context;
 };
@@ -139,6 +139,8 @@ public:
   // void set_ocean_deep_alpha(float alpha) { _ocean_deep_alpha = alpha; }
 
   void save_to_dbc();
+
+  Sky(int id, glm::vec3 const& position, float inner_radius, float outer_radius, std::vector<SkyParam*> params, Noggit::NoggitRenderContext context);
 
 private:
   // bool _highlight_sky;
@@ -210,15 +212,16 @@ private:
   int _last_time = -1;
   glm::vec3 _last_pos;
 
-  float _river_shallow_alpha;
-  float _river_deep_alpha;
-  float _ocean_shallow_alpha;
-  float _ocean_deep_alpha;
-  float _glow;
-  float _fog_rate;
+  float _river_shallow_alpha = 0.6f;
+  float _river_deep_alpha = 1.0f;
+  float _ocean_shallow_alpha = 0.6f;
+  float _ocean_deep_alpha = 1.0f;
+  float _glow = 0.0f;
+  float _fog_rate = 1.5f;
 
-  float _fog_distance;
-  float _fog_multiplier;
+  float _fog_distance = 18000.0f;
+  float _fog_multiplier = 0.25f;
+  int _area_light_id = 0;
 
 public:
   std::vector<Sky> skies;
@@ -232,6 +235,7 @@ public:
   Sky* findClosestSkyByDistance(glm::vec3 pos);
 
   void setCurrentParam(int param_id);
+  void setAreaLightId(int light_id);
   void update_sky_colors(glm::vec3 pos, int time);
 
   bool draw ( glm::mat4x4 const& model_view
@@ -260,7 +264,7 @@ public:
   );
 
 
-  bool hasSkies() { return numSkies > 0; }
+  bool hasSkies() { return true; }
 
   float river_shallow_alpha() const { return _river_shallow_alpha; }
   float river_deep_alpha() const { return _river_deep_alpha; }

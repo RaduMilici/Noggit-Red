@@ -129,7 +129,13 @@ bool WMORender::drawSkybox(const glm::mat4x4& model_view, const glm::vec3& camer
       continue;
     }
 
-    auto& extent(group_extents.at(i));
+    auto extent_it = group_extents.find(i);
+    if (extent_it == group_extents.end())
+    {
+      continue;
+    }
+
+    auto& extent(extent_it->second);
 
     if (math::is_inside_of(camera_pos, extent.first, extent.second))
     {
@@ -150,6 +156,7 @@ bool WMORender::drawSkybox(const glm::mat4x4& model_view, const glm::vec3& camer
       m2_shader.uniform("unlit",  static_cast<int>(model_render_state.unlit));
       m2_shader.uniform("tex_unit_lookup_1", 0);
       m2_shader.uniform("tex_unit_lookup_2", 0);
+      m2_shader.uniform("masked_additive", 0);
       m2_shader.uniform("pixel_shader", 0);
 
       _wmo->skybox->get()->renderer()->draw(model_view, sky, m2_shader, model_render_state, frustum, cull_distance, camera_pos, animtime, display_mode::in_3D);

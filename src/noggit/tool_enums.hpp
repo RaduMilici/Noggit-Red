@@ -71,11 +71,12 @@ enum class editing_mode
   water = 6,
   mccv = 7,
   object = 8,
-  minimap = 9,
-  stamp = 10,
-  light = 11,
-  scripting = 12,
-  chunk = 13
+  creature = 9,
+  minimap = 10,
+  stamp = 11,
+  light = 12,
+  scripting = 13,
+  chunk = 14
 };
 
 enum water_opacity
