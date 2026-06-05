@@ -69,6 +69,7 @@ namespace Noggit::Rendering
 
     float ordering_thingy = 0.f;
     uint16_t index_start = 0, index_count = 0, vertex_start = 0, vertex_end = 0;
+    uint16_t geoset_id = 0;
     uint16_t blend_mode = 0;
     texture_unit_lookup tu_lookups[2];
     uint16_t textures[2];

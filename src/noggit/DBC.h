@@ -349,6 +349,11 @@ public:
     static const size_t ModelName2 = 2;
     static const size_t ModelTexture1 = 3;
     static const size_t ModelTexture2 = 4;
+    static const size_t GeosetGroup1 = 6;
+    static const size_t GeosetGroup2 = 7;
+    static const size_t GeosetGroup3 = 8;
+    static const size_t HelmetGeosetVis1 = 12;
+    static const size_t HelmetGeosetVis2 = 13;
     static const size_t TextureUpperArm = 14;
     static const size_t TextureLowerArm = 15;
     static const size_t TextureHands = 16;

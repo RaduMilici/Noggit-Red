@@ -8,12 +8,27 @@
 #include <math/bounding_box.hpp>
 #include <noggit/Misc.h>
 #include <fstream>
+#include <cstdlib>
+#include <cstring>
+#include <set>
+#include <sstream>
 
 
 using namespace Noggit::Rendering;
 
 namespace
 {
+  bool model_texture_debug_enabled()
+  {
+    static bool const enabled = []()
+    {
+      char const* value = std::getenv("NOGGIT_MODEL_TEXTURE_DEBUG");
+      return value && *value && std::strcmp(value, "0") != 0;
+    }();
+
+    return enabled;
+  }
+
   bool is_classic_creature_or_character_model(Model const* model)
   {
     if (!model || !model->usesClassicLayout() || !model->file_key().hasFilepath())
@@ -23,6 +38,82 @@ namespace
 
     auto const& path = model->file_key().filepath();
     return path.starts_with("creature/") || path.starts_with("character/");
+  }
+
+  bool is_classic_character_model(Model const* model)
+  {
+    if (!model || !model->usesClassicLayout() || !model->file_key().hasFilepath())
+    {
+      return false;
+    }
+
+    return model->file_key().filepath().starts_with("character/");
+  }
+
+  void log_classic_character_controlled_geoset_decision(Model const* model,
+                                                        ModelInstance const* instance,
+                                                        std::uint16_t geoset_id,
+                                                        char const* decision)
+  {
+    if (!model_texture_debug_enabled() || !is_classic_character_model(model) || !instance)
+    {
+      return;
+    }
+
+    auto const geoset_family = static_cast<std::uint16_t>(geoset_id / 100);
+    if (geoset_family < 4 || geoset_family > 15)
+    {
+      return;
+    }
+
+    static std::set<std::string> logged_draws;
+
+    std::ostringstream key;
+    key << model->file_key().stringRepr() << '|'
+        << instance->uid << '|'
+        << decision << '|'
+        << geoset_id << '|';
+    for (auto family : instance->controlledGeosetFamilies())
+    {
+      key << family << ',';
+    }
+    key << '|';
+    for (auto visible : instance->visibleGeosetIds())
+    {
+      key << visible << ',';
+    }
+
+    if (!logged_draws.insert(key.str()).second)
+    {
+      return;
+    }
+
+    std::ostringstream log_line;
+    log_line << "Classic character controlled geoset " << decision
+             << " model='" << model->file_key().stringRepr()
+             << "' uid=" << instance->uid
+             << " geosetId=" << geoset_id
+             << " family=" << geoset_family
+             << " controlledFamilies=[";
+    for (std::size_t index = 0; index < instance->controlledGeosetFamilies().size(); ++index)
+    {
+      if (index != 0)
+      {
+        log_line << ", ";
+      }
+      log_line << instance->controlledGeosetFamilies()[index];
+    }
+    log_line << "] visibleGeosets=[";
+    for (std::size_t index = 0; index < instance->visibleGeosetIds().size(); ++index)
+    {
+      if (index != 0)
+      {
+        log_line << ", ";
+      }
+      log_line << instance->visibleGeosetIds()[index];
+    }
+    log_line << "]";
+    LogDebug << log_line.str() << std::endl;
   }
 
   bool is_masked_lightray_model(Model const* model)
@@ -806,6 +897,7 @@ void ModelRender::initRenderPasses(ModelView const* view, ModelTexUnit const* te
 
     ModelRenderPass pass(tex_unit[j], _model);
     pass.ordering_thingy = model_geosets[geoset].BoundingBox[0].x;
+    pass.geoset_id = model_geosets[geoset].id;
 
     pass.index_start = model_geosets[geoset].istart;
     pass.index_count = model_geosets[geoset].icount;
@@ -849,12 +941,36 @@ ModelRenderPass::ModelRenderPass(ModelTexUnit const& tex_unit, Model* m)
 
 bool ModelRenderPass::prepareDraw(OpenGL::Scoped::use_program& m2_shader, Model *m, ModelInstance const* instance, OpenGL::M2RenderState& model_render_state)
 {
-  if (submesh >= m->showGeosets.size()
+  auto const* visible_geosets = &m->showGeosets;
+  if (instance && !instance->geosetVisibility().empty())
+  {
+    visible_geosets = &instance->geosetVisibility();
+  }
+
+  if (submesh >= visible_geosets->size()
       || renderflag_index >= m->_render_flags.size()
       || (!m->_uses_classic_layout && !pixel_shader))
   {
     return false;
   }
+
+  if (!(*visible_geosets)[submesh])
+  {
+    return false;
+  }
+
+  if (instance && !instance->controlledGeosetFamilies().empty())
+  {
+    auto const geoset_family = static_cast<std::uint16_t>(geoset_id / 100);
+    if (instance->isGeosetFamilyControlled(geoset_family)
+        && !instance->isGeosetIdVisible(geoset_id))
+    {
+      log_classic_character_controlled_geoset_decision(m, instance, geoset_id, "hidden");
+      return false;
+    }
+  }
+
+  log_classic_character_controlled_geoset_decision(m, instance, geoset_id, "draw");
 
   if (is_masked_lightray_model(m) && !model_render_state.allow_lightray_model)
   {
@@ -1114,14 +1230,22 @@ bool ModelRenderPass::bindTexture(size_t index, Model* m, ModelInstance const* i
     selected_texture = &m->_textures[tex];
   }
 
-  // If the selected override hasn't loaded or failed, fall back to the model's
-  // placeholder (black.blp) so the creature renders black instead of vanishing.
-  if (selected_texture != &m->_textures[tex])
+  if (model_texture_debug_enabled() && m->_specialTextures[tex] > 0 && m->_specialTextures[tex] < 32)
   {
-    auto& override_tex = *selected_texture;
-    if (!override_tex->finishedLoading() || override_tex->loading_failed())
+    std::uint32_t const special_type = static_cast<std::uint32_t>(m->_specialTextures[tex]);
+    std::uint32_t const special_bit = (1u << special_type);
+    bool const using_placeholder = selected_texture == &m->_textures[tex];
+
+    if (using_placeholder && (m->_logged_missing_special_texture_mask & special_bit) == 0)
     {
-      selected_texture = &m->_textures[tex];
+      m->_logged_missing_special_texture_mask |= special_bit;
+      LogDebug << "M2 special texture fallback model='" << m->file_key().stringRepr()
+               << "' textureIndex=" << tex
+               << " specialType=" << special_type
+               << " hasInstance=" << (instance ? 1 : 0)
+               << " classicLayout=" << m->usesClassicLayout()
+               << " placeholder='tileset/generic/black.blp'"
+               << std::endl;
     }
   }
 
@@ -1131,19 +1255,36 @@ bool ModelRenderPass::bindTexture(size_t index, Model* m, ModelInstance const* i
     texture->wait_until_loaded();
   }
 
-  if (!texture->finishedLoading() || texture->loading_failed())
+  // For classic creature/character overrides, give the selected replacement a
+  // chance to finish loading before falling back to black.
+  if (selected_texture != &m->_textures[tex])
+  {
+    auto& override_tex = *selected_texture;
+    if (override_tex->loading_failed() || !override_tex->finishedLoading())
+    {
+      selected_texture = &m->_textures[tex];
+    }
+  }
+
+  auto& resolved_texture = *selected_texture;
+  if (!resolved_texture->finishedLoading() && is_classic_creature_or_character_model(m))
+  {
+    resolved_texture->wait_until_loaded();
+  }
+
+  if (!resolved_texture->finishedLoading() || resolved_texture->loading_failed())
   {
     return false;
   }
 
-  texture->upload();
-  if (!texture->is_uploaded())
+  resolved_texture->upload();
+  if (!resolved_texture->is_uploaded())
   {
     return false;
   }
 
-  GLuint tex_array = texture->texture_array();
-  int tex_index = texture->array_index();
+  GLuint tex_array = resolved_texture->texture_array();
+  int tex_index = resolved_texture->array_index();
 
   gl.activeTexture(static_cast<GLenum>(GL_TEXTURE0 + index + 1));
   gl.bindTexture(GL_TEXTURE_2D_ARRAY, tex_array);

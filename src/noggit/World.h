@@ -60,6 +60,12 @@ class World
 public:
   struct CreatureSpawnOverlay
   {
+    struct AttachmentModel
+    {
+      int attachment_id = -1;
+      std::optional<ModelInstance> model_instance;
+    };
+
     std::uint32_t guid = 0;
     std::uint32_t entry = 0;
     std::uint32_t display_id = 0;
@@ -72,6 +78,7 @@ public:
     bool selected = false;
     bool dirty = false;
     std::optional<ModelInstance> model_instance;
+    std::vector<AttachmentModel> attachment_models;
 
     CreatureSpawnOverlay() = default;
     CreatureSpawnOverlay(CreatureSpawnOverlay&&) noexcept = default;

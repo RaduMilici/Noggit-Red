@@ -18,6 +18,21 @@ using namespace Noggit::Rendering;
 
 namespace
 {
+  bool classic_attachment_debug_enabled()
+  {
+    static bool const enabled = []
+    {
+      if (char const* value = std::getenv("NOGGIT_CLASSIC_M2_DEBUG"))
+      {
+        return std::string(value) != "0";
+      }
+
+      return false;
+    }();
+
+    return enabled;
+  }
+
   bool is_too_dark(glm::vec3 const& color, float minimum)
   {
     return color.x + color.y + color.z < minimum;
@@ -26,6 +41,48 @@ namespace
   glm::vec3 ensure_min_light(glm::vec3 color, glm::vec3 const& fallback, float minimum)
   {
     return is_too_dark(color, minimum) ? fallback : color;
+  }
+
+  ModelAttachmentDef const* find_attachment_def(Model const* model, int attachment_id)
+  {
+    if (!model)
+    {
+      return nullptr;
+    }
+
+    if (attachment_id < 0
+        || static_cast<std::size_t>(attachment_id) >= model->_attachment_lookup.size())
+    {
+      return nullptr;
+    }
+
+    auto const lookup = model->_attachment_lookup[attachment_id];
+    if (lookup < 0 || static_cast<std::size_t>(lookup) >= model->_attachments.size())
+    {
+      return nullptr;
+    }
+
+    return &model->_attachments[lookup];
+  }
+
+  glm::mat4x4 attachment_world_matrix(ModelInstance const& parent_instance,
+                                      Model const* parent_model,
+                                      ModelAttachmentDef const* attachment_def)
+  {
+    if (!parent_model || !attachment_def)
+    {
+      return parent_instance.transformMatrix();
+    }
+
+    glm::mat4x4 attachment_matrix = glm::translate(glm::mat4x4(1.0f), fixCoordSystem(attachment_def->pos));
+
+    if (attachment_def->bone >= 0
+        && static_cast<std::size_t>(attachment_def->bone) < parent_model->bone_matrices.size())
+    {
+      attachment_matrix = parent_model->bone_matrices[attachment_def->bone] * attachment_matrix;
+    }
+
+    return parent_instance.transformMatrix() * attachment_matrix;
   }
 }
 
@@ -665,25 +722,6 @@ void WorldRender::draw (glm::mat4x4 const& model_view
       }
     }
 
-    // Inject creature spawn M2 models into the draw batch
-    if (draw_creature_spawns)
-    {
-      ZoneScopedN("World::draw() : Inject creature spawn models");
-      for (auto& spawn : _world->creatureSpawns())
-      {
-        if (glm::distance(camera_pos, spawn.pos) > creature_spawn_draw_distance)
-        {
-          continue;
-        }
-
-        if (!spawn.model_instance.has_value()) continue;
-        auto& mi = *spawn.model_instance;
-        mi.ensureExtents();
-        if (!mi.model->finishedLoading()) continue;
-        models_to_draw[mi.model.get()].push_back(mi.transformMatrix());
-      }
-    }
-
     /*
     if (_world->need_model_updates)
     {
@@ -949,6 +987,120 @@ void WorldRender::draw (glm::mat4x4 const& model_view
                   }) != _world->current_selection().end();*/
 
           model->draw_box(model_view, projection, is_selected); // make optional!
+        }
+      }
+
+      if (draw_creature_spawns)
+      {
+        ZoneScopedN("World::draw() : Draw creature spawn models");
+
+        OpenGL::Scoped::use_program m2_shader {*_m2_program.get()};
+
+        OpenGL::M2RenderState model_render_state;
+        model_render_state.tex_arrays = {0, 0};
+        model_render_state.tex_indices = {0, 0};
+        model_render_state.tex_unit_lookups = {-1, -1};
+        gl.blendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        gl.disable(GL_BLEND);
+        gl.depthMask(GL_TRUE);
+        gl.enable(GL_CULL_FACE);
+        m2_shader.uniform("blend_mode", 0);
+        m2_shader.uniform("unfogged", static_cast<int>(model_render_state.unfogged));
+        m2_shader.uniform("unlit",  static_cast<int>(model_render_state.unlit));
+        m2_shader.uniform("tex_unit_lookup_1", 0);
+        m2_shader.uniform("tex_unit_lookup_2", 0);
+        m2_shader.uniform("masked_additive", 0);
+        m2_shader.uniform("pixel_shader", 0);
+
+        for (auto& spawn : _world->creatureSpawns())
+        {
+          if (glm::distance(camera_pos, spawn.pos) > creature_spawn_draw_distance)
+          {
+            continue;
+          }
+
+          if (!spawn.model_instance.has_value())
+          {
+            continue;
+          }
+
+          auto& mi = *spawn.model_instance;
+          mi.ensureExtents();
+          if (!mi.model->finishedLoading() || mi.model->loading_failed())
+          {
+            continue;
+          }
+
+          if (draw_hidden_models || !mi.model->is_hidden())
+          {
+            mi.model->renderer()->draw(model_view,
+                                       mi,
+                                       m2_shader,
+                                       model_render_state,
+                                       frustum,
+                                       _cull_distance,
+                                       camera_pos,
+                                       _world->animtime,
+                                       display);
+            ++_world->_n_rendered_objects;
+
+            for (auto& attachment : spawn.attachment_models)
+            {
+              if (!attachment.model_instance.has_value())
+              {
+                continue;
+              }
+
+              Model const* parent_model = mi.model.get();
+              if (!parent_model)
+              {
+                continue;
+              }
+
+              auto const* attachment_def = find_attachment_def(parent_model, attachment.attachment_id);
+              if (!attachment_def)
+              {
+                if (classic_attachment_debug_enabled())
+                {
+                  LogDebug << "Missing creature attachment anchor parent='" << mi.model->file_key().stringRepr()
+                           << "' child='" << attachment.model_instance->model->file_key().stringRepr()
+                           << "' attachmentId=" << attachment.attachment_id
+                           << " lookupSize=" << mi.model->_attachment_lookup.size()
+                           << " attachmentCount=" << mi.model->_attachments.size()
+                           << std::endl;
+                }
+                continue;
+              }
+
+              if (classic_attachment_debug_enabled())
+              {
+                LogDebug << "Creature attachment draw parent='" << mi.model->file_key().stringRepr()
+                         << "' child='" << attachment.model_instance->model->file_key().stringRepr()
+                         << "' attachmentId=" << attachment.attachment_id
+                         << " bone=" << attachment_def->bone
+                         << " pos=(" << attachment_def->pos.x << "," << attachment_def->pos.y << "," << attachment_def->pos.z << ")"
+                         << std::endl;
+              }
+
+              auto& attachment_instance = *attachment.model_instance;
+              if (!attachment_instance.model->finishedLoading() || attachment_instance.model->loading_failed())
+              {
+                continue;
+              }
+
+              attachment_instance.setTransformMatrix(attachment_world_matrix(mi, parent_model, attachment_def));
+              attachment_instance.model->renderer()->draw(model_view,
+                                                         attachment_instance,
+                                                         m2_shader,
+                                                         model_render_state,
+                                                         frustum,
+                                                         _cull_distance,
+                                                         camera_pos,
+                                                         _world->animtime,
+                                                         display,
+                                                         true);
+            }
+          }
         }
       }
     }

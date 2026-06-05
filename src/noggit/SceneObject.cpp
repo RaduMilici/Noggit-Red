@@ -59,6 +59,12 @@ void SceneObject::updateTransformMatrix()
   _transform_mat_inverted = glm::inverse(matrix);
 }
 
+void SceneObject::setTransformMatrix(glm::mat4x4 const& matrix)
+{
+  _transform_mat = matrix;
+  _transform_mat_inverted = glm::inverse(matrix);
+}
+
 void SceneObject::resetDirection()
 {
   dir =  math::degrees::vec3(math::degrees(0)._, dir.y, math::degrees(0)._);

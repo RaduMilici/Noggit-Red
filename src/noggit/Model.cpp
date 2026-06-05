@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <string>
@@ -24,6 +25,17 @@
 
 namespace
 {
+  bool classic_m2_debug_enabled()
+  {
+    static bool const enabled = []()
+    {
+      char const* value = std::getenv("NOGGIT_CLASSIC_M2_DEBUG");
+      return value && *value && std::strcmp(value, "0") != 0;
+    }();
+
+    return enabled;
+  }
+
   struct ClassicModelHeader
   {
     char id[4];
@@ -383,6 +395,25 @@ void Model::finishLoading()
     animated = isAnimated(f);  // isAnimated will set animGeometry and animTextures
   }
 
+  if (!_logged_layout_summary && classic_m2_debug_enabled())
+  {
+    _logged_layout_summary = true;
+    LogDebug << "M2 runtime layout model='" << _file_key.stringRepr()
+             << "' layout=" << (_uses_classic_layout ? "classic" : "wotlk")
+             << " version=" << m2_version(header.version)
+             << " animated=" << animated
+             << " animBones=" << animBones
+             << " animGeometry=" << animGeometry
+             << " animTextures=" << animTextures
+             << " perInstance=" << _per_instance_animation
+             << " bones=" << header.nBones
+             << " vertices=" << header.nVertices
+             << " views=" << header.nViews
+             << (_uses_classic_layout ? " embeddedViewOffset=" : " globalSequences=")
+             << (_uses_classic_layout ? _embedded_view_offset : header.nGlobalSequences)
+             << std::endl;
+  }
+
   trans = 1.0f;
   _current_anim_seq = 0;
 
@@ -690,6 +721,8 @@ void Model::initCommon(const BlizzardArchive::ClientFile& f)
 
   // init transparency
   _transparency_lookup = M2Array<int16_t>(f, header.ofsTransparencyLookup, header.nTransparencyLookup);
+  _attachments = M2Array<ModelAttachmentDef>(f, header.ofsAttachments, header.nAttachments);
+  _attachment_lookup = M2Array<int16_t>(f, header.ofsAttachLookup, header.nAttachLookup);
 
   if (_uses_classic_layout && header.nTransparency)
   {
@@ -816,6 +849,27 @@ void Model::initCommon(const BlizzardArchive::ClientFile& f)
         classic_model_geosets.push_back(translate_classic_geoset(classic_geosets[i]));
       }
       model_geosets = classic_model_geosets.data();
+
+      if (!_logged_classic_character_geosets
+          && file_key().hasFilepath()
+          && file_key().filepath().starts_with("character/"))
+      {
+        _logged_classic_character_geosets = true;
+        std::ostringstream geoset_log;
+        geoset_log << "Classic character geosets model='" << file_key().stringRepr() << "'";
+        for (size_t geoset_index = 0; geoset_index < classic_model_geosets.size(); ++geoset_index)
+        {
+          auto const& geoset = classic_model_geosets[geoset_index];
+          geoset_log << " [submesh=" << geoset_index
+                     << " id=" << geoset.id
+                     << " vstart=" << geoset.vstart
+                     << " vcount=" << geoset.vcount
+                     << " istart=" << geoset.istart
+                     << " icount=" << geoset.icount
+                     << "]";
+        }
+        LogDebug << geoset_log.str() << std::endl;
+      }
     }
     else
     {
@@ -888,7 +942,7 @@ void Model::initCommon(const BlizzardArchive::ClientFile& f)
     _texture_unit_lookup = M2Array<int16_t>(f, header.ofsTexUnitLookup, header.nTexUnitLookup);
 
     showGeosets.resize (view->n_submesh);
-    for (size_t i = 0; i<view->n_submesh; ++i) 
+    for (size_t i = 0; i<view->n_submesh; ++i)
     {
       showGeosets[i] = true;
     }
@@ -1048,6 +1102,21 @@ void Model::calcBones(glm::mat4x4 const& model_view
 
 void Model::animate(glm::mat4x4 const& model_view, int anim_id, int anim_time)
 {
+  if (!_logged_animation_branch && classic_m2_debug_enabled())
+  {
+    _logged_animation_branch = true;
+    LogDebug << "M2 animate branch model='" << _file_key.stringRepr()
+             << "' branch=" << (_uses_classic_layout ? "classic" : "wotlk")
+             << " animId=" << anim_id
+             << " animated=" << animated
+             << " animBones=" << animBones
+             << " animGeometry=" << animGeometry
+             << " animTextures=" << animTextures
+             << " classicStaticBones=" << _classic_static_bones.size()
+             << " seqBuckets=" << _animations_seq_per_id.size()
+             << std::endl;
+  }
+
   if (_uses_classic_layout)
   {
     calcClassicStaticBones(model_view);

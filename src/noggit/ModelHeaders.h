@@ -356,8 +356,9 @@ struct ModelEvents {
 };
 
 struct ModelAttachmentDef {
-  int32_t id;
-  int32_t bone;
+  uint32_t id;
+  uint16_t bone;
+  uint16_t unknown1;
   glm::vec3 pos;
   AnimationBlock Enabled;
 };

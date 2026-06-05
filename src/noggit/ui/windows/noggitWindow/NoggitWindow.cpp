@@ -29,6 +29,7 @@
 #include <noggit/ui/windows/noggitWindow/widgets/MapListItem.hpp>
 #include <noggit/ui/windows/noggitWindow/widgets/MapBookmarkListItem.hpp>
 #include <QtNetwork/QTcpSocket>
+#include <cstdlib>
 #include <sstream>
 #include <QSysInfo>
 #include <QStandardPaths>
@@ -471,6 +472,43 @@ namespace Noggit::Ui::Windows
     LogDebug << "NoggitWindow::buildMenu before buildMapList" << std::endl;
     _buildMapListComponent->buildMapList(this);
     LogDebug << "NoggitWindow::buildMenu after buildMapList" << std::endl;
+
+    if (char const* autoload_map = std::getenv("NOGGIT_AUTOLOAD_MAP"))
+    {
+      QString const autoload_value = QString::fromUtf8(autoload_map).trimmed();
+      int autoload_map_id = -1;
+
+      bool ok = false;
+      int const parsed_id = autoload_value.toInt(&ok);
+      if (ok)
+      {
+        autoload_map_id = parsed_id;
+      }
+      else
+      {
+        for (DBCFile::Iterator it = gMapDB.begin(); it != gMapDB.end(); ++it)
+        {
+          QString const internal_name = QString::fromUtf8(it->getString(MapDB::InternalName));
+          if (internal_name.compare(autoload_value, Qt::CaseInsensitive) == 0)
+          {
+            autoload_map_id = it->getInt(MapDB::MapID);
+            break;
+          }
+        }
+      }
+
+      if (autoload_map_id >= 0)
+      {
+        QTimer::singleShot(0, this, [this, autoload_map_id]
+        {
+          loadMap(autoload_map_id);
+          if (_world)
+          {
+            check_uid_then_enter_map(glm::vec3(0.0f, 0.0f, 0.0f), math::degrees(30.f), math::degrees(90.f), false);
+          }
+        });
+      }
+    }
 
     qulonglong bookmark_index(0);
     for (auto entry: _project->Bookmarks)

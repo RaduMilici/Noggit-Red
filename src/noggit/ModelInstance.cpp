@@ -65,6 +65,10 @@ ModelInstance& ModelInstance::operator=(ModelInstance const& other)
     _replace_textures.emplace(pair.first, pair.second);
   }
 
+  _show_geosets = other._show_geosets;
+  _visible_geoset_ids = other._visible_geoset_ids;
+  _controlled_geoset_families = other._controlled_geoset_families;
+
   return *this;
 }
 

@@ -53,6 +53,8 @@ public:
   [[nodiscard]]
   glm::mat4x4 transformMatrix() const { return _transform_mat; };
 
+  void setTransformMatrix(glm::mat4x4 const& matrix);
+
   [[nodiscard]]
   glm::mat4x4 transformMatrixInverted() const { return _transform_mat_inverted; };
 

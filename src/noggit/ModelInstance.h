@@ -16,6 +16,7 @@
 #include <map>
 #include <optional>
 #include <cstdint>
+#include <vector>
 
 namespace math { class frustum; }
 class Model;
@@ -51,6 +52,10 @@ public:
     , size_cat (other.size_cat)
     , _need_recalc_extents(other._need_recalc_extents)
     , _forced_anim_id(other._forced_anim_id)
+    , _replace_textures(std::move(other._replace_textures))
+    , _show_geosets(std::move(other._show_geosets))
+    , _visible_geoset_ids(std::move(other._visible_geoset_ids))
+    , _controlled_geoset_families(std::move(other._controlled_geoset_families))
   {
     pos = other.pos;
     dir = other.dir;
@@ -73,6 +78,10 @@ public:
     std::swap (size_cat, other.size_cat);
     std::swap (_need_recalc_extents, other._need_recalc_extents);
     std::swap (_forced_anim_id, other._forced_anim_id);
+    std::swap (_replace_textures, other._replace_textures);
+    std::swap (_show_geosets, other._show_geosets);
+    std::swap (_visible_geoset_ids, other._visible_geoset_ids);
+    std::swap (_controlled_geoset_families, other._controlled_geoset_families);
     std::swap (extents, other.extents);
     std::swap(_transform_mat_inverted, other._transform_mat_inverted);
     std::swap(_context, other._context);
@@ -109,9 +118,33 @@ public:
   AsyncObject* instance_model() const override { return model.get(); };
 
   void setReplaceTexture(std::size_t texture_type, std::string const& filename);
+  void setGeosetVisibility(std::vector<bool> show_geosets) { _show_geosets = std::move(show_geosets); }
+  void setGeosetSelections(std::vector<std::uint16_t> visible_geoset_ids,
+                           std::vector<std::uint16_t> controlled_geoset_families)
+  {
+    _visible_geoset_ids = std::move(visible_geoset_ids);
+    _controlled_geoset_families = std::move(controlled_geoset_families);
+  }
 
   [[nodiscard]]
   std::map<std::size_t, scoped_blp_texture_reference> const& replaceTextures() const { return _replace_textures; }
+  [[nodiscard]]
+  std::vector<bool> const& geosetVisibility() const { return _show_geosets; }
+  [[nodiscard]]
+  std::vector<std::uint16_t> const& visibleGeosetIds() const { return _visible_geoset_ids; }
+  [[nodiscard]]
+  std::vector<std::uint16_t> const& controlledGeosetFamilies() const { return _controlled_geoset_families; }
+  [[nodiscard]]
+  bool isGeosetFamilyControlled(std::uint16_t geoset_family) const
+  {
+    return std::find(_controlled_geoset_families.begin(), _controlled_geoset_families.end(), geoset_family)
+      != _controlled_geoset_families.end();
+  }
+  [[nodiscard]]
+  bool isGeosetIdVisible(std::uint16_t geoset_id) const
+  {
+    return std::find(_visible_geoset_ids.begin(), _visible_geoset_ids.end(), geoset_id) != _visible_geoset_ids.end();
+  }
 
   void updateDetails(Noggit::Ui::detail_infos* detail_widget) override;
 
@@ -127,6 +160,9 @@ protected:
   std::uint32_t _gpu_transform_uid;
   int _forced_anim_id = -1;
   std::map<std::size_t, scoped_blp_texture_reference> _replace_textures;
+  std::vector<bool> _show_geosets;
+  std::vector<std::uint16_t> _visible_geoset_ids;
+  std::vector<std::uint16_t> _controlled_geoset_families;
 
 };
 

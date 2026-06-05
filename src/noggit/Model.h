@@ -198,6 +198,8 @@ public:
   std::vector<int> _specialTextures;
   std::vector<bool> _useReplaceTextures;
   std::vector<int16_t> _texture_unit_lookup;
+  std::vector<ModelAttachmentDef> _attachments;
+  std::vector<int16_t> _attachment_lookup;
 
   // ===============================
   // Misc ?
@@ -233,6 +235,10 @@ private:
   bool _per_instance_animation;
   bool _uses_classic_layout = false;
   uint32_t _embedded_view_offset = 0;
+  bool _logged_layout_summary = false;
+  bool _logged_animation_branch = false;
+  bool _logged_classic_character_geosets = false;
+  std::uint32_t _logged_missing_special_texture_mask = 0;
   std::vector<ClassicStaticBone> _classic_static_bones;
   int _current_anim_seq;
   int _anim_time;
