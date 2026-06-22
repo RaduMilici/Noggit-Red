@@ -74,8 +74,21 @@ public:
     glm::vec3 original_pos = glm::vec3(0.0f);
     float orientation = 0.0f;
     float original_orientation = 0.0f;
+    int animation_time_offset = 0;
+    float template_scale = 1.0f;
+    float model_scale = 1.0f;
+    std::string model_path;
+    bool is_character_model = false;
+    std::uint32_t mainhand_display_id = 0;
+    std::uint32_t offhand_display_id = 0;
+    std::uint32_t ranged_display_id = 0;
+    std::uint32_t mainhand_inventory_type = 0;
+    std::uint32_t offhand_inventory_type = 0;
+    std::uint32_t ranged_inventory_type = 0;
+    bool model_create_failed = false;
     bool hovered = false;
     bool selected = false;
+    bool pending_create = false;
     bool dirty = false;
     std::optional<ModelInstance> model_instance;
     std::vector<AttachmentModel> attachment_models;
@@ -438,6 +451,10 @@ public:
   bool reloadCreatureSpawns();
   void ensureCreatureSpawnsLoaded();
   void clearCreatureSpawns();
+  bool ensureCreatureSpawnModel(CreatureSpawnOverlay& spawn);
+  std::vector<std::pair<std::size_t, std::string>> applyCreatureSpawnModelAppearance(CreatureSpawnOverlay const& spawn,
+                                                                                     ModelInstance& model_instance,
+                                                                                     Noggit::NoggitRenderContext context) const;
   void setDrawCreatureSpawns(bool state) { _draw_creature_spawns = state; }
   bool drawCreatureSpawns() const { return _draw_creature_spawns; }
   bool hasCreatureSpawnsLoaded() const { return _creature_spawns_loaded; }

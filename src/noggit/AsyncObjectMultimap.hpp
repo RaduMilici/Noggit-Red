@@ -22,11 +22,21 @@ struct pair_hash
   {
     auto h1 = std::hash<int>{}(p.first);
     auto h2 = std::hash<std::string>{}(p.second.hasFilepath() ? p.second.filepath() : "");
-    auto h3 = std::hash<int>{}(p.second.fileDataID());
+    auto h3 = std::hash<int>{}(p.second.hasFileDataID() ? p.second.fileDataID() : 0);
 
     return h1 ^ h2 ^ h3;
   }
 };
+
+inline std::string async_object_filename(BlizzardArchive::Listfile::FileKey const& file_key)
+{
+  if (file_key.hasFilepath())
+  {
+    return file_key.filepath();
+  }
+
+  return file_key.hasFileDataID() ? std::to_string(file_key.fileDataID()) : std::string();
+}
 
 namespace Noggit
 {
@@ -65,7 +75,7 @@ namespace Noggit
                      {
                        return &_elements.emplace ( std::piecewise_construct
                                                  , std::forward_as_tuple (pair)
-                                                 , std::forward_as_tuple (file_key.filepath(), context, args...)
+                                                 , std::forward_as_tuple (async_object_filename(file_key), context, args...)
                                                  ).first->second;
                      }()
                    );
@@ -92,11 +102,9 @@ namespace Noggit
 
       if (obj)
       {
-        // always make sure an async object can be deleted before deleting it
-        if (!obj->finishedLoading())
-        {
-          AsyncLoader::instance().ensure_deletable(obj);
-        }
+        // The object may have been loaded manually while a queued async pointer
+        // still exists, so it must always be removed from the loader before erase.
+        AsyncLoader::instance().ensure_deletable(obj);
 
         {
           std::scoped_lock lock(_mutex);

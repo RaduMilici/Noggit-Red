@@ -35,6 +35,7 @@
 #include <opengl/scoped.hpp>
 #include <noggit/ui/tools/ViewToolbar/Ui/ViewToolbar.hpp>
 #include <noggit/ui/tools/AssetBrowser/Ui/AssetBrowser.hpp>
+#include <noggit/ui/tools/AssetBrowser/ModelView.hpp>
 #include <noggit/ui/tools/PresetEditor/Ui/PresetEditor.hpp>
 #include <noggit/ui/tools/NodeEditor/Ui/NodeEditor.hpp>
 #include <noggit/ui/tools/UiCommon/ImageBrowser.hpp>
@@ -68,6 +69,7 @@
 
 #include <QtCore/QTimer>
 #include <QtGui/QMouseEvent>
+#include <QtGui/QColor>
 #include <QtWidgets/QApplication>
 #include <QtWidgets/QCheckBox>
 #include <QtWidgets/QHBoxLayout>
@@ -77,9 +79,13 @@
 #include <QtWidgets/QMenuBar>
 #include <QtWidgets/QDoubleSpinBox>
 #include <QtWidgets/QFormLayout>
+#include <QtWidgets/QGroupBox>
+#include <QtWidgets/QHeaderView>
 #include <QtWidgets/QPushButton>
+#include <QtWidgets/QSplitter>
 #include <QtWidgets/QStatusBar>
 #include <QtWidgets/QToolTip>
+#include <QtWidgets/QTreeWidget>
 #include <QtWidgets/QVBoxLayout>
 #include <QWidgetAction>
 #include <QSurfaceFormat>
@@ -98,14 +104,37 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <functional>
 #include <iomanip>
 #include <iostream>
+#include <map>
+#include <memory>
 
 #include <vector>
 #include <random>
 
 namespace
 {
+  bool capture_debug_enabled()
+  {
+    if (char const* value = std::getenv("NOGGIT_CAPTURE_DEBUG"))
+    {
+      return std::string(value) != "0";
+    }
+
+    return false;
+  }
+
+  bool creature_capture_overlay_enabled()
+  {
+    if (char const* value = std::getenv("NOGGIT_CAPTURE_CREATURES"))
+    {
+      return std::string(value) != "0";
+    }
+
+    return true;
+  }
+
   glm::vec3 server_to_client_creature_position(float server_x, float server_y, float server_z, bool global_wmo_map)
   {
     if (global_wmo_map)
@@ -138,6 +167,67 @@ namespace
 
     return orientation;
   }
+
+  QString creature_type_label(std::uint32_t creature_type)
+  {
+    switch (creature_type)
+    {
+      case 1:  return "Beast";
+      case 2:  return "Dragonkin";
+      case 3:  return "Demon";
+      case 4:  return "Elemental";
+      case 5:  return "Giant";
+      case 6:  return "Undead";
+      case 7:  return "Humanoid";
+      case 8:  return "Critter";
+      case 9:  return "Mechanical";
+      case 10: return "Not specified";
+      case 11: return "Totem";
+      case 12: return "Non-combat Pet";
+      case 13: return "Gas Cloud";
+      default: return QString("Type %1").arg(creature_type);
+    }
+  }
+
+  class CreaturePreviewModelViewer final : public Noggit::Ui::Tools::AssetBrowser::ModelViewer
+  {
+  public:
+    explicit CreaturePreviewModelViewer(QWidget* parent = nullptr)
+      : Noggit::Ui::Tools::AssetBrowser::ModelViewer(parent, Noggit::NoggitRenderContext::ASSET_BROWSER)
+    {
+    }
+
+    std::function<void()> on_double_click;
+
+    void setCreatureSpawnPreview(World& world, World::CreatureSpawnOverlay const& spawn)
+    {
+      setModel(spawn.model_path);
+      if (_model_instances.empty())
+      {
+        return;
+      }
+
+      auto& instance = _model_instances.back();
+      instance.scale = std::clamp(spawn.template_scale * spawn.model_scale,
+                                  ModelInstance::min_scale(),
+                                  ModelInstance::max_scale());
+      instance.dir = glm::vec3(0.0f, spawn.orientation, 0.0f);
+      instance.updateTransformMatrix();
+      world.applyCreatureSpawnModelAppearance(spawn, instance, _context);
+      instance.recalcExtents();
+      resetCamera();
+    }
+
+  protected:
+    void mouseDoubleClickEvent(QMouseEvent* event) override
+    {
+      if (on_double_click)
+      {
+        on_double_click();
+      }
+      event->accept();
+    }
+  };
 }
 
 
@@ -357,6 +447,7 @@ void MapView::set_editing_mode(editing_mode mode)
         _minimap->use_selection(minimapTool->getSelectedTiles());
         break;
       case editing_mode::creature:
+        _show_creature_browser.set(true);
         if (!_world->hasCreatureSpawnsLoaded())
         {
           _world->reloadCreatureSpawns();
@@ -390,6 +481,28 @@ void MapView::setToolPropertyWidgetVisibility(editing_mode mode)
 {
   _tool_panel_dock->setCurrentIndex(static_cast<int>(mode));
 
+  auto set_creature_docks_visible = [](bool visible, std::initializer_list<QDockWidget*> docks)
+  {
+    for (auto* dock : docks)
+    {
+      if (dock)
+      {
+        dock->setVisible(visible);
+      }
+    }
+  };
+
+  if (mode != editing_mode::creature)
+  {
+    if (_creature_actions_overlay)
+    {
+      _creature_actions_overlay->setVisible(false);
+    }
+    set_creature_docks_visible(false, {_creature_browser_dock,
+                                       _creature_editor_dock,
+                                       _creature_model_picker_dock});
+  }
+
   switch (mode)
   {
 
@@ -399,7 +512,14 @@ void MapView::setToolPropertyWidgetVisibility(editing_mode mode)
     _viewport_overlay_ui->gizmoBar->setVisible(!ui_hidden);
     break;
   case editing_mode::creature:
-    _creature_browser_dock->setVisible(!ui_hidden);
+    if (_creature_actions_overlay)
+    {
+      _creature_actions_overlay->setVisible(!ui_hidden && _show_creature_browser.get());
+    }
+    set_creature_docks_visible(!ui_hidden && _show_creature_browser.get(),
+                               {_creature_browser_dock,
+                                _creature_editor_dock,
+                                _creature_model_picker_dock});
     break;
   case editing_mode::paint:
     _texture_browser_dock->setVisible(!ui_hidden && _settings->value("map_view/texture_browser", false).toBool());
@@ -945,11 +1065,18 @@ void MapView::setupObjectEditorUi()
 
 void MapView::setupCreatureEditorUi()
 {
+  _creature_editor_dock = new QDockWidget("Creature Coordinates", _main_window);
+  _creature_editor_dock->setFeatures(QDockWidget::DockWidgetMovable
+                                      | QDockWidget::DockWidgetFloatable
+                                      | QDockWidget::DockWidgetClosable);
+  _creature_editor_dock->setAllowedAreas(Qt::RightDockWidgetArea | Qt::BottomDockWidgetArea);
+  _creature_editor_dock->setMinimumWidth(260);
+
   auto container = new QWidget(this);
   auto layout = new QVBoxLayout(container);
   layout->setContentsMargins(6, 6, 6, 6);
 
-  auto hint = new QLabel("Left click: select/drag spawn\nShift+click or shift-drag: multi-select\nUse 'Export SQL' to persist", container);
+  auto hint = new QLabel("Left click: select or drag\nShift: add or box-select", container);
   hint->setWordWrap(true);
   layout->addWidget(hint);
 
@@ -982,7 +1109,6 @@ void MapView::setupCreatureEditorUi()
   form->addRow("Z:", _spawn_edit_z);
   form->addRow("Orientation:", _spawn_edit_orientation);
   layout->addLayout(form);
-  layout->addStretch();
 
   auto on_change = [this](double) {
     if (!_selected_creature_spawn_guid)
@@ -996,7 +1122,8 @@ void MapView::setupCreatureEditorUi()
       static_cast<float>(_spawn_edit_y->value()),
       static_cast<float>(_spawn_edit_z->value()));
     spawn->orientation = static_cast<float>(glm::radians(_spawn_edit_orientation->value()));
-    spawn->dirty = glm::distance(spawn->pos, spawn->original_pos) > 0.01f
+    spawn->dirty = spawn->pending_create
+                || glm::distance(spawn->pos, spawn->original_pos) > 0.01f
                 || std::abs(spawn->orientation - spawn->original_orientation) > 0.01f;
 
     if (spawn->model_instance)
@@ -1016,16 +1143,25 @@ void MapView::setupCreatureEditorUi()
   connect(_spawn_edit_z,           qOverload<double>(&QDoubleSpinBox::valueChanged), on_change);
   connect(_spawn_edit_orientation, qOverload<double>(&QDoubleSpinBox::valueChanged), on_change);
 
-  _tool_panel_dock->registerTool("Creature Editor", container);
+  _creature_editor_dock->setWidget(container);
+  _main_window->addDockWidget(Qt::RightDockWidgetArea, _creature_editor_dock);
+  if (_creature_browser_dock)
+  {
+    _main_window->splitDockWidget(_creature_browser_dock, _creature_editor_dock, Qt::Vertical);
+  }
+  _creature_editor_dock->setVisible(false);
+  connect(this, &QObject::destroyed, _creature_editor_dock, &QObject::deleteLater);
 }
 
 void MapView::setupCreatureBrowserUi()
 {
-  _creature_browser_dock = new QDockWidget("Creature Browser", this);
+  _creature_browser_dock = new QDockWidget("Creature Browser", _main_window);
   _creature_browser_dock->setFeatures(QDockWidget::DockWidgetMovable
                                       | QDockWidget::DockWidgetFloatable
                                       | QDockWidget::DockWidgetClosable);
   _creature_browser_dock->setAllowedAreas(Qt::LeftDockWidgetArea | Qt::RightDockWidgetArea | Qt::BottomDockWidgetArea);
+  _creature_browser_dock->setMinimumWidth(330);
+  _creature_browser_dock->resize(380, 520);
   _main_window->addDockWidget(Qt::RightDockWidgetArea, _creature_browser_dock);
   connect(this, &QObject::destroyed, _creature_browser_dock, &QObject::deleteLater);
 
@@ -1037,28 +1173,17 @@ void MapView::setupCreatureBrowserUi()
   _creature_search_field->setPlaceholderText("Search by creature name, guid, or entry");
   layout->addWidget(_creature_search_field);
 
-  _creature_search_all_maps = new QCheckBox("Search all maps", container);
-  layout->addWidget(_creature_search_all_maps);
-
   _creature_list_widget = new QListWidget(container);
   _creature_list_widget->setSelectionMode(QAbstractItemView::SingleSelection);
+  _creature_list_widget->setMinimumHeight(360);
   layout->addWidget(_creature_list_widget, 1);
-
-  auto button_row = new QHBoxLayout();
-  auto reload_button = new QPushButton("Reload", container);
-  auto save_button = new QPushButton("Export SQL", container);
-  auto revert_button = new QPushButton("Discard Pending", container);
-  button_row->addWidget(reload_button);
-  button_row->addWidget(save_button);
-  button_row->addWidget(revert_button);
-  layout->addLayout(button_row);
 
   _creature_browser_status = new QLabel(container);
   _creature_browser_status->setWordWrap(true);
   layout->addWidget(_creature_browser_status);
 
   _creature_browser_dock->setWidget(container);
-  _creature_browser_dock->setVisible(_settings->value("map_view/creature_browser", false).toBool());
+  _creature_browser_dock->setVisible(false);
 
   connect(_creature_browser_dock, &QDockWidget::visibilityChanged,
           [this](bool visible)
@@ -1073,9 +1198,24 @@ void MapView::setupCreatureBrowserUi()
   connect(&_show_creature_browser, &Noggit::BoolToggleProperty::changed,
           [this](bool visible)
           {
-            if (!ui_hidden && _creature_browser_dock)
+            if (ui_hidden)
             {
-              _creature_browser_dock->setVisible(visible);
+              return;
+            }
+
+            if (_creature_actions_overlay)
+            {
+              _creature_actions_overlay->setVisible(visible);
+            }
+
+            for (auto* dock : {_creature_browser_dock,
+                               _creature_editor_dock,
+                               _creature_model_picker_dock})
+            {
+              if (dock)
+              {
+                dock->setVisible(visible);
+              }
             }
           });
   connect(_creature_browser_dock, &QDockWidget::visibilityChanged,
@@ -1086,13 +1226,54 @@ void MapView::setupCreatureBrowserUi()
           {
             rebuildCreatureBrowserList(true);
           });
-  connect(_creature_search_all_maps, &QCheckBox::toggled,
-          [this]()
-          {
-            rebuildCreatureBrowserList(false);
-          });
   connect(_creature_list_widget, &QListWidget::itemClicked,
           this, &MapView::jumpToCreatureListItem);
+
+  updateCreatureBrowserStatus();
+}
+
+void MapView::setupCreatureActionsUi()
+{
+  if (!_overlay_widget)
+  {
+    return;
+  }
+
+  _creature_actions_overlay = new QWidget(_overlay_widget);
+  _creature_actions_overlay->setObjectName("creatureActionsOverlay");
+  _creature_actions_overlay->setAttribute(Qt::WA_StyledBackground, true);
+  _creature_actions_overlay->setStyleSheet(
+    "#creatureActionsOverlay { background: rgba(28, 31, 37, 210); border: 1px solid rgba(85, 91, 103, 180); }"
+    "#creatureActionsOverlay QPushButton { padding: 5px 9px; }");
+
+  auto layout = new QHBoxLayout(_creature_actions_overlay);
+  layout->setContentsMargins(5, 5, 5, 5);
+  layout->setSpacing(5);
+
+  auto reload_button = new QPushButton("Reload Spawns", _creature_actions_overlay);
+  auto save_button = new QPushButton("Export SQL", _creature_actions_overlay);
+  auto revert_button = new QPushButton("Discard Pending", _creature_actions_overlay);
+  layout->addWidget(reload_button);
+  layout->addWidget(save_button);
+  layout->addWidget(revert_button);
+
+  auto place_actions = [this]()
+  {
+    if (!_creature_actions_overlay)
+    {
+      return;
+    }
+
+    _creature_actions_overlay->adjustSize();
+    _creature_actions_overlay->move(std::max(8, width() - _creature_actions_overlay->width() - 14), 8);
+    _creature_actions_overlay->raise();
+  };
+
+  _creature_actions_overlay->setVisible(false);
+  place_actions();
+  connect(this, &MapView::resized, this, place_actions);
+  connect(this, &QObject::destroyed, _creature_actions_overlay, &QObject::deleteLater);
+
   connect(reload_button, &QPushButton::clicked,
           [this]()
           {
@@ -1108,8 +1289,453 @@ void MapView::setupCreatureBrowserUi()
           {
             refreshCreatureSpawnOverlay(true);
           });
+}
 
-  updateCreatureBrowserStatus();
+void MapView::setupCreatureModelPickerUi()
+{
+  _creature_model_picker_dock = new QDockWidget("NPC Model Picker", _main_window);
+  _creature_model_picker_dock->setFeatures(QDockWidget::DockWidgetMovable
+                                           | QDockWidget::DockWidgetFloatable
+                                           | QDockWidget::DockWidgetClosable);
+  _creature_model_picker_dock->setAllowedAreas(Qt::BottomDockWidgetArea | Qt::TopDockWidgetArea);
+  _creature_model_picker_dock->setMinimumHeight(220);
+
+  auto container = new QWidget(this);
+  auto root_layout = new QVBoxLayout(container);
+  root_layout->setContentsMargins(6, 6, 6, 6);
+  root_layout->setSpacing(6);
+
+  auto filter_layout = new QHBoxLayout();
+  auto categorize_by_faction = new QCheckBox("Type", container);
+  auto elite_only = new QCheckBox("Elite", container);
+  auto boss_only = new QCheckBox("Boss", container);
+  auto civilian_only = new QCheckBox("Civilian", container);
+  auto trainer_only = new QCheckBox("Trainer", container);
+  categorize_by_faction->setToolTip("Group creature_template entries by creature type when available.");
+  elite_only->setToolTip("Show rank 1 and 2 entries.");
+  boss_only->setToolTip("Show rank 3 and higher entries.");
+  civilian_only->setToolTip("Show entries with the civilian type flag.");
+  trainer_only->setToolTip("Show entries with trainer NPC flags.");
+  filter_layout->addWidget(categorize_by_faction);
+  filter_layout->addWidget(elite_only);
+  filter_layout->addWidget(boss_only);
+  filter_layout->addWidget(civilian_only);
+  filter_layout->addWidget(trainer_only);
+  filter_layout->addStretch();
+  root_layout->addLayout(filter_layout);
+
+  auto splitter = new QSplitter(Qt::Horizontal, container);
+  _creature_model_tree = new QTreeWidget(splitter);
+  _creature_model_tree->setHeaderHidden(true);
+  _creature_model_tree->setMinimumWidth(360);
+
+  auto preview = new CreaturePreviewModelViewer(splitter);
+  preview->setMinimumSize(360, 220);
+
+  auto spawn_box = new QGroupBox("New Spawn", splitter);
+  auto spawn_layout = new QFormLayout(spawn_box);
+  auto guid_field = new QLineEdit(spawn_box);
+  auto entry_field = new QLineEdit(spawn_box);
+  auto display_field = new QLineEdit(spawn_box);
+  auto add_button = new QPushButton("Add Pending Spawn", spawn_box);
+  add_button->setEnabled(false);
+  guid_field->setPlaceholderText("GUID");
+  entry_field->setPlaceholderText("Entry");
+  display_field->setPlaceholderText("Display ID");
+  spawn_layout->addRow("GUID:", guid_field);
+  spawn_layout->addRow("Entry:", entry_field);
+  spawn_layout->addRow("Display:", display_field);
+  spawn_layout->addRow(add_button);
+  splitter->addWidget(_creature_model_tree);
+  splitter->addWidget(preview);
+  splitter->addWidget(spawn_box);
+  splitter->setStretchFactor(0, 2);
+  splitter->setStretchFactor(1, 3);
+  splitter->setStretchFactor(2, 1);
+  splitter->setSizes({420, 620, 260});
+  root_layout->addWidget(splitter, 1);
+
+  _creature_model_picker_status = new QLabel("Loading creature_template entries...", container);
+  _creature_model_picker_status->setWordWrap(true);
+  root_layout->addWidget(_creature_model_picker_status);
+
+  struct TemplatePickerEntry
+  {
+    std::uint32_t entry = 0;
+    std::uint32_t faction = 0;
+    std::uint32_t creature_type = 0;
+    std::uint32_t rank = 0;
+    std::uint32_t npc_flags = 0;
+    std::uint32_t type_flags = 0;
+    std::uint32_t flags_extra = 0;
+    std::uint32_t display_id = 0;
+    std::uint32_t model_id = 0;
+    std::string name;
+    std::string path;
+    float template_scale = 1.0f;
+    float model_scale = 1.0f;
+  };
+
+  auto normalize_picker_path = [](std::string path)
+  {
+    std::replace(path.begin(), path.end(), '\\', '/');
+    std::transform(path.begin(), path.end(), path.begin(), [](unsigned char c)
+    {
+      return static_cast<char>(std::tolower(c));
+    });
+
+    if (auto extension_pos = path.rfind(".mdx"); extension_pos != std::string::npos)
+    {
+      path.replace(extension_pos, 4, ".m2");
+    }
+    else if (auto extension_pos = path.rfind(".mdl"); extension_pos != std::string::npos)
+    {
+      path.replace(extension_pos, 4, ".m2");
+    }
+    else if (path.rfind('.') == std::string::npos)
+    {
+      path += ".m2";
+    }
+    return path;
+  };
+
+  auto resolve_display_model = [&](std::uint32_t display_id,
+                                   std::uint32_t& model_id,
+                                   std::string& model_path,
+                                   float& model_scale)
+  {
+    try
+    {
+      auto display = gCreatureDisplayInfoDB.getByID(display_id);
+      model_id = display.getUInt(CreatureDisplayInfoDB::ModelID);
+      auto model = gCreatureModelDataDB.getByID(model_id);
+      model_path = normalize_picker_path(model.getString(CreatureModelDataDB::ModelName));
+      auto const scale = model.getFloat(CreatureModelDataDB::ModelScale);
+      model_scale = scale > 0.0f ? scale : 1.0f;
+      return !model_path.empty();
+    }
+    catch (DBCFile::NotFound const&)
+    {
+      model_id = 0;
+      model_path.clear();
+      model_scale = 1.0f;
+      return false;
+    }
+  };
+
+  auto template_entries = std::make_shared<std::vector<TemplatePickerEntry>>();
+
+#ifdef USE_MYSQL_UID_STORAGE
+  std::string template_error;
+  auto records = mysql::getCreatureTemplates(25000, &template_error);
+  template_entries->reserve(records.size());
+  for (auto const& record : records)
+  {
+    TemplatePickerEntry entry;
+    entry.entry = record.entry;
+    entry.faction = record.faction;
+    entry.creature_type = record.creature_type;
+    entry.rank = record.rank;
+    entry.npc_flags = record.npc_flags;
+    entry.type_flags = record.type_flags;
+    entry.flags_extra = record.flags_extra;
+    entry.display_id = record.display_id;
+    entry.name = record.name;
+    entry.template_scale = record.template_scale;
+    if (entry.display_id)
+    {
+      resolve_display_model(entry.display_id, entry.model_id, entry.path, entry.model_scale);
+    }
+    template_entries->push_back(std::move(entry));
+  }
+#else
+  std::string template_error = "Build does not include MySQL support.";
+#endif
+
+  auto selected_template = std::make_shared<std::optional<TemplatePickerEntry>>();
+
+  auto suggested_guid = [this]()
+  {
+    std::uint32_t highest = 0;
+    for (auto const& spawn : _world->creatureSpawns())
+    {
+      highest = std::max(highest, spawn.guid);
+    }
+    return highest + 1;
+  };
+
+  auto passes_filters = [=](TemplatePickerEntry const& entry)
+  {
+    if (elite_only->isChecked() && !(entry.rank == 1u || entry.rank == 2u))
+    {
+      return false;
+    }
+    if (boss_only->isChecked() && entry.rank < 3u && (entry.type_flags & 0x4u) == 0u)
+    {
+      return false;
+    }
+    if (civilian_only->isChecked() && (entry.flags_extra & 0x2u) == 0u && (entry.type_flags & 0x80u) == 0u)
+    {
+      return false;
+    }
+    if (trainer_only->isChecked() && (entry.npc_flags & 0x10u) == 0u)
+    {
+      return false;
+    }
+    return true;
+  };
+
+  auto rebuild_template_tree = [=]()
+  {
+    _creature_model_tree->clear();
+    std::map<std::uint32_t, QTreeWidgetItem*> group_items;
+    std::size_t visible_count = 0;
+    std::size_t previewable_count = 0;
+
+    for (auto const& entry : *template_entries)
+    {
+      if (!passes_filters(entry))
+      {
+        continue;
+      }
+
+      ++visible_count;
+      if (!entry.path.empty())
+      {
+        ++previewable_count;
+      }
+
+      QTreeWidgetItem* parent = nullptr;
+      if (categorize_by_faction->isChecked())
+      {
+        auto const group_id = entry.creature_type ? entry.creature_type : entry.faction;
+        auto it = group_items.find(group_id);
+        if (it == group_items.end())
+        {
+          parent = new QTreeWidgetItem(_creature_model_tree);
+          parent->setText(0, entry.creature_type
+            ? QString("%1 (%2)").arg(creature_type_label(entry.creature_type)).arg(entry.creature_type)
+            : QString("Faction %1").arg(entry.faction));
+          parent->setData(0, Qt::UserRole + 1, false);
+          it = group_items.emplace(group_id, parent).first;
+        }
+        parent = it->second;
+      }
+
+      auto* row = parent ? new QTreeWidgetItem(parent) : new QTreeWidgetItem(_creature_model_tree);
+      row->setText(0, QString("%1 - %2").arg(entry.entry).arg(QString::fromStdString(entry.name)));
+      row->setData(0, Qt::UserRole, static_cast<qulonglong>(entry.entry));
+      row->setData(0, Qt::UserRole + 1, true);
+      if (entry.path.empty())
+      {
+        row->setForeground(0, QColor(135, 135, 135));
+      }
+    }
+
+    _creature_model_tree->sortItems(0, Qt::AscendingOrder);
+    if (categorize_by_faction->isChecked())
+    {
+      _creature_model_tree->expandToDepth(0);
+    }
+
+    if (_creature_model_picker_status)
+    {
+      QString message = QString("%1 creature_template entr%2 shown, %3 previewable")
+                          .arg(visible_count)
+                          .arg(visible_count == 1 ? "y" : "ies")
+                          .arg(previewable_count);
+      if (!template_error.empty())
+      {
+        message = QString("Template load failed: %1").arg(QString::fromStdString(template_error));
+      }
+      _creature_model_picker_status->setText(message);
+    }
+  };
+
+  auto update_add_button = [=]()
+  {
+    bool guid_ok = false;
+    bool entry_ok = false;
+    bool display_ok = false;
+    guid_field->text().toUInt(&guid_ok);
+    entry_field->text().toUInt(&entry_ok);
+    display_field->text().toUInt(&display_ok);
+    add_button->setEnabled(guid_ok && entry_ok && display_ok && selected_template && selected_template->has_value()
+                           && !selected_template->value().path.empty());
+  };
+
+  auto select_template_entry = [=](std::uint32_t entry_id)
+  {
+    auto found = std::find_if(template_entries->begin(), template_entries->end(),
+      [entry_id](TemplatePickerEntry const& entry)
+      {
+        return entry.entry == entry_id;
+      });
+
+    if (found == template_entries->end())
+    {
+      selected_template->reset();
+      update_add_button();
+      return;
+    }
+
+    *selected_template = *found;
+    guid_field->setText(QString::number(suggested_guid()));
+    entry_field->setText(QString::number(found->entry));
+    display_field->setText(QString::number(found->display_id));
+
+    if (!found->path.empty())
+    {
+      World::CreatureSpawnOverlay preview_spawn;
+      preview_spawn.guid = suggested_guid();
+      preview_spawn.entry = found->entry;
+      preview_spawn.display_id = found->display_id;
+      preview_spawn.name = found->name;
+      preview_spawn.template_scale = found->template_scale;
+      preview_spawn.model_scale = found->model_scale;
+      preview_spawn.model_path = found->path;
+      preview_spawn.is_character_model = preview_spawn.model_path.rfind("character/", 0) == 0;
+
+      try
+      {
+        preview->setCreatureSpawnPreview(*_world, preview_spawn);
+        _creature_model_picker_status->setText(QString("%1 | entry %2 | display %3 | %4")
+                                                 .arg(QString::fromStdString(found->name))
+                                                 .arg(found->entry)
+                                                 .arg(found->display_id)
+                                                 .arg(found->creature_type
+                                                   ? creature_type_label(found->creature_type)
+                                                   : QString("faction %1").arg(found->faction)));
+      }
+      catch (std::exception const& error)
+      {
+        _creature_model_picker_status->setText(QString("Preview failed for %1: %2")
+                                                 .arg(QString::fromStdString(found->path))
+                                                 .arg(error.what()));
+      }
+      catch (...)
+      {
+        _creature_model_picker_status->setText(QString("Preview failed for %1")
+                                                 .arg(QString::fromStdString(found->path)));
+      }
+    }
+    else
+    {
+      _creature_model_picker_status->setText(QString("%1 has no previewable CreatureDisplayInfo model")
+                                               .arg(QString::fromStdString(found->name)));
+    }
+
+    update_add_button();
+  };
+
+  auto add_pending_spawn = [=]()
+  {
+    if (!selected_template || !selected_template->has_value())
+    {
+      _main_window->statusBar()->showMessage("Select a creature_template entry first", 5000);
+      return;
+    }
+
+    bool guid_ok = false;
+    bool entry_ok = false;
+    bool display_ok = false;
+    auto const guid = guid_field->text().toUInt(&guid_ok);
+    auto const entry_id = entry_field->text().toUInt(&entry_ok);
+    auto const display_id = display_field->text().toUInt(&display_ok);
+    if (!guid_ok || !entry_ok || !display_ok || !guid || !entry_id || !display_id)
+    {
+      _main_window->statusBar()->showMessage("Enter a valid GUID, entry, and display ID", 5000);
+      return;
+    }
+
+    if (_world->findCreatureSpawn(guid))
+    {
+      _main_window->statusBar()->showMessage(QString("Creature GUID %1 already exists in this overlay").arg(guid), 5000);
+      return;
+    }
+
+    TemplatePickerEntry entry = selected_template->value();
+    if (entry.display_id != display_id)
+    {
+      entry.display_id = display_id;
+      resolve_display_model(entry.display_id, entry.model_id, entry.path, entry.model_scale);
+    }
+
+    if (entry.path.empty())
+    {
+      _main_window->statusBar()->showMessage(QString("Creature template %1 has no previewable model").arg(entry_id), 5000);
+      return;
+    }
+
+    glm::vec3 spawn_pos = _camera.position + _camera.direction() * 8.0f;
+    if (spawn_pos.y < -5000.0f)
+    {
+      spawn_pos = _cursor_pos;
+    }
+
+    World::CreatureSpawnOverlay spawn;
+    spawn.guid = guid;
+    spawn.entry = entry_id;
+    spawn.display_id = entry.display_id;
+    spawn.name = entry.name.empty() ? "New pending NPC" : entry.name;
+    spawn.pos = spawn_pos;
+    spawn.original_pos = spawn.pos;
+    spawn.orientation = _camera.yaw()._;
+    spawn.original_orientation = spawn.orientation;
+    spawn.animation_time_offset = static_cast<int>(((guid * 1103515245u) + (entry_id * 12345u)) % 3500u);
+    spawn.template_scale = entry.template_scale;
+    spawn.model_scale = entry.model_scale;
+    spawn.model_path = entry.path;
+    spawn.is_character_model = spawn.model_path.rfind("character/", 0) == 0;
+    spawn.pending_create = true;
+    spawn.dirty = true;
+    spawn.selected = true;
+
+    for (auto& existing_spawn : _world->creatureSpawns())
+    {
+      existing_spawn.selected = false;
+    }
+
+    _world->creatureSpawns().push_back(std::move(spawn));
+    auto& added_spawn = _world->creatureSpawns().back();
+    _world->ensureCreatureSpawnModel(added_spawn);
+
+    _selected_creature_spawn_guid = guid;
+    rebuildCreatureBrowserList(true);
+    refreshCreatureEditorKnobs();
+    updateDatabaseStatus();
+    guid_field->setText(QString::number(suggested_guid()));
+    _needs_redraw = true;
+    _main_window->statusBar()->showMessage(QString("Pending creature spawn %1 added in front of camera").arg(guid), 5000);
+  };
+
+  connect(_creature_model_tree, &QTreeWidget::itemClicked,
+          [=](QTreeWidgetItem* item, int)
+          {
+            if (!item || !item->data(0, Qt::UserRole + 1).toBool())
+            {
+              return;
+            }
+            select_template_entry(static_cast<std::uint32_t>(item->data(0, Qt::UserRole).toULongLong()));
+          });
+
+  connect(guid_field, &QLineEdit::textChanged, update_add_button);
+  connect(entry_field, &QLineEdit::textChanged, update_add_button);
+  connect(display_field, &QLineEdit::textChanged, update_add_button);
+  connect(categorize_by_faction, &QCheckBox::stateChanged, rebuild_template_tree);
+  connect(elite_only, &QCheckBox::stateChanged, rebuild_template_tree);
+  connect(boss_only, &QCheckBox::stateChanged, rebuild_template_tree);
+  connect(civilian_only, &QCheckBox::stateChanged, rebuild_template_tree);
+  connect(trainer_only, &QCheckBox::stateChanged, rebuild_template_tree);
+  connect(add_button, &QPushButton::clicked, add_pending_spawn);
+  preview->on_double_click = add_pending_spawn;
+
+  rebuild_template_tree();
+
+  _creature_model_picker_dock->setWidget(container);
+  _main_window->addDockWidget(Qt::BottomDockWidgetArea, _creature_model_picker_dock);
+  _creature_model_picker_dock->setVisible(false);
+  connect(this, &QObject::destroyed, _creature_model_picker_dock, &QObject::deleteLater);
 }
 
 void MapView::setupMinimapEditorUi()
@@ -1145,6 +1771,8 @@ void MapView::setupNodeEditor()
                                  | QDockWidget::DockWidgetFloatable
                                  | QDockWidget::DockWidgetClosable);
 
+  // QtNodes startup can still abort the process during style initialization.
+  // Keep the dock shell, but do not restore/create the widget automatically.
   auto ensure_node_editor = [this]()
   {
     if (_node_editor_dock->widget())
@@ -1152,18 +1780,32 @@ void MapView::setupNodeEditor()
       return;
     }
 
-    auto node_editor = new Noggit::Ui::Tools::NodeEditor::Ui::NodeEditorWidget(this);
-    _node_editor_dock->setWidget(node_editor);
+    try
+    {
+      auto node_editor = new Noggit::Ui::Tools::NodeEditor::Ui::NodeEditorWidget(this);
+      _node_editor_dock->setWidget(node_editor);
+    }
+    catch (...)
+    {
+      LogError << "Failed to initialize node editor dock during map view setup; hiding dock to keep map load alive."
+               << std::endl;
+      _settings->setValue("map_view/node_editor", false);
+      _settings->sync();
+      _node_editor_dock->hide();
+    }
   };
 
-  _node_editor_dock->setVisible(_settings->value ("map_view/node_editor", false).toBool());
+  _settings->setValue("map_view/node_editor", false);
+  _settings->sync();
+  _node_editor_dock->hide();
 
   connect(_node_editor_dock, &QDockWidget::visibilityChanged,
           [=](bool visible)
           {
             if (visible)
             {
-              ensure_node_editor();
+              _node_editor_dock->hide();
+              return;
             }
 
             if (ui_hidden)
@@ -2263,6 +2905,10 @@ void MapView::setupViewMenu()
         _texture_browser_dock,
         _texture_picker_dock,
         _detail_infos_dock,
+        _creature_actions_overlay,
+        _creature_browser_dock,
+        _creature_editor_dock,
+        _creature_model_picker_dock,
         _keybindings,
         _minimap_dock,
         objectEditor->modelImport,
@@ -2279,7 +2925,7 @@ void MapView::setupViewMenu()
     if (_main_window->displayed_widgets.empty())
     {
       for (auto widget : widget_list)
-        if (widget->isVisible())
+        if (widget && widget->isVisible())
         {
           _main_window->displayed_widgets.emplace(widget);
           widget->hide();
@@ -2289,7 +2935,8 @@ void MapView::setupViewMenu()
     else
     {
       for (auto widget : _main_window->displayed_widgets)
-        widget->show();
+        if (widget)
+          widget->show();
 
       _main_window->displayed_widgets.clear();
     }
@@ -2503,39 +3150,6 @@ void MapView::rebuildCreatureBrowserList(bool preserve_selection)
   QSignalBlocker blocker(_creature_list_widget);
   _creature_list_widget->clear();
 
-#ifdef USE_MYSQL_UID_STORAGE
-  if (_creature_search_all_maps && _creature_search_all_maps->isChecked() && !search_text.isEmpty())
-  {
-    std::string error;
-    auto rows = mysql::searchCreatureSpawns(search_text.toStdString(), 500, &error);
-    if (!error.empty())
-    {
-      updateCreatureBrowserStatus(QString::fromStdString(error));
-      return;
-    }
-
-    for (auto const& row : rows)
-    {
-      auto* item = new QListWidgetItem(QString("%1 [entry %2] guid %3 | map %4")
-                                         .arg(QString::fromStdString(row.name.empty() ? std::string("<unnamed>") : row.name))
-                                         .arg(row.entry)
-                                         .arg(row.guid)
-                                         .arg(row.map),
-                                       _creature_list_widget);
-      item->setData(Qt::UserRole, static_cast<qulonglong>(row.guid));
-      item->setData(Qt::UserRole + 1, static_cast<int>(row.map));
-      item->setData(Qt::UserRole + 2, row.position_x);
-      item->setData(Qt::UserRole + 3, row.position_y);
-      item->setData(Qt::UserRole + 4, row.position_z);
-      item->setData(Qt::UserRole + 5, row.orientation);
-      item->setData(Qt::UserRole + 6, false);
-    }
-
-    updateCreatureBrowserStatus(QString("Global search: %1 result(s)").arg(_creature_list_widget->count()));
-    return;
-  }
-#endif
-
   for (auto const& spawn : _world->creatureSpawns())
   {
     auto name = QString::fromStdString(spawn.name.empty() ? std::string("<unnamed>") : spawn.name);
@@ -2554,6 +3168,10 @@ void MapView::rebuildCreatureBrowserList(bool preserve_selection)
     if (spawn.selected)
     {
       prefix += "[selected] ";
+    }
+    if (spawn.pending_create)
+    {
+      prefix += "[new] ";
     }
     if (spawn.dirty)
     {
@@ -2940,7 +3558,8 @@ void MapView::translateSelectedCreatureSpawns(glm::vec3 const& delta)
   auto apply_position = [](World::CreatureSpawnOverlay& spawn, glm::vec3 const& pos)
   {
     spawn.pos = pos;
-    spawn.dirty = glm::distance(spawn.pos, spawn.original_pos) > 0.01f
+    spawn.dirty = spawn.pending_create
+               || glm::distance(spawn.pos, spawn.original_pos) > 0.01f
                || std::abs(spawn.orientation - spawn.original_orientation) > 0.01f;
 
     if (spawn.model_instance)
@@ -2992,7 +3611,8 @@ void MapView::updateSelectedCreatureSpawnPosition(glm::vec3 const& pos)
   auto apply_position = [](World::CreatureSpawnOverlay& spawn, glm::vec3 const& new_pos)
   {
     spawn.pos = new_pos;
-    spawn.dirty = glm::distance(spawn.pos, spawn.original_pos) > 0.01f
+    spawn.dirty = spawn.pending_create
+               || glm::distance(spawn.pos, spawn.original_pos) > 0.01f
                || std::abs(spawn.orientation - spawn.original_orientation) > 0.01f;
 
     if (spawn.model_instance)
@@ -3123,15 +3743,32 @@ void MapView::saveDirtyCreatureSpawns()
     stream << "-- GUID " << spawn.guid << " entry " << spawn.entry << " "
            << QString::fromStdString(spawn.name.empty() ? std::string("<unnamed>") : spawn.name)
            << "\n";
-    stream << "UPDATE creature\n"
-           << "SET position_x = " << QString::number(server_pos.x, 'f', 6) << ",\n"
-           << "    position_y = " << QString::number(server_pos.y, 'f', 6) << ",\n"
-           << "    position_z = " << QString::number(server_pos.z, 'f', 6) << ",\n"
-           << "    orientation = " << QString::number(server_orientation, 'f', 6) << "\n"
-           << "WHERE guid = " << spawn.guid << ";\n\n";
+
+    if (spawn.pending_create)
+    {
+      stream << "-- Preview display ID: " << spawn.display_id << "\n";
+      stream << "INSERT INTO creature (guid, id, map, position_x, position_y, position_z, orientation)\n"
+             << "VALUES (" << spawn.guid << ", "
+             << spawn.entry << ", "
+             << _world->getMapID() << ", "
+             << QString::number(server_pos.x, 'f', 6) << ", "
+             << QString::number(server_pos.y, 'f', 6) << ", "
+             << QString::number(server_pos.z, 'f', 6) << ", "
+             << QString::number(server_orientation, 'f', 6) << ");\n\n";
+    }
+    else
+    {
+      stream << "UPDATE creature\n"
+             << "SET position_x = " << QString::number(server_pos.x, 'f', 6) << ",\n"
+             << "    position_y = " << QString::number(server_pos.y, 'f', 6) << ",\n"
+             << "    position_z = " << QString::number(server_pos.z, 'f', 6) << ",\n"
+             << "    orientation = " << QString::number(server_orientation, 'f', 6) << "\n"
+             << "WHERE guid = " << spawn.guid << ";\n\n";
+    }
 
     spawn.original_pos = spawn.pos;
     spawn.original_orientation = spawn.orientation;
+    spawn.pending_create = false;
     spawn.dirty = false;
   }
   output.close();
@@ -3658,10 +4295,12 @@ void MapView::createGUI()
   LogDebug << "MapView::createGUI setupVertexPainterUi done" << std::endl;
   setupObjectEditorUi();
   LogDebug << "MapView::createGUI setupObjectEditorUi done" << std::endl;
-  setupCreatureEditorUi();
-  LogDebug << "MapView::createGUI setupCreatureEditorUi done" << std::endl;
   setupCreatureBrowserUi();
   LogDebug << "MapView::createGUI setupCreatureBrowserUi done" << std::endl;
+  setupCreatureEditorUi();
+  LogDebug << "MapView::createGUI setupCreatureEditorUi done" << std::endl;
+  setupCreatureModelPickerUi();
+  LogDebug << "MapView::createGUI setupCreatureModelPickerUi done" << std::endl;
   setupMinimapEditorUi();
   LogDebug << "MapView::createGUI setupMinimapEditorUi done" << std::endl;
   setupStampUi();
@@ -3676,8 +4315,8 @@ void MapView::createGUI()
 
   setupViewportOverlay();
   LogDebug << "MapView::createGUI setupViewportOverlay done" << std::endl;
-  setupNodeEditor();
-  LogDebug << "MapView::createGUI setupNodeEditor done" << std::endl;
+  setupCreatureActionsUi();
+  LogDebug << "MapView::createGUI setupCreatureActionsUi done" << std::endl;
   setupAssetBrowser();
   LogDebug << "MapView::createGUI setupAssetBrowser done" << std::endl;
   setupDetailInfos();
@@ -3706,9 +4345,14 @@ void MapView::createGUI()
 
   set_editing_mode (editing_mode::ground);
 
-  _draw_creature_spawns.set(_settings->value("view/creature_spawns", false).toBool());
-  _show_creature_browser.set(_settings->value("map_view/creature_browser", false).toBool());
+  _draw_creature_spawns.set(creature_capture_overlay_enabled()
+                              ? _settings->value("view/creature_spawns", false).toBool()
+                              : false);
+  _settings->setValue("map_view/creature_browser", false);
+  _settings->sync();
+  _show_creature_browser.set(false);
   refreshCreatureSpawnOverlay(false);
+  updateDatabaseStatus();
   LogDebug << "MapView::createGUI end" << std::endl;
 }
 
@@ -3723,6 +4367,10 @@ void MapView::on_exit_prompt()
   objectEditor->modelImport->hide();
   objectEditor->rotationEditor->hide();
   _detail_infos_dock->hide();
+  if (_creature_actions_overlay) _creature_actions_overlay->hide();
+  if (_creature_browser_dock) _creature_browser_dock->hide();
+  if (_creature_editor_dock) _creature_editor_dock->hide();
+  if (_creature_model_picker_dock) _creature_model_picker_dock->hide();
   _texture_picker_dock->hide();
   _texture_browser_dock->hide();
 }
@@ -3731,10 +4379,11 @@ MapView::MapView( math::degrees camera_yaw0
                 , math::degrees camera_pitch0
                 , glm::vec3 camera_pos
                 , Noggit::Ui::Windows::NoggitWindow* NoggitWindow
-				        , std::shared_ptr<Noggit::Project::NoggitProject> Project
+                , std::shared_ptr<Noggit::Project::NoggitProject> Project
                 , std::unique_ptr<World> world
                 , uid_fix_mode uid_fix
                 , bool from_bookmark
+                , bool capture_probe
                 )
   : _camera (camera_pos, camera_yaw0, camera_pitch0)
   , mTimespeed(0.0f)
@@ -3758,6 +4407,7 @@ MapView::MapView( math::degrees camera_yaw0
     _project(Project)
 {
   LogDebug << "MapView::MapView begin" << std::endl;
+  _capture_probe = capture_probe;
   setWindowTitle ("Noggit Studio Red - " STRPRODUCTVER);
   setFocusPolicy (Qt::StrongFocus);
   setMouseTracking (true);
@@ -3839,11 +4489,26 @@ MapView::MapView( math::degrees camera_yaw0
   int _fps_calcul = (int)((1.f / (float)_fps_limit) * 1000.f);
   std::cout << "FPS limit is set to : " << _fps_limit << " (" << _fps_calcul << ")" << std::endl;
 
-  _update_every_event_loop.start (_fps_calcul);
-  connect(&_update_every_event_loop, &QTimer::timeout,[=]{ _needs_redraw = true; update(); });
+  if (!capture_probe)
+  {
+    _update_every_event_loop.start (_fps_calcul);
+    connect(&_update_every_event_loop, &QTimer::timeout,[=]{ _needs_redraw = true; update(); });
+  }
+  else
+  {
+    LogDebug << "MapView::MapView capture probe mode: redraw timer disabled" << std::endl;
+  }
   LogDebug << "MapView::MapView before createGUI" << std::endl;
   createGUI();
   LogDebug << "MapView::MapView after createGUI" << std::endl;
+  if (capture_debug_enabled())
+  {
+    LogDebug << "MapView::MapView end capture_probe=" << _capture_probe
+             << " size=" << width() << "x" << height()
+             << " needs_redraw=" << _needs_redraw
+             << " gl_initialized=" << _gl_initialized
+             << std::endl;
+  }
 }
 
 void MapView::tabletEvent(QTabletEvent* event)
@@ -3915,6 +4580,14 @@ void MapView::on_uid_fix_fail()
 
 void MapView::initializeGL()
 {
+  if (capture_debug_enabled())
+  {
+    LogDebug << "MapView::initializeGL begin capture_probe=" << _capture_probe
+             << " size=" << width() << "x" << height()
+             << " pos=(" << _camera.position.x << ", " << _camera.position.y << ", " << _camera.position.z << ")"
+             << std::endl;
+  }
+
   bool uid_warning = false;
 
   OpenGL::context::scoped_setter const _ (::gl, context());
@@ -3970,6 +4643,10 @@ void MapView::initializeGL()
   _last_opengl_context = context();
 
   _world->renderer()->upload();
+  if (capture_debug_enabled())
+  {
+    LogDebug << "MapView::initializeGL after renderer upload" << std::endl;
+  }
   onSettingsSave();
 
   _buffers.upload();
@@ -3980,6 +4657,10 @@ void MapView::initializeGL()
   connect(context(), &QOpenGLContext::aboutToBeDestroyed, [this](){ emit aboutToLooseContext(); });
 
   _gl_initialized = true;
+  if (capture_debug_enabled())
+  {
+    LogDebug << "MapView::initializeGL end" << std::endl;
+  }
 }
 
 
@@ -4235,8 +4916,13 @@ void MapView::saveMinimap(MinimapRenderSettings* settings)
 
 void MapView::paintGL()
 {
-  ZoneScoped;
-
+  if (capture_debug_enabled())
+  {
+    LogDebug << "MapView::paintGL entered capture_probe=" << _capture_probe
+             << " needs_redraw=" << _needs_redraw
+             << " gl_initialized=" << _gl_initialized
+             << std::endl;
+  }
   static bool lock = false;
 
   if (lock)
@@ -4247,14 +4933,31 @@ void MapView::paintGL()
   else
     _needs_redraw = false;
 
+  if (capture_debug_enabled())
+  {
+    LogDebug << "MapView::paintGL after redraw gate" << std::endl;
+  }
+
   if (!_gl_initialized)
   {
+    if (capture_debug_enabled())
+    {
+      LogDebug << "MapView::paintGL before initializeGL" << std::endl;
+    }
     initializeGL();
+    if (capture_debug_enabled())
+    {
+      LogDebug << "MapView::paintGL after initializeGL gl_initialized=" << _gl_initialized << std::endl;
+    }
   }
 
   if (_last_opengl_context != context())
   {
     _gl_initialized = false;
+    if (capture_debug_enabled())
+    {
+      LogDebug << "MapView::paintGL context changed, skipping frame" << std::endl;
+    }
     return;
   }
 
@@ -4274,17 +4977,45 @@ void MapView::paintGL()
     return;
   }
 
+  if (capture_debug_enabled())
+  {
+    LogDebug << "MapView::paintGL before context setter" << std::endl;
+  }
   OpenGL::context::scoped_setter const _(::gl, context());
+  if (capture_debug_enabled())
+  {
+    LogDebug << "MapView::paintGL before makeCurrent" << std::endl;
+  }
   makeCurrent();
+  if (capture_debug_enabled())
+  {
+    LogDebug << "MapView::paintGL before clear" << std::endl;
+  }
 
   gl.clear (GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
   if (!saving_minimap)
   {
     lock = true;
+    if (capture_debug_enabled())
+    {
+      LogDebug << "MapView::paintGL before draw_map" << std::endl;
+    }
     draw_map();
+    if (capture_debug_enabled())
+    {
+      LogDebug << "MapView::paintGL after draw_map" << std::endl;
+    }
     lock = false;
+    if (capture_debug_enabled())
+    {
+      LogDebug << "MapView::paintGL before tick" << std::endl;
+    }
     tick (now - _last_update);
+    if (capture_debug_enabled())
+    {
+      LogDebug << "MapView::paintGL after tick" << std::endl;
+    }
   }
 
   _last_update = now;
@@ -5122,7 +5853,10 @@ void MapView::tick (float dt)
   // _minimap->update(); // causes massive performance issues
 
   _world->time += this->mTimespeed * dt;
-  _world->animtime += dt * 1000.0f;
+  if (_draw_model_animations.get())
+  {
+    _world->animtime += dt * 1000.0f;
+  }
 
   lightEditor->UpdateWorldTime();
 
@@ -5568,7 +6302,8 @@ void MapView::draw_map()
   }
 
   //! \note Select terrain below mouse, if no item selected or the item is map.
-  if (!(_world->has_selection()
+  if (!_capture_probe
+    && !(_world->has_selection()
     || _locked_cursor_mode.get()))
   {
     doSelection(true);
@@ -5624,6 +6359,71 @@ void MapView::draw_map()
 
   // reset after each world::draw call
   _camera_moved_since_last_draw = false;
+}
+
+void MapView::setCameraForCapture(glm::vec3 const& position, math::degrees yaw, math::degrees pitch)
+{
+  _camera.position = position;
+  _camera.yaw(yaw);
+  _camera.pitch(pitch);
+  _camera_moved_since_last_draw = true;
+  _needs_redraw = true;
+  update();
+}
+
+QImage MapView::grabRenderedFrameForCapture()
+{
+  if (width() <= 0 || height() <= 0)
+  {
+    return {};
+  }
+
+  if (capture_debug_enabled())
+  {
+    LogDebug << "MapView::grabRenderedFrameForCapture begin size="
+             << width() << "x" << height()
+             << " gl_initialized=" << _gl_initialized
+             << std::endl;
+  }
+  makeCurrent();
+  if (capture_debug_enabled())
+  {
+    LogDebug << "MapView::grabRenderedFrameForCapture after makeCurrent" << std::endl;
+  }
+  OpenGL::context::scoped_setter const _(::gl, context());
+  _needs_redraw = true;
+  if (capture_debug_enabled())
+  {
+    LogDebug << "MapView::grabRenderedFrameForCapture before paintGL" << std::endl;
+  }
+  paintGL();
+  if (capture_debug_enabled())
+  {
+    LogDebug << "MapView::grabRenderedFrameForCapture after paintGL" << std::endl;
+  }
+  glFinish();
+  if (capture_debug_enabled())
+  {
+    LogDebug << "MapView::grabRenderedFrameForCapture after glFinish" << std::endl;
+  }
+
+  QImage image(width(), height(), QImage::Format_RGBA8888);
+  if (!image.isNull())
+  {
+    gl.readPixels(0, 0, width(), height(), GL_RGBA, GL_UNSIGNED_BYTE, image.bits());
+    image = image.mirrored(false, true);
+  }
+  if (capture_debug_enabled())
+  {
+    LogDebug << "MapView::grabRenderedFrameForCapture after readPixels null=" << image.isNull() << std::endl;
+  }
+
+  doneCurrent();
+  if (capture_debug_enabled())
+  {
+    LogDebug << "MapView::grabRenderedFrameForCapture end" << std::endl;
+  }
+  return image;
 }
 
 bool MapView::event(QEvent* e)

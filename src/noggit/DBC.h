@@ -364,6 +364,55 @@ public:
     static const size_t TextureFoot = 21;
   };
 
+  class CharacterFacialHairStylesDB : public DBCFile
+  {
+  public:
+    CharacterFacialHairStylesDB() :
+      DBCFile("DBFilesClient\\CharacterFacialHairStyles.dbc")
+    { }
+
+    static const size_t RaceID = 0;
+    static const size_t SexID = 1;
+    static const size_t VariationID = 2;
+    static const size_t BeardGeoset = 3;
+    static const size_t MoustacheGeoset = 4;
+    static const size_t SideburnGeoset = 5;
+  };
+
+  class CharacterHairGeosetsDB : public DBCFile
+  {
+  public:
+    CharacterHairGeosetsDB() :
+      DBCFile("DBFilesClient\\CharHairGeosets.dbc")
+    { }
+
+    static const size_t ID = 0;
+    static const size_t RaceID = 1;
+    static const size_t SexID = 2;
+    static const size_t VariationID = 3;
+    static const size_t GeosetID = 4;
+    static const size_t ShowsScalp = 5;
+  };
+
+  class CharacterSectionsDB : public DBCFile
+  {
+  public:
+    CharacterSectionsDB() :
+      DBCFile("DBFilesClient\\CharSections.dbc")
+    { }
+
+    static const size_t ID = 0;
+    static const size_t RaceID = 1;
+    static const size_t SexID = 2;
+    static const size_t BaseSection = 3;
+    static const size_t VariationIndex = 4;
+    static const size_t ColorIndex = 5;
+    static const size_t TextureName1 = 6;
+    static const size_t TextureName2 = 7;
+    static const size_t TextureName3 = 8;
+    static const size_t Flags = 9;
+  };
+
 class WMOAreaTableDB : public DBCFile
 {
 public:
@@ -433,5 +482,8 @@ extern CreatureDisplayInfoDB gCreatureDisplayInfoDB;
 extern CreatureDisplayInfoExtraDB gCreatureDisplayInfoExtraDB;
 extern CreatureModelDataDB gCreatureModelDataDB;
 extern ItemDisplayInfoDB gItemDisplayInfoDB;
+extern CharacterFacialHairStylesDB gCharacterFacialHairStylesDB;
+extern CharacterHairGeosetsDB gCharacterHairGeosetsDB;
+extern CharacterSectionsDB gCharacterSectionsDB;
 extern WMOAreaTableDB gWMOAreaTableDB;
 extern GameObjectDisplayInfoDB gGameObjectDisplayInfoDB;

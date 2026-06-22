@@ -72,7 +72,8 @@ public:
 
   void error_on_loading()
   {
-    LogError << "File " <<  (_file_key.hasFilepath() ? _file_key.filepath() : std::to_string(_file_key.fileDataID()))
+    LogError << "Async load failed type=" << async_object_type_name()
+      << " file " <<  (_file_key.hasFilepath() ? _file_key.filepath() : std::to_string(_file_key.fileDataID()))
       << " could not be loaded" << std::endl;
 
     _loading_failed = true;
@@ -94,4 +95,10 @@ public:
 
   virtual void finishLoading() = 0;
   virtual void waitForChildrenLoaded() = 0;
+
+  [[nodiscard]]
+  virtual char const* async_object_type_name() const
+  {
+    return "AsyncObject";
+  }
 };

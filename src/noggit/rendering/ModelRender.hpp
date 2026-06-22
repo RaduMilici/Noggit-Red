@@ -180,6 +180,7 @@ namespace Noggit::Rendering
     GLuint const& _box_vbo = _buffers[2];
 
     GLuint _bone_matrices_buf_tex;
+    std::size_t _bone_matrices_buffer_size = 0;
     std::vector<glm::vec3> _vertex_box_points;
     std::vector<ModelRenderPass> _render_passes;
 

@@ -236,27 +236,22 @@ void PreviewRenderer::draw()
     m2_shader.uniform("masked_additive", 0);
     m2_shader.uniform("pixel_shader", 0);
 
-    std::vector<ModelInstance*> instance{ nullptr };
     std::vector<glm::mat4x4> instance_mtx{ glm::mat4x4(1)};
 
     for (auto& model_instance : _model_instances)
     {
       model_instance.model->wait_until_loaded();
       model_instance.model->waitForChildrenLoaded();
-      instance[0] = &model_instance;
-      instance_mtx[0] = model_instance.transformMatrix();
 
       model_instance.model->renderer()->draw(
         mv
-        , instance_mtx
+        , model_instance
         , m2_shader
         , model_render_state
         , frustum
         , culldistance
         , _camera.position
         , _animtime
-        , _draw_boxes.get()
-        , model_boxes_to_draw
         , display_mode::in_3D
       );
     }

@@ -21,6 +21,7 @@
 #include <noggit/project/CurrentProject.hpp>
 #include <noggit/ActionManager.hpp>
 #include <external/tracy/Tracy.hpp>
+#include <ClientFile.hpp>
 #ifdef USE_MYSQL_UID_STORAGE
 #include <mysql/mysql.h>
 #endif
@@ -55,15 +56,30 @@ namespace
 {
   constexpr char const* creature_geoset_trace_filename = "creature_geoset_trace_20260604.log";
   constexpr std::size_t max_logged_creature_model_failures = 8;
+  constexpr bool enable_creature_spawn_character_geosets = true;
 
   std::string normalize_model_filename(std::string filename);
   std::string normalize_texture_filename(std::string filename);
 
+  struct ClientFileHeaderProbe
+  {
+    bool opened = false;
+    std::size_t size = 0;
+    std::string magic;
+  };
+
   enum class CharacterTextureRegion
   {
+    ArmUpper,
+    ArmLower,
+    Hand,
+    FaceUpper,
+    FaceLower,
+    TorsoUpper,
     TorsoLower,
     LegUpper,
-    LegLower
+    LegLower,
+    Foot
   };
 
   struct CharacterTextureRegionRect
@@ -81,12 +97,26 @@ namespace
   {
     switch (region)
     {
+      case CharacterTextureRegion::ArmUpper:
+        return {0, 0, 256, 128};
+      case CharacterTextureRegion::ArmLower:
+        return {0, 128, 256, 128};
+      case CharacterTextureRegion::Hand:
+        return {0, 256, 256, 64};
+      case CharacterTextureRegion::FaceUpper:
+        return {0, 320, 256, 64};
+      case CharacterTextureRegion::FaceLower:
+        return {0, 384, 256, 128};
+      case CharacterTextureRegion::TorsoUpper:
+        return {256, 0, 256, 128};
       case CharacterTextureRegion::TorsoLower:
         return {256, 128, 256, 64};
       case CharacterTextureRegion::LegUpper:
         return {256, 192, 256, 128};
       case CharacterTextureRegion::LegLower:
         return {256, 320, 256, 128};
+      case CharacterTextureRegion::Foot:
+        return {256, 448, 256, 64};
     }
 
     return {0, 0, 0, 0};
@@ -108,6 +138,18 @@ namespace
     char const* prefix = nullptr;
     switch (region)
     {
+      case CharacterTextureRegion::ArmUpper:
+        prefix = "item/texturecomponents/armuppertexture/";
+        break;
+      case CharacterTextureRegion::ArmLower:
+        prefix = "item/texturecomponents/armlowertexture/";
+        break;
+      case CharacterTextureRegion::Hand:
+        prefix = "item/texturecomponents/handtexture/";
+        break;
+      case CharacterTextureRegion::TorsoUpper:
+        prefix = "item/texturecomponents/torsouppertexture/";
+        break;
       case CharacterTextureRegion::TorsoLower:
         prefix = "item/texturecomponents/torsolowertexture/";
         break;
@@ -116,6 +158,9 @@ namespace
         break;
       case CharacterTextureRegion::LegLower:
         prefix = "item/texturecomponents/leglowertexture/";
+        break;
+      case CharacterTextureRegion::Foot:
+        prefix = "item/texturecomponents/foottexture/";
         break;
     }
 
@@ -127,40 +172,183 @@ namespace
     return normalize_texture_filename(std::string(prefix) + texture_name);
   }
 
-  bool load_client_texture_image(std::string const& filename, QImage& image)
+  bool load_client_texture_image(std::string const& filename,
+                                 QImage& image,
+                                 std::string* loaded_filename = nullptr,
+                                 char const** load_method = nullptr)
   {
     if (filename.empty())
     {
       return false;
     }
 
-    try
+    auto const try_load = [&](std::string const& candidate)
     {
-      scoped_blp_texture_reference texture(filename, Noggit::NoggitRenderContext::MAP_VIEW);
-      texture->finishLoading();
+      bool const is_baked_texture = candidate.find("textures/bakednpctextures/") != std::string::npos;
+      bool const is_generated_texture = candidate.find("textures/generated/") != std::string::npos;
+      auto* client = Noggit::Application::NoggitApplication::instance()->clientData();
 
-      auto const mip = texture->data().find(0);
-      if (mip == texture->data().end() || mip->second.empty() || texture->width() <= 0 || texture->height() <= 0)
+      if (!is_generated_texture && !client->exists(candidate))
       {
         return false;
       }
 
-      QImage decoded(reinterpret_cast<unsigned char const*>(mip->second.data()),
-                     texture->width(),
-                     texture->height(),
-                     QImage::Format_RGBA8888);
-      image = decoded.copy();
-      return !image.isNull();
+      try
+      {
+        scoped_blp_texture_reference texture(candidate, Noggit::NoggitRenderContext::MAP_VIEW);
+        texture->finishLoading();
+
+        auto const mip = texture->data().find(0);
+        if (mip == texture->data().end() || mip->second.empty() || texture->width() <= 0 || texture->height() <= 0)
+        {
+          if (is_baked_texture)
+          {
+            LogDebug << "baked texture raw path unavailable: '" << candidate
+                     << "' hasMip=" << (mip != texture->data().end())
+                     << " mipEmpty=" << (mip == texture->data().end() ? 1 : mip->second.empty())
+                     << " width=" << texture->width()
+                     << " height=" << texture->height()
+                     << std::endl;
+          }
+
+          if (is_baked_texture || is_generated_texture)
+          {
+            return false;
+          }
+        }
+
+        if (mip != texture->data().end() && !mip->second.empty() && texture->width() > 0 && texture->height() > 0)
+        {
+          QImage decoded(reinterpret_cast<unsigned char const*>(mip->second.data()),
+                         texture->width(),
+                         texture->height(),
+                         QImage::Format_RGBA8888);
+          image = decoded.copy();
+          if (!image.isNull())
+          {
+            if (loaded_filename)
+            {
+              *loaded_filename = candidate;
+            }
+            if (load_method)
+            {
+              *load_method = "raw";
+            }
+          }
+          if (!image.isNull())
+          {
+            return true;
+          }
+        }
+      }
+      catch (std::exception const& error)
+      {
+        if (is_baked_texture)
+        {
+          LogDebug << "baked texture raw decode failed: '" << candidate << "' error='" << error.what() << "'" << std::endl;
+        }
+        if (is_baked_texture || is_generated_texture)
+        {
+          return false;
+        }
+      }
+      catch (...)
+      {
+        if (is_baked_texture)
+        {
+          LogDebug << "baked texture raw decode failed: '" << candidate << "' error='<unknown>'" << std::endl;
+        }
+        if (is_baked_texture || is_generated_texture)
+        {
+          return false;
+        }
+      }
+
+      try
+      {
+        QPixmap const* rendered = Noggit::BLPRenderer::getInstance().render_blp_to_pixmap(candidate, -1, -1);
+        if (!rendered || rendered->isNull())
+        {
+          if (is_baked_texture)
+          {
+            LogDebug << "baked texture renderer returned null pixmap: '" << candidate << "'" << std::endl;
+          }
+          return false;
+        }
+
+        image = rendered->toImage().convertToFormat(QImage::Format_RGBA8888);
+        if (image.isNull())
+        {
+          if (is_baked_texture)
+          {
+            LogDebug << "baked texture renderer produced null image: '" << candidate << "'" << std::endl;
+          }
+          return false;
+        }
+        if (!image.isNull())
+        {
+          if (loaded_filename)
+          {
+            *loaded_filename = candidate;
+          }
+          if (load_method)
+          {
+            *load_method = "renderer";
+          }
+        }
+        return !image.isNull();
+      }
+      catch (std::exception const& error)
+      {
+        if (is_baked_texture)
+        {
+          LogDebug << "baked texture renderer decode failed: '" << candidate << "' error='" << error.what() << "'" << std::endl;
+        }
+        return false;
+      }
+      catch (...)
+      {
+        if (is_baked_texture)
+        {
+          LogDebug << "baked texture renderer decode failed: '" << candidate << "' error='<unknown>'" << std::endl;
+        }
+        return false;
+      }
+    };
+
+    if (try_load(filename))
+    {
+      return true;
     }
-    catch (...)
+
+    bool const is_texture_component = filename.find("item/texturecomponents/") != std::string::npos;
+    bool const already_gendered = filename.ends_with("_u.blp") || filename.ends_with("_m.blp") || filename.ends_with("_f.blp");
+    if (!is_texture_component || already_gendered)
     {
       return false;
     }
+
+    auto const extension_pos = filename.rfind(".blp");
+    if (extension_pos == std::string::npos)
+    {
+      return false;
+    }
+
+    auto const stem = filename.substr(0, extension_pos);
+    for (char const* suffix : {"_u.blp", "_m.blp", "_f.blp"})
+    {
+      if (try_load(stem + suffix))
+      {
+        return true;
+      }
+    }
+
+    return false;
   }
 
   void set_texture_override(std::vector<std::pair<std::size_t, std::string>>& overrides,
                             std::size_t slot,
-                            std::string texture)
+                            std::string const& texture)
   {
     if (texture.empty())
     {
@@ -175,38 +363,48 @@ namespace
 
     if (existing != overrides.end())
     {
-      existing->second = std::move(texture);
+      existing->second = texture;
       return;
     }
 
-    overrides.emplace_back(slot, std::move(texture));
+    overrides.emplace_back(slot, texture);
   }
 
-  bool compose_character_legs_texture(std::uint32_t display_id,
-                                      std::uint32_t legs_display_id,
+  struct CharacterTextureLayer
+  {
+    std::string texture;
+    CharacterTextureRegion region;
+  };
+
+  enum class CharacterSectionType : std::uint32_t
+  {
+    Skin = 0,
+    Face = 1,
+    FacialHair = 2,
+    Hair = 3,
+    Underwear = 4
+  };
+
+  struct CharacterSectionTextures
+  {
+    std::array<std::string, 3> textures;
+    bool found = false;
+  };
+
+  bool compose_character_body_texture(std::uint32_t display_id,
                                       std::string const& base_texture,
+                                      std::vector<CharacterTextureLayer> const& layers,
+                                      Noggit::NoggitRenderContext context,
                                       std::string& composed_texture,
                                       std::ostringstream* debug_details)
   {
-    if (!display_id || !legs_display_id || base_texture.empty())
+    if (!display_id || base_texture.empty() || layers.empty())
     {
       return false;
     }
 
     try
     {
-      auto const item_display = gItemDisplayInfoDB.getByID(legs_display_id);
-
-      auto const upper_leg_texture = resolve_item_texture_component_filename(
-        item_display.getString(ItemDisplayInfoDB::TextureUpperLeg), CharacterTextureRegion::LegUpper);
-      auto const lower_leg_texture = resolve_item_texture_component_filename(
-        item_display.getString(ItemDisplayInfoDB::TextureLowerLeg), CharacterTextureRegion::LegLower);
-
-      if (upper_leg_texture.empty() && lower_leg_texture.empty())
-      {
-        return false;
-      }
-
       QImage body_image;
       if (!load_client_texture_image(base_texture, body_image))
       {
@@ -228,13 +426,28 @@ namespace
         }
 
         QImage overlay_image;
-        if (!load_client_texture_image(texture_filename, overlay_image))
+        std::string loaded_overlay_filename;
+        char const* overlay_load_method = nullptr;
+        if (!load_client_texture_image(texture_filename, overlay_image, &loaded_overlay_filename, &overlay_load_method))
         {
           if (debug_details)
           {
             *debug_details << " overlayLoadFailed='" << texture_filename << "'";
           }
           return;
+        }
+
+        if (debug_details && !loaded_overlay_filename.empty() && loaded_overlay_filename != texture_filename)
+        {
+          *debug_details << " overlayLoaded='" << texture_filename << "'->'" << loaded_overlay_filename << "'";
+          if (overlay_load_method)
+          {
+            *debug_details << " overlayLoadedVia='" << overlay_load_method << "'";
+          }
+        }
+        else if (debug_details && overlay_load_method)
+        {
+          *debug_details << " overlayLoadedVia='" << overlay_load_method << "'";
         }
 
         auto const layout_rect = legacy_character_texture_rect(region);
@@ -251,8 +464,10 @@ namespace
         applied_any_layer = true;
       };
 
-      paint_region(upper_leg_texture, CharacterTextureRegion::LegUpper);
-      paint_region(lower_leg_texture, CharacterTextureRegion::LegLower);
+      for (auto const& layer : layers)
+      {
+        paint_region(layer.texture, layer.region);
+      }
 
       if (!applied_any_layer)
       {
@@ -264,21 +479,22 @@ namespace
       std::copy(source_pixels, source_pixels + raw_pixels.size(), raw_pixels.begin());
 
       composed_texture = normalize_texture_filename(
-        "textures/generated/creaturedisplay-" + std::to_string(display_id) + "-legs-composed.blp");
+        "textures/generated/creaturedisplay-" + std::to_string(display_id) + "-body-composed.blp");
       TextureManager::register_raw_texture(composed_texture,
-                                           Noggit::NoggitRenderContext::MAP_VIEW,
+                                           context,
                                            body_image.width(),
                                            body_image.height(),
                                            std::move(raw_pixels));
 
       if (debug_details)
       {
-        *debug_details << " legsTextureComposed='" << composed_texture << "'";
+        *debug_details << " bodyTextureComposed='" << composed_texture
+                       << "' layerCount=" << layers.size();
       }
 
       return true;
     }
-    catch (DBCFile::NotFound const&)
+    catch (...)
     {
       return false;
     }
@@ -306,7 +522,12 @@ namespace
     static bool const enabled = []()
     {
       char const* value = std::getenv("NOGGIT_CLASSIC_PANTS_COMPOSITE");
-      return value && *value && std::strcmp(value, "0") != 0;
+      if (!value || !*value)
+      {
+        return true;
+      }
+
+      return std::strcmp(value, "0") != 0;
     }();
 
     return enabled;
@@ -356,6 +577,28 @@ namespace
     return enabled;
   }
 
+  bool creature_spawn_attachments_enabled()
+  {
+    static bool const enabled = []()
+    {
+      char const* value = std::getenv("NOGGIT_CREATURE_ATTACHMENTS");
+      return !value || !*value || std::strcmp(value, "0") != 0;
+    }();
+
+    return enabled;
+  }
+
+  bool creature_spawn_geosets_enabled()
+  {
+    static bool const enabled = []()
+    {
+      char const* value = std::getenv("NOGGIT_CREATURE_GEOSETS");
+      return !value || !*value || std::strcmp(value, "0") != 0;
+    }();
+
+    return enabled;
+  }
+
   std::string format_texture_override_list(std::vector<std::pair<std::size_t, std::string>> const& overrides)
   {
     std::ostringstream stream;
@@ -395,6 +638,7 @@ namespace
     Geoset300 = 3,
     Gloves = 4,
     Boots = 5,
+    Tail = 6,
     Ears = 7,
     Wristbands = 8,
     Kneepads = 9,
@@ -403,15 +647,21 @@ namespace
     Tabard = 12,
     Trousers = 13,
     Cape = 15,
+    EyeGlow = 17,
     Belt = 18,
-    Feet = 20
+    Feet = 20,
+    Torso = 22
   };
 
   enum class CharacterAttachmentId : int
   {
+    LeftWrist = 0,
+    RightPalm = 1,
+    LeftPalm = 2,
     RightShoulder = 5,
     LeftShoulder = 6,
-    Helmet = 11
+    Helmet = 11,
+    RightBackSheath = 26
   };
 
   std::string normalize_texture_filename(std::string filename);
@@ -442,7 +692,8 @@ namespace
 
   std::uint16_t make_geoset_id(CharacterGeosetFamily family, std::uint32_t flags, bool relative = true)
   {
-    return static_cast<std::uint16_t>(static_cast<std::uint16_t>(family) * 100u + flags + (relative ? 1u : 0u));
+    auto const relative_offset = relative ? 1u : 0u;
+    return static_cast<std::uint16_t>(static_cast<std::uint16_t>(family) * 100u + flags + relative_offset);
   }
 
   void assign_geoset_selection(CreatureGeosetSelection& selection,
@@ -466,6 +717,24 @@ namespace
         }),
       selection.visible_ids.end());
     selection.visible_ids.push_back(geoset_id);
+  }
+
+  void add_geoset_visible_id(CreatureGeosetSelection& selection,
+                             std::uint16_t geoset_id)
+  {
+    auto const family_id = geoset_family_of(geoset_id);
+
+    if (std::find(selection.controlled_families.begin(), selection.controlled_families.end(), family_id)
+        == selection.controlled_families.end())
+    {
+      selection.controlled_families.push_back(family_id);
+    }
+
+    if (std::find(selection.visible_ids.begin(), selection.visible_ids.end(), geoset_id)
+        == selection.visible_ids.end())
+    {
+      selection.visible_ids.push_back(geoset_id);
+    }
   }
 
   void hide_geoset_family(CreatureGeosetSelection& selection,
@@ -564,6 +833,22 @@ namespace
     }
   }
 
+  void append_uint16_list_debug(std::ostringstream& debug,
+                                char const* label,
+                                std::vector<std::uint16_t> const& values)
+  {
+    debug << " " << label << "=[";
+    for (std::size_t index = 0; index < values.size(); ++index)
+    {
+      if (index != 0)
+      {
+        debug << ", ";
+      }
+      debug << values[index];
+    }
+    debug << "]";
+  }
+
   void append_creature_geoset_trace(char const* category, std::string const& message)
   {
     if (!creature_texture_debug_enabled())
@@ -578,6 +863,99 @@ namespace
     }
 
     trace << category << ' ' << message << '\n';
+  }
+
+  struct ClassicFacialHairGeosets
+  {
+    std::uint32_t beard = 0;
+    std::uint32_t moustache = 0;
+    std::uint32_t sideburn = 0;
+  };
+
+  std::optional<ClassicFacialHairGeosets> resolve_classic_facial_hair_geosets(std::uint32_t race_id,
+                                                                              std::uint32_t sex_id,
+                                                                              std::uint32_t variation_id)
+  {
+    auto const sane_selector = [](std::uint32_t value)
+    {
+      return value <= 50;
+    };
+
+    for (auto it = gCharacterFacialHairStylesDB.begin(); it != gCharacterFacialHairStylesDB.end(); ++it)
+    {
+      if (it->getUInt(CharacterFacialHairStylesDB::RaceID) != race_id
+          || it->getUInt(CharacterFacialHairStylesDB::SexID) != sex_id
+          || it->getUInt(CharacterFacialHairStylesDB::VariationID) != variation_id)
+      {
+        continue;
+      }
+
+      auto const beard = it->getUInt(CharacterFacialHairStylesDB::BeardGeoset);
+      auto const moustache = it->getUInt(CharacterFacialHairStylesDB::MoustacheGeoset);
+      auto const sideburn = it->getUInt(CharacterFacialHairStylesDB::SideburnGeoset);
+
+      // Guard against malformed/unsupported classic DBC layouts producing
+      // garbage selectors that would hide the whole head family.
+      if (!sane_selector(beard) || !sane_selector(moustache) || !sane_selector(sideburn))
+      {
+        return std::nullopt;
+      }
+
+      return ClassicFacialHairGeosets{beard, moustache, sideburn};
+    }
+
+    return std::nullopt;
+  }
+
+  std::optional<std::uint32_t> resolve_classic_hair_geoset(std::uint32_t race_id,
+                                                           std::uint32_t sex_id,
+                                                           std::uint32_t variation_id)
+  {
+    for (auto it = gCharacterHairGeosetsDB.begin(); it != gCharacterHairGeosetsDB.end(); ++it)
+    {
+      if (it->getUInt(CharacterHairGeosetsDB::RaceID) != race_id
+          || it->getUInt(CharacterHairGeosetsDB::SexID) != sex_id
+          || it->getUInt(CharacterHairGeosetsDB::VariationID) != variation_id)
+      {
+        continue;
+      }
+
+      auto const geoset_id = it->getUInt(CharacterHairGeosetsDB::GeosetID);
+      if (geoset_id > 99)
+      {
+        return std::nullopt;
+      }
+
+      return std::max<std::uint32_t>(1u, geoset_id);
+    }
+
+    return std::nullopt;
+  }
+
+  void apply_character_default_geosets(CreatureGeosetSelection& selection)
+  {
+    // Match WMVx ModelDefaultsGeosetModifier: geoset 0 plus each family's
+    // xx1 default stays visible until a later customization/equipment modifier
+    // picks a sibling in that family.
+    assign_geoset_selection(selection, CharacterGeosetFamily::SkinOrHairStyle, 0, false);
+    assign_geoset_selection(selection, CharacterGeosetFamily::Geoset100, 0);
+    assign_geoset_selection(selection, CharacterGeosetFamily::Geoset200, 0);
+    assign_geoset_selection(selection, CharacterGeosetFamily::Geoset300, 0);
+    assign_geoset_selection(selection, CharacterGeosetFamily::Gloves, 0);
+    assign_geoset_selection(selection, CharacterGeosetFamily::Boots, 0);
+    assign_geoset_selection(selection, CharacterGeosetFamily::Tail, 0);
+    assign_geoset_selection(selection, CharacterGeosetFamily::Ears, 2, false);
+    assign_geoset_selection(selection, CharacterGeosetFamily::Wristbands, 0);
+    assign_geoset_selection(selection, CharacterGeosetFamily::Kneepads, 0);
+    assign_geoset_selection(selection, CharacterGeosetFamily::Chest, 0);
+    assign_geoset_selection(selection, CharacterGeosetFamily::Pants, 0);
+    assign_geoset_selection(selection, CharacterGeosetFamily::Tabard, 0);
+    assign_geoset_selection(selection, CharacterGeosetFamily::Trousers, 0);
+    assign_geoset_selection(selection, CharacterGeosetFamily::Cape, 0);
+    assign_geoset_selection(selection, CharacterGeosetFamily::Belt, 0);
+    assign_geoset_selection(selection, CharacterGeosetFamily::EyeGlow, 0);
+    assign_geoset_selection(selection, CharacterGeosetFamily::Feet, 0);
+    assign_geoset_selection(selection, CharacterGeosetFamily::Torso, 0);
   }
 
   std::string attachment_model_variant_suffix(std::uint32_t race_id, std::uint32_t sex_id)
@@ -643,6 +1021,99 @@ namespace
     return candidate;
   }
 
+  void append_item_attachment_specs(std::vector<CreatureAttachmentModelSpec>& attachments,
+                                    std::uint32_t item_display_id,
+                                    char const* component_dir,
+                                    int attachment_id_model1,
+                                    int attachment_id_model2,
+                                    std::uint32_t race_id,
+                                    std::uint32_t sex_id)
+  {
+    if (!item_display_id)
+    {
+      return;
+    }
+
+    try
+    {
+      auto item_display = gItemDisplayInfoDB.getByID(item_display_id);
+
+      auto resolve_texture_path = [&](std::string texture_name)
+      {
+        auto texture = normalize_texture_filename(std::move(texture_name));
+        if (texture.empty())
+        {
+          return texture;
+        }
+
+        if (texture.find('/') == std::string::npos)
+        {
+          texture = normalize_texture_filename(std::string("item/objectcomponents/")
+                                               + component_dir
+                                               + "/"
+                                               + texture);
+        }
+
+        return texture;
+      };
+
+      auto add_item_attachment = [&](int attachment_id, std::string model_name, std::string texture_name)
+      {
+        if (component_dir == std::string_view("shoulder"))
+        {
+          std::string lower_model_name = model_name;
+          std::transform(lower_model_name.begin(), lower_model_name.end(), lower_model_name.begin(), [](unsigned char c)
+          {
+            return static_cast<char>(std::tolower(c));
+          });
+
+          if (lower_model_name.rfind("lshoulder_", 0) == 0)
+          {
+            attachment_id = static_cast<int>(CharacterAttachmentId::LeftShoulder);
+          }
+          else if (lower_model_name.rfind("rshoulder_", 0) == 0)
+          {
+            attachment_id = static_cast<int>(CharacterAttachmentId::RightShoulder);
+          }
+        }
+
+        auto model_path = resolve_item_attachment_model_path(component_dir,
+                                                             std::move(model_name),
+                                                             race_id,
+                                                             sex_id);
+        if (model_path.empty())
+        {
+          return;
+        }
+
+        CreatureAttachmentModelSpec spec;
+        spec.attachment_id = attachment_id;
+        spec.model_path = std::move(model_path);
+
+        auto texture_path = resolve_texture_path(std::move(texture_name));
+        if (!texture_path.empty())
+        {
+          spec.texture_overrides.emplace_back(2u, std::move(texture_path));
+        }
+
+        attachments.push_back(std::move(spec));
+      };
+
+      add_item_attachment(attachment_id_model1,
+                          item_display.getString(ItemDisplayInfoDB::ModelName1),
+                          item_display.getString(ItemDisplayInfoDB::ModelTexture1));
+      if (attachment_id_model2 >= 0)
+      {
+        add_item_attachment(attachment_id_model2,
+                            item_display.getString(ItemDisplayInfoDB::ModelName2),
+                            item_display.getString(ItemDisplayInfoDB::ModelTexture2));
+      }
+    }
+    catch (DBCFile::NotFound const&)
+    {
+    }
+  }
+
   std::vector<CreatureAttachmentModelSpec> resolve_creature_attachment_models(std::uint32_t display_id)
   {
     std::vector<CreatureAttachmentModelSpec> attachments;
@@ -663,114 +1134,83 @@ namespace
       auto display_extra = gCreatureDisplayInfoExtraDB.getByID(extra_display_id);
       auto const race_id = display_extra.getUInt(CreatureDisplayInfoExtraDB::DisplayRaceID);
       auto const sex_id = display_extra.getUInt(CreatureDisplayInfoExtraDB::DisplaySexID);
-      auto add_attachment = [&](int attachment_id, std::string model_path)
-      {
-        if (model_path.empty())
-        {
-          return;
-        }
 
-        attachments.push_back({attachment_id, std::move(model_path)});
-      };
-
-      auto add_from_item = [&](std::uint32_t item_display_id, char const* component_dir, int attachment_id_model1, int attachment_id_model2)
-      {
-        if (!item_display_id)
-        {
-          return;
-        }
-
-        try
-        {
-          auto item_display = gItemDisplayInfoDB.getByID(item_display_id);
-
-          auto resolve_texture_path = [&](std::string texture_name)
-          {
-            auto texture = normalize_texture_filename(std::move(texture_name));
-            if (texture.empty())
-            {
-              return texture;
-            }
-
-            if (texture.find('/') == std::string::npos)
-            {
-              texture = normalize_texture_filename(std::string("item/objectcomponents/")
-                                                   + component_dir
-                                                   + "/"
-                                                   + texture);
-            }
-
-            return texture;
-          };
-
-          auto add_item_attachment = [&](int attachment_id, std::string model_name, std::string texture_name)
-          {
-            if (component_dir == std::string_view("shoulder"))
-            {
-              std::string lower_model_name = model_name;
-              std::transform(lower_model_name.begin(), lower_model_name.end(), lower_model_name.begin(), [](unsigned char c)
-              {
-                return static_cast<char>(std::tolower(c));
-              });
-
-              if (lower_model_name.rfind("lshoulder_", 0) == 0)
-              {
-                attachment_id = static_cast<int>(CharacterAttachmentId::LeftShoulder);
-              }
-              else if (lower_model_name.rfind("rshoulder_", 0) == 0)
-              {
-                attachment_id = static_cast<int>(CharacterAttachmentId::RightShoulder);
-              }
-            }
-
-            auto model_path = resolve_item_attachment_model_path(component_dir,
-                                                                 std::move(model_name),
-                                                                 race_id,
-                                                                 sex_id);
-            if (model_path.empty())
-            {
-              return;
-            }
-
-            CreatureAttachmentModelSpec spec;
-            spec.attachment_id = attachment_id;
-            spec.model_path = std::move(model_path);
-
-            auto texture_path = resolve_texture_path(std::move(texture_name));
-            if (!texture_path.empty())
-            {
-              spec.texture_overrides.emplace_back(2u, std::move(texture_path));
-            }
-
-            attachments.push_back(std::move(spec));
-          };
-
-          add_item_attachment(attachment_id_model1,
-                              item_display.getString(ItemDisplayInfoDB::ModelName1),
-                              item_display.getString(ItemDisplayInfoDB::ModelTexture1));
-          if (attachment_id_model2 >= 0)
-          {
-            add_item_attachment(attachment_id_model2,
-                                item_display.getString(ItemDisplayInfoDB::ModelName2),
-                                item_display.getString(ItemDisplayInfoDB::ModelTexture2));
-          }
-        }
-        catch (DBCFile::NotFound const&)
-        {
-        }
-      };
-
-      add_from_item(display_extra.getUInt(CreatureDisplayInfoExtraDB::HeadDisplayID),
-                    "head",
-                    static_cast<int>(CharacterAttachmentId::Helmet),
-                    -1);
+      append_item_attachment_specs(attachments,
+                                   display_extra.getUInt(CreatureDisplayInfoExtraDB::HeadDisplayID),
+                                   "head",
+                                   static_cast<int>(CharacterAttachmentId::Helmet),
+                                   -1,
+                                   race_id,
+                                   sex_id);
       if (!classic_disable_shoulder_attachments_enabled())
       {
-        add_from_item(display_extra.getUInt(CreatureDisplayInfoExtraDB::ShouldersDisplayID),
-                      "shoulder",
-                      static_cast<int>(CharacterAttachmentId::LeftShoulder),
-                      static_cast<int>(CharacterAttachmentId::RightShoulder));
+        append_item_attachment_specs(attachments,
+                                     display_extra.getUInt(CreatureDisplayInfoExtraDB::ShouldersDisplayID),
+                                     "shoulder",
+                                     static_cast<int>(CharacterAttachmentId::LeftShoulder),
+                                     static_cast<int>(CharacterAttachmentId::RightShoulder),
+                                     race_id,
+                                     sex_id);
       }
+    }
+    catch (DBCFile::NotFound const&)
+    {
+    }
+
+    return attachments;
+  }
+
+  std::vector<CreatureAttachmentModelSpec> resolve_creature_equipment_attachment_models(std::uint32_t display_id,
+                                                                                       std::uint32_t mainhand_display_id,
+                                                                                       std::uint32_t offhand_display_id,
+                                                                                       std::uint32_t ranged_display_id,
+                                                                                       std::uint32_t offhand_inventory_type)
+  {
+    std::vector<CreatureAttachmentModelSpec> attachments;
+    if (!display_id)
+    {
+      return attachments;
+    }
+
+    try
+    {
+      auto display = gCreatureDisplayInfoDB.getByID(display_id);
+      auto extra_display_id = display.getUInt(CreatureDisplayInfoDB::ExtendedDisplayInfoID);
+      if (!extra_display_id)
+      {
+        return attachments;
+      }
+
+      auto display_extra = gCreatureDisplayInfoExtraDB.getByID(extra_display_id);
+      auto const race_id = display_extra.getUInt(CreatureDisplayInfoExtraDB::DisplayRaceID);
+      auto const sex_id = display_extra.getUInt(CreatureDisplayInfoExtraDB::DisplaySexID);
+
+      append_item_attachment_specs(attachments,
+                                   mainhand_display_id,
+                                   "weapon",
+                                   static_cast<int>(CharacterAttachmentId::RightPalm),
+                                   -1,
+                                   race_id,
+                                   sex_id);
+
+      bool const offhand_is_shield = offhand_inventory_type == 14;
+      append_item_attachment_specs(attachments,
+                                   offhand_display_id,
+                                   offhand_is_shield ? "shield" : "weapon",
+                                   offhand_is_shield
+                                     ? static_cast<int>(CharacterAttachmentId::LeftWrist)
+                                     : static_cast<int>(CharacterAttachmentId::LeftPalm),
+                                   -1,
+                                   race_id,
+                                   sex_id);
+
+      append_item_attachment_specs(attachments,
+                                   ranged_display_id,
+                                   "weapon",
+                                   static_cast<int>(CharacterAttachmentId::RightBackSheath),
+                                   -1,
+                                   race_id,
+                                   sex_id);
     }
     catch (DBCFile::NotFound const&)
     {
@@ -802,23 +1242,46 @@ namespace
       debug << " extraDisplay=" << extra_display_id;
       debug << " buildProbe=20260605a";
       bool has_robe_bottom = false;
+      auto const race_id = display_extra.getUInt(CreatureDisplayInfoExtraDB::DisplayRaceID);
+      auto const sex_id = display_extra.getUInt(CreatureDisplayInfoExtraDB::DisplaySexID);
+      auto const hair_style_id = display_extra.getUInt(CreatureDisplayInfoExtraDB::HairStyleID);
+      auto const facial_hair_id = display_extra.getUInt(CreatureDisplayInfoExtraDB::FacialHairID);
       auto const gloves_display_id = display_extra.getUInt(CreatureDisplayInfoExtraDB::GlovesDisplayID);
 
-      // CreatureDisplayInfoExtra has no cloak/back slot. Hide cape by default so
-      // classic character models do not keep stray default back geosets visible.
-      hide_geoset_family(selection, CharacterGeosetFamily::Cape);
-      debug << " capeHiddenDefault=1";
+      apply_character_default_geosets(selection);
+      debug << " defaults=wmvxLegacy";
 
-      // Tabard should also stay hidden unless an actual tabard item re-enables it.
-      hide_geoset_family(selection, CharacterGeosetFamily::Tabard);
-      debug << " tabardHiddenDefault=1";
+      if (auto hair_geoset = resolve_classic_hair_geoset(race_id, sex_id, hair_style_id))
+      {
+        add_geoset_visible_id(selection, static_cast<std::uint16_t>(*hair_geoset));
+        debug << " hairGeosetApplied=" << *hair_geoset;
+      }
+      else
+      {
+        debug << " hairGeosetMissing=1";
+      }
 
-      // Classic texture-only outfits still need one base glove-family geoset so
-      // the arm mesh remains visible while sibling glove variants stay hidden.
-      assign_geoset_selection(selection, CharacterGeosetFamily::Gloves, 1);
-      debug << " glovesBaseDefault=1";
-      hide_geoset_family(selection, CharacterGeosetFamily::Boots);
-      debug << " bootsHiddenDefault=1";
+      if (race_id == 9)
+      {
+        auto const goblin_hair_variant = std::max<std::uint32_t>(hair_style_id, 1u);
+        assign_geoset_selection(selection, CharacterGeosetFamily::Geoset100, goblin_hair_variant);
+        debug << " goblinHairVariantApplied=" << goblin_hair_variant;
+      }
+
+      if (auto facial_hair_geosets = resolve_classic_facial_hair_geosets(race_id, sex_id, facial_hair_id))
+      {
+        assign_geoset_selection_if_nonzero(selection, CharacterGeosetFamily::Geoset100, facial_hair_geosets->beard, true);
+        assign_geoset_selection_if_nonzero(selection, CharacterGeosetFamily::Geoset200, facial_hair_geosets->moustache, true);
+        assign_geoset_selection_if_nonzero(selection, CharacterGeosetFamily::Geoset300, facial_hair_geosets->sideburn, true);
+        debug << " facialHairApplied=["
+              << facial_hair_geosets->beard << ","
+              << facial_hair_geosets->moustache << ","
+              << facial_hair_geosets->sideburn << "]";
+      }
+      else
+      {
+        debug << " facialHairMissing=1";
+      }
 
       auto apply_item = [&](char const* slot_name,
                             std::uint32_t item_display_id,
@@ -848,12 +1311,14 @@ namespace
         [&](DBCFile::Record const& item_display)
         {
           auto const wrist_flags = item_display.getUInt(ItemDisplayInfoDB::GeosetGroup1);
-          hide_geoset_family(selection, CharacterGeosetFamily::Wristbands);
-          debug << " shirtWristForcedHidden=1";
-          if (wrist_flags == 0)
+          auto const robe_flags = item_display.getUInt(ItemDisplayInfoDB::GeosetGroup3);
+          assign_geoset_selection(selection, CharacterGeosetFamily::Wristbands, wrist_flags);
+          debug << " shirtWristApplied=" << wrist_flags;
+          if (robe_flags != 0)
           {
-            hide_geoset_family(selection, CharacterGeosetFamily::Wristbands);
-            debug << " shirtWristZero=1";
+            assign_geoset_selection(selection, CharacterGeosetFamily::Trousers, robe_flags);
+            has_robe_bottom = has_robe_bottom || robe_flags == 1;
+            debug << " shirtRobeApplied=" << robe_flags;
           }
         });
 
@@ -861,65 +1326,35 @@ namespace
         [&](DBCFile::Record const& item_display)
         {
           auto const wrist_flags = item_display.getUInt(ItemDisplayInfoDB::GeosetGroup1);
-          hide_geoset_family(selection, CharacterGeosetFamily::Wristbands);
-          debug << " chestWristForcedHidden=1";
-          if (wrist_flags == 0)
+          auto const robe_flags = item_display.getUInt(ItemDisplayInfoDB::GeosetGroup3);
+          assign_geoset_selection(selection, CharacterGeosetFamily::Wristbands, wrist_flags);
+          debug << " chestWristApplied=" << wrist_flags;
+          if (robe_flags != 0)
           {
-            hide_geoset_family(selection, CharacterGeosetFamily::Wristbands);
-            debug << " chestWristZero=1";
+            assign_geoset_selection(selection, CharacterGeosetFamily::Trousers, robe_flags);
+            has_robe_bottom = has_robe_bottom || robe_flags == 1;
+            debug << " chestRobeApplied=" << robe_flags;
           }
         });
 
       apply_item("legs", display_extra.getUInt(CreatureDisplayInfoExtraDB::LegsDisplayID),
         [&](DBCFile::Record const& item_display)
         {
-          auto const pants_flags = item_display.getUInt(ItemDisplayInfoDB::GeosetGroup1);
           auto const kneepad_flags = item_display.getUInt(ItemDisplayInfoDB::GeosetGroup2);
           auto const robe_flags = item_display.getUInt(ItemDisplayInfoDB::GeosetGroup3);
-          assign_geoset_selection_if_nonzero(selection, CharacterGeosetFamily::Pants, pants_flags);
-          assign_geoset_selection_if_nonzero(selection, CharacterGeosetFamily::Kneepads, kneepad_flags);
-          if (pants_flags == 0)
-          {
-            assign_geoset_selection(selection, CharacterGeosetFamily::Pants, 1);
-            debug << " legsPantsDefault=1";
-          }
-          if (kneepad_flags == 0)
-          {
-            hide_geoset_family(selection, CharacterGeosetFamily::Kneepads);
-            debug << " legsKneepadZero=1";
-          }
-          if (robe_flags != 0)
-          {
-            assign_geoset_selection(selection, CharacterGeosetFamily::Trousers, robe_flags);
-            debug << " legsTrousersApplied=" << robe_flags;
-          }
-          else if (has_robe_bottom)
-          {
-            debug << " legsTrousersPreserved=1";
-          }
-          else
-          {
-            hide_geoset_family(selection, CharacterGeosetFamily::Trousers);
-            debug << " legsTrousersSkipped=1";
-          }
+          assign_geoset_selection(selection, CharacterGeosetFamily::Kneepads, kneepad_flags);
+          assign_geoset_selection(selection, CharacterGeosetFamily::Trousers, robe_flags);
           has_robe_bottom = has_robe_bottom || robe_flags == 1;
+          debug << " legsKneepadApplied=" << kneepad_flags
+                << " legsTrousersApplied=" << robe_flags;
         });
 
       apply_item("gloves", gloves_display_id,
         [&](DBCFile::Record const& item_display)
         {
           auto const glove_flags = item_display.getUInt(ItemDisplayInfoDB::GeosetGroup1);
-          hide_geoset_family(selection, CharacterGeosetFamily::Wristbands);
-          debug << " glovesHideWristbands=1";
-          if (glove_flags != 0)
-          {
-            assign_geoset_selection(selection, CharacterGeosetFamily::Gloves, glove_flags);
-          }
-          else
-          {
-            assign_geoset_selection(selection, CharacterGeosetFamily::Gloves, 1);
-            debug << " glovesBaseFromZero=1";
-          }
+          assign_geoset_selection(selection, CharacterGeosetFamily::Gloves, glove_flags);
+          debug << " glovesApplied=" << glove_flags;
         });
 
       apply_item("boots", display_extra.getUInt(CreatureDisplayInfoExtraDB::BootsDisplayID),
@@ -928,14 +1363,8 @@ namespace
           if (!has_robe_bottom)
           {
             auto const boot_flags = item_display.getUInt(ItemDisplayInfoDB::GeosetGroup1);
-            if (boot_flags != 0)
-            {
-              assign_geoset_selection(selection, CharacterGeosetFamily::Boots, boot_flags);
-            }
-            else
-            {
-              hide_geoset_family(selection, CharacterGeosetFamily::Boots);
-            }
+            assign_geoset_selection(selection, CharacterGeosetFamily::Boots, boot_flags);
+            debug << " bootsApplied=" << boot_flags;
           }
         });
 
@@ -950,7 +1379,7 @@ namespace
         {
           if (!has_robe_bottom)
           {
-            assign_geoset_selection(selection, CharacterGeosetFamily::Tabard, 0);
+            assign_geoset_selection(selection, CharacterGeosetFamily::Tabard, 1);
             debug << " tabardShown=1";
           }
           else
@@ -972,23 +1401,8 @@ namespace
         debug << " probeHideChest=1";
       }
 
-      if (!selection.visible_ids.empty())
-      {
-        debug << " selectedGeosets=[";
-        for (std::size_t index = 0; index < selection.visible_ids.size(); ++index)
-        {
-          if (index != 0)
-          {
-            debug << ", ";
-          }
-          debug << selection.visible_ids[index];
-        }
-        debug << "]";
-      }
-      else
-      {
-        debug << " selectedGeosets=[]";
-      }
+      append_uint16_list_debug(debug, "selectedGeosets", selection.visible_ids);
+      append_uint16_list_debug(debug, "controlledFamilies", selection.controlled_families);
 
       selection.debug_summary = debug.str();
       return selection;
@@ -1055,6 +1469,193 @@ namespace
     return normalize_texture_filename(std::move(filename));
   }
 
+  bool character_section_texture_suffix_matches(DBCFile::Record const& section,
+                                                std::uint32_t value)
+  {
+    std::string const suffix = "_" + (value < 10 ? std::string("0") : std::string()) + std::to_string(value) + ".blp";
+
+    for (std::size_t field : {CharacterSectionsDB::TextureName1,
+                              CharacterSectionsDB::TextureName2,
+                              CharacterSectionsDB::TextureName3})
+    {
+      auto texture = normalize_texture_filename(section.getString(field));
+      if (texture.size() >= suffix.size()
+          && texture.compare(texture.size() - suffix.size(), suffix.size(), suffix) == 0)
+      {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  CharacterSectionTextures resolve_character_section_textures(std::uint32_t race_id,
+                                                              std::uint32_t sex_id,
+                                                              CharacterSectionType section_type,
+                                                              std::optional<std::uint32_t> section_id,
+                                                              std::optional<std::uint32_t> color_id,
+                                                              std::uint32_t preferred_suffix_value)
+  {
+    CharacterSectionTextures selected;
+    bool selected_matches_suffix = false;
+
+    for (auto it = gCharacterSectionsDB.begin(); it != gCharacterSectionsDB.end(); ++it)
+    {
+      if (it->getUInt(CharacterSectionsDB::RaceID) != race_id
+          || it->getUInt(CharacterSectionsDB::SexID) != sex_id
+          || it->getUInt(CharacterSectionsDB::BaseSection) != static_cast<std::uint32_t>(section_type))
+      {
+        continue;
+      }
+
+      if (section_id && it->getUInt(CharacterSectionsDB::VariationIndex) != *section_id)
+      {
+        continue;
+      }
+
+      if (color_id && it->getUInt(CharacterSectionsDB::ColorIndex) != *color_id)
+      {
+        continue;
+      }
+
+      bool const candidate_matches_suffix = character_section_texture_suffix_matches(*it, preferred_suffix_value);
+      if (selected.found && (selected_matches_suffix || !candidate_matches_suffix))
+      {
+        continue;
+      }
+
+      selected.found = true;
+      selected_matches_suffix = candidate_matches_suffix;
+      selected.textures = {
+        normalize_texture_filename(it->getString(CharacterSectionsDB::TextureName1)),
+        normalize_texture_filename(it->getString(CharacterSectionsDB::TextureName2)),
+        normalize_texture_filename(it->getString(CharacterSectionsDB::TextureName3))
+      };
+    }
+
+    return selected;
+  }
+
+  std::vector<std::pair<std::size_t, std::string>> resolve_creature_texture_overrides_stable(std::uint32_t display_id)
+  {
+    if (!display_id)
+    {
+      return {};
+    }
+
+    try
+    {
+      auto display = gCreatureDisplayInfoDB.getByID(display_id);
+      constexpr std::array<std::pair<std::size_t, std::size_t>, 6> slot_fields = {{
+        {1, CreatureDisplayInfoDB::TextureVariation1},
+        {2, CreatureDisplayInfoDB::TextureVariation2},
+        {3, CreatureDisplayInfoDB::TextureVariation3},
+        {11, CreatureDisplayInfoDB::TextureVariation1},
+        {12, CreatureDisplayInfoDB::TextureVariation2},
+        {13, CreatureDisplayInfoDB::TextureVariation3},
+      }};
+
+      std::string model_dir;
+      try
+      {
+        auto model_id = display.getUInt(CreatureDisplayInfoDB::ModelID);
+        auto model = gCreatureModelDataDB.getByID(model_id);
+        auto model_path = normalize_model_filename(model.getString(CreatureModelDataDB::ModelName));
+        auto sep = model_path.rfind('/');
+        if (sep != std::string::npos)
+        {
+          model_dir = model_path.substr(0, sep + 1);
+        }
+      }
+      catch (...) {}
+
+      std::vector<std::pair<std::size_t, std::string>> overrides;
+      overrides.reserve(slot_fields.size());
+      bool has_explicit_texture_variation = false;
+
+      for (auto const& slot_field : slot_fields)
+      {
+        auto texture = normalize_texture_filename(display.getString(slot_field.second));
+        if (!texture.empty())
+        {
+          has_explicit_texture_variation = true;
+          if (!model_dir.empty() && texture.find('/') == std::string::npos)
+          {
+            texture = model_dir + texture;
+          }
+          overrides.emplace_back(slot_field.first, std::move(texture));
+        }
+      }
+
+      auto extra_display_id = display.getUInt(CreatureDisplayInfoDB::ExtendedDisplayInfoID);
+      if (extra_display_id && !has_explicit_texture_variation)
+      {
+        try
+        {
+          auto display_extra = gCreatureDisplayInfoExtraDB.getByID(extra_display_id);
+          auto baked_texture = normalize_baked_creature_texture_filename(display_extra.getString(CreatureDisplayInfoExtraDB::BakedTexture));
+          auto* client = Noggit::Application::NoggitApplication::instance()->clientData();
+          bool const is_character_model = model_dir.rfind("character/", 0) == 0;
+          bool const baked_texture_exists = !baked_texture.empty() && client->exists(baked_texture);
+          bool baked_texture_loadable = !is_character_model && baked_texture_exists;
+
+          if (baked_texture_exists && baked_texture_loadable)
+          {
+            overrides.emplace_back(1, std::move(baked_texture));
+          }
+          else
+          {
+            auto race_id = display_extra.getUInt(CreatureDisplayInfoExtraDB::DisplayRaceID);
+            auto sex_id  = display_extra.getUInt(CreatureDisplayInfoExtraDB::DisplaySexID);
+            auto skin_id = display_extra.getUInt(CreatureDisplayInfoExtraDB::SkinID);
+
+            std::string race_name;
+            switch (race_id)
+            {
+              case  1: race_name = "Human";    break;
+              case  2: race_name = "Orc";      break;
+              case  3: race_name = "Dwarf";    break;
+              case  4: race_name = "NightElf"; break;
+              case  5: race_name = "Scourge";  break;
+              case  6: race_name = "Tauren";   break;
+              case  7: race_name = "Gnome";    break;
+              case  8: race_name = "Troll";    break;
+              case 10: race_name = "BloodElf"; break;
+              case 11: race_name = "Draenei";  break;
+              default: break;
+            }
+
+            if (!race_name.empty())
+            {
+              std::string const sex_name = (sex_id == 0) ? "Male" : "Female";
+              std::string skin_pad = (skin_id < 10 ? "0" : "") + std::to_string(skin_id);
+              auto skin_path = normalize_texture_filename("Character/" + race_name + "/" + sex_name + "/"
+                + race_name + sex_name + "Skin00_" + skin_pad + ".blp");
+              if (!client->exists(skin_path))
+              {
+                skin_path = normalize_texture_filename("Character/" + race_name + "/" + sex_name + "/"
+                  + race_name + sex_name + "Skin00_00.blp");
+              }
+              if (client->exists(skin_path))
+              {
+                overrides.emplace_back(1, std::move(skin_path));
+              }
+            }
+          }
+        }
+        catch (DBCFile::NotFound const&)
+        {
+        }
+      }
+
+      return overrides;
+    }
+    catch (DBCFile::NotFound const&)
+    {
+      return {};
+    }
+  }
+
   std::string build_character_model_skin_fallback(std::string const& model_dir)
   {
     if (model_dir.rfind("character/", 0) != 0 || model_dir.size() <= 1)
@@ -1091,6 +1692,45 @@ namespace
     return normalize_texture_filename(path + "/" + base_name + "skin00_00.blp");
   }
 
+  ClientFileHeaderProbe probe_client_file_header(std::string const& filename)
+  {
+    ClientFileHeaderProbe probe;
+
+    if (filename.empty())
+    {
+      return probe;
+    }
+
+    try
+    {
+      BlizzardArchive::ClientFile file(filename,
+        Noggit::Application::NoggitApplication::instance()->clientData());
+
+      if (file.isEof())
+      {
+        return probe;
+      }
+
+      probe.opened = true;
+      probe.size = file.getSize();
+
+      std::size_t const magic_size = std::min<std::size_t>(4, probe.size);
+      probe.magic.assign(file.getBuffer(), file.getBuffer() + magic_size);
+      for (char& character : probe.magic)
+      {
+        if (character < 32 || character > 126)
+        {
+          character = '?';
+        }
+      }
+    }
+    catch (...)
+    {
+    }
+
+    return probe;
+  }
+
   glm::vec3 server_to_client_position(float server_x, float server_y, float server_z, bool global_wmo_map)
   {
     if (global_wmo_map)
@@ -1106,7 +1746,8 @@ namespace
     return glm::degrees(orientation) - 180.0f;
   }
 
-  std::vector<std::pair<std::size_t, std::string>> resolve_creature_texture_overrides(std::uint32_t display_id)
+  std::vector<std::pair<std::size_t, std::string>> resolve_creature_texture_overrides(std::uint32_t display_id,
+                                                                                      Noggit::NoggitRenderContext context)
   {
     if (!display_id)
     {
@@ -1197,7 +1838,6 @@ namespace
       }
 
       auto extra_display_id = display.getUInt(CreatureDisplayInfoDB::ExtendedDisplayInfoID);
-      std::uint32_t legs_display_id_for_composite = 0;
       if (debug_character_override)
       {
         debug_details << " extraDisplay=" << extra_display_id;
@@ -1220,11 +1860,52 @@ namespace
           auto chest_display_id = display_extra.getUInt(CreatureDisplayInfoExtraDB::ChestDisplayID);
           auto belt_display_id = display_extra.getUInt(CreatureDisplayInfoExtraDB::BeltDisplayID);
           auto legs_display_id = display_extra.getUInt(CreatureDisplayInfoExtraDB::LegsDisplayID);
-          legs_display_id_for_composite = legs_display_id;
           auto boots_display_id = display_extra.getUInt(CreatureDisplayInfoExtraDB::BootsDisplayID);
           auto bracers_display_id = display_extra.getUInt(CreatureDisplayInfoExtraDB::BracersDisplayID);
           auto gloves_display_id = display_extra.getUInt(CreatureDisplayInfoExtraDB::GlovesDisplayID);
           auto tabard_display_id = display_extra.getUInt(CreatureDisplayInfoExtraDB::TabardDisplayID);
+          auto* client = Noggit::Application::NoggitApplication::instance()->clientData();
+          std::vector<CharacterTextureLayer> body_texture_layers;
+          bool const is_character_model = model_dir.rfind("character/", 0) == 0;
+          CharacterSectionTextures skin_section;
+          CharacterSectionTextures face_section;
+          CharacterSectionTextures hair_section;
+          CharacterSectionTextures facial_hair_section;
+          CharacterSectionTextures underwear_section;
+
+          if (is_character_model)
+          {
+            skin_section = resolve_character_section_textures(race_id,
+                                                              sex_id,
+                                                              CharacterSectionType::Skin,
+                                                              std::nullopt,
+                                                              skin_id,
+                                                              skin_id);
+            face_section = resolve_character_section_textures(race_id,
+                                                              sex_id,
+                                                              CharacterSectionType::Face,
+                                                              face_id,
+                                                              skin_id,
+                                                              skin_id);
+            hair_section = resolve_character_section_textures(race_id,
+                                                              sex_id,
+                                                              CharacterSectionType::Hair,
+                                                              hair_style_id,
+                                                              hair_color_id,
+                                                              hair_color_id);
+            facial_hair_section = resolve_character_section_textures(race_id,
+                                                                     sex_id,
+                                                                     CharacterSectionType::FacialHair,
+                                                                     hair_color_id,
+                                                                     hair_color_id,
+                                                                     hair_color_id);
+            underwear_section = resolve_character_section_textures(race_id,
+                                                                   sex_id,
+                                                                   CharacterSectionType::Underwear,
+                                                                   std::nullopt,
+                                                                   skin_id,
+                                                                   skin_id);
+          }
 
           if (debug_character_override)
           {
@@ -1246,6 +1927,16 @@ namespace
                           << " glovesDisplayId=" << gloves_display_id
                           << " tabardDisplayId=" << tabard_display_id;
 
+            if (is_character_model)
+            {
+              debug_details << " charSectionsFound=[skin:" << (skin_section.found ? 1 : 0)
+                            << ",face:" << (face_section.found ? 1 : 0)
+                            << ",hair:" << (hair_section.found ? 1 : 0)
+                            << ",facial:" << (facial_hair_section.found ? 1 : 0)
+                            << ",underwear:" << (underwear_section.found ? 1 : 0)
+                            << "]";
+            }
+
             append_item_display_debug_if_present(debug_details, "head", head_display_id);
             append_item_display_debug_if_present(debug_details, "shoulders", shoulders_display_id);
             append_item_display_debug_if_present(debug_details, "shirt", shirt_display_id);
@@ -1258,38 +1949,142 @@ namespace
             append_item_display_debug_if_present(debug_details, "tabard", tabard_display_id);
           }
 
-          if (!has_explicit_texture_variation)
+          auto append_body_layer = [&](DBCFile::Record const& item_display,
+                                       std::size_t texture_field,
+                                       CharacterTextureRegion region)
           {
-            auto baked_texture = normalize_baked_creature_texture_filename(display_extra.getString(CreatureDisplayInfoExtraDB::BakedTexture));
-            auto* client = Noggit::Application::NoggitApplication::instance()->clientData();
-            bool const is_character_model = model_dir.rfind("character/", 0) == 0;
-            bool const disable_baked_npc_textures = is_character_model && classic_probe_disable_baked_npc_textures_enabled();
-            auto append_character_fallback = [&](std::string texture)
+            auto texture = resolve_item_texture_component_filename(item_display.getString(texture_field), region);
+            if (!texture.empty())
             {
-              if (is_character_model)
-              {
-                append_override(1, texture);
-                append_override(2, texture);
-              }
-              else
-              {
-                append_override(1, std::move(texture));
-              }
-            };
+              body_texture_layers.push_back({std::move(texture), region});
+            }
+          };
 
-            bool const baked_texture_exists = !baked_texture.empty() && client->exists(baked_texture);
-            if (baked_texture_exists && !disable_baked_npc_textures)
+          auto append_section_body_layer = [&](CharacterSectionTextures const& section,
+                                               std::size_t texture_index,
+                                               CharacterTextureRegion region)
+          {
+            if (!section.found || texture_index >= section.textures.size())
             {
+              return;
+            }
+
+            auto texture = section.textures[texture_index];
+            if (!texture.empty())
+            {
+              body_texture_layers.push_back({std::move(texture), region});
+            }
+          };
+
+          auto append_item_body_layers = [&](std::uint32_t item_display_id, auto&& callback)
+          {
+            if (!item_display_id)
+            {
+              return;
+            }
+
+            try
+            {
+              auto const item_display = gItemDisplayInfoDB.getByID(item_display_id);
+              callback(item_display);
+            }
+            catch (DBCFile::NotFound const&)
+            {
+            }
+          };
+
+          append_section_body_layer(underwear_section, 0, CharacterTextureRegion::LegUpper);
+          append_section_body_layer(underwear_section, 1, CharacterTextureRegion::TorsoUpper);
+          append_section_body_layer(face_section, 0, CharacterTextureRegion::FaceLower);
+          append_section_body_layer(face_section, 1, CharacterTextureRegion::FaceUpper);
+          append_section_body_layer(facial_hair_section, 0, CharacterTextureRegion::FaceLower);
+          append_section_body_layer(facial_hair_section, 1, CharacterTextureRegion::FaceUpper);
+          append_section_body_layer(hair_section, 1, CharacterTextureRegion::FaceLower);
+          append_section_body_layer(hair_section, 2, CharacterTextureRegion::FaceUpper);
+
+          auto append_chest_like_layers = [&](DBCFile::Record const& item_display)
+          {
+            append_body_layer(item_display, ItemDisplayInfoDB::TextureUpperArm, CharacterTextureRegion::ArmUpper);
+            append_body_layer(item_display, ItemDisplayInfoDB::TextureLowerArm, CharacterTextureRegion::ArmLower);
+            append_body_layer(item_display, ItemDisplayInfoDB::TextureUpperChest, CharacterTextureRegion::TorsoUpper);
+            append_body_layer(item_display, ItemDisplayInfoDB::TextureLowerChest, CharacterTextureRegion::TorsoLower);
+
+            auto const robe_flags = item_display.getUInt(ItemDisplayInfoDB::GeosetGroup3);
+            if (robe_flags != 0)
+            {
+              append_body_layer(item_display, ItemDisplayInfoDB::TextureUpperLeg, CharacterTextureRegion::LegUpper);
+              append_body_layer(item_display, ItemDisplayInfoDB::TextureLowerLeg, CharacterTextureRegion::LegLower);
+            }
+          };
+
+          append_item_body_layers(shirt_display_id, append_chest_like_layers);
+          append_item_body_layers(chest_display_id, append_chest_like_layers);
+          append_item_body_layers(belt_display_id,
+            [&](DBCFile::Record const& item_display)
+            {
+              append_body_layer(item_display, ItemDisplayInfoDB::TextureLowerChest, CharacterTextureRegion::TorsoLower);
+              append_body_layer(item_display, ItemDisplayInfoDB::TextureUpperLeg, CharacterTextureRegion::LegUpper);
+            });
+          append_item_body_layers(bracers_display_id,
+            [&](DBCFile::Record const& item_display)
+            {
+              append_body_layer(item_display, ItemDisplayInfoDB::TextureLowerArm, CharacterTextureRegion::ArmLower);
+            });
+          append_item_body_layers(legs_display_id,
+            [&](DBCFile::Record const& item_display)
+            {
+              append_body_layer(item_display, ItemDisplayInfoDB::TextureUpperLeg, CharacterTextureRegion::LegUpper);
+              append_body_layer(item_display, ItemDisplayInfoDB::TextureLowerLeg, CharacterTextureRegion::LegLower);
+            });
+          append_item_body_layers(gloves_display_id,
+            [&](DBCFile::Record const& item_display)
+            {
+              append_body_layer(item_display, ItemDisplayInfoDB::TextureHands, CharacterTextureRegion::Hand);
+              append_body_layer(item_display, ItemDisplayInfoDB::TextureLowerArm, CharacterTextureRegion::ArmLower);
+            });
+          append_item_body_layers(boots_display_id,
+            [&](DBCFile::Record const& item_display)
+            {
+              append_body_layer(item_display, ItemDisplayInfoDB::TextureLowerLeg, CharacterTextureRegion::LegLower);
+              append_body_layer(item_display, ItemDisplayInfoDB::TextureFoot, CharacterTextureRegion::Foot);
+            });
+          append_item_body_layers(tabard_display_id,
+            [&](DBCFile::Record const& item_display)
+            {
+              append_body_layer(item_display, ItemDisplayInfoDB::TextureUpperChest, CharacterTextureRegion::TorsoUpper);
+              append_body_layer(item_display, ItemDisplayInfoDB::TextureLowerChest, CharacterTextureRegion::TorsoLower);
+            });
+
+          std::string character_skin_texture;
+          bool character_skin_exists = false;
+          if (is_character_model)
+          {
+            if (skin_section.found && !skin_section.textures[0].empty())
+            {
+              character_skin_texture = skin_section.textures[0];
+              character_skin_exists = client->exists(character_skin_texture);
+            }
+
+            if (!hair_section.textures[0].empty() && client->exists(hair_section.textures[0]))
+            {
+              append_override(6, hair_section.textures[0]);
               if (debug_character_override)
               {
-                debug_details << " baked='" << baked_texture << "' bakedExists=1";
+                debug_details << " hairTexture='" << hair_section.textures[0] << "'";
               }
-              append_character_fallback(std::move(baked_texture));
             }
-            else
+
+            if (skin_section.found && !skin_section.textures[1].empty() && client->exists(skin_section.textures[1]))
             {
-              // Baked texture not available (hash-named runtime textures are not shipped in MPQ).
-              // Fall back to the character's base skin texture derived from CDIExtra fields.
+              append_override(8, skin_section.textures[1]);
+              if (debug_character_override)
+              {
+                debug_details << " extraSkinTexture='" << skin_section.textures[1] << "'";
+              }
+            }
+
+            if (!character_skin_exists)
+            {
               std::string race_name;
               switch (race_id)
               {
@@ -1305,38 +2100,163 @@ namespace
                 case 11: race_name = "Draenei";  break;
                 default: break;
               }
-              std::string const sex_name = (sex_id == 0) ? "Male" : "Female";
 
+              if (!race_name.empty())
+              {
+                std::string const sex_name = (sex_id == 0) ? "Male" : "Female";
+                std::string skin_pad = (skin_id < 10 ? "0" : "") + std::to_string(skin_id);
+                character_skin_texture = normalize_texture_filename("Character/" + race_name + "/" + sex_name + "/"
+                  + race_name + sex_name + "Skin00_" + skin_pad + ".blp");
+                character_skin_exists = client->exists(character_skin_texture);
+                if (!character_skin_exists)
+                {
+                  character_skin_texture = normalize_texture_filename("Character/" + race_name + "/" + sex_name + "/"
+                    + race_name + sex_name + "Skin00_00.blp");
+                  character_skin_exists = client->exists(character_skin_texture);
+                }
+              }
+            }
+          }
+
+          if (!has_explicit_texture_variation)
+          {
+            auto baked_texture = normalize_baked_creature_texture_filename(display_extra.getString(CreatureDisplayInfoExtraDB::BakedTexture));
+            bool const disable_baked_npc_textures = is_character_model && classic_probe_disable_baked_npc_textures_enabled();
+            auto append_character_fallback = [&](std::string texture)
+            {
+              if (is_character_model)
+              {
+                append_override(1, texture);
+                append_override(2, texture);
+              }
+              else
+              {
+                append_override(1, std::move(texture));
+              }
+            };
+
+            bool const baked_texture_exists = !baked_texture.empty() && client->exists(baked_texture);
+            bool baked_texture_loadable = baked_texture_exists;
+            char const* baked_texture_load_method = nullptr;
+            ClientFileHeaderProbe baked_texture_probe;
+            if (debug_character_override && baked_texture_exists)
+            {
+              baked_texture_probe = probe_client_file_header(baked_texture);
+            }
+
+            if (baked_texture_exists && is_character_model && !disable_baked_npc_textures)
+            {
+              QImage baked_texture_image;
+              baked_texture_loadable = load_client_texture_image(baked_texture,
+                                                                 baked_texture_image,
+                                                                 nullptr,
+                                                                 &baked_texture_load_method);
+            }
+
+            if (baked_texture_exists && baked_texture_loadable && !disable_baked_npc_textures)
+            {
+              if (debug_character_override)
+              {
+                debug_details << " baked='" << baked_texture << "' bakedExists=1";
+                debug_details << " bakedLoadable=" << (baked_texture_loadable ? 1 : 0);
+                debug_details << " bakedOpened=" << (baked_texture_probe.opened ? 1 : 0);
+                if (baked_texture_probe.opened)
+                {
+                  debug_details << " bakedSize=" << baked_texture_probe.size
+                                << " bakedMagic='" << baked_texture_probe.magic << "'";
+                }
+                if (baked_texture_load_method)
+                {
+                  debug_details << " bakedLoadMethod='" << baked_texture_load_method << "'";
+                }
+              }
+              append_character_fallback(std::move(baked_texture));
+            }
+            else
+            {
+              // Baked texture not available (hash-named runtime textures are not shipped in MPQ).
+              // Fall back to the character's base skin texture derived from CDIExtra fields.
               if (debug_character_override)
               {
                 debug_details << " baked='" << baked_texture << "' bakedExists=" << (baked_texture_exists ? 1 : 0);
+                if (baked_texture_exists)
+                {
+                  debug_details << " bakedLoadable=" << (baked_texture_loadable ? 1 : 0);
+                  debug_details << " bakedOpened=" << (baked_texture_probe.opened ? 1 : 0);
+                  if (baked_texture_probe.opened)
+                  {
+                    debug_details << " bakedSize=" << baked_texture_probe.size
+                                  << " bakedMagic='" << baked_texture_probe.magic << "'";
+                  }
+                  if (baked_texture_load_method)
+                  {
+                    debug_details << " bakedLoadMethod='" << baked_texture_load_method << "'";
+                  }
+                }
                 if (disable_baked_npc_textures)
                 {
                   debug_details << " bakedSuppressed=1";
                 }
               }
 
-              if (!race_name.empty())
+              if (!character_skin_texture.empty())
               {
-                std::string skin_pad = (skin_id < 10 ? "0" : "") + std::to_string(skin_id);
-                std::string skin_path = normalize_texture_filename("Character/" + race_name + "/" + sex_name + "/"
-                  + race_name + sex_name + "Skin00_" + skin_pad + ".blp");
-                bool skin_exists = client->exists(skin_path);
-                if (!skin_exists)
-                {
-                  // Specific skin not found; try default skin 0 as fallback.
-                  skin_path = normalize_texture_filename("Character/" + race_name + "/" + sex_name + "/"
-                    + race_name + sex_name + "Skin00_00.blp");
-                  skin_exists = client->exists(skin_path);
-                }
                 if (debug_character_override)
                 {
-                  debug_details << " skin='" << skin_path << "' skinExists=" << (skin_exists ? 1 : 0);
+                  debug_details << " skin='" << character_skin_texture << "' skinExists=" << (character_skin_exists ? 1 : 0);
                 }
-                if (skin_exists)
+                if (character_skin_exists)
                 {
-                  append_character_fallback(std::move(skin_path));
+                  append_character_fallback(character_skin_texture);
                 }
+              }
+            }
+          }
+
+          if (debug_character_override && !character_skin_texture.empty() && has_explicit_texture_variation)
+          {
+            debug_details << " skin='" << character_skin_texture << "' skinExists=" << (character_skin_exists ? 1 : 0);
+          }
+
+          if (classic_pants_composite_enabled()
+              && model_dir.rfind("character/", 0) == 0
+              && !body_texture_layers.empty())
+          {
+            auto const body_override = std::find_if(overrides.begin(), overrides.end(),
+              [](std::pair<std::size_t, std::string> const& override_entry)
+              {
+                return override_entry.first == 1u || override_entry.first == 2u;
+              });
+
+            if (body_override != overrides.end())
+            {
+              std::string composed_texture;
+              bool composed = compose_character_body_texture(display_id,
+                                                             body_override->second,
+                                                             body_texture_layers,
+                                                             context,
+                                                             composed_texture,
+                                                             debug_character_override ? &debug_details : nullptr);
+
+              if (!composed && character_skin_exists && body_override->second != character_skin_texture)
+              {
+                if (debug_character_override)
+                {
+                  debug_details << " bodyTextureBaseFallback='" << character_skin_texture << "'";
+                }
+
+                composed = compose_character_body_texture(display_id,
+                                                          character_skin_texture,
+                                                          body_texture_layers,
+                                                          context,
+                                                          composed_texture,
+                                                          debug_character_override ? &debug_details : nullptr);
+              }
+
+              if (composed)
+              {
+                set_texture_override(overrides, 1u, composed_texture);
+                set_texture_override(overrides, 2u, composed_texture);
               }
             }
           }
@@ -1363,36 +2283,14 @@ namespace
         }
       }
 
-      if (classic_pants_composite_enabled()
-          && model_dir.rfind("character/", 0) == 0
-          && legs_display_id_for_composite != 0)
-      {
-        auto const body_override = std::find_if(overrides.begin(), overrides.end(),
-          [](std::pair<std::size_t, std::string> const& override_entry)
-          {
-            return override_entry.first == 1u || override_entry.first == 2u;
-          });
-
-        if (body_override != overrides.end())
-        {
-          std::string composed_texture;
-          if (compose_character_legs_texture(display_id,
-                                             legs_display_id_for_composite,
-                                             body_override->second,
-                                             composed_texture,
-                                             debug_character_override ? &debug_details : nullptr))
-          {
-            set_texture_override(overrides, 1u, composed_texture);
-            set_texture_override(overrides, 2u, composed_texture);
-          }
-        }
-      }
-
       if (debug_character_override)
       {
-        LogDebug << "Creature texture overrides: " << debug_details.str()
-                 << " finalOverrides=[" << format_texture_override_list(overrides) << "]"
-                 << std::endl;
+        std::ostringstream override_log;
+        override_log << debug_details.str()
+                     << " finalOverrides=[" << format_texture_override_list(overrides) << "]";
+
+        LogDebug << "Creature texture overrides: " << override_log.str() << std::endl;
+        append_creature_geoset_trace("texture", override_log.str());
       }
 
       return overrides;
@@ -1620,6 +2518,10 @@ bool World::reloadCreatureSpawns()
 {
   append_creature_geoset_trace("reload", std::string("mapId=") + std::to_string(mapIndex._map_id));
   _creature_spawns_load_attempted = true;
+  if (!_creature_spawns.empty())
+  {
+    AsyncLoader::instance().wait_until_idle();
+  }
   clearCreatureSpawns();
 
 #ifdef USE_MYSQL_UID_STORAGE
@@ -1641,7 +2543,6 @@ bool World::reloadCreatureSpawns()
   std::size_t missing_model_info = 0;
   std::size_t empty_model_name = 0;
   std::size_t model_construct_failures = 0;
-  std::size_t logged_failures = 0;
 
   for (auto const& row : rows)
   {
@@ -1657,128 +2558,24 @@ bool World::reloadCreatureSpawns()
     spawn.original_pos = spawn.pos;
     spawn.orientation = server_to_client_orientation(row.orientation);
     spawn.original_orientation = spawn.orientation;
+    spawn.animation_time_offset = static_cast<int>(((row.guid * 1103515245u) + (row.entry * 12345u)) % 3500u);
+    spawn.template_scale = row.template_scale > 0.0f ? row.template_scale : 1.0f;
+    spawn.mainhand_display_id = row.mainhand_display_id;
+    spawn.offhand_display_id = row.offhand_display_id;
+    spawn.ranged_display_id = row.ranged_display_id;
+    spawn.mainhand_inventory_type = row.mainhand_inventory_type;
+    spawn.offhand_inventory_type = row.offhand_inventory_type;
+    spawn.ranged_inventory_type = row.ranged_inventory_type;
 
     if (spawn.display_id)
     {
       auto const model_result = resolve_creature_model_path(spawn.display_id);
       if (model_result.status == CreatureModelPathStatus::Success)
       {
-        try
-        {
-          BlizzardArchive::Listfile::FileKey const file_key(model_result.path);
-          spawn.model_instance.emplace(file_key, _context);
-          spawn.model_instance->pos   = spawn.pos;
-          spawn.model_instance->dir   = glm::vec3(0.0f, spawn.orientation, 0.0f);
-          float template_scale = row.template_scale > 0.0f ? row.template_scale : 1.0f;
-          float model_scale = resolve_creature_model_scale(spawn.display_id);
-          spawn.model_instance->scale = std::clamp(template_scale * model_scale,
-                                                   ModelInstance::min_scale(),
-                                                   ModelInstance::max_scale());
-          spawn.model_instance->updateTransformMatrix();
-
-          auto const overrides = resolve_creature_texture_overrides(spawn.display_id);
-          for (auto const& ov : overrides)
-          {
-            spawn.model_instance->setReplaceTexture(ov.first, ov.second);
-          }
-          spawn.attachment_models.clear();
-          if (model_result.path.rfind("character/", 0) == 0)
-          {
-            for (auto const& attachment_spec : resolve_creature_attachment_models(spawn.display_id))
-            {
-              World::CreatureSpawnOverlay::AttachmentModel attachment;
-              attachment.attachment_id = attachment_spec.attachment_id;
-              attachment.model_instance.emplace(BlizzardArchive::Listfile::FileKey(attachment_spec.model_path), _context);
-
-              for (auto const& override_entry : overrides)
-              {
-                if (override_entry.first == 2u)
-                {
-                  continue;
-                }
-
-                attachment.model_instance->setReplaceTexture(override_entry.first, override_entry.second);
-              }
-
-              for (auto const& override_entry : attachment_spec.texture_overrides)
-              {
-                attachment.model_instance->setReplaceTexture(override_entry.first, override_entry.second);
-              }
-
-              spawn.attachment_models.push_back(std::move(attachment));
-            }
-          }
-
-          std::size_t geoset_controlled_family_count = 0;
-          std::string geoset_debug_summary;
-
-          if (model_result.path.rfind("character/", 0) == 0)
-          {
-            auto const geoset_selection = resolve_creature_geoset_selection(spawn.display_id);
-            geoset_controlled_family_count = geoset_selection.controlled_families.size();
-            geoset_debug_summary = geoset_selection.debug_summary;
-            if (!geoset_selection.empty())
-            {
-              spawn.model_instance->setGeosetSelections(geoset_selection.visible_ids,
-                                                        geoset_selection.controlled_families);
-            }
-
-            if (creature_texture_debug_enabled())
-            {
-              std::ostringstream geoset_line;
-              geoset_line << "guid=" << spawn.guid
-                          << " display=" << spawn.display_id
-                          << " model='" << model_result.path << "'"
-                          << " controlledFamilyCount=" << geoset_selection.controlled_families.size()
-                          << geoset_selection.debug_summary;
-              LogDebug << "Creature geoset selection: " << geoset_line.str() << std::endl;
-              append_creature_geoset_trace("selection", geoset_line.str());
-            }
-          }
-
-          if (creature_texture_debug_enabled()
-              && spawn.model_instance
-              && model_result.path.rfind("character/", 0) == 0)
-          {
-            std::ostringstream applied_slots;
-            bool first = true;
-            for (auto const& replacement : spawn.model_instance->replaceTextures())
-            {
-              if (!first)
-              {
-                applied_slots << ", ";
-              }
-              first = false;
-              applied_slots << replacement.first;
-            }
-
-            std::ostringstream replacements_line;
-            replacements_line << "guid=" << spawn.guid
-                              << " display=" << spawn.display_id
-                              << " model='" << model_result.path << "'"
-                              << " overrideCount=" << overrides.size()
-                              << " appliedSlots=[" << applied_slots.str() << "]"
-                              << " controlledFamilyCount=" << geoset_controlled_family_count
-                              << geoset_debug_summary;
-
-            LogDebug << "Creature instance replacements: " << replacements_line.str() << std::endl;
-            append_creature_geoset_trace("instance", replacements_line.str());
-          }
-
-          ++resolved_models;
-        }
-        catch (std::exception const& ex)
-        {
-          ++model_construct_failures;
-          if (logged_failures < max_logged_creature_model_failures)
-          {
-            LogDebug << "Creature spawn model load failed: guid=" << spawn.guid
-                     << " display_id=" << spawn.display_id
-                     << " path=" << model_result.path
-                     << " error=" << ex.what() << std::endl;
-            ++logged_failures;
-          }
-        }
+        spawn.model_path = model_result.path;
+        spawn.model_scale = resolve_creature_model_scale(spawn.display_id);
+        spawn.is_character_model = spawn.model_path.rfind("character/", 0) == 0;
+        ++resolved_models;
       }
       else
       {
@@ -1815,6 +2612,207 @@ bool World::reloadCreatureSpawns()
 #endif
 }
 
+bool World::ensureCreatureSpawnModel(CreatureSpawnOverlay& spawn)
+{
+  if (spawn.model_instance.has_value())
+  {
+    return true;
+  }
+
+  if (spawn.model_create_failed || spawn.model_path.empty())
+  {
+    return false;
+  }
+
+  try
+  {
+    BlizzardArchive::Listfile::FileKey const file_key(spawn.model_path);
+    spawn.model_instance.emplace(file_key, _context);
+    spawn.model_instance->pos = spawn.pos;
+    spawn.model_instance->dir = glm::vec3(0.0f, spawn.orientation, 0.0f);
+    spawn.model_instance->scale = std::clamp(spawn.template_scale * spawn.model_scale,
+                                             ModelInstance::min_scale(),
+                                             ModelInstance::max_scale());
+    spawn.model_instance->updateTransformMatrix();
+
+    auto const overrides = applyCreatureSpawnModelAppearance(spawn, *spawn.model_instance, Noggit::NoggitRenderContext::MAP_VIEW);
+
+    spawn.attachment_models.clear();
+    if (spawn.is_character_model && creature_spawn_attachments_enabled())
+    {
+      auto attachment_specs = resolve_creature_attachment_models(spawn.display_id);
+      auto equipment_specs = resolve_creature_equipment_attachment_models(spawn.display_id,
+                                                                          spawn.mainhand_display_id,
+                                                                          spawn.offhand_display_id,
+                                                                          spawn.ranged_display_id,
+                                                                          spawn.offhand_inventory_type);
+      attachment_specs.insert(attachment_specs.end(),
+                              std::make_move_iterator(equipment_specs.begin()),
+                              std::make_move_iterator(equipment_specs.end()));
+
+      if (creature_texture_debug_enabled() && !attachment_specs.empty())
+      {
+        std::ostringstream attachment_line;
+        attachment_line << "guid=" << spawn.guid
+                        << " display=" << spawn.display_id
+                        << " mainhandDisplay=" << spawn.mainhand_display_id
+                        << " offhandDisplay=" << spawn.offhand_display_id
+                        << " rangedDisplay=" << spawn.ranged_display_id
+                        << " attachmentCount=" << attachment_specs.size();
+        for (auto const& attachment_spec : attachment_specs)
+        {
+          attachment_line << " {id=" << attachment_spec.attachment_id
+                          << ", model='" << attachment_spec.model_path << "'}";
+        }
+        LogDebug << "Creature attachment selection: " << attachment_line.str() << std::endl;
+        append_creature_geoset_trace("attachment", attachment_line.str());
+      }
+
+      for (auto const& attachment_spec : attachment_specs)
+      {
+        try
+        {
+          CreatureSpawnOverlay::AttachmentModel attachment;
+          attachment.attachment_id = attachment_spec.attachment_id;
+          attachment.model_instance.emplace(BlizzardArchive::Listfile::FileKey(attachment_spec.model_path), _context);
+          attachment.model_instance->pos = spawn.pos;
+          attachment.model_instance->dir = spawn.model_instance->dir;
+          attachment.model_instance->scale = spawn.model_instance->scale;
+          attachment.model_instance->updateTransformMatrix();
+
+          for (auto const& texture_override : attachment_spec.texture_overrides)
+          {
+            attachment.model_instance->setReplaceTexture(texture_override.first, texture_override.second);
+          }
+
+          spawn.attachment_models.push_back(std::move(attachment));
+        }
+        catch (std::exception const& ex)
+        {
+          if (creature_texture_debug_enabled())
+          {
+            LogDebug << "Creature attachment model load failed: guid=" << spawn.guid
+                     << " display_id=" << spawn.display_id
+                     << " attachment=" << attachment_spec.attachment_id
+                     << " path='" << attachment_spec.model_path << "'"
+                     << " error=" << ex.what()
+                     << std::endl;
+          }
+        }
+      }
+    }
+
+    std::size_t geoset_controlled_family_count = 0;
+    std::string geoset_debug_summary;
+
+    if (enable_creature_spawn_character_geosets
+        && creature_spawn_geosets_enabled()
+        && spawn.is_character_model)
+    {
+      auto const geoset_selection = resolve_creature_geoset_selection(spawn.display_id);
+      geoset_controlled_family_count = geoset_selection.controlled_families.size();
+      geoset_debug_summary = geoset_selection.debug_summary;
+      if (!geoset_selection.empty())
+      {
+        spawn.model_instance->setGeosetSelections(geoset_selection.visible_ids,
+                                                  geoset_selection.controlled_families);
+      }
+
+      if (creature_texture_debug_enabled())
+      {
+        std::ostringstream geoset_line;
+        geoset_line << "guid=" << spawn.guid
+                    << " display=" << spawn.display_id
+                    << " model='" << spawn.model_path << "'"
+                    << " controlledFamilyCount=" << geoset_selection.controlled_families.size()
+                    << geoset_selection.debug_summary;
+        LogDebug << "Creature geoset selection: " << geoset_line.str() << std::endl;
+        append_creature_geoset_trace("selection", geoset_line.str());
+      }
+    }
+
+    if (creature_texture_debug_enabled()
+        && spawn.is_character_model)
+    {
+      std::ostringstream applied_slots;
+      std::ostringstream override_paths;
+      bool first = true;
+      for (auto const& replacement : spawn.model_instance->replaceTextures())
+      {
+        if (!first)
+        {
+          applied_slots << ", ";
+        }
+        first = false;
+        applied_slots << replacement.first;
+      }
+
+      for (std::size_t index = 0; index < overrides.size(); ++index)
+      {
+        if (index != 0)
+        {
+          override_paths << ", ";
+        }
+
+        override_paths << overrides[index].first << ":'" << overrides[index].second << "'";
+      }
+
+      std::ostringstream replacements_line;
+      replacements_line << "guid=" << spawn.guid
+                        << " display=" << spawn.display_id
+                        << " model='" << spawn.model_path << "'"
+                        << " overrideCount=" << overrides.size()
+                        << " appliedSlots=[" << applied_slots.str() << "]"
+                        << " overridePaths=[" << override_paths.str() << "]"
+                        << " controlledFamilyCount=" << geoset_controlled_family_count
+                        << geoset_debug_summary;
+
+      LogDebug << "Creature instance replacements: " << replacements_line.str() << std::endl;
+      append_creature_geoset_trace("instance", replacements_line.str());
+    }
+
+    return true;
+  }
+  catch (std::exception const& ex)
+  {
+    spawn.model_create_failed = true;
+    LogDebug << "Creature spawn model load failed: guid=" << spawn.guid
+             << " display_id=" << spawn.display_id
+             << " path=" << spawn.model_path
+             << " error=" << ex.what() << std::endl;
+  }
+
+  return false;
+}
+
+std::vector<std::pair<std::size_t, std::string>> World::applyCreatureSpawnModelAppearance(CreatureSpawnOverlay const& spawn,
+                                                                                         ModelInstance& model_instance,
+                                                                                         Noggit::NoggitRenderContext context) const
+{
+  auto const overrides = spawn.is_character_model
+    ? resolve_creature_texture_overrides(spawn.display_id, context)
+    : resolve_creature_texture_overrides_stable(spawn.display_id);
+
+  for (auto const& override_entry : overrides)
+  {
+    model_instance.setReplaceTexture(override_entry.first, override_entry.second);
+  }
+
+  if (enable_creature_spawn_character_geosets
+      && creature_spawn_geosets_enabled()
+      && spawn.is_character_model)
+  {
+    auto const geoset_selection = resolve_creature_geoset_selection(spawn.display_id);
+    if (!geoset_selection.empty())
+    {
+      model_instance.setGeosetSelections(geoset_selection.visible_ids,
+                                         geoset_selection.controlled_families);
+    }
+  }
+
+  return overrides;
+}
+
 void World::clearCreatureSpawns()
 {
   _creature_spawns.clear();
@@ -1834,7 +2832,7 @@ std::size_t World::creatureSpawnModelCount() const
   return static_cast<std::size_t>(std::count_if(_creature_spawns.begin(), _creature_spawns.end(),
     [](CreatureSpawnOverlay const& spawn)
     {
-      return spawn.model_instance.has_value();
+      return !spawn.model_path.empty() && !spawn.model_create_failed;
     }));
 }
 
@@ -2740,7 +3738,7 @@ void World::update_selected_model_groups()
 MapChunk* World::getChunkAt(glm::vec3 const& pos)
 {
   MapTile* tile(mapIndex.getTile(pos));
-  if (tile && tile->finishedLoading())
+  if (tile && tile->finishedLoading() && !tile->loading_failed())
   {
     return tile->getChunk((pos.x - tile->xbase) / CHUNKSIZE, (pos.z - tile->zbase) / CHUNKSIZE);
   }
@@ -2838,7 +3836,7 @@ selection_result World::intersect (glm::mat4x4 const& model_view
       if (!mapIndex.tileLoaded(index) || mapIndex.tileAwaitingLoading(index))
           continue;
 
-      if (!tile->finishedLoading())
+      if (!tile->finishedLoading() || tile->loading_failed())
         continue;
 
       if (tile->intersect(ray, &results))
@@ -3193,7 +4191,7 @@ std::vector<selected_object_type> World::getObjectsInRange(glm::vec3 const& pos,
     /* This causes duplicates at tile edges
     for (MapTile* tile : mapIndex.tiles_in_range(pos, radius))
     {
-        if (!tile->finishedLoading())
+        if (!tile->finishedLoading() || tile->loading_failed())
         {
             continue;
         }
@@ -5302,4 +6300,3 @@ void World::clear_selection_groups()
     _selection_groups.clear(); // in case it didn't properly clear
     saveSelectionGroups(); // only save once
 }
-

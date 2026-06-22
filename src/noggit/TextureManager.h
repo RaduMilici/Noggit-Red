@@ -16,6 +16,7 @@
 #include <QtOpenGL/QGLPixelBuffer>
 #include <optional>
 #include <map>
+#include <mutex>
 #include <unordered_map>
 #include <string>
 #include <vector>
@@ -45,6 +46,7 @@ struct blp_texture : public AsyncObject
   blp_texture (BlizzardArchive::Listfile::FileKey const& filename, Noggit::NoggitRenderContext context);
   void finishLoading() override;
   virtual void waitForChildrenLoaded() override {};
+  char const* async_object_type_name() const override { return "blp_texture"; }
 
   void loadFromUncompressedData(BLPHeader const* lHeader, char const* lData);
   void loadFromCompressedData(BLPHeader const* lHeader, char const* lData);
@@ -121,6 +123,7 @@ private:
   static Noggit::AsyncObjectMultimap<blp_texture> _;
   static std::array<std::unordered_map<std::tuple<GLint, int, int, int>, TexArrayParams, tuple_hash>, 7> _tex_arrays;
   static std::map<std::pair<std::string, int>, raw_texture_data> _raw_textures;
+  static std::mutex _raw_textures_mutex;
 
 };
 

@@ -18,11 +18,24 @@ using namespace Noggit::Rendering;
 
 namespace
 {
+  constexpr char const* classic_character_render_trace_filename = "creature_geoset_trace_20260604.log";
+
   bool model_texture_debug_enabled()
   {
     static bool const enabled = []()
     {
       char const* value = std::getenv("NOGGIT_MODEL_TEXTURE_DEBUG");
+      return value && *value && std::strcmp(value, "0") != 0;
+    }();
+
+    return enabled;
+  }
+
+  bool capture_debug_enabled()
+  {
+    static bool const enabled = []()
+    {
+      char const* value = std::getenv("NOGGIT_CAPTURE_DEBUG");
       return value && *value && std::strcmp(value, "0") != 0;
     }();
 
@@ -50,6 +63,22 @@ namespace
     return model->file_key().filepath().starts_with("character/");
   }
 
+  void append_classic_character_render_trace(std::string const& message)
+  {
+    if (!model_texture_debug_enabled())
+    {
+      return;
+    }
+
+    std::ofstream trace(classic_character_render_trace_filename, std::ios::app);
+    if (!trace.is_open())
+    {
+      return;
+    }
+
+    trace << "render " << message << '\n';
+  }
+
   void log_classic_character_controlled_geoset_decision(Model const* model,
                                                         ModelInstance const* instance,
                                                         std::uint16_t geoset_id,
@@ -61,10 +90,14 @@ namespace
     }
 
     auto const geoset_family = static_cast<std::uint16_t>(geoset_id / 100);
+    bool const family_controlled = instance->isGeosetFamilyControlled(geoset_family);
+    bool const geoset_visible = instance->isGeosetIdVisible(geoset_id);
     if (geoset_family < 4 || geoset_family > 15)
     {
       return;
     }
+
+    bool const lower_body_family = geoset_family >= 10 && geoset_family <= 13;
 
     static std::set<std::string> logged_draws;
 
@@ -94,6 +127,8 @@ namespace
              << "' uid=" << instance->uid
              << " geosetId=" << geoset_id
              << " family=" << geoset_family
+             << " controlled=" << (family_controlled ? 1 : 0)
+             << " visible=" << (geoset_visible ? 1 : 0)
              << " controlledFamilies=[";
     for (std::size_t index = 0; index < instance->controlledGeosetFamilies().size(); ++index)
     {
@@ -114,6 +149,11 @@ namespace
     }
     log_line << "]";
     LogDebug << log_line.str() << std::endl;
+
+    if (lower_body_family)
+    {
+      append_classic_character_render_trace(log_line.str());
+    }
   }
 
   bool is_masked_lightray_model(Model const* model)
@@ -149,6 +189,7 @@ void ModelRender::upload()
   _buffers.upload();
   _vertex_arrays.upload();
   _bone_matrices_buf_tex = 0;
+  _bone_matrices_buffer_size = 0;
 
   if (_model->animBones)
   {
@@ -156,7 +197,8 @@ void ModelRender::upload()
 
     gl.bindTexture(GL_TEXTURE_BUFFER, _bone_matrices_buf_tex);
     OpenGL::Scoped::buffer_binder<GL_TEXTURE_BUFFER> const binder(_bone_matrices_buffer);
-    gl.bufferData(GL_TEXTURE_BUFFER, _model->bone_matrices.size() * sizeof(glm::mat4x4), nullptr, GL_STREAM_DRAW);
+    _bone_matrices_buffer_size = _model->bone_matrices.size() * sizeof(glm::mat4x4);
+    gl.bufferData(GL_TEXTURE_BUFFER, _bone_matrices_buffer_size, nullptr, GL_STREAM_DRAW);
     gl.texBuffer(GL_TEXTURE_BUFFER, GL_RGBA32F, _bone_matrices_buffer);
   }
 
@@ -233,7 +275,8 @@ void ModelRender::draw(glm::mat4x4 const& model_view
 
   if (_model->animated && (!_model->animcalc || _model->_per_instance_animation))
   {
-    _model->animate(model_view, 0, animtime);
+    auto const anim_id = instance.forcedAnimationId() >= 0 ? instance.forcedAnimationId() : 0;
+    _model->animate(model_view, anim_id, animtime);
     _model->animcalc = true;
   }
 
@@ -241,11 +284,24 @@ void ModelRender::draw(glm::mat4x4 const& model_view
 
   m2_shader.uniform("transform", instance.transformMatrix());
 
+  if (_model->animBones)
+  {
+    gl.activeTexture(GL_TEXTURE0);
+    gl.bindTexture(GL_TEXTURE_BUFFER, _bone_matrices_buf_tex);
+    m2_shader.uniform("anim_bones", true);
+    m2_shader.uniform("bone_matrix_count", static_cast<int>(_model->bone_matrices.size()));
+  }
+  else
+  {
+    m2_shader.uniform("anim_bones", false);
+    m2_shader.uniform("bone_matrix_count", 0);
+  }
+
   {
     OpenGL::Scoped::buffer_binder<GL_ARRAY_BUFFER> const binder(_vertices_buffer);
     m2_shader.attrib("pos", 3, GL_FLOAT, GL_FALSE, sizeof(ModelVertex), 0);
-    m2_shader.attrib("bones_weight",  4, GL_UNSIGNED_BYTE,  GL_FALSE, sizeof (ModelVertex), reinterpret_cast<void*> (sizeof (::glm::vec3)));
-    m2_shader.attrib("bones_indices", 4, GL_UNSIGNED_BYTE,  GL_FALSE, sizeof (ModelVertex), reinterpret_cast<void*> (sizeof (::glm::vec3) + 4));
+    m2_shader.attribi("bones_weight",  4, GL_UNSIGNED_BYTE, sizeof (ModelVertex), reinterpret_cast<void*> (sizeof (::glm::vec3)));
+    m2_shader.attribi("bones_indices", 4, GL_UNSIGNED_BYTE, sizeof (ModelVertex), reinterpret_cast<void*> (sizeof (::glm::vec3) + 4));
     m2_shader.attrib("normal", 3, GL_FLOAT, GL_FALSE, sizeof(ModelVertex), reinterpret_cast<void*> (sizeof(::glm::vec3) + 8));
     m2_shader.attrib("texcoord1", 2, GL_FLOAT, GL_FALSE, sizeof(ModelVertex), reinterpret_cast<void*> (sizeof(::glm::vec3) * 2 + 8));
     m2_shader.attrib("texcoord2", 2, GL_FLOAT, GL_FALSE, sizeof(ModelVertex), reinterpret_cast<void*> (sizeof(::glm::vec3) * 2 + 8 + sizeof(glm::vec2)));
@@ -286,6 +342,16 @@ void ModelRender::draw(glm::mat4x4 const& model_view
   {
     ZoneScopedN("Model::draw() : uploads")
 
+    if (capture_debug_enabled())
+    {
+      LogDebug << "ModelRender::draw instanced uploads begin model='"
+               << _model->file_key().stringRepr()
+               << "' uploaded=" << _uploaded
+               << " vaoSetup=" << _vao_setup
+               << " instances=" << instances.size()
+               << std::endl;
+    }
+
     if (!_model->finishedLoading() || _model->loading_failed())
     {
       return;
@@ -300,6 +366,13 @@ void ModelRender::draw(glm::mat4x4 const& model_view
     {
       setupVAO(m2_shader);
     }
+
+    if (capture_debug_enabled())
+    {
+      LogDebug << "ModelRender::draw instanced uploads end model='"
+               << _model->file_key().stringRepr()
+               << "'" << std::endl;
+    }
   }
 
   if (instances.empty())
@@ -312,8 +385,27 @@ void ModelRender::draw(glm::mat4x4 const& model_view
 
     if (_model->animated && (!_model->animcalc || _model->_per_instance_animation))
     {
+      if (capture_debug_enabled())
+      {
+        LogDebug << "ModelRender::draw instanced animate begin model='"
+                 << _model->file_key().stringRepr()
+                 << "' animcalc=" << _model->animcalc
+                 << " perInstance=" << _model->_per_instance_animation
+                 << " bones=" << _model->bones.size()
+                 << " boneMatrices=" << _model->bone_matrices.size()
+                 << " animtime=" << animtime
+                 << std::endl;
+      }
+
       _model->animate(model_view, 0, animtime);
       _model->animcalc = true;
+
+      if (capture_debug_enabled())
+      {
+        LogDebug << "ModelRender::draw instanced animate end model='"
+                 << _model->file_key().stringRepr()
+                 << "'" << std::endl;
+      }
     }
 
     // store the model count to draw the bounding boxes later
@@ -331,6 +423,14 @@ void ModelRender::draw(glm::mat4x4 const& model_view
 
     OpenGL::Scoped::vao_binder const _ (_vao);
 
+    if (capture_debug_enabled())
+    {
+      LogDebug << "ModelRender::draw instanced gpu begin model='"
+               << _model->file_key().stringRepr()
+               << "' passes=" << _render_passes.size()
+               << std::endl;
+    }
+
     {
       OpenGL::Scoped::buffer_binder<GL_ARRAY_BUFFER> const transform_binder (_transform_buffer);
       gl.bufferData(GL_ARRAY_BUFFER, instances.size() * sizeof(::glm::mat4x4), instances.data(), GL_DYNAMIC_DRAW);
@@ -342,10 +442,12 @@ void ModelRender::draw(glm::mat4x4 const& model_view
       gl.activeTexture(GL_TEXTURE0);
       gl.bindTexture(GL_TEXTURE_BUFFER, _bone_matrices_buf_tex);
       m2_shader.uniform("anim_bones", true);
+      m2_shader.uniform("bone_matrix_count", static_cast<int>(_model->bone_matrices.size()));
     }
     else
     {
       m2_shader.uniform("anim_bones", false);
+      m2_shader.uniform("bone_matrix_count", 0);
     }
 
     OpenGL::Scoped::buffer_binder<GL_ELEMENT_ARRAY_BUFFER> indices_binder(_indices_buffer);
@@ -357,6 +459,13 @@ void ModelRender::draw(glm::mat4x4 const& model_view
         gl.drawElementsInstanced(GL_TRIANGLES, p.index_count, GL_UNSIGNED_SHORT, reinterpret_cast<void*>(p.index_start * sizeof(GLushort)), static_cast<GLsizei>(instances.size()));
         p.afterDraw();
       }
+    }
+
+    if (capture_debug_enabled())
+    {
+      LogDebug << "ModelRender::draw instanced gpu end model='"
+               << _model->file_key().stringRepr()
+               << "'" << std::endl;
     }
   }
 
@@ -437,7 +546,7 @@ void ModelRender::fixShaderIdBlendOverride()
     }
 
     int shader = 0;
-    bool blend_mode_override = (_model->header.Flags & 8);
+    bool blend_mode_override = !_model->_uses_classic_layout && (_model->header.Flags & 8);
 
     if (is_masked_lightray_model(_model)
         && pass.renderflag_index < _model->_render_flags.size())
@@ -491,6 +600,13 @@ void ModelRender::fixShaderIdBlendOverride()
 
       for (int i = 0; i < pass.texture_count; ++i)
       {
+        if (pass.shader_id + i >= _model->blend_override.size())
+        {
+          blend_mode_override = false;
+          shader = 0;
+          break;
+        }
+
         uint16_t override_blend = _model->blend_override[pass.shader_id + i];
         uint16_t texture_unit_lookup = _model->_texture_unit_lookup[pass.texture_coord_combo_index + i];
 
@@ -924,9 +1040,47 @@ void ModelRender::initRenderPasses(ModelView const* view, ModelTexUnit const* te
 
 void ModelRender::updateBoneMatrices()
 {
+  if (!_model->animBones || _model->bone_matrices.empty())
+  {
+    return;
+  }
+
+  std::size_t const upload_size = _model->bone_matrices.size() * sizeof(glm::mat4x4);
+
+  if (capture_debug_enabled()
+      && _model->file_key().filepath().find("gnomemachine") != std::string::npos)
+  {
+    LogDebug << "ModelRender::updateBoneMatrices begin model='"
+             << _model->file_key().stringRepr()
+             << "' uploadSize=" << upload_size
+             << " bufferSize=" << _bone_matrices_buffer_size
+             << " buffer=" << _bone_matrices_buffer
+             << " texture=" << _bone_matrices_buf_tex
+             << std::endl;
+  }
+
   {
     OpenGL::Scoped::buffer_binder<GL_TEXTURE_BUFFER> const binder (_bone_matrices_buffer);
-    gl.bufferSubData(GL_TEXTURE_BUFFER, 0, _model->bone_matrices.size() * sizeof(glm::mat4x4), _model->bone_matrices.data());
+    if (upload_size != _bone_matrices_buffer_size)
+    {
+      _bone_matrices_buffer_size = upload_size;
+      gl.bufferData(GL_TEXTURE_BUFFER, _bone_matrices_buffer_size, nullptr, GL_STREAM_DRAW);
+      if (_bone_matrices_buf_tex)
+      {
+        gl.bindTexture(GL_TEXTURE_BUFFER, _bone_matrices_buf_tex);
+        gl.texBuffer(GL_TEXTURE_BUFFER, GL_RGBA32F, _bone_matrices_buffer);
+      }
+    }
+
+    gl.bufferSubData(GL_TEXTURE_BUFFER, 0, upload_size, _model->bone_matrices.data());
+  }
+
+  if (capture_debug_enabled()
+      && _model->file_key().filepath().find("gnomemachine") != std::string::npos)
+  {
+    LogDebug << "ModelRender::updateBoneMatrices end model='"
+             << _model->file_key().stringRepr()
+             << "'" << std::endl;
   }
 }
 

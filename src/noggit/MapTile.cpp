@@ -22,7 +22,10 @@
 #include <noggit/World.inl>
 #include <QtCore/QSettings>
 
+#include <algorithm>
 #include <cassert>
+#include <cctype>
+#include <cstring>
 #include <list>
 #include <map>
 #include <optional>
@@ -33,9 +36,77 @@
 
 namespace
 {
+  std::uint32_t reverse_fourcc(std::uint32_t fourcc)
+  {
+    return ((fourcc & 0x000000FFu) << 24u)
+         | ((fourcc & 0x0000FF00u) << 8u)
+         | ((fourcc & 0x00FF0000u) >> 8u)
+         | ((fourcc & 0xFF000000u) >> 24u);
+  }
+
+  std::string fourcc_to_string(std::uint32_t fourcc)
+  {
+    char text[5] = {};
+    std::memcpy(text, &fourcc, 4);
+    return text;
+  }
+
+  bool is_null_adt_asset_reference(std::string filename)
+  {
+    auto const is_trimmed_char = [](unsigned char character)
+    {
+      return character == '\0' || std::isspace(character);
+    };
+
+    filename.erase(filename.begin(),
+                   std::find_if(filename.begin(), filename.end(),
+                                [&](unsigned char character) { return !is_trimmed_char(character); }));
+    filename.erase(std::find_if(filename.rbegin(), filename.rend(),
+                                [&](unsigned char character) { return !is_trimmed_char(character); }).base(),
+                   filename.end());
+
+    std::transform(filename.begin(), filename.end(), filename.begin(), [](unsigned char character)
+    {
+      return static_cast<char>(std::tolower(character));
+    });
+    std::replace(filename.begin(), filename.end(), '\\', '/');
+
+    if (filename.empty() || filename == "0" || filename == "none" || filename == "null")
+    {
+      return true;
+    }
+
+    if (filename.find('/') == std::string::npos)
+    {
+      auto const extension_pos = filename.rfind('.');
+      if (extension_pos != std::string::npos && filename.substr(0, extension_pos) == "0")
+      {
+        auto const extension = filename.substr(extension_pos);
+        return extension == ".m2" || extension == ".mdx" || extension == ".mdl" || extension == ".wmo";
+      }
+    }
+
+    return false;
+  }
+
+  std::string normalize_adt_asset_filename(std::string filename)
+  {
+    if (is_null_adt_asset_reference(filename))
+    {
+      return {};
+    }
+
+    filename = BlizzardArchive::ClientData::normalizeFilenameInternal(std::move(filename));
+    return is_null_adt_asset_reference(filename) ? std::string() : std::move(filename);
+  }
+
   std::string normalize_adt_model_filename(std::string filename)
   {
-    filename = BlizzardArchive::ClientData::normalizeFilenameInternal(std::move(filename));
+    filename = normalize_adt_asset_filename(std::move(filename));
+    if (filename.empty())
+    {
+      return {};
+    }
 
     auto const marker = filename.find(".m2/");
     if (marker == std::string::npos)
@@ -51,7 +122,7 @@ namespace
       filename.erase(marker + 3);
     }
 
-    return filename;
+    return is_null_adt_asset_reference(filename) ? std::string() : std::move(filename);
   }
 
   bool readADTChunkHeader(BlizzardArchive::ClientFile& file, std::uint32_t absolute_offset,
@@ -73,8 +144,47 @@ namespace
     if (fourcc != expected_fourcc)
     {
       LogError << "Expected ADT chunk " << chunk_name << " at offset " << absolute_offset
-               << ", got fourcc 0x" << std::hex << fourcc << std::dec << "." << std::endl;
+               << ", got fourcc '" << fourcc_to_string(fourcc)
+               << "' (0x" << std::hex << fourcc << std::dec << ")." << std::endl;
       return false;
+    }
+
+    if (*size > file.getSize() - absolute_offset - 8)
+    {
+      LogError << "ADT chunk " << chunk_name << " at offset " << absolute_offset
+               << " has size " << *size << " beyond file size " << file.getSize()
+               << "." << std::endl;
+      return false;
+    }
+
+    return true;
+  }
+
+  template<typename Callback>
+  bool readADTStringTable(BlizzardArchive::ClientFile& file,
+                          std::uint32_t size,
+                          char const* chunk_name,
+                          Callback&& callback)
+  {
+    char const* cursor = reinterpret_cast<char const*>(file.getPointer());
+    char const* const end = cursor + size;
+
+    while (cursor < end)
+    {
+      char const* const terminator = std::find(cursor, end, '\0');
+      if (terminator == end)
+      {
+        LogError << "ADT string table " << chunk_name
+                 << " is not null-terminated inside its chunk bounds." << std::endl;
+        return false;
+      }
+
+      if (terminator != cursor)
+      {
+        callback(std::string(cursor, terminator));
+      }
+
+      cursor = terminator + 1;
     }
 
     return true;
@@ -214,14 +324,17 @@ void MapTile::finishLoading()
   theFile.seekRelative(4);
   theFile.read(&version, 4);
 
-  if (fourcc != 'MVER' || version != 18)
+  if (fourcc != 'MVER' || (version != 18 && version != 19))
   {
-    char fourcc_text[5] = {};
-    std::memcpy(fourcc_text, &fourcc, 4);
-    LogError << "ADT \"" << _file_key.stringRepr() << "\" has unsupported MVER fourcc='" << fourcc_text
+    LogError << "ADT \"" << _file_key.stringRepr() << "\" has unsupported MVER fourcc='" << fourcc_to_string(fourcc)
              << "' version=" << version << ". Aborting tile load." << std::endl;
     abort_loading();
     return;
+  }
+  if (version == 19)
+  {
+    LogDebug << "ADT \"" << _file_key.stringRepr() << "\" uses legacy MVER fourcc='"
+             << fourcc_to_string(fourcc) << "' version=" << version << "." << std::endl;
   }
 
   // - MHDR ----------------------------------------------
@@ -231,7 +344,8 @@ void MapTile::finishLoading()
 
   if (fourcc != 'MHDR')
   {
-    LogError << "ADT \"" << _file_key.stringRepr() << "\" is missing MHDR. Aborting tile load." << std::endl;
+    LogError << "ADT \"" << _file_key.stringRepr() << "\" is missing MHDR; got fourcc='"
+             << fourcc_to_string(fourcc) << "'. Aborting tile load." << std::endl;
     abort_loading();
     return;
   }
@@ -245,6 +359,13 @@ void MapTile::finishLoading()
   if (!readADTChunkHeader(theFile, Header.mcin + 0x14, 'MCIN', "MCIN", &size))
   {
     LogError << "ADT \"" << _file_key.stringRepr() << "\" is missing a readable MCIN. Aborting tile load." << std::endl;
+    abort_loading();
+    return;
+  }
+  if (size < 256 * 16)
+  {
+    LogError << "ADT \"" << _file_key.stringRepr() << "\" has short MCIN size "
+             << size << ". Aborting tile load." << std::endl;
     abort_loading();
     return;
   }
@@ -268,16 +389,11 @@ void MapTile::finishLoading()
 
   if (_load_textures)
   {
-    {
-      char const* lCurPos = reinterpret_cast<char const*>(theFile.getPointer());
-      char const* lEnd = lCurPos + size;
-
-      while (lCurPos < lEnd)
+    _load_textures = readADTStringTable(theFile, size, "MTEX",
+      [this](std::string const& filename)
       {
-        mTextureFilenames.push_back(BlizzardArchive::ClientData::normalizeFilenameInternal(std::string(lCurPos)));
-        lCurPos += strlen(lCurPos) + 1;
-      }
-    }
+        mTextureFilenames.push_back(BlizzardArchive::ClientData::normalizeFilenameInternal(filename));
+      });
   }
   if (_load_models)
   {
@@ -292,17 +408,15 @@ void MapTile::finishLoading()
 
   if (_load_models)
   {
-    {
-      char const* lCurPos = reinterpret_cast<char const*>(theFile.getPointer());
-      char const* lEnd = lCurPos + size;
-
-      while (lCurPos < lEnd)
+    _load_models = readADTStringTable(theFile, size, "MMDX",
+      [this](std::string const& filename)
       {
-        mModelFilenames.push_back(normalize_adt_model_filename(std::string(lCurPos)));
-        lCurPos += strlen(lCurPos) + 1;
-      }
-    }
+        mModelFilenames.push_back(normalize_adt_model_filename(filename));
+      });
+  }
 
+  if (_load_models)
+  {
     // - MWMO ----------------------------------------------
 
     if (!readADTChunkHeader(theFile, Header.mwmo + 0x14, 'MWMO', "MWMO", &size))
@@ -314,17 +428,15 @@ void MapTile::finishLoading()
 
   if (_load_models)
   {
-    {
-      char const* lCurPos = reinterpret_cast<char const*>(theFile.getPointer());
-      char const* lEnd = lCurPos + size;
-
-      while (lCurPos < lEnd)
+    _load_models = readADTStringTable(theFile, size, "MWMO",
+      [this](std::string const& filename)
       {
-        mWMOFilenames.push_back(BlizzardArchive::ClientData::normalizeFilenameInternal(std::string(lCurPos)));
-        lCurPos += strlen(lCurPos) + 1;
-      }
-    }
+        mWMOFilenames.push_back(normalize_adt_asset_filename(filename));
+      });
+  }
 
+  if (_load_models)
+  {
     // - MDDF ----------------------------------------------
 
     if (!readADTChunkHeader(theFile, Header.mddf + 0x14, 'MDDF', "MDDF", &size))
@@ -367,9 +479,12 @@ void MapTile::finishLoading()
   // - MH2O ----------------------------------------------
   if (Header.mh2o != 0) {
     int ofsW = Header.mh2o + 0x14 + 0x8;
-    if (readOptionalADTChunkHeader(theFile, Header.mh2o, 'MH2O', "MH2O"))
+    if (auto mh2o_size = readOptionalADTChunkHeader(theFile, Header.mh2o, 'MH2O', "MH2O"))
     {
-      Water.readFromFile(theFile, ofsW);
+      if (*mh2o_size != 0)
+      {
+        Water.readFromFile(theFile, ofsW);
+      }
     }
   }
 
@@ -447,16 +562,40 @@ void MapTile::finishLoading()
 
     for (auto const& object : lWMOInstances)
     {
-      add_model(_world->add_wmo_instance(WMOInstance(mWMOFilenames[object.nameID],
-                                                     &object, _context), _tile_is_being_reloaded));
+      if (object.nameID >= mWMOFilenames.size())
+      {
+        LogError << "ADT \"" << _file_key.stringRepr() << "\" MODF references missing WMO nameID "
+                 << object.nameID << " (names=" << mWMOFilenames.size() << ")." << std::endl;
+        continue;
+      }
+
+      auto const& filename = mWMOFilenames[object.nameID];
+      if (filename.empty())
+      {
+        continue;
+      }
+
+      add_model(_world->add_wmo_instance(WMOInstance(filename, &object, _context), _tile_is_being_reloaded));
     }
 
     // - Load M2s ------------------------------------------
 
     for (auto const& model : lModelInstances)
     {
-      add_model(_world->add_model_instance(ModelInstance(mModelFilenames[model.nameID],
-                                                         &model, _context), _tile_is_being_reloaded));
+      if (model.nameID >= mModelFilenames.size())
+      {
+        LogError << "ADT \"" << _file_key.stringRepr() << "\" MDDF references missing M2 nameID "
+                 << model.nameID << " (names=" << mModelFilenames.size() << ")." << std::endl;
+        continue;
+      }
+
+      auto const& filename = mModelFilenames[model.nameID];
+      if (filename.empty())
+      {
+        continue;
+      }
+
+      add_model(_world->add_model_instance(ModelInstance(filename, &model, _context), _tile_is_being_reloaded));
     }
 
     _world->need_model_updates = true;
@@ -1810,5 +1949,3 @@ void MapTile::recalcCombinedExtents()
 
   _combined_extents_dirty = false;
 }
-
-

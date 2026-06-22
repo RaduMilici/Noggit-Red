@@ -1,4 +1,5 @@
 #include <noggit/ui/windows/about/About.h>
+#include <noggit/AsyncLoader.h>
 #include <noggit/DBC.h>
 #include <noggit/DBCFile.h>
 #include <noggit/Log.h>
@@ -16,6 +17,9 @@
 #include <noggit/ui/tools/UiCommon/StackedWidget.hpp>
 #include <BlizzardDatabase.h>
 #include <QtGui/QCloseEvent>
+#include <QtGui/QImage>
+#include <QtGui/QScreen>
+#include <QtWidgets/QApplication>
 #include <QtWidgets/QHBoxLayout>
 #include <QtWidgets/QListWidget>
 #include <QtWidgets/QMenuBar>
@@ -30,11 +34,13 @@
 #include <noggit/ui/windows/noggitWindow/widgets/MapBookmarkListItem.hpp>
 #include <QtNetwork/QTcpSocket>
 #include <cstdlib>
+#include <cstring>
 #include <sstream>
 #include <QSysInfo>
 #include <QStandardPaths>
 #include <QDir>
 #include <QIcon>
+#include <QThread>
 #include <noggit/ui/windows/noggitWindow/components/BuildMapListComponent.hpp>
 #include <noggit/application/Utils.hpp>
 
@@ -52,6 +58,45 @@
 
 namespace Noggit::Ui::Windows
 {
+  namespace
+  {
+    bool imageLooksBlank(QImage const& image, bool includes_window_chrome = false)
+    {
+      if (image.isNull())
+      {
+        return true;
+      }
+
+      QRect sample_rect(0, 0, image.width(), image.height());
+      if (includes_window_chrome)
+      {
+        int const left = std::min(96, image.width() / 4);
+        int const top = std::min(72, image.height() / 4);
+        sample_rect = QRect(left, top, image.width() - left, image.height() - top);
+      }
+
+      int const step_x = std::max(1, sample_rect.width() / 64);
+      int const step_y = std::max(1, sample_rect.height() / 64);
+      int non_dark = 0;
+      int sampled = 0;
+
+      for (int y = sample_rect.top(); y < sample_rect.bottom(); y += step_y)
+      {
+        for (int x = sample_rect.left(); x < sample_rect.right(); x += step_x)
+        {
+          QColor const color(image.pixel(x, y));
+          if (color.red() > 8 || color.green() > 8 || color.blue() > 8)
+          {
+            ++non_dark;
+          }
+          ++sampled;
+        }
+      }
+
+      return sampled == 0 || non_dark < sampled / 100;
+    }
+  }
+
   void NoggitWindow::ensureSettingsWindow()
   {
     if (_settings)
@@ -241,7 +286,8 @@ namespace Noggit::Ui::Windows
 
   void
   NoggitWindow::enterMapAt(glm::vec3 pos, math::degrees camera_pitch, math::degrees camera_yaw, uid_fix_mode uid_fix,
-                           bool from_bookmark
+                           bool from_bookmark,
+                           bool capture_probe
   )
   {
       LogDebug << "NoggitWindow::enterMapAt begin" << std::endl;
@@ -270,7 +316,7 @@ namespace Noggit::Ui::Windows
     if (_map_creation_wizard)
       _map_creation_wizard->destroyFakeWorld();
   LogDebug << "NoggitWindow::enterMapAt before MapView ctor" << std::endl;
-    _map_view = (new MapView(camera_yaw, camera_pitch, pos, this, _project, std::move(_world), uid_fix, from_bookmark));
+    _map_view = (new MapView(camera_yaw, camera_pitch, pos, this, _project, std::move(_world), uid_fix, from_bookmark, capture_probe));
   LogDebug << "NoggitWindow::enterMapAt after MapView ctor" << std::endl;
     connect(_map_view, &MapView::uid_fix_failed, [this]()
     { promptUidFixFailure(); });
@@ -364,6 +410,163 @@ namespace Noggit::Ui::Windows
     }
 
     check_uid_then_enter_map(pos, camera_pitch, camera_yaw, from_bookmark);
+  }
+
+  bool NoggitWindow::captureMapCreaturesToPng(int map_id,
+                                              QString const& output_path,
+                                              int width,
+                                              int height,
+                                              std::optional<glm::vec3> camera_position,
+                                              math::degrees camera_yaw,
+                                              math::degrees camera_pitch)
+  {
+    setAnimated(false);
+    setDockOptions(AllowNestedDocks | AllowTabbedDocks | GroupedDragging);
+    QApplication::setEffectEnabled(Qt::UI_AnimateMenu, false);
+    QApplication::setEffectEnabled(Qt::UI_FadeMenu, false);
+    QApplication::setEffectEnabled(Qt::UI_AnimateCombo, false);
+    QApplication::setEffectEnabled(Qt::UI_AnimateTooltip, false);
+    QApplication::setEffectEnabled(Qt::UI_FadeTooltip, false);
+    QApplication::setEffectEnabled(Qt::UI_AnimateToolBox, false);
+    resize(width, height);
+    show();
+    qApp->processEvents();
+
+    loadMap(map_id);
+    if (!_world)
+    {
+      LogError << "capture-world-creatures: failed to load mapId=" << map_id << std::endl;
+      return false;
+    }
+
+    LogDebug << "capture-world-creatures: enter map begin" << std::endl;
+    enterMapAt(camera_position.value_or(glm::vec3(0.f, 50.f, 0.f)),
+               camera_position ? camera_pitch : math::degrees(25.f),
+               camera_position ? camera_yaw : math::degrees(0.f),
+               uid_fix_mode::none,
+               camera_position.has_value(),
+               true);
+    LogDebug << "capture-world-creatures: enter map done" << std::endl;
+    if (!_map_view)
+    {
+      LogError << "capture-world-creatures: failed to create map view mapId=" << map_id << std::endl;
+      return false;
+    }
+
+    bool const capture_creatures = []()
+    {
+      char const* value = std::getenv("NOGGIT_CAPTURE_CREATURES");
+      return !value || !*value || std::strcmp(value, "0") != 0;
+    }();
+
+    bool loaded = !capture_creatures;
+    if (capture_creatures)
+    {
+      _map_view->_draw_creature_spawns.set(true);
+      _map_view->getWorld()->setDrawCreatureSpawns(true);
+
+      loaded = !_map_view->getWorld()->creatureSpawns().empty();
+      if (loaded)
+      {
+        LogDebug << "capture-world-creatures: reusing loaded creature spawns count="
+                 << _map_view->getWorld()->creatureSpawns().size() << std::endl;
+      }
+      else
+      {
+        LogDebug << "capture-world-creatures: reload creature spawns begin" << std::endl;
+        loaded = _map_view->getWorld()->reloadCreatureSpawns();
+        LogDebug << "capture-world-creatures: reload creature spawns done loaded=" << loaded << std::endl;
+      }
+    }
+    else
+    {
+      _map_view->_draw_creature_spawns.set(false);
+      _map_view->getWorld()->setDrawCreatureSpawns(false);
+      LogDebug << "capture-world-creatures: creature overlay disabled by NOGGIT_CAPTURE_CREATURES=0" << std::endl;
+    }
+    LogDebug << "capture-world-creatures: wait async begin" << std::endl;
+    AsyncLoader::instance().wait_until_idle();
+    LogDebug << "capture-world-creatures: wait async done" << std::endl;
+
+    if (!loaded)
+    {
+      LogError << "capture-world-creatures: failed to load creature spawns mapId=" << map_id
+               << " status='" << _map_view->getWorld()->creatureSpawnStatus() << "'" << std::endl;
+      return false;
+    }
+
+    auto const& spawns = _map_view->getWorld()->creatureSpawns();
+    if (camera_position)
+    {
+      _map_view->setCameraForCapture(*camera_position, camera_yaw, camera_pitch);
+      LogDebug << "capture-world-creatures camera explicit position=("
+               << camera_position->x << ", " << camera_position->y << ", " << camera_position->z
+               << ") yaw=" << camera_yaw._ << " pitch=" << camera_pitch._ << std::endl;
+    }
+    else if (!spawns.empty())
+    {
+      auto const target = spawns.front().pos;
+      _map_view->setCameraForCapture(target + glm::vec3(0.f, 12.f, -35.f),
+                                     math::degrees(0.f),
+                                     math::degrees(18.f));
+      LogDebug << "capture-world-creatures camera firstSpawn guid=" << spawns.front().guid
+               << " target=(" << target.x << ", " << target.y << ", " << target.z << ")"
+               << " camera=(" << target.x << ", " << (target.y + 12.f) << ", " << (target.z - 35.f) << ")"
+               << std::endl;
+    }
+
+    LogDebug << "capture-world-creatures: render frame begin" << std::endl;
+    bool const capture_debug = []()
+    {
+      if (char const* value = std::getenv("NOGGIT_CAPTURE_DEBUG"))
+      {
+        return std::string(value) != "0";
+      }
+      return false;
+    }();
+    if (capture_debug)
+    {
+      LogDebug << "capture-world-creatures direct framebuffer render" << std::endl;
+    }
+    _map_view->setCameraDirty();
+    LogDebug << "capture-world-creatures: render frame done" << std::endl;
+
+    QImage image = _map_view->grabRenderedFrameForCapture();
+    char const* capture_source = "mapview-readpixels";
+
+    if (imageLooksBlank(image))
+    {
+      if (auto* screen = _map_view->screen())
+      {
+        image = screen->grabWindow(_map_view->winId()).toImage();
+        capture_source = "screen-map-view";
+      }
+    }
+
+    if (image.isNull())
+    {
+      LogError << "capture-world-creatures: framebuffer capture was empty mapId=" << map_id << std::endl;
+      return false;
+    }
+
+    if (imageLooksBlank(image))
+    {
+      LogError << "capture-world-creatures: captured image is blank mapId=" << map_id
+               << " source=" << capture_source << std::endl;
+      return false;
+    }
+
+    bool const saved = image.save(output_path);
+    LogDebug << "capture-world-creatures result mapId=" << map_id
+             << " saved=" << saved
+             << " source=" << capture_source
+             << " path='" << output_path.toStdString() << "'"
+             << " size=" << image.width() << "x" << image.height()
+             << " status='" << _map_view->getWorld()->creatureSpawnStatus() << "'"
+             << " importantObjectFailed=" << AsyncLoader::instance().important_object_failed_loading()
+             << std::endl;
+
+    return saved && !AsyncLoader::instance().important_object_failed_loading();
   }
 
   void NoggitWindow::buildMenu()

@@ -7,12 +7,49 @@
 #include <QtCore/QSettings>
 
 #include <algorithm>
+#include <cstdlib>
 #include <list>
+
+namespace
+{
+  bool async_loader_trace_enabled()
+  {
+    static bool const enabled = std::getenv("NOGGIT_ASYNC_LOADER_TRACE") != nullptr;
+    return enabled;
+  }
+
+  std::string async_object_key(AsyncObject const* object)
+  {
+    if (!object)
+    {
+      return {};
+    }
+
+    auto const& key = object->file_key();
+    if (key.hasFilepath())
+    {
+      return key.filepath();
+    }
+
+    return key.hasFileDataID() ? std::to_string(key.fileDataID()) : std::string();
+  }
+}
 
 bool AsyncLoader::is_loading()
 {
   std::lock_guard<std::mutex> const lock (_guard);
   return !_currently_loading.empty();
+}
+
+void AsyncLoader::wait_until_idle()
+{
+  std::unique_lock<std::mutex> lock(_guard);
+  _state_changed.wait(lock, [&]
+  {
+    return std::all_of(_to_load.begin(), _to_load.end(),
+                       [](auto const& to_load) { return to_load.empty(); })
+        && _currently_loading.empty();
+  });
 }
 
 void AsyncLoader::process()
@@ -59,6 +96,13 @@ void AsyncLoader::process()
 
     try
     {
+      if (async_loader_trace_enabled())
+      {
+        LogDebug << "Async finish begin type=" << object->async_object_type_name()
+                 << " key='" << async_object_key(object)
+                 << "' ptr=" << object << std::endl;
+      }
+
       if (additional_log)
       {
         std::lock_guard<std::mutex> const lock(_guard);
@@ -67,6 +111,13 @@ void AsyncLoader::process()
       }
 
       object->finishLoading();
+
+      if (async_loader_trace_enabled())
+      {
+        LogDebug << "Async finish done type=" << object->async_object_type_name()
+                 << " key='" << async_object_key(object)
+                 << "' ptr=" << object << std::endl;
+      }
 
       if (additional_log)
       {
@@ -93,10 +144,15 @@ void AsyncLoader::process()
       }
 
       _currently_loading.remove(object);
+      _state_changed.notify_all();
     }
-    catch (...)
+    catch (std::exception const& e)
     {
       std::lock_guard<std::mutex> const lock(_guard);
+
+      LogError << "Async load exception type=" << object->async_object_type_name()
+               << " key='" << async_object_key(object)
+               << "' what='" << e.what() << "'" << std::endl;
 
       object->error_on_loading();
 
@@ -106,6 +162,24 @@ void AsyncLoader::process()
       }
 
       _currently_loading.remove(object);
+      _state_changed.notify_all();
+    }
+    catch (...)
+    {
+      std::lock_guard<std::mutex> const lock(_guard);
+
+      LogError << "Async load unknown exception type=" << object->async_object_type_name()
+               << " key='" << async_object_key(object) << "'" << std::endl;
+
+      object->error_on_loading();
+
+      if (object->is_required_when_saving())
+      {
+        _important_object_failed_loading = true;
+      }
+
+      _currently_loading.remove(object);
+      _state_changed.notify_all();
     }
   }
 }

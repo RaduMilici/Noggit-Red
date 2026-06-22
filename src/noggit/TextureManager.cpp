@@ -8,13 +8,78 @@
 #include <QtGui/QPixmap>
 
 #include <algorithm>
+#include <cctype>
 #include <glm/vec2.hpp>
 
 decltype (TextureManager::_) TextureManager::_;
 decltype (TextureManager::_tex_arrays) TextureManager::_tex_arrays;
 decltype (TextureManager::_raw_textures) TextureManager::_raw_textures;
+decltype (TextureManager::_raw_textures_mutex) TextureManager::_raw_textures_mutex;
 
 constexpr unsigned N_ARRAY_TEX = 1;
+namespace
+{
+  constexpr char const* fallback_texture_filename = "tileset/generic/black.blp";
+
+  bool is_null_texture_reference(std::string filename)
+  {
+    auto const is_trimmed_char = [](unsigned char character)
+    {
+      return character == '\0' || std::isspace(character);
+    };
+
+    filename.erase(filename.begin(),
+                   std::find_if(filename.begin(), filename.end(),
+                                [&](unsigned char character) { return !is_trimmed_char(character); }));
+    filename.erase(std::find_if(filename.rbegin(), filename.rend(),
+                                [&](unsigned char character) { return !is_trimmed_char(character); }).base(),
+                   filename.end());
+
+    std::transform(filename.begin(), filename.end(), filename.begin(), [](unsigned char character)
+    {
+      return static_cast<char>(std::tolower(character));
+    });
+
+    std::replace(filename.begin(), filename.end(), '\\', '/');
+
+    if (filename.empty() || filename == "0" || filename == "none" || filename == "null")
+    {
+      return true;
+    }
+
+    if (filename.find('/') == std::string::npos)
+    {
+      auto const extension_pos = filename.rfind('.');
+      if (extension_pos != std::string::npos && filename.substr(0, extension_pos) == "0")
+      {
+        return filename.substr(extension_pos) == ".blp";
+      }
+    }
+
+    return false;
+  }
+
+  std::string safe_texture_filename(std::string filename)
+  {
+    if (is_null_texture_reference(filename))
+    {
+      return fallback_texture_filename;
+    }
+
+    filename = BlizzardArchive::ClientData::normalizeFilenameInternal(std::move(filename));
+    return is_null_texture_reference(filename) ? fallback_texture_filename : std::move(filename);
+  }
+
+  BlizzardArchive::Listfile::FileKey safe_texture_file_key(BlizzardArchive::Listfile::FileKey const& file_key)
+  {
+    if (!file_key.hasFilepath())
+    {
+      return BlizzardArchive::Listfile::FileKey(fallback_texture_filename);
+    }
+
+    return BlizzardArchive::Listfile::FileKey(safe_texture_filename(file_key.filepath()));
+  }
+}
 
 void TextureManager::report()
 {
@@ -53,11 +118,13 @@ void TextureManager::register_raw_texture(std::string const& filename, Noggit::N
     return;
   }
 
+  std::lock_guard<std::mutex> lock(_raw_textures_mutex);
   _raw_textures[{BlizzardArchive::ClientData::normalizeFilenameInternal(filename), static_cast<int>(context)}] = {width, height, std::move(data)};
 }
 
 bool TextureManager::load_raw_texture(std::string const& filename, Noggit::NoggitRenderContext context, int& width, int& height, std::map<int, std::vector<uint32_t>>& data)
 {
+  std::lock_guard<std::mutex> lock(_raw_textures_mutex);
   auto found = _raw_textures.find({BlizzardArchive::ClientData::normalizeFilenameInternal(filename), static_cast<int>(context)});
   if (found == _raw_textures.end())
   {
@@ -460,20 +527,25 @@ void blp_texture::loadFromCompressedData(BLPHeader const* lHeader, char const* l
 }
 
 blp_texture::blp_texture(BlizzardArchive::Listfile::FileKey const& file_key, Noggit::NoggitRenderContext context)
-  : AsyncObject(file_key)
+  : AsyncObject(safe_texture_file_key(file_key))
   , _context(context)
 {
 }
 
 void blp_texture::finishLoading()
 {
-  if (TextureManager::load_raw_texture(_file_key.filepath(), _context, _width, _height, _data))
+  auto const texture_filename = _file_key.hasFilepath()
+    ? safe_texture_filename(_file_key.filepath())
+    : std::string(fallback_texture_filename);
+
+  if (TextureManager::load_raw_texture(texture_filename, _context, _width, _height, _data))
   {
     finished = true;
+    _state_changed.notify_all();
     return;
   }
 
-  bool exists = Noggit::Application::NoggitApplication::instance()->clientData()->exists( _file_key.filepath());
+  bool exists = Noggit::Application::NoggitApplication::instance()->clientData()->exists(texture_filename);
   if (!exists)
   {
     LogError << "file not found: '" <<  _file_key.stringRepr() << "'" << std::endl;
@@ -482,11 +554,11 @@ void blp_texture::finishLoading()
   std::string spec_filename;
   bool has_specular = false;
 
-  if (_file_key.filepath().starts_with("tileset/"))
+  if (texture_filename.starts_with("tileset/"))
   {
     _is_tileset = true;
 
-    spec_filename = _file_key.filepath().substr(0, _file_key.filepath().find_last_of(".")) + "_s.blp";
+    spec_filename = texture_filename.substr(0, texture_filename.find_last_of(".")) + "_s.blp";
     has_specular = Noggit::Application::NoggitApplication::instance()->clientData()->exists(spec_filename);
 
     if (has_specular)
@@ -496,7 +568,7 @@ void blp_texture::finishLoading()
   }
 
   BlizzardArchive::ClientFile f(
-      exists ? (has_specular ? spec_filename : _file_key.filepath()) : "textures/shanecube.blp"
+      exists ? (has_specular ? spec_filename : texture_filename) : "textures/shanecube.blp"
       , Noggit::Application::NoggitApplication::instance()->clientData());
   if (f.isEof())
   {
@@ -686,7 +758,7 @@ namespace Noggit
 
                                   void main()
                                   {
-                                    out_color = vec4(texture(tex, vec3(f_tex_coord/2.f + vec2(0.5), tex_index)).rgb, 1.);
+                                    out_color = texture(tex, vec3(f_tex_coord/2.f + vec2(0.5), tex_index));
                                   }
                                   )code"
                                }
@@ -729,12 +801,12 @@ namespace Noggit
 }
 
 scoped_blp_texture_reference::scoped_blp_texture_reference (std::string const& filename, Noggit::NoggitRenderContext context)
-  : _blp_texture(TextureManager::_.emplace(filename, context))
+  : _blp_texture(TextureManager::_.emplace(safe_texture_filename(filename), context))
   , _context(context)
 {}
 
 scoped_blp_texture_reference::scoped_blp_texture_reference (scoped_blp_texture_reference const& other)
-  : _blp_texture(other._blp_texture ? TextureManager::_.emplace(other._blp_texture->file_key().filepath(), other._context) : nullptr)
+  : _blp_texture(other._blp_texture ? TextureManager::_.emplace(safe_texture_filename(other._blp_texture->file_key().filepath()), other._context) : nullptr)
   , _context(other._context)
 {}
 

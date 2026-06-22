@@ -34,6 +34,7 @@ uniform mat4 tex_matrix_1;
 uniform mat4 tex_matrix_2;
 
 uniform bool anim_bones;
+uniform int bone_matrix_count;
 
 // code from https://wowdev.wiki/M2/.skin#Environment_mapping
 vec2 sphere_map(vec3 vert, vec3 norm)
@@ -67,6 +68,11 @@ vec2 get_texture_uv(int tex_unit_lookup, vec3 vert, vec3 norm)
 
 mat4 get_bone_matrix(uint bone_index)
 {
+  if (bone_matrix_count <= 0 || bone_index >= uint(bone_matrix_count))
+  {
+    return mat4(1.0);
+  }
+
   mat4 matrix;
   int pixel_start = int(bone_index) * 4;
   matrix[0] = texelFetch(bone_matrices, pixel_start).rgba;

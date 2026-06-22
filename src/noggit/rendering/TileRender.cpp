@@ -6,6 +6,8 @@
 #include <noggit/ui/TexturingGUI.h>
 #include <external/tracy/Tracy.hpp>
 
+#include <algorithm>
+
 using namespace Noggit::Rendering;
 
 
@@ -65,7 +67,7 @@ void TileRender::draw (OpenGL::Scoped::use_program& mcnk_shader
 
   static constexpr unsigned NUM_SAMPLERS = 11;
 
-  if (!_map_tile->finished.load())
+  if (!_map_tile || !_map_tile->finished.load() || _map_tile->loading_failed())
   [[unlikely]]
   {
     return;
@@ -277,15 +279,6 @@ void TileRender::draw (OpenGL::Scoped::use_program& mcnk_shader
 
   _map_tile->recalcExtents();
 
-  // do not draw anything when textures did not finish loading
-  if (_texture_not_loaded)
-  [[unlikely]]
-  {
-    gl.bindBufferRange(GL_UNIFORM_BUFFER, OpenGL::ubo_targets::CHUNK_INSTANCE_DATA,
-                       _chunk_instance_data_ubo, 0, sizeof(OpenGL::ChunkInstanceDataUniformBlock) * 256);
-    return;
-  }
-
   gl.bindBufferRange(GL_UNIFORM_BUFFER, OpenGL::ubo_targets::CHUNK_INSTANCE_DATA,
                      _chunk_instance_data_ubo, 0, sizeof(OpenGL::ChunkInstanceDataUniformBlock) * 256);
 
@@ -468,23 +461,21 @@ bool TileRender::fillSamplers(MapChunk* chunk, unsigned chunk_index,  unsigned i
 {
   MapTileDrawCall& draw_call = _draw_calls[draw_call_index];
 
-  _chunk_instance_data[chunk_index].ChunkHoles_DrawImpass_TexLayerCount_CantPaint[2] = static_cast<int>(chunk->texture_set->num());
-
+  static constexpr unsigned NUM_LAYERS = 4;
   static constexpr unsigned NUM_SAMPLERS = 11;
 
-  _chunk_instance_data[chunk_index].ChunkTextureSamplers[0] = 0;
-  _chunk_instance_data[chunk_index].ChunkTextureSamplers[1] = 0;
-  _chunk_instance_data[chunk_index].ChunkTextureSamplers[2] = 0;
-  _chunk_instance_data[chunk_index].ChunkTextureSamplers[3] = 0;
+  auto const n_render_layers = std::min<std::size_t>(chunk->texture_set->num(), NUM_LAYERS);
+  _chunk_instance_data[chunk_index].ChunkHoles_DrawImpass_TexLayerCount_CantPaint[2] = static_cast<int>(n_render_layers);
 
-  _chunk_instance_data[chunk_index].ChunkTextureArrayIDs[0] = -1;
-  _chunk_instance_data[chunk_index].ChunkTextureArrayIDs[1] = -1;
-  _chunk_instance_data[chunk_index].ChunkTextureArrayIDs[2] = -1;
-  _chunk_instance_data[chunk_index].ChunkTextureArrayIDs[3] = -1;
+  for (unsigned k = 0; k < NUM_LAYERS; ++k)
+  {
+    _chunk_instance_data[chunk_index].ChunkTextureSamplers[k] = 0;
+    _chunk_instance_data[chunk_index].ChunkTextureArrayIDs[k] = -1;
+  }
 
 
   auto& chunk_textures = (*chunk->texture_set->getTextures());
-  for (int k = 0; k < chunk->texture_set->num(); ++k)
+  for (std::size_t k = 0; k < n_render_layers; ++k)
   {
     chunk_textures[k]->upload();
 

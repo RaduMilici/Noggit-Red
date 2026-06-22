@@ -138,6 +138,22 @@ struct AnimationBlock {
   uint32_t ofsKeys;
 };
 
+struct ClassicAnimationRange {
+  uint32_t start;
+  uint32_t end;
+};
+
+struct ClassicAnimationBlock {
+  int16_t type; // interpolation type (0=none, 1=linear, 2=hermite, 3=Bezier)
+  int16_t seq; // global sequence id or -1
+  uint32_t nRanges;
+  uint32_t ofsRanges;
+  uint32_t nTimes;
+  uint32_t ofsTimes;
+  uint32_t nKeys;
+  uint32_t ofsKeys;
+};
+
 struct FakeAnimationBlock {
   uint32_t nTimes;
   uint32_t ofsTimes;
@@ -235,6 +251,10 @@ struct ModelColorDef {
 // block H - transp defs
 struct ModelTransDef {
   AnimationBlock trans;
+};
+
+struct ClassicModelTransDef {
+  ClassicAnimationBlock trans;
 };
 
 struct ModelTextureDef {
@@ -361,6 +381,17 @@ struct ModelAttachmentDef {
   uint16_t unknown1;
   glm::vec3 pos;
   AnimationBlock Enabled;
+};
+
+struct ClassicModelBoneDef {
+  int32_t KeyBoneID;
+  uint32_t flags;
+  int16_t parent; // parent bone index
+  uint16_t submesh_id;
+  ClassicAnimationBlock translation;
+  ClassicAnimationBlock rotation;
+  ClassicAnimationBlock scaling;
+  glm::vec3 pivot;
 };
 
 struct ModelBoneDef {

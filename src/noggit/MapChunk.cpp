@@ -319,16 +319,6 @@ MapChunk::MapChunk(MapTile* maintile, BlizzardArchive::ClientFile* f, bool bigAl
       std::vector<mclq> layers(1);
       f->read(layers.data(), sizeof(mclq));
 
-      static int logged_mclq_chunks = 0;
-      if (logged_mclq_chunks < 40)
-      {
-        LogError << "Turtle water: MCLQ chunk tile " << mt->index.x << "," << mt->index.z
-                 << " chunk " << px << "," << py
-                 << " payload " << payload_size
-                 << " trailing " << (payload_size - sizeof(mclq)) << std::endl;
-        logged_mclq_chunks++;
-      }
-
       mt->Water.getChunk(px, py)->from_mclq(layers);
     }
 
@@ -2011,5 +2001,4 @@ void MapChunk::registerChunkUpdate(unsigned flags)
   _chunk_update_flags |= flags;
   mt->registerChunkUpdate(flags);
 }
-
 

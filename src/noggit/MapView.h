@@ -48,6 +48,8 @@ class QCheckBox;
 class QLineEdit;
 class QListWidget;
 class QListWidgetItem;
+class QPushButton;
+class QTreeWidget;
 
 namespace Noggit::Ui::Windows
 {
@@ -272,6 +274,7 @@ public:
           , std::unique_ptr<World>
           , uid_fix_mode uid_fix = uid_fix_mode::none
           , bool from_bookmark = false
+          , bool capture_probe = false
           );
   ~MapView();
 
@@ -282,6 +285,8 @@ public:
   void initMinimapSave() { saving_minimap = true; };
   auto setBrushTexture(QImage const* img) -> void;
   Noggit::Camera* getCamera() { return &_camera; };
+  void setCameraForCapture(glm::vec3 const& position, math::degrees yaw, math::degrees pitch);
+  QImage grabRenderedFrameForCapture();
   void randomizeTerrainRotation();
   void randomizeTexturingRotation();
   void randomizeShaderRotation();
@@ -449,15 +454,19 @@ private:
 
   QDockWidget* _asset_browser_dock;
   QDockWidget* _node_editor_dock;
+  QWidget* _creature_actions_overlay = nullptr;
+  QDockWidget* _creature_editor_dock = nullptr;
   QDockWidget* _creature_browser_dock;
+  QDockWidget* _creature_model_picker_dock = nullptr;
   QDockWidget* _texture_browser_dock;
   QDockWidget* _texture_picker_dock;
   QDockWidget* _detail_infos_dock;
 
   QLineEdit* _creature_search_field = nullptr;
-  QCheckBox* _creature_search_all_maps = nullptr;
   QListWidget* _creature_list_widget = nullptr;
   QLabel* _creature_browser_status = nullptr;
+  QTreeWidget* _creature_model_tree = nullptr;
+  QLabel* _creature_model_picker_status = nullptr;
 
   QLabel* _creature_editor_info = nullptr;
   QDoubleSpinBox* _spawn_edit_x = nullptr;
@@ -484,6 +493,7 @@ private:
   bool _gl_initialized = false;
   bool _destroying = false;
   bool _needs_redraw = false;
+  bool _capture_probe = false;
 
   bool _mod_z_down = false;
   bool _mod_x_down = false;
@@ -514,6 +524,8 @@ private:
   void setupObjectEditorUi();
   void setupCreatureEditorUi();
   void setupCreatureBrowserUi();
+  void setupCreatureActionsUi();
+  void setupCreatureModelPickerUi();
   void setupMinimapEditorUi();
   void setupStampUi();
   void setupLightEditorUi();

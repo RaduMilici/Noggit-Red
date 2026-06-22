@@ -14,7 +14,50 @@
 #include <opengl/scoped.hpp>
 #include <opengl/shader.hpp>
 
+#include <algorithm>
+#include <cctype>
 #include <sstream>
+
+namespace
+{
+  bool is_null_texture_reference(std::string filename)
+  {
+    auto const is_trimmed_char = [](unsigned char character)
+    {
+      return character == '\0' || std::isspace(character);
+    };
+
+    filename.erase(filename.begin(),
+                   std::find_if(filename.begin(), filename.end(),
+                                [&](unsigned char character) { return !is_trimmed_char(character); }));
+    filename.erase(std::find_if(filename.rbegin(), filename.rend(),
+                                [&](unsigned char character) { return !is_trimmed_char(character); }).base(),
+                   filename.end());
+
+    std::transform(filename.begin(), filename.end(), filename.begin(), [](unsigned char character)
+    {
+      return static_cast<char>(std::tolower(character));
+    });
+
+    std::replace(filename.begin(), filename.end(), '\\', '/');
+
+    if (filename.empty() || filename == "0" || filename == "none" || filename == "null")
+    {
+      return true;
+    }
+
+    if (filename.find('/') == std::string::npos)
+    {
+      auto const extension_pos = filename.rfind('.');
+      if (extension_pos != std::string::npos && filename.substr(0, extension_pos) == "0")
+      {
+        return filename.substr(extension_pos) == ".blp";
+      }
+    }
+
+    return false;
+  }
+}
 
 ModelInstance::ModelInstance(BlizzardArchive::Listfile::FileKey const& file_key
                              , Noggit::NoggitRenderContext context)
@@ -75,6 +118,11 @@ ModelInstance& ModelInstance::operator=(ModelInstance const& other)
 void ModelInstance::setReplaceTexture(std::size_t texture_type, std::string const& filename)
 {
   _replace_textures.erase(texture_type);
+  if (is_null_texture_reference(filename))
+  {
+    return;
+  }
+
   _replace_textures.emplace(std::piecewise_construct,
                             std::forward_as_tuple(texture_type),
                             std::forward_as_tuple(filename, _context));
@@ -370,4 +418,3 @@ void wmo_doodad_instance::update_transform_matrix_wmo(WMOInstance* wmo)
 
   _need_matrix_update = false;
 }
-

@@ -38,7 +38,9 @@ glm::vec3 fixCoordSystem(glm::vec3 v);
 class Bone {
   Animation::M2Value<glm::vec3> trans;
   Animation::M2Value<glm::quat, packed_quaternion> rot;
+  Animation::M2Value<glm::quat> classic_rot;
   Animation::M2Value<glm::vec3> scale;
+  bool _uses_classic_rotation = false;
 
 public:
   glm::vec3 pivot;
@@ -66,6 +68,8 @@ public:
   bool calc;
   void calcMatrix(glm::mat4x4 const& model_view
                  , Bone* allbones
+                 , std::string const& model_name
+                 , size_t bone_index
                  , int anim
                  , int time
                  , int animtime
@@ -74,6 +78,11 @@ public:
          const ModelBoneDef &b,
          int *global,
          const std::vector<std::unique_ptr<BlizzardArchive::ClientFile>>& animation_files
+       );
+
+  Bone ( const BlizzardArchive::ClientFile& f,
+         const ClassicModelBoneDef &b,
+         int *global
        );
 
 };
@@ -292,4 +301,3 @@ private:
 
   bool _hidden = false;
 };
-

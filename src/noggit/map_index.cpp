@@ -22,6 +22,7 @@
 #include <QRegExp>
 #include <QFile>
 
+#include <algorithm>
 #include <forward_list>
 #include <cstdlib>
 
@@ -275,21 +276,15 @@ void MapIndex::save()
 
 void MapIndex::enterTile(const TileIndex& tile)
 {
-  if (!hasTile(tile))
-  {
-    noadt = true;
-    return;
-  }
-
-  noadt = false;
+  noadt = !hasTile(tile);
   int cx = static_cast<int>(tile.x);
   int cz = static_cast<int>(tile.z);
 
-  for (int pz = std::max(cz - 1, 0); pz < std::min(cz + 2, 63); ++pz)
+  for (int pz = std::max(cz - 1, 0); pz < std::min(cz + 2, 64); ++pz)
   {
-    for (int px = std::max(cx - 1, 0); px < std::min(cx + 2, 63); ++px)
+    for (int px = std::max(cx - 1, 0); px < std::min(cx + 2, 64); ++px)
     {
-      loadTile(TileIndex(px, pz));
+      loadTile(TileIndex(static_cast<std::size_t>(px), static_cast<std::size_t>(pz)));
     }
   }
 }

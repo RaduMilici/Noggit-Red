@@ -13,10 +13,12 @@
 #include <QtWidgets/QStackedWidget>
 #include <string>
 #include <memory>
+#include <optional>
 #include <unordered_set>
 #include <QWidget>
 
 class StackedWidget;
+class QString;
 
 namespace Noggit::Ui
 {
@@ -44,6 +46,13 @@ namespace Noggit::Ui::Windows
                              math::degrees camera_pitch = math::degrees(30.f),
                              math::degrees camera_yaw = math::degrees(90.f),
                              bool from_bookmark = false);
+      bool captureMapCreaturesToPng(int map_id,
+                                    QString const& output_path,
+                                    int width = 1280,
+                                    int height = 800,
+                                    std::optional<glm::vec3> camera_position = std::nullopt,
+                                    math::degrees camera_yaw = math::degrees(90.f),
+                                    math::degrees camera_pitch = math::degrees(30.f));
 
       QMenuBar* _menuBar;
 
@@ -77,6 +86,7 @@ namespace Noggit::Ui::Windows
                       , math::degrees camera_yaw
                       , uid_fix_mode uid_fix = uid_fix_mode::none
                       , bool from_bookmark = false
+                      , bool capture_probe = false
                       );
 
       minimap_widget* _minimap;

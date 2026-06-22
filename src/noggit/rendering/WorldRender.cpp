@@ -13,6 +13,9 @@
 #include <QBuffer>
 
 #include <algorithm>
+#include <cmath>
+#include <cstdlib>
+#include <set>
 
 using namespace Noggit::Rendering;
 
@@ -31,6 +34,79 @@ namespace
     }();
 
     return enabled;
+  }
+
+  bool capture_debug_enabled()
+  {
+    static bool const enabled = []
+    {
+      if (char const* value = std::getenv("NOGGIT_CAPTURE_DEBUG"))
+      {
+        return std::string(value) != "0";
+      }
+
+      return false;
+    }();
+
+    return enabled;
+  }
+
+  float creature_spawn_model_draw_distance()
+  {
+    static float const distance = []
+    {
+      if (char const* value = std::getenv("NOGGIT_CREATURE_MODEL_DRAW_DISTANCE"))
+      {
+        auto const parsed = std::strtof(value, nullptr);
+        if (std::isfinite(parsed) && parsed > 0.0f)
+        {
+          return parsed;
+        }
+      }
+
+      return 120.0f;
+    }();
+
+    return distance;
+  }
+
+  float creature_spawn_marker_draw_distance()
+  {
+    static float const distance = []
+    {
+      if (char const* value = std::getenv("NOGGIT_CREATURE_MARKER_DRAW_DISTANCE"))
+      {
+        auto const parsed = std::strtof(value, nullptr);
+        if (std::isfinite(parsed) && parsed > 0.0f)
+        {
+          return parsed;
+        }
+      }
+
+      return 300.0f;
+    }();
+
+    return distance;
+  }
+
+  std::size_t creature_spawn_model_create_budget()
+  {
+    static std::size_t const budget = []
+    {
+      if (char const* value = std::getenv("NOGGIT_CREATURE_MODEL_CREATE_BUDGET"))
+      {
+        char* end = nullptr;
+        auto const parsed = std::strtoul(value, &end, 10);
+        if (end != value && parsed > 0ul)
+        {
+          return static_cast<std::size_t>(parsed);
+        }
+      }
+
+      return static_cast<std::size_t>(32);
+    }();
+
+    return budget;
   }
 
   bool is_too_dark(glm::vec3 const& color, float minimum)
@@ -57,12 +133,35 @@ namespace
     }
 
     auto const lookup = model->_attachment_lookup[attachment_id];
-    if (lookup < 0 || static_cast<std::size_t>(lookup) >= model->_attachments.size())
+    auto const attachment_is_sane = [model](ModelAttachmentDef const& attachment)
     {
-      return nullptr;
+      return attachment.bone < model->header.nBones
+          && std::isfinite(attachment.pos.x)
+          && std::isfinite(attachment.pos.y)
+          && std::isfinite(attachment.pos.z);
+    };
+
+    if (lookup >= 0 && static_cast<std::size_t>(lookup) < model->_attachments.size())
+    {
+      auto const& attachment = model->_attachments[lookup];
+      if (!model->usesClassicLayout() || attachment_is_sane(attachment))
+      {
+        return &attachment;
+      }
     }
 
-    return &model->_attachments[lookup];
+    if (model->usesClassicLayout())
+    {
+      for (auto const& attachment : model->_attachments)
+      {
+        if (static_cast<int>(attachment.id) == attachment_id && attachment_is_sane(attachment))
+        {
+          return &attachment;
+        }
+      }
+    }
+
+    return nullptr;
   }
 
   glm::mat4x4 attachment_world_matrix(ModelInstance const& parent_instance,
@@ -83,6 +182,114 @@ namespace
     }
 
     return parent_instance.transformMatrix() * attachment_matrix;
+  }
+
+  bool should_suppress_legacy_creature_instance(World const* world, ModelInstance const& model_instance)
+  {
+    if (!world || !world->drawCreatureSpawns() || !model_instance.model.get())
+    {
+      return false;
+    }
+
+    if (!model_instance.model->file_key().hasFilepath())
+    {
+      return false;
+    }
+
+    auto const& model_path = model_instance.model->file_key().filepath();
+    if (!model_path.starts_with("creature/"))
+    {
+      return false;
+    }
+
+    float legacy_radius = model_instance.model->rad * model_instance.scale;
+    if (legacy_radius <= 0.0f)
+    {
+      legacy_radius = 1.0f;
+    }
+
+    static std::set<std::string> logged_suppressions;
+    static std::set<std::string> logged_legacy_candidates;
+    float nearest_distance = std::numeric_limits<float>::max();
+    std::uint32_t nearest_guid = 0;
+    std::string nearest_model;
+
+    for (auto const& spawn : world->creatureSpawns())
+    {
+      if (!spawn.model_instance.has_value() && spawn.model_path.empty())
+      {
+        continue;
+      }
+
+      float overlay_radius = std::max(0.5f, spawn.template_scale * spawn.model_scale);
+      if (spawn.model_instance.has_value())
+      {
+        auto const& overlay = *spawn.model_instance;
+        if (overlay.model.get())
+        {
+          overlay_radius = overlay.model->rad * overlay.scale;
+        }
+      }
+      if (overlay_radius <= 0.0f)
+      {
+        overlay_radius = 1.0f;
+      }
+
+      float const distance = glm::distance(model_instance.get_pos(), spawn.pos);
+      if (distance < nearest_distance)
+      {
+        nearest_distance = distance;
+        nearest_guid = spawn.guid;
+        if (spawn.model_instance.has_value()
+            && spawn.model_instance->model.get()
+            && spawn.model_instance->model->file_key().hasFilepath())
+        {
+          nearest_model = spawn.model_instance->model->file_key().filepath();
+        }
+        else
+        {
+          nearest_model = spawn.model_path;
+        }
+      }
+      float const overlap_radius = std::max(4.0f, legacy_radius + overlay_radius + 1.5f);
+      if (distance <= overlap_radius)
+      {
+        std::ostringstream key;
+        key << model_instance.model->file_key().stringRepr() << '|'
+            << model_instance.uid << '|'
+            << spawn.guid;
+        if (logged_suppressions.insert(key.str()).second)
+        {
+          LogDebug << "Suppressing legacy creature instance model='"
+                   << model_instance.model->file_key().stringRepr()
+                   << "' uid=" << model_instance.uid
+                   << " overlayGuid=" << spawn.guid
+                   << " distance=" << distance
+                   << " radius=" << overlap_radius
+                   << std::endl;
+        }
+        return true;
+      }
+    }
+
+    if (model_path == "creature/humanmalepeasant/humanmalepeasant.m2"
+        || model_path == "creature/humanfemalepeasant/humanfemalepeasant.m2")
+    {
+      std::ostringstream key;
+      key << model_path << '|' << model_instance.uid;
+      if (logged_legacy_candidates.insert(key.str()).second)
+      {
+        LogDebug << "Legacy creature candidate model='" << model_path
+                 << "' uid=" << model_instance.uid
+                 << " pos={" << model_instance.get_pos().x << "," << model_instance.get_pos().y << "," << model_instance.get_pos().z << "}"
+                 << " nearestOverlayGuid=" << nearest_guid
+                 << " nearestOverlayModel='" << nearest_model << "'"
+                 << " nearestDistance=" << nearest_distance
+                 << std::endl;
+      }
+    }
+
+    return false;
   }
 }
 
@@ -141,6 +348,19 @@ void WorldRender::draw (glm::mat4x4 const& model_view
   glm::mat4x4 const mvp(projection * model_view);
   math::frustum const frustum (mvp);
 
+  if (capture_debug_enabled())
+  {
+    LogDebug << "WorldRender::draw begin camera={"
+             << camera_pos.x << ", " << camera_pos.y << ", " << camera_pos.z << "}"
+             << " draw_terrain=" << draw_terrain
+             << " draw_wmo=" << draw_wmo
+             << " draw_water=" << draw_water
+             << " draw_wmo_doodads=" << draw_wmo_doodads
+             << " draw_models=" << draw_models
+             << " draw_creatures=" << _world->drawCreatureSpawns()
+             << std::endl;
+  }
+
   if (camera_moved)
     updateMVPUniformBlock(model_view, projection);
 
@@ -169,11 +389,16 @@ void WorldRender::draw (glm::mat4x4 const& model_view
   if (_need_terrain_params_ubo_update)
     updateTerrainParamsUniformBlock();
 
+  // Tile occlusion culling is currently too aggressive around large terrain/WMOs
+  // and can hide visible ADTs while their objects still render.
+  constexpr bool occlusion_cull = false;
+
   // Frustum culling
   _world->_n_loaded_tiles = 0;
   unsigned tile_counter = 0;
   for (MapTile* tile : _world->mapIndex.loaded_tiles())
   {
+    tile->recalcExtents();
     tile->recalcObjectInstanceExtents();
     tile->recalcCombinedExtents();
 
@@ -192,33 +417,32 @@ void WorldRender::draw (glm::mat4x4 const& model_view
     }
 
     auto& tile_extents = tile->getCombinedExtents();
-    if (frustum.intersects(tile_extents[1], tile_extents[0]) || tile->getChunkUpdateFlags())
+    bool const tile_in_frustum = frustum.intersects(tile_extents[1], tile_extents[0]) || tile->getChunkUpdateFlags();
+
+    tile->calcCamDist(camera_pos);
+    _world->_loaded_tiles_buffer[tile_counter] = std::make_pair(std::make_pair(static_cast<int>(tile->index.x), static_cast<int>(tile->index.z)), tile);
+
+    tile->renderer()->setObjectsFrustumCullTest(tile_in_frustum ? 1 : 0);
+    if (!occlusion_cull)
     {
-      tile->calcCamDist(camera_pos);
-      _world->_loaded_tiles_buffer[tile_counter] = std::make_pair(std::make_pair(static_cast<int>(tile->index.x), static_cast<int>(tile->index.z)), tile);
-
-      tile->renderer()->setObjectsFrustumCullTest(1);
-      if (frustum.contains(tile_extents[0]) && frustum.contains(tile_extents[1]))
-      {
-        tile->renderer()->setObjectsFrustumCullTest( tile->renderer()->objectsFrustumCullTest() + 1);
-      }
-
-      if (tile->renderer()->isFrustumCulled())
-      {
-        tile->renderer()->setOverrideOcclusionCulling(true);
-        tile->renderer()->discardTileOcclusionQuery();
-        tile->renderer()->setOccluded(false);
-      }
-
-      tile->renderer()->setFrustumCulled(false);
-
-      tile_counter++;
+      tile->renderer()->discardTileOcclusionQuery();
+      tile->renderer()->setOccluded(false);
     }
-    else
+
+    if (tile_in_frustum && frustum.contains(tile_extents[0]) && frustum.contains(tile_extents[1]))
     {
-      tile->renderer()->setFrustumCulled(true);
-      tile->renderer()->setObjectsFrustumCullTest(0);
+      tile->renderer()->setObjectsFrustumCullTest(tile->renderer()->objectsFrustumCullTest() + 1);
     }
+
+    if (tile->renderer()->isFrustumCulled())
+    {
+      tile->renderer()->setOverrideOcclusionCulling(true);
+      tile->renderer()->discardTileOcclusionQuery();
+      tile->renderer()->setOccluded(false);
+    }
+
+    tile->renderer()->setFrustumCulled(false);
+    tile_counter++;
 
     _world->_n_loaded_tiles++;
   }
@@ -319,6 +543,11 @@ void WorldRender::draw (glm::mat4x4 const& model_view
 
   if (draw_terrain)
   {
+    if (capture_debug_enabled())
+    {
+      LogDebug << "WorldRender::draw terrain begin" << std::endl;
+    }
+
     ZoneScopedN("World::draw() : Draw terrain");
 
     gl.disable(GL_BLEND);
@@ -378,6 +607,11 @@ void WorldRender::draw (glm::mat4x4 const& model_view
       gl.bindVertexArray(0);
       gl.bindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
     }
+
+    if (capture_debug_enabled())
+    {
+      LogDebug << "WorldRender::draw terrain end" << std::endl;
+    }
   }
 
   if (terrainMode == editing_mode::object && _world->has_multiple_model_selected())
@@ -412,6 +646,13 @@ void WorldRender::draw (glm::mat4x4 const& model_view
   std::unordered_map<Model*, std::size_t> model_with_particles;
 
   tsl::robin_map<Model*, std::vector<glm::mat4x4>> models_to_draw;
+  struct CreatureSpawnInstanceDraw
+  {
+    std::uint32_t guid = 0;
+    ModelInstance* instance = nullptr;
+    World::CreatureSpawnOverlay* spawn = nullptr;
+  };
+  std::vector<CreatureSpawnInstanceDraw> creature_spawn_instances_to_draw;
   std::vector<WMOInstance*> wmos_to_draw;
 
   // frame counter loop. pretty hacky but works
@@ -483,6 +724,11 @@ void WorldRender::draw (glm::mat4x4 const& model_view
 
           auto m2_instance = static_cast<ModelInstance*>(instance);
 
+          if (!minimap_render && should_suppress_legacy_creature_instance(_world, *m2_instance))
+          {
+            continue;
+          }
+
           if ((tile->renderer()->objectsFrustumCullTest() > 1 || m2_instance->isInFrustum(frustum)) && m2_instance->isInRenderDist(_cull_distance, camera_pos, display))
           {
             instances.push_back(m2_instance->transformMatrix());
@@ -532,6 +778,11 @@ void WorldRender::draw (glm::mat4x4 const& model_view
   // WMOs / map objects
   if (draw_wmo || _world->mapIndex.hasAGlobalWMO())
   {
+    if (capture_debug_enabled())
+    {
+      LogDebug << "WorldRender::draw wmo begin queued=" << wmos_to_draw.size() << std::endl;
+    }
+
     ZoneScopedN("World::draw() : Draw WMOs");
     {
       OpenGL::Scoped::use_program wmo_program{*_wmo_program.get()};
@@ -620,6 +871,11 @@ void WorldRender::draw (glm::mat4x4 const& model_view
         }
       }
     }
+
+    if (capture_debug_enabled())
+    {
+      LogDebug << "WorldRender::draw wmo end" << std::endl;
+    }
   }
 
 
@@ -629,9 +885,13 @@ void WorldRender::draw (glm::mat4x4 const& model_view
   // rendering a little extra is cheaper than querying.
   // occlusion latency has 1-2 frames delay.
 
-  constexpr bool occlusion_cull = true;
   if (occlusion_cull)
   {
+    if (capture_debug_enabled())
+    {
+      LogDebug << "WorldRender::draw occlusion begin" << std::endl;
+    }
+
     OpenGL::Scoped::use_program occluder_shader{ *_occluder_program.get() };
     gl.colorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
     gl.depthMask(GL_FALSE);
@@ -657,6 +917,11 @@ void WorldRender::draw (glm::mat4x4 const& model_view
     gl.depthMask(GL_TRUE);
     gl.bindVertexArray(0);
     gl.bindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+
+    if (capture_debug_enabled())
+    {
+      LogDebug << "WorldRender::draw occlusion end" << std::endl;
+    }
   }
 
 
@@ -687,10 +952,19 @@ void WorldRender::draw (glm::mat4x4 const& model_view
 
   bool draw_doodads_wmo = draw_wmo && draw_wmo_doodads;
   bool draw_creature_spawns = !minimap_render && _world->drawCreatureSpawns();
-  constexpr float creature_spawn_draw_distance = 650.0f;
+  float const creature_spawn_model_distance = creature_spawn_model_draw_distance();
+  float const creature_spawn_marker_distance = creature_spawn_marker_draw_distance();
   // M2s / models
   if (draw_models || draw_doodads_wmo || draw_creature_spawns || (minimap_render && minimap_render_settings->use_filters))
   {
+    if (capture_debug_enabled())
+    {
+      LogDebug << "WorldRender::draw m2 begin draw_models=" << draw_models
+               << " draw_doodads_wmo=" << draw_doodads_wmo
+               << " draw_creature_spawns=" << draw_creature_spawns
+               << std::endl;
+    }
+
     ZoneScopedN("World::draw() : Draw M2s");
 
     if (draw_model_animations)
@@ -700,6 +974,11 @@ void WorldRender::draw (glm::mat4x4 const& model_view
 
     if (draw_doodads_wmo)
     {
+      if (capture_debug_enabled())
+      {
+        LogDebug << "WorldRender::draw wmo doodad inject begin wmos=" << wmos_to_draw.size() << std::endl;
+      }
+
       ZoneScopedN("World::draw() : Inject visible WMO doodads");
       for (auto* wmo_instance : wmos_to_draw)
       {
@@ -707,6 +986,11 @@ void WorldRender::draw (glm::mat4x4 const& model_view
         for (auto* doodad : doodads)
         {
           if (!doodad)
+          {
+            continue;
+          }
+
+          if (!minimap_render && should_suppress_legacy_creature_instance(_world, *doodad))
           {
             continue;
           }
@@ -719,6 +1003,67 @@ void WorldRender::draw (glm::mat4x4 const& model_view
 
           models_to_draw[doodad->model.get()].push_back(doodad->transformMatrix());
         }
+      }
+
+      if (capture_debug_enabled())
+      {
+        std::size_t doodad_instance_count = 0;
+        for (auto const& pair : models_to_draw)
+        {
+          doodad_instance_count += pair.second.size();
+        }
+        LogDebug << "WorldRender::draw wmo doodad inject end modelBuckets=" << models_to_draw.size()
+                 << " instances=" << doodad_instance_count
+                 << std::endl;
+      }
+    }
+
+    if (draw_creature_spawns)
+    {
+      _world->ensureCreatureSpawnsLoaded();
+      ZoneScopedN("World::draw() : Inject creature spawn models");
+      std::size_t models_created_this_frame = 0;
+      std::size_t const model_create_budget = creature_spawn_model_create_budget();
+      for (auto& spawn : _world->creatureSpawns())
+      {
+        if (glm::distance(camera_pos, spawn.pos) > creature_spawn_model_distance)
+        {
+          continue;
+        }
+
+        if (!spawn.model_instance.has_value())
+        {
+          if (models_created_this_frame >= model_create_budget)
+          {
+            continue;
+          }
+
+          if (!_world->ensureCreatureSpawnModel(spawn))
+          {
+            continue;
+          }
+
+          ++models_created_this_frame;
+        }
+
+        if (!spawn.model_instance.has_value())
+        {
+          continue;
+        }
+
+        auto& mi = *spawn.model_instance;
+        mi.ensureExtents();
+        if (!mi.model->finishedLoading() || mi.model->loading_failed())
+        {
+          continue;
+        }
+
+        if (!mi.isInFrustum(frustum))
+        {
+          continue;
+        }
+
+        creature_spawn_instances_to_draw.push_back({spawn.guid, &mi, &spawn});
       }
     }
 
@@ -733,6 +1078,18 @@ void WorldRender::draw (glm::mat4x4 const& model_view
     {
       if (draw_models || (minimap_render && minimap_render_settings->use_filters))
       {
+        if (capture_debug_enabled())
+        {
+          std::size_t instanced_m2_count = 0;
+          for (auto const& pair : models_to_draw)
+          {
+            instanced_m2_count += pair.second.size();
+          }
+          LogDebug << "WorldRender::draw instanced m2 begin modelBuckets=" << models_to_draw.size()
+                   << " instances=" << instanced_m2_count
+                   << std::endl;
+        }
+
         OpenGL::Scoped::use_program m2_shader {*_m2_instanced_program.get()};
 
         OpenGL::M2RenderState model_render_state;
@@ -781,6 +1138,16 @@ void WorldRender::draw (glm::mat4x4 const& model_view
 
           if (draw_hidden_models || !pair.first->is_hidden())
           {
+            if (capture_debug_enabled())
+            {
+              LogDebug << "WorldRender::draw instanced m2 bucket begin model='"
+                       << pair.first->file_key().stringRepr()
+                       << "' instances=" << pair.second.size()
+                       << " animated=" << pair.first->animated
+                       << " animBones=" << pair.first->animBones
+                       << std::endl;
+            }
+
             pair.first->renderer()->draw( model_view
                 , pair.second
                 , m2_shader
@@ -794,7 +1161,19 @@ void WorldRender::draw (glm::mat4x4 const& model_view
                 , display
             );
             _world->_n_rendered_objects += pair.second.size();
+
+            if (capture_debug_enabled())
+            {
+              LogDebug << "WorldRender::draw instanced m2 bucket end model='"
+                       << pair.first->file_key().stringRepr()
+                       << "'" << std::endl;
+            }
           }
+        }
+
+        if (capture_debug_enabled())
+        {
+          LogDebug << "WorldRender::draw instanced m2 end" << std::endl;
         }
 
         /*
@@ -836,6 +1215,163 @@ void WorldRender::draw (glm::mat4x4 const& model_view
 
     }
 
+    if (!creature_spawn_instances_to_draw.empty())
+    {
+      OpenGL::Scoped::use_program m2_shader {*_m2_program.get()};
+
+      OpenGL::M2RenderState model_render_state;
+      model_render_state.tex_arrays = {0, 0};
+      model_render_state.tex_indices = {0, 0};
+      model_render_state.tex_unit_lookups = {0, 0};
+      gl.blendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+      gl.disable(GL_BLEND);
+      gl.depthMask(GL_TRUE);
+      gl.enable(GL_CULL_FACE);
+      m2_shader.uniform("blend_mode", 0);
+      m2_shader.uniform("unfogged", static_cast<int>(model_render_state.unfogged));
+      m2_shader.uniform("unlit",  static_cast<int>(model_render_state.unlit));
+      m2_shader.uniform("tex_unit_lookup_1", 0);
+      m2_shader.uniform("tex_unit_lookup_2", 0);
+      m2_shader.uniform("pixel_shader", 0);
+
+      for (auto const& draw_item : creature_spawn_instances_to_draw)
+      {
+        auto* instance = draw_item.instance;
+        if (!instance || instance->model->loading_failed())
+        {
+          continue;
+        }
+
+        if (draw_hidden_models || !instance->model->is_hidden())
+        {
+          if (capture_debug_enabled())
+          {
+            LogDebug << "Creature spawn model draw guid=" << draw_item.guid
+                     << " model='" << instance->model->file_key().stringRepr() << "'"
+                     << " pos={" << instance->pos.x << ", " << instance->pos.y << ", " << instance->pos.z << "}"
+                     << " scale=" << instance->scale
+                     << std::endl;
+          }
+
+          int const creature_animtime = draw_model_animations && draw_item.spawn
+            ? static_cast<int>(_world->animtime) + draw_item.spawn->animation_time_offset
+            : static_cast<int>(_world->animtime);
+          if (draw_model_animations)
+          {
+            instance->model->animcalc = false;
+          }
+
+          instance->model->renderer()->draw(model_view
+            , *instance
+            , m2_shader
+            , model_render_state
+            , frustum
+            , _cull_distance
+            , camera_pos
+            , creature_animtime
+            , display
+          );
+          ++_world->_n_rendered_objects;
+
+          auto* parent_model = instance->model.get();
+          if (draw_item.spawn && parent_model)
+          {
+            for (auto& attachment : draw_item.spawn->attachment_models)
+            {
+              if (!attachment.model_instance.has_value())
+              {
+                if (capture_debug_enabled())
+                {
+                  LogDebug << "Creature attachment draw skip guid=" << draw_item.guid
+                           << " attachmentId=" << attachment.attachment_id
+                           << " reason=no-instance"
+                           << std::endl;
+                }
+                continue;
+              }
+
+              auto& attachment_instance = *attachment.model_instance;
+              auto const attachment_path = attachment_instance.model.get()
+                ? attachment_instance.model->file_key().stringRepr()
+                : std::string("<null>");
+              if (!attachment_instance.model.get())
+              {
+                if (capture_debug_enabled())
+                {
+                  LogDebug << "Creature attachment draw skip guid=" << draw_item.guid
+                           << " attachmentId=" << attachment.attachment_id
+                           << " model='" << attachment_path << "'"
+                           << " reason=no-model"
+                           << std::endl;
+                }
+                continue;
+              }
+
+              if (!attachment_instance.model->finishedLoading()
+                  || attachment_instance.model->loading_failed()
+                  || attachment_instance.model->is_hidden())
+              {
+                if (capture_debug_enabled())
+                {
+                  LogDebug << "Creature attachment draw skip guid=" << draw_item.guid
+                           << " attachmentId=" << attachment.attachment_id
+                           << " model='" << attachment_path << "'"
+                           << " finished=" << attachment_instance.model->finishedLoading()
+                           << " failed=" << attachment_instance.model->loading_failed()
+                           << " hidden=" << attachment_instance.model->is_hidden()
+                           << std::endl;
+                }
+                continue;
+              }
+
+              auto const* attachment_def = find_attachment_def(parent_model, attachment.attachment_id);
+              if (!attachment_def)
+              {
+                if (capture_debug_enabled())
+                {
+                  LogDebug << "Creature attachment draw skip guid=" << draw_item.guid
+                           << " attachmentId=" << attachment.attachment_id
+                           << " model='" << attachment_path << "'"
+                           << " reason=no-attachment-def"
+                           << std::endl;
+                }
+                continue;
+              }
+
+              attachment_instance.setTransformMatrix(attachment_world_matrix(*instance, parent_model, attachment_def));
+              if (draw_model_animations)
+              {
+                attachment_instance.model->animcalc = false;
+              }
+              if (capture_debug_enabled())
+              {
+                LogDebug << "Creature attachment draw guid=" << draw_item.guid
+                         << " attachmentId=" << attachment.attachment_id
+                         << " model='" << attachment_path << "'"
+                         << " bone=" << attachment_def->bone
+                         << " pos={" << attachment_def->pos.x << ", "
+                         << attachment_def->pos.y << ", "
+                         << attachment_def->pos.z << "}"
+                         << std::endl;
+              }
+              attachment_instance.model->renderer()->draw(model_view
+                , attachment_instance
+                , m2_shader
+                , model_render_state
+                , frustum
+                , _cull_distance
+                , camera_pos
+                , creature_animtime
+                , display
+                , true
+              );
+              ++_world->_n_rendered_objects;
+            }
+          }
+        }
+      }
+    }
+
     gl.disable(GL_BLEND);
     gl.enable(GL_CULL_FACE);
     gl.depthMask(GL_TRUE);
@@ -869,7 +1405,7 @@ void WorldRender::draw (glm::mat4x4 const& model_view
       }
     }
 
-    if (!minimap_render)
+    if (draw_creature_spawns)
     {
       _world->ensureCreatureSpawnsLoaded();
     }
@@ -890,6 +1426,13 @@ void WorldRender::draw (glm::mat4x4 const& model_view
       std::vector<MarkerData> markers;
       markers.reserve(512);
 
+      if (capture_debug_enabled())
+      {
+        LogDebug << "Creature spawn marker collect begin total=" << _world->creatureSpawns().size()
+                 << " camera={" << camera_pos.x << ", " << camera_pos.y << ", " << camera_pos.z << "}"
+                 << std::endl;
+      }
+
       for (auto const& spawn : _world->creatureSpawns())
       {
         float distance = glm::distance(camera_pos, spawn.pos);
@@ -899,7 +1442,7 @@ void WorldRender::draw (glm::mat4x4 const& model_view
           closest_guid = spawn.guid;
           closest_pos = spawn.pos;
         }
-        if (distance > creature_spawn_draw_distance) continue;
+        if (distance > creature_spawn_marker_distance) continue;
         ++nearby_spawns;
 
         // Derive circle radius from the model's bounding sphere so it scales
@@ -924,6 +1467,15 @@ void WorldRender::draw (glm::mat4x4 const& model_view
         markers.push_back({ground_pos, color, ring_radius});
       }
 
+      if (capture_debug_enabled())
+      {
+        LogDebug << "Creature spawn marker draw begin nearby=" << nearby_spawns
+                 << " markers=" << markers.size()
+                 << " closestGuid=" << closest_guid
+                 << " closestDistance=" << closest_distance
+                 << std::endl;
+      }
+
       gl.blendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
       gl.enable(GL_DEPTH_TEST);
 
@@ -944,12 +1496,17 @@ void WorldRender::draw (glm::mat4x4 const& model_view
       // Restore depth function
       gl.depthFunc(GL_LEQUAL);
 
-      if (!logged_creature_marker_stats)
+      if (capture_debug_enabled())
+      {
+        LogDebug << "Creature spawn marker draw end markers=" << markers.size() << std::endl;
+      }
+
+      if (!logged_creature_marker_stats || capture_debug_enabled())
       {
         LogDebug << "Creature spawn marker draw: total=" << _world->creatureSpawns().size()
                  << ", nearby=" << nearby_spawns
                  << ", drawn=" << markers.size()
-                 << ", markerDistance=" << creature_spawn_draw_distance
+                 << ", markerDistance=" << creature_spawn_marker_distance
                  << ", camera={" << camera_pos.x << ", " << camera_pos.y << ", " << camera_pos.z << "}"
                  << ", closestGuid=" << closest_guid
                  << ", closestDistance=" << closest_distance
@@ -990,119 +1547,11 @@ void WorldRender::draw (glm::mat4x4 const& model_view
         }
       }
 
-      if (draw_creature_spawns)
-      {
-        ZoneScopedN("World::draw() : Draw creature spawn models");
+    }
 
-        OpenGL::Scoped::use_program m2_shader {*_m2_program.get()};
-
-        OpenGL::M2RenderState model_render_state;
-        model_render_state.tex_arrays = {0, 0};
-        model_render_state.tex_indices = {0, 0};
-        model_render_state.tex_unit_lookups = {-1, -1};
-        gl.blendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-        gl.disable(GL_BLEND);
-        gl.depthMask(GL_TRUE);
-        gl.enable(GL_CULL_FACE);
-        m2_shader.uniform("blend_mode", 0);
-        m2_shader.uniform("unfogged", static_cast<int>(model_render_state.unfogged));
-        m2_shader.uniform("unlit",  static_cast<int>(model_render_state.unlit));
-        m2_shader.uniform("tex_unit_lookup_1", 0);
-        m2_shader.uniform("tex_unit_lookup_2", 0);
-        m2_shader.uniform("masked_additive", 0);
-        m2_shader.uniform("pixel_shader", 0);
-
-        for (auto& spawn : _world->creatureSpawns())
-        {
-          if (glm::distance(camera_pos, spawn.pos) > creature_spawn_draw_distance)
-          {
-            continue;
-          }
-
-          if (!spawn.model_instance.has_value())
-          {
-            continue;
-          }
-
-          auto& mi = *spawn.model_instance;
-          mi.ensureExtents();
-          if (!mi.model->finishedLoading() || mi.model->loading_failed())
-          {
-            continue;
-          }
-
-          if (draw_hidden_models || !mi.model->is_hidden())
-          {
-            mi.model->renderer()->draw(model_view,
-                                       mi,
-                                       m2_shader,
-                                       model_render_state,
-                                       frustum,
-                                       _cull_distance,
-                                       camera_pos,
-                                       _world->animtime,
-                                       display);
-            ++_world->_n_rendered_objects;
-
-            for (auto& attachment : spawn.attachment_models)
-            {
-              if (!attachment.model_instance.has_value())
-              {
-                continue;
-              }
-
-              Model const* parent_model = mi.model.get();
-              if (!parent_model)
-              {
-                continue;
-              }
-
-              auto const* attachment_def = find_attachment_def(parent_model, attachment.attachment_id);
-              if (!attachment_def)
-              {
-                if (classic_attachment_debug_enabled())
-                {
-                  LogDebug << "Missing creature attachment anchor parent='" << mi.model->file_key().stringRepr()
-                           << "' child='" << attachment.model_instance->model->file_key().stringRepr()
-                           << "' attachmentId=" << attachment.attachment_id
-                           << " lookupSize=" << mi.model->_attachment_lookup.size()
-                           << " attachmentCount=" << mi.model->_attachments.size()
-                           << std::endl;
-                }
-                continue;
-              }
-
-              if (classic_attachment_debug_enabled())
-              {
-                LogDebug << "Creature attachment draw parent='" << mi.model->file_key().stringRepr()
-                         << "' child='" << attachment.model_instance->model->file_key().stringRepr()
-                         << "' attachmentId=" << attachment.attachment_id
-                         << " bone=" << attachment_def->bone
-                         << " pos=(" << attachment_def->pos.x << "," << attachment_def->pos.y << "," << attachment_def->pos.z << ")"
-                         << std::endl;
-              }
-
-              auto& attachment_instance = *attachment.model_instance;
-              if (!attachment_instance.model->finishedLoading() || attachment_instance.model->loading_failed())
-              {
-                continue;
-              }
-
-              attachment_instance.setTransformMatrix(attachment_world_matrix(mi, parent_model, attachment_def));
-              attachment_instance.model->renderer()->draw(model_view,
-                                                         attachment_instance,
-                                                         m2_shader,
-                                                         model_render_state,
-                                                         frustum,
-                                                         _cull_distance,
-                                                         camera_pos,
-                                                         _world->animtime,
-                                                         display,
-                                                         true);
-            }
-          }
-        }
-      }
+    if (capture_debug_enabled())
+    {
+      LogDebug << "WorldRender::draw m2 end" << std::endl;
     }
   }
 
@@ -1179,6 +1628,11 @@ void WorldRender::draw (glm::mat4x4 const& model_view
 
   if (draw_water)
   {
+    if (capture_debug_enabled())
+    {
+      LogDebug << "WorldRender::draw water begin" << std::endl;
+    }
+
     ZoneScopedN("World::draw() : Draw water");
 
     // draw the water on both sides
@@ -1213,6 +1667,11 @@ void WorldRender::draw (glm::mat4x4 const& model_view
     }
 
     gl.bindVertexArray(0);
+
+    if (capture_debug_enabled())
+    {
+      LogDebug << "WorldRender::draw water end" << std::endl;
+    }
   }
 
   if (angled_mode || use_ref_pos)

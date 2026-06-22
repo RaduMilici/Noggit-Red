@@ -49,6 +49,9 @@ CreatureDisplayInfoDB gCreatureDisplayInfoDB;
 CreatureDisplayInfoExtraDB gCreatureDisplayInfoExtraDB;
 CreatureModelDataDB gCreatureModelDataDB;
 ItemDisplayInfoDB gItemDisplayInfoDB;
+CharacterFacialHairStylesDB gCharacterFacialHairStylesDB;
+CharacterHairGeosetsDB gCharacterHairGeosetsDB;
+CharacterSectionsDB gCharacterSectionsDB;
 WMOAreaTableDB gWMOAreaTableDB;
 
 void OpenDBs(std::shared_ptr<BlizzardArchive::ClientData> clientData)
@@ -86,6 +89,30 @@ void OpenDBs(std::shared_ptr<BlizzardArchive::ClientData> clientData)
   catch (std::exception const& e)
   {
     LogError << "Failed to open ItemDisplayInfo.dbc: " << e.what() << std::endl;
+  }
+  try
+  {
+    gCharacterFacialHairStylesDB.open(clientData);
+  }
+  catch (std::exception const& e)
+  {
+    LogError << "Failed to open CharacterFacialHairStyles.dbc: " << e.what() << std::endl;
+  }
+  try
+  {
+    gCharacterHairGeosetsDB.open(clientData);
+  }
+  catch (std::exception const& e)
+  {
+    LogError << "Failed to open CharacterHairGeosets.dbc: " << e.what() << std::endl;
+  }
+  try
+  {
+    gCharacterSectionsDB.open(clientData);
+  }
+  catch (std::exception const& e)
+  {
+    LogError << "Failed to open CharSections.dbc: " << e.what() << std::endl;
   }
   gWMOAreaTableDB.open(clientData);
 }

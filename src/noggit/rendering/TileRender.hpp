@@ -59,7 +59,7 @@ namespace Noggit::Rendering
 
     [[nodiscard]]
     bool isOverridingOcclusionCulling() const { return _tile_occlusion_cull_override; };
-    void setOverrideOcclusionCulling(bool state) { _tile_frustum_culled = state; };
+    void setOverrideOcclusionCulling(bool state) { _tile_occlusion_cull_override = state; };
 
   private:
 

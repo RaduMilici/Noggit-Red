@@ -3,6 +3,7 @@
 #pragma once
 #include <noggit/ModelHeaders.h>
 #include <math/interpolation.hpp>
+#include <algorithm>
 #include <cassert>
 #include <map>
 #include <vector>
@@ -84,6 +85,12 @@ namespace Animation
     std::map<AnimationIdType, AnimatedTypeVectorType> out;
 
   public:
+    M2Value()
+      : _globalSequenceID(NO_GLOBAL_SEQUENCE)
+      , _globalSequences(nullptr)
+      , _interpolationType(Animation::Interpolation::Type::NONE)
+    {}
+
     bool uses(AnimationIdType anim)
     {
       if (_globalSequenceID != NO_GLOBAL_SEQUENCE)
@@ -123,6 +130,21 @@ namespace Animation
 
       if (!timestampVector.empty())
       {
+        size_t usable_count = std::min(timestampVector.size(), dataVector.size());
+        if (_interpolationType == Animation::Interpolation::Type::HERMITE)
+        {
+          usable_count = std::min(usable_count, std::min(inVector.size(), outVector.size()));
+        }
+
+        if (!usable_count)
+        {
+          return result;
+        }
+        if (usable_count == 1)
+        {
+          return dataVector[0];
+        }
+
         TimestampType max_time = timestampVector.back();
         if (max_time > 0)
         {
@@ -134,7 +156,7 @@ namespace Animation
         }
 
         size_t pos = 0;
-        for (size_t i = 0; i < timestampVector.size() - 1; ++i)
+        for (size_t i = 0; i < usable_count - 1; ++i)
         {
           if (time >= timestampVector[i] && time < timestampVector[i + 1])
           {
@@ -143,7 +165,7 @@ namespace Animation
           }
         }
 
-        if (pos == timestampVector.size() - 1 || _interpolationType == Animation::Interpolation::Type::NONE)
+        if (pos >= usable_count - 1 || _interpolationType == Animation::Interpolation::Type::NONE)
         {
           result = dataVector[pos];
         }
@@ -181,6 +203,91 @@ namespace Animation
       }
 
       return result;
+    }
+
+    M2Value (const ClassicAnimationBlock& animationBlock
+             , const BlizzardArchive::ClientFile& file
+             , int32_t* globalSequences
+            )
+    {
+      _interpolationType = animationBlock.type;
+
+      _globalSequences = globalSequences;
+      _globalSequenceID = animationBlock.seq;
+      if (_globalSequenceID != NO_GLOBAL_SEQUENCE)
+      {
+        assert(_globalSequences && "Animation said to have global sequence, but pointer to global sequence data is nullptr");
+      }
+
+      auto const range_fits = [&](std::uint32_t offset, std::uint32_t count, std::size_t element_size)
+      {
+        return !count || (offset < file.getSize() && count <= (file.getSize() - offset) / element_size);
+      };
+
+      if (!range_fits(animationBlock.ofsTimes, animationBlock.nTimes, sizeof(TimestampType))
+          || !range_fits(animationBlock.ofsKeys, animationBlock.nKeys, sizeof(DataType))
+          || !range_fits(animationBlock.ofsRanges, animationBlock.nRanges, sizeof(ClassicAnimationRange)))
+      {
+        return;
+      }
+
+      TimestampType const* timestamps = file.get<TimestampType>(animationBlock.ofsTimes);
+      DataType const* keys = file.get<DataType>(animationBlock.ofsKeys);
+      ClassicAnimationRange const* ranges = file.get<ClassicAnimationRange>(animationBlock.ofsRanges);
+
+      auto append_range = [&](AnimationIdType animation, std::uint32_t start, std::uint32_t end)
+      {
+        if (animationBlock.nTimes == 0 || animationBlock.nKeys == 0 || start > end || start >= animationBlock.nTimes)
+        {
+          return;
+        }
+
+        end = std::min(end, animationBlock.nTimes - 1);
+        TimestampType const base_time = timestamps[start];
+
+        for (std::uint32_t i = start; i <= end; ++i)
+        {
+          TimestampType const normalized_time = timestamps[i] >= base_time ? timestamps[i] - base_time : timestamps[i];
+
+          switch (_interpolationType)
+          {
+          case Animation::Interpolation::Type::NONE:
+          case Animation::Interpolation::Type::LINEAR:
+            if (i < animationBlock.nKeys)
+            {
+              times[animation].push_back(normalized_time);
+              data[animation].push_back(_conversion(keys[i]));
+            }
+            break;
+
+          case Animation::Interpolation::Type::HERMITE:
+          default:
+          {
+            std::uint32_t const key_index = i * 3;
+            if (key_index + 2 < animationBlock.nKeys)
+            {
+              times[animation].push_back(normalized_time);
+              data[animation].push_back(_conversion(keys[key_index]));
+              in[animation].push_back(_conversion(keys[key_index + 1]));
+              out[animation].push_back(_conversion(keys[key_index + 2]));
+            }
+            break;
+          }
+          }
+        }
+      };
+
+      if (animationBlock.nRanges)
+      {
+        for (std::uint32_t range_index = 0; range_index < animationBlock.nRanges; ++range_index)
+        {
+          append_range(range_index, ranges[range_index].start, ranges[range_index].end);
+        }
+      }
+      else if (animationBlock.nTimes && animationBlock.nKeys)
+      {
+        append_range(0, 0, std::min(animationBlock.nTimes, animationBlock.nKeys) - 1);
+      }
     }
 
     //! \todo Use a vector of BlizzardArchive::ClientFile& for the anim files instead for safety.

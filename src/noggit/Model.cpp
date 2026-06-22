@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cctype>
 #include <cstdlib>
 #include <cstring>
 #include <map>
@@ -25,11 +26,64 @@
 
 namespace
 {
+  bool is_null_asset_reference(std::string filename)
+  {
+    auto const is_trimmed_char = [](unsigned char character)
+    {
+      return character == '\0' || std::isspace(character);
+    };
+
+    filename.erase(filename.begin(),
+                   std::find_if(filename.begin(), filename.end(),
+                                [&](unsigned char character) { return !is_trimmed_char(character); }));
+    filename.erase(std::find_if(filename.rbegin(), filename.rend(),
+                                [&](unsigned char character) { return !is_trimmed_char(character); }).base(),
+                   filename.end());
+
+    std::transform(filename.begin(), filename.end(), filename.begin(), [](unsigned char character)
+    {
+      return static_cast<char>(std::tolower(character));
+    });
+
+    std::replace(filename.begin(), filename.end(), '\\', '/');
+
+    if (filename.empty() || filename == "0" || filename == "none" || filename == "null")
+    {
+      return true;
+    }
+
+    if (filename.find('/') == std::string::npos)
+    {
+      auto const extension_pos = filename.rfind('.');
+      if (extension_pos != std::string::npos && filename.substr(0, extension_pos) == "0")
+      {
+        auto const extension = filename.substr(extension_pos);
+        return extension == ".m2"
+            || extension == ".mdx"
+            || extension == ".mdl"
+            || extension == ".blp";
+      }
+    }
+
+    return false;
+  }
+
   bool classic_m2_debug_enabled()
   {
     static bool const enabled = []()
     {
       char const* value = std::getenv("NOGGIT_CLASSIC_M2_DEBUG");
+      return value && *value && std::strcmp(value, "0") != 0;
+    }();
+
+    return enabled;
+  }
+
+  bool capture_m2_animation_debug_enabled()
+  {
+    static bool const enabled = []()
+    {
+      char const* value = std::getenv("NOGGIT_CAPTURE_DEBUG");
       return value && *value && std::strcmp(value, "0") != 0;
     }();
 
@@ -150,6 +204,35 @@ namespace
     glm::vec3 center;
   };
 
+  struct ClassicModelAnimation
+  {
+    uint16_t animID;
+    uint16_t subAnimID;
+    uint32_t startTimestamp;
+    uint32_t endTimestamp;
+    float moveSpeed;
+    uint32_t flags;
+    uint16_t frequency;
+    uint16_t unused;
+    uint32_t minimumRepetitions;
+    uint32_t maximumRepetitions;
+    uint32_t blendTime;
+    glm::vec3 boxA;
+    glm::vec3 boxB;
+    float rad;
+    int16_t nextAnimation;
+    uint16_t aliasNext;
+  };
+
+  struct ClassicModelAttachmentDef
+  {
+    uint32_t id;
+    uint16_t bone;
+    uint16_t unknown1;
+    glm::vec3 pos;
+    ClassicAnimationBlock Enabled;
+  };
+
   uint32_t m2_version(uint8_t const version[4])
   {
     uint32_t value = 0;
@@ -194,9 +277,9 @@ namespace
         && range_fits(file, header.ofsParticleEmitters, header.nParticleEmitters, sizeof(ModelParticleEmitterDef));
   }
 
-        bool m2_static_ranges_fit(BlizzardArchive::ClientFile const& file, ModelHeader const& header)
-        {
-          return range_fits(file, header.ofsVertices, header.nVertices, sizeof(ModelVertex))
+  bool m2_static_ranges_fit(BlizzardArchive::ClientFile const& file, ModelHeader const& header)
+  {
+    return range_fits(file, header.ofsVertices, header.nVertices, sizeof(ModelVertex))
           && range_fits(file, header.ofsTextures, header.nTextures, sizeof(ModelTextureDef))
           && range_fits(file, header.ofsTexReplace, header.nTexReplace, sizeof(uint16_t))
           && range_fits(file, header.ofsRenderFlags, header.nRenderFlags, sizeof(ModelRenderFlags))
@@ -208,7 +291,25 @@ namespace
           && range_fits(file, header.ofsBoundingTriangles, header.nBoundingTriangles, sizeof(uint16_t))
           && range_fits(file, header.ofsBoundingVertices, header.nBoundingVertices, sizeof(glm::vec3))
           && range_fits(file, header.ofsBoundingNormals, header.nBoundingNormals, sizeof(glm::vec3));
-        }
+  }
+
+  void copy_classic_header(ClassicModelHeader const& classic_header, ModelHeader& header);
+
+  bool m2_classic_ranges_fit(BlizzardArchive::ClientFile const& file, ClassicModelHeader const& header)
+  {
+    ModelHeader translated_header;
+    copy_classic_header(header, translated_header);
+
+    return m2_static_ranges_fit(file, translated_header)
+        && range_fits(file, header.ofsGlobalSequences, header.nGlobalSequences, sizeof(int))
+        && range_fits(file, header.ofsAnimations, header.nAnimations, sizeof(ClassicModelAnimation))
+        && range_fits(file, header.ofsAnimationLookup, header.nAnimationLookup, sizeof(int16_t))
+        && range_fits(file, header.ofsBones, header.nBones, sizeof(ClassicModelBoneDef))
+        && range_fits(file, header.ofsKeyBoneLookup, header.nKeyBoneLookup, sizeof(int16_t))
+        && range_fits(file, header.ofsTransparency, header.nTransparency, sizeof(ClassicModelTransDef))
+        && range_fits(file, header.ofsAttachments, header.nAttachments, sizeof(ClassicModelAttachmentDef))
+        && range_fits(file, header.ofsAttachLookup, header.nAttachLookup, sizeof(int16_t));
+  }
 
   void copy_classic_header(ClassicModelHeader const& classic_header, ModelHeader& header)
   {
@@ -314,6 +415,22 @@ namespace
     geoset.radius = 0.f;
     return geoset;
   }
+
+  ModelAttachmentDef translate_classic_attachment(ClassicModelAttachmentDef const& classic_attachment)
+  {
+    ModelAttachmentDef attachment = {};
+    attachment.id = classic_attachment.id;
+    attachment.bone = classic_attachment.bone;
+    attachment.unknown1 = classic_attachment.unknown1;
+    attachment.pos = classic_attachment.pos;
+    attachment.Enabled.type = classic_attachment.Enabled.type;
+    attachment.Enabled.seq = classic_attachment.Enabled.seq;
+    attachment.Enabled.nTimes = classic_attachment.Enabled.nTimes;
+    attachment.Enabled.ofsTimes = classic_attachment.Enabled.ofsTimes;
+    attachment.Enabled.nKeys = classic_attachment.Enabled.nKeys;
+    attachment.Enabled.ofsKeys = classic_attachment.Enabled.ofsKeys;
+    return attachment;
+  }
 }
 
 Model::Model(const std::string& filename, Noggit::NoggitRenderContext context)
@@ -355,7 +472,7 @@ void Model::finishLoading()
     if (std::memcmp(translated_header.id, "MD20", 4) == 0
         && m2_version(translated_header.version) <= 256
         && range_fits(f, classic_header.ofsViews, classic_header.nViews, sizeof(ClassicModelView))
-        && m2_static_ranges_fit(f, translated_header))
+        && m2_classic_ranges_fit(f, classic_header))
     {
       header = translated_header;
       _embedded_view_offset = classic_header.ofsViews;
@@ -419,7 +536,7 @@ void Model::finishLoading()
 
   rad = header.bounding_box_radius;
 
-  if (!_uses_classic_layout && header.nGlobalSequences)
+  if (header.nGlobalSequences)
   {
     _global_sequences = M2Array<int>(f, header.ofsGlobalSequences, header.nGlobalSequences);
   }
@@ -427,7 +544,7 @@ void Model::finishLoading()
   //! \todo  This takes a biiiiiit long. Have a look at this.
   initCommon(f);
 
-  if (animated && !_uses_classic_layout)
+  if (animated)
   {
     initAnimated(f);
   }
@@ -443,14 +560,14 @@ bool Model::initClassicStaticBones(const BlizzardArchive::ClientFile& f)
   _classic_static_bones.clear();
   bone_matrices.clear();
 
-  if (!_uses_classic_layout || !header.nBones || !range_fits(f, header.ofsBones, header.nBones, sizeof(ModelBoneDef)))
+  if (!_uses_classic_layout || !header.nBones || !range_fits(f, header.ofsBones, header.nBones, sizeof(ClassicModelBoneDef)))
   {
     return false;
   }
 
   bool has_runtime_bone = false;
   bool has_weighted_vertices = false;
-  auto const* model_bones = reinterpret_cast<ModelBoneDef const*>(f.getBuffer() + header.ofsBones);
+  auto const* model_bones = reinterpret_cast<ClassicModelBoneDef const*>(f.getBuffer() + header.ofsBones);
   _classic_static_bones.reserve(header.nBones);
 
   for (std::size_t i = 0; i < header.nBones; ++i)
@@ -662,6 +779,13 @@ void Model::initCommon(const BlizzardArchive::ClientFile& f)
       bool invalid_size = *(blp_ptr + texdef[i].nameLen-1) != '\0';
       _textureFilenames[i] = std::string(blp_ptr, texdef[i].nameLen - (invalid_size ? 0 : 1));
 
+      if (is_null_asset_reference(_textureFilenames[i]))
+      {
+        _textureFilenames[i] = "tileset/generic/black.blp";
+        classic_missing_texture_fallbacks++;
+        continue;
+      }
+
       if (_uses_classic_layout
           && !Noggit::Application::NoggitApplication::instance()->clientData()->exists(_textureFilenames[i]))
       {
@@ -721,13 +845,111 @@ void Model::initCommon(const BlizzardArchive::ClientFile& f)
 
   // init transparency
   _transparency_lookup = M2Array<int16_t>(f, header.ofsTransparencyLookup, header.nTransparencyLookup);
-  _attachments = M2Array<ModelAttachmentDef>(f, header.ofsAttachments, header.nAttachments);
+
+  if (_uses_classic_layout)
+  {
+    auto const classic_attachments = M2Array<ClassicModelAttachmentDef>(f, header.ofsAttachments, header.nAttachments);
+    _attachments.clear();
+    _attachments.reserve(classic_attachments.size());
+
+    for (auto const& classic_attachment : classic_attachments)
+    {
+      _attachments.push_back(translate_classic_attachment(classic_attachment));
+    }
+  }
+  else
+  {
+    _attachments = M2Array<ModelAttachmentDef>(f, header.ofsAttachments, header.nAttachments);
+  }
+
   _attachment_lookup = M2Array<int16_t>(f, header.ofsAttachLookup, header.nAttachLookup);
+
+  if (_uses_classic_layout
+      && classic_m2_debug_enabled()
+      && _file_key.hasFilepath()
+      && _file_key.filepath().starts_with("character/"))
+  {
+    std::ostringstream attachment_log;
+    attachment_log << "Classic attachment dump model='" << _file_key.stringRepr() << "'"
+                   << " attachmentCount=" << _attachments.size()
+                   << " lookupCount=" << _attachment_lookup.size()
+                   << " lookup[0,1,2,5,6,11,26]={";
+    for (int lookup_id : {0, 1, 2, 5, 6, 11, 26})
+    {
+      if (lookup_id != 0)
+      {
+        attachment_log << ", ";
+      }
+      attachment_log << lookup_id << ':';
+      if (lookup_id >= 0 && static_cast<std::size_t>(lookup_id) < _attachment_lookup.size())
+      {
+        attachment_log << _attachment_lookup[lookup_id];
+      }
+      else
+      {
+        attachment_log << "<out>";
+      }
+    }
+    attachment_log << "} lookupRecords=";
+
+    bool first_lookup_record = true;
+    for (int lookup_id : {0, 1, 2, 5, 6, 11, 26})
+    {
+      if (lookup_id < 0 || static_cast<std::size_t>(lookup_id) >= _attachment_lookup.size())
+      {
+        continue;
+      }
+
+      auto const lookup_index = _attachment_lookup[lookup_id];
+      if (lookup_index < 0 || static_cast<std::size_t>(lookup_index) >= _attachments.size())
+      {
+        continue;
+      }
+
+      auto const& attachment = _attachments[lookup_index];
+      if (!first_lookup_record)
+      {
+        attachment_log << ' ';
+      }
+      first_lookup_record = false;
+      attachment_log << "[lookupId=" << lookup_id
+                     << " idx=" << lookup_index
+                     << " id=" << attachment.id
+                     << " bone=" << attachment.bone
+                     << " pos={" << attachment.pos.x << ',' << attachment.pos.y << ',' << attachment.pos.z << "}]";
+    }
+
+    attachment_log << " matchingIds=";
+
+    bool first_record = true;
+    for (std::size_t index = 0; index < _attachments.size(); ++index)
+    {
+      auto const& attachment = _attachments[index];
+      if (attachment.id != 0 && attachment.id != 1 && attachment.id != 2
+          && attachment.id != 5 && attachment.id != 6 && attachment.id != 11
+          && attachment.id != 26)
+      {
+        continue;
+      }
+
+      if (!first_record)
+      {
+        attachment_log << ' ';
+      }
+      first_record = false;
+      attachment_log << "[idx=" << index
+                     << " id=" << attachment.id
+                     << " bone=" << attachment.bone
+                     << " pos={" << attachment.pos.x << ',' << attachment.pos.y << ',' << attachment.pos.z << "}]";
+    }
+
+    LogDebug << attachment_log.str() << std::endl;
+  }
 
   if (_uses_classic_layout && header.nTransparency)
   {
     _classic_transparency_values.reserve(header.nTransparency);
-    ModelTransDef const* trDefs = reinterpret_cast<ModelTransDef const*>(f.getBuffer() + header.ofsTransparency);
+    ClassicModelTransDef const* trDefs = reinterpret_cast<ClassicModelTransDef const*>(f.getBuffer() + header.ofsTransparency);
     Animation::Conversion<int16_t, float> convert_alpha;
 
     for (size_t i = 0; i < header.nTransparency; ++i)
@@ -852,7 +1074,8 @@ void Model::initCommon(const BlizzardArchive::ClientFile& f)
 
       if (!_logged_classic_character_geosets
           && file_key().hasFilepath()
-          && file_key().filepath().starts_with("character/"))
+          && file_key().filepath().starts_with("character/")
+          && classic_m2_debug_enabled())
       {
         _logged_classic_character_geosets = true;
         std::ostringstream geoset_log;
@@ -997,34 +1220,139 @@ void Model::initAnimated(const BlizzardArchive::ClientFile& f)
 
   if (header.nAnimations > 0) 
   {
-    std::vector<ModelAnimation> animations(header.nAnimations);
-
-    memcpy(animations.data(), f.getBuffer() + header.ofsAnimations, header.nAnimations * sizeof(ModelAnimation));
-
-    for (auto& anim : animations)
+    if (_uses_classic_layout)
     {
-      anim.length = std::max(anim.length, 1U);
+      auto const* classic_animations = reinterpret_cast<ClassicModelAnimation const*>(f.getBuffer() + header.ofsAnimations);
 
-      _animation_length[anim.animID] += anim.length;
-      _animations_seq_per_id[anim.animID][anim.subAnimID] = anim;
-
-      std::string lodname = _file_key.filepath().substr(0, _file_key.filepath().length() - 3);
-      std::stringstream tempname;
-      tempname << lodname << anim.animID << "-" << anim.subAnimID << ".anim";
-      if (Noggit::Application::NoggitApplication::instance()->clientData()->exists(tempname.str()))
+      for (std::uint32_t animation_index = 0; animation_index < header.nAnimations; ++animation_index)
       {
-        animation_files.push_back(std::make_unique<BlizzardArchive::ClientFile>(tempname.str(),
-            Noggit::Application::NoggitApplication::instance()->clientData()));
+        auto const& classic_anim = classic_animations[animation_index];
+        ModelAnimation anim = {};
+        anim.animID = static_cast<int16_t>(classic_anim.animID);
+        anim.subAnimID = static_cast<int16_t>(classic_anim.subAnimID);
+        anim.length = classic_anim.endTimestamp > classic_anim.startTimestamp
+          ? classic_anim.endTimestamp - classic_anim.startTimestamp
+          : 1U;
+        anim.moveSpeed = classic_anim.moveSpeed;
+        anim.flags = classic_anim.flags;
+        anim.boxA = classic_anim.boxA;
+        anim.boxB = classic_anim.boxB;
+        anim.rad = classic_anim.rad;
+        anim.NextAnimation = classic_anim.nextAnimation;
+        anim.Index = static_cast<int16_t>(animation_index);
+
+        _animation_length[anim.animID] += anim.length;
+        _animations_seq_per_id[anim.animID][anim.subAnimID] = anim;
+      }
+    }
+    else
+    {
+      std::vector<ModelAnimation> animations(header.nAnimations);
+
+      memcpy(animations.data(), f.getBuffer() + header.ofsAnimations, header.nAnimations * sizeof(ModelAnimation));
+
+      for (auto& anim : animations)
+      {
+        anim.length = std::max(anim.length, 1U);
+
+        _animation_length[anim.animID] += anim.length;
+        _animations_seq_per_id[anim.animID][anim.subAnimID] = anim;
+
+        std::string lodname = _file_key.filepath().substr(0, _file_key.filepath().length() - 3);
+        std::stringstream tempname;
+        tempname << lodname << anim.animID << "-" << anim.subAnimID << ".anim";
+        if (Noggit::Application::NoggitApplication::instance()->clientData()->exists(tempname.str()))
+        {
+          animation_files.push_back(std::make_unique<BlizzardArchive::ClientFile>(tempname.str(),
+              Noggit::Application::NoggitApplication::instance()->clientData()));
+        }
       }
     }
   }
 
   if (animBones)
   {
-    ModelBoneDef const* mb = reinterpret_cast<ModelBoneDef const*>(f.getBuffer() + header.ofsBones);
-    for (size_t i = 0; i<header.nBones; ++i)
+    auto sanitize_sequence_id = [this](auto& animation_block)
     {
-      bones.emplace_back(f, mb[i], _global_sequences.data(), animation_files);
+      if (animation_block.seq != -1
+          && (animation_block.seq < 0
+              || static_cast<std::size_t>(animation_block.seq) >= _global_sequences.size()))
+      {
+        animation_block.seq = -1;
+      }
+    };
+
+    if (_uses_classic_layout)
+    {
+      ClassicModelBoneDef const* mb = reinterpret_cast<ClassicModelBoneDef const*>(f.getBuffer() + header.ofsBones);
+      for (size_t i = 0; i<header.nBones; ++i)
+      {
+        auto bone = mb[i];
+        sanitize_sequence_id(bone.translation);
+        sanitize_sequence_id(bone.rotation);
+        sanitize_sequence_id(bone.scaling);
+        bones.emplace_back(f, bone, _global_sequences.data());
+      }
+    }
+    else
+    {
+      ModelBoneDef const* mb = reinterpret_cast<ModelBoneDef const*>(f.getBuffer() + header.ofsBones);
+      for (size_t i = 0; i<header.nBones; ++i)
+      {
+        auto bone = mb[i];
+        sanitize_sequence_id(bone.translation);
+        sanitize_sequence_id(bone.rotation);
+        sanitize_sequence_id(bone.scaling);
+        bones.emplace_back(f, bone, _global_sequences.data(), animation_files);
+      }
+    }
+
+    for (size_t i = 0; i < bones.size(); ++i)
+    {
+      auto invalid_parent = [this, i](int parent)
+      {
+        return parent < 0
+            || static_cast<size_t>(parent) >= bones.size()
+            || static_cast<size_t>(parent) == i;
+      };
+
+      if (bones[i].parent < 0)
+      {
+        continue;
+      }
+
+      bool detach_parent = invalid_parent(bones[i].parent);
+      std::set<size_t> visited;
+      int parent = bones[i].parent;
+      while (!detach_parent && parent >= 0)
+      {
+        auto const parent_index = static_cast<size_t>(parent);
+        if (!visited.insert(parent_index).second)
+        {
+          detach_parent = true;
+          break;
+        }
+
+        parent = bones[parent_index].parent;
+        if (parent >= 0
+            && (static_cast<size_t>(parent) >= bones.size()
+                || static_cast<size_t>(parent) == i))
+        {
+          detach_parent = true;
+        }
+      }
+
+      if (detach_parent)
+      {
+        if (classic_m2_debug_enabled())
+        {
+          LogDebug << "Detaching invalid M2 bone parent model='" << _file_key.stringRepr()
+                   << "' bone=" << i
+                   << " parent=" << bones[i].parent
+                   << std::endl;
+        }
+        bones[i].parent = -1;
+      }
     }
 
     bone_matrices.resize(bones.size());
@@ -1040,8 +1368,20 @@ void Model::initAnimated(const BlizzardArchive::ClientFile& f)
   }
 
   
+  // Vanilla/classic emitter structs are not WotLK-compatible. Rendering the
+  // animated mesh is safer than reading particle data with the wrong layout.
+  if (_uses_classic_layout
+      && classic_m2_debug_enabled()
+      && (header.nParticleEmitters || header.nRibbonEmitters || header.nLights))
+  {
+    LogDebug << "Skipping classic M2 effects model='" << _file_key.stringRepr()
+             << "' particles=" << header.nParticleEmitters
+             << " ribbons=" << header.nRibbonEmitters
+             << " lights=" << header.nLights << std::endl;
+  }
+
   // particle systems
-  if (header.nParticleEmitters)
+  if (!_uses_classic_layout && header.nParticleEmitters)
   {
     _particles.reserve(header.nParticleEmitters);
     ModelParticleEmitterDef const* pdefs = reinterpret_cast<ModelParticleEmitterDef const*>(f.getBuffer() + header.ofsParticleEmitters);
@@ -1061,7 +1401,7 @@ void Model::initAnimated(const BlizzardArchive::ClientFile& f)
 
   
   // ribbons
-  if (header.nRibbonEmitters)
+  if (!_uses_classic_layout && header.nRibbonEmitters)
   {
     _ribbons.reserve(header.nRibbonEmitters);
     ModelRibbonEmitterDef const* rdefs = reinterpret_cast<ModelRibbonEmitterDef const*>(f.getBuffer() + header.ofsRibbonEmitters);
@@ -1072,7 +1412,7 @@ void Model::initAnimated(const BlizzardArchive::ClientFile& f)
   
 
   // init lights
-  if (header.nLights)
+  if (!_uses_classic_layout && header.nLights)
   {
     _lights.reserve(header.nLights);
     ModelLightDef const* lDefs = reinterpret_cast<ModelLightDef const*>(f.getBuffer() + header.ofsLights);
@@ -1096,7 +1436,27 @@ void Model::calcBones(glm::mat4x4 const& model_view
 
   for (size_t i = 0; i<header.nBones; ++i)
   {
-    bones[i].calcMatrix(model_view, bones.data(), _anim, time, animation_time);
+    if (capture_m2_animation_debug_enabled()
+        && _file_key.filepath().find("gnomemachine") != std::string::npos)
+    {
+      LogDebug << "Model::calcBones bone begin model='" << _file_key.stringRepr()
+               << "' bone=" << i
+               << " parent=" << bones[i].parent
+               << " anim=" << _anim
+               << " time=" << time
+               << " animtime=" << animation_time
+               << std::endl;
+    }
+
+    bones[i].calcMatrix(model_view, bones.data(), _file_key.stringRepr(), i, _anim, time, animation_time);
+
+    if (capture_m2_animation_debug_enabled()
+        && _file_key.filepath().find("gnomemachine") != std::string::npos)
+    {
+      LogDebug << "Model::calcBones bone end model='" << _file_key.stringRepr()
+               << "' bone=" << i
+               << std::endl;
+    }
   }
 }
 
@@ -1119,12 +1479,14 @@ void Model::animate(glm::mat4x4 const& model_view, int anim_id, int anim_time)
 
   if (_uses_classic_layout)
   {
-    calcClassicStaticBones(model_view);
-    _renderer.updateBoneMatrices();
-    return;
+    if (_animations_seq_per_id.empty() || _animations_seq_per_id[anim_id].empty())
+    {
+      calcClassicStaticBones(model_view);
+      _renderer.updateBoneMatrices();
+      return;
+    }
   }
-
-  if (_animations_seq_per_id.empty() || _animations_seq_per_id[anim_id].empty())
+  else if (_animations_seq_per_id.empty() || _animations_seq_per_id[anim_id].empty())
   {
     return;
   }
@@ -1148,16 +1510,25 @@ void Model::animate(glm::mat4x4 const& model_view, int anim_id, int anim_time)
   ModelAnimation const& a = _animations_seq_per_id[anim_id][current_sub_anim];
 
   _current_anim_seq = a.Index;//_animations_seq_lookup[anim_id][current_sub_anim];
-  _anim_time = t;
+  _anim_time = _uses_classic_layout ? time_for_anim : t;
   _global_animtime = anim_time;
 
   if (animBones) 
   {
-    calcBones(model_view, _current_anim_seq, t, _global_animtime);
+    calcBones(model_view, _current_anim_seq, _anim_time, _global_animtime);
   }
 
   if (animGeometry || animBones)
   {
+    if (capture_m2_animation_debug_enabled()
+        && _file_key.filepath().find("gnomemachine") != std::string::npos)
+    {
+      LogDebug << "Model::animate bone matrix copy begin model='" << _file_key.stringRepr()
+               << "' bones=" << bones.size()
+               << " matrices=" << bone_matrices.size()
+               << std::endl;
+    }
+
     std::size_t bone_counter = 0;
     for (auto& bone : bones)
     {
@@ -1165,7 +1536,24 @@ void Model::animate(glm::mat4x4 const& model_view, int anim_id, int anim_time)
       bone_counter++;
     }
 
+    if (capture_m2_animation_debug_enabled()
+        && _file_key.filepath().find("gnomemachine") != std::string::npos)
+    {
+      LogDebug << "Model::animate bone matrix copy end model='" << _file_key.stringRepr()
+               << "' copied=" << bone_counter
+               << std::endl;
+      LogDebug << "Model::animate bone matrix upload begin model='" << _file_key.stringRepr()
+               << "'" << std::endl;
+    }
+
     _renderer.updateBoneMatrices();
+
+    if (capture_m2_animation_debug_enabled()
+        && _file_key.filepath().find("gnomemachine") != std::string::npos)
+    {
+      LogDebug << "Model::animate bone matrix upload end model='" << _file_key.stringRepr()
+               << "'" << std::endl;
+    }
 
 
     // transform vertices
@@ -1199,9 +1587,10 @@ void Model::animate(glm::mat4x4 const& model_view, int anim_id, int anim_time)
      */
   }
 
-  for (size_t i=0; i<header.nLights; ++i) 
+  for (size_t i = 0; i < _lights.size(); ++i) 
   {
-    if (_lights[i].parent >= 0) 
+    if (_lights[i].parent >= 0
+        && static_cast<std::size_t>(_lights[i].parent) < bones.size()) 
     {
         _lights[i].tpos = bones[_lights[i].parent].mat * glm::vec4(_lights[i].pos,0);
       _lights[i].tdir = bones[_lights[i].parent].mrot * glm::vec4(_lights[i].dir,0);
@@ -1311,7 +1700,9 @@ Bone::Bone( const BlizzardArchive::ClientFile& f,
             const std::vector<std::unique_ptr<BlizzardArchive::ClientFile>>& animation_files)
   : trans (b.translation, f, global, animation_files)
   , rot (b.rotation, f, global, animation_files)
+  , classic_rot()
   , scale (b.scaling, f, global, animation_files)
+  , _uses_classic_rotation(false)
   , pivot (fixCoordSystem (b.pivot))
   , parent (b.parent)
 {
@@ -1322,8 +1713,28 @@ Bone::Bone( const BlizzardArchive::ClientFile& f,
   scale.apply(fixCoordSystem2);
 }
 
+Bone::Bone( const BlizzardArchive::ClientFile& f,
+            const ClassicModelBoneDef &b,
+            int *global)
+  : trans (b.translation, f, global)
+  , rot()
+  , classic_rot (b.rotation, f, global)
+  , scale (b.scaling, f, global)
+  , _uses_classic_rotation(true)
+  , pivot (fixCoordSystem (b.pivot))
+  , parent (b.parent)
+{
+  memcpy(&flags, &b.flags, sizeof(uint32_t));
+
+  trans.apply(fixCoordSystem);
+  classic_rot.apply(fixCoordSystemQuat);
+  scale.apply(fixCoordSystem2);
+}
+
 void Bone::calcMatrix(glm::mat4x4 const& model_view
                      , Bone *allbones
+                     , std::string const& model_name
+                     , size_t bone_index
                      , int anim
                      , int time
                      , int animtime
@@ -1334,6 +1745,7 @@ void Bone::calcMatrix(glm::mat4x4 const& model_view
 
   glm::mat4x4 m = glm::mat4x4(1);
   glm::mat4x4 mr = glm::mat4x4(1);
+  bool const has_rotation = _uses_classic_rotation ? classic_rot.uses(anim) : rot.uses(anim);
 
   if ( flags.transformed
     || flags.billboard 
@@ -1347,13 +1759,41 @@ void Bone::calcMatrix(glm::mat4x4 const& model_view
 
     if (trans.uses(anim))
     {
+      if (capture_m2_animation_debug_enabled()
+          && model_name.find("gnomemachine") != std::string::npos)
+      {
+        LogDebug << "Bone::calcMatrix translation begin model='" << model_name
+                 << "' bone=" << bone_index << std::endl;
+      }
       m = glm::translate(m, trans.getValue (anim, time, animtime));
+      if (capture_m2_animation_debug_enabled()
+          && model_name.find("gnomemachine") != std::string::npos)
+      {
+        LogDebug << "Bone::calcMatrix translation end model='" << model_name
+                 << "' bone=" << bone_index << std::endl;
+      }
     }
 
-    if (rot.uses(anim))
+    if (has_rotation)
     {
+      if (capture_m2_animation_debug_enabled()
+          && model_name.find("gnomemachine") != std::string::npos)
+      {
+        LogDebug << "Bone::calcMatrix rotation begin model='" << model_name
+                 << "' bone=" << bone_index
+                 << " classic=" << _uses_classic_rotation
+                 << std::endl;
+      }
       glm::quat ref = glm::quat_cast(glm::mat4x4(1));
-      glm::quat q = rot.getValue(anim, time, animtime);
+      glm::quat q = _uses_classic_rotation ? classic_rot.getValue(anim, time, animtime) : rot.getValue(anim, time, animtime);
+      if (capture_m2_animation_debug_enabled()
+          && model_name.find("gnomemachine") != std::string::npos)
+      {
+        LogDebug << "Bone::calcMatrix rotation value model='" << model_name
+                 << "' bone=" << bone_index
+                 << " quat=(" << q.w << "," << q.x << "," << q.y << "," << q.z << ")"
+                 << std::endl;
+      }
       glm::vec3 rot_euler = glm::eulerAngles(q);
 
       glm::vec3 test_rot_vec = glm::vec3(rot_euler[2], 
@@ -1367,7 +1807,19 @@ void Bone::calcMatrix(glm::mat4x4 const& model_view
 
     if (scale.uses(anim))
     {
+      if (capture_m2_animation_debug_enabled()
+          && model_name.find("gnomemachine") != std::string::npos)
+      {
+        LogDebug << "Bone::calcMatrix scale begin model='" << model_name
+                 << "' bone=" << bone_index << std::endl;
+      }
       m = glm::scale(m, scale.getValue (anim, time, animtime));
+      if (capture_m2_animation_debug_enabled()
+          && model_name.find("gnomemachine") != std::string::npos)
+      {
+        LogDebug << "Bone::calcMatrix scale end model='" << model_name
+                 << "' bone=" << bone_index << std::endl;
+      }
     }
 
     if (flags.billboard)
@@ -1388,7 +1840,7 @@ void Bone::calcMatrix(glm::mat4x4 const& model_view
 
   if (parent >= 0)
   {
-    allbones[parent].calcMatrix (model_view, allbones, anim, time, animtime);
+    allbones[parent].calcMatrix (model_view, allbones, model_name, static_cast<size_t>(parent), anim, time, animtime);
     mat = allbones[parent].mat * m;
   }
   else
@@ -1397,7 +1849,7 @@ void Bone::calcMatrix(glm::mat4x4 const& model_view
   }
   
   // transform matrix for normal vectors ... ??
-  if (rot.uses(anim))
+  if (has_rotation)
   {
     if (parent >= 0)
     {
@@ -1494,4 +1946,3 @@ void Model::updateEmitters(float dt)
     }
   }
 }
-

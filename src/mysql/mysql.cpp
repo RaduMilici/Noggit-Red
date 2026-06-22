@@ -10,6 +10,8 @@
 #include <QMessageBox>
 
 #include <cstdlib>
+#include <initializer_list>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -78,6 +80,11 @@ namespace
 			}
 			return nullptr;
 		}
+
+		unsigned int const timeout_seconds = 5;
+		mysql_options(connection, MYSQL_OPT_CONNECT_TIMEOUT, &timeout_seconds);
+		mysql_options(connection, MYSQL_OPT_READ_TIMEOUT, &timeout_seconds);
+		mysql_options(connection, MYSQL_OPT_WRITE_TIMEOUT, &timeout_seconds);
 
 		if (!mysql_real_connect(connection,
 														details.host.c_str(),
@@ -188,6 +195,72 @@ namespace
 		return has_row;
 	}
 
+	bool tableExists(MYSQL* connection, char const* table_name)
+	{
+		std::stringstream statement;
+		statement << "SELECT 1 FROM INFORMATION_SCHEMA.TABLES "
+		          << "WHERE TABLE_SCHEMA = DATABASE() "
+		          << "AND TABLE_NAME='" << table_name << "' LIMIT 1";
+
+		if (mysql_query(connection, statement.str().c_str()) != 0)
+		{
+			return false;
+		}
+
+		MYSQL_RES* result = mysql_store_result(connection);
+		if (!result)
+		{
+			return false;
+		}
+
+		bool const has_row = mysql_num_rows(result) > 0;
+		mysql_free_result(result);
+		return has_row;
+	}
+
+	bool hasCreatureEquipmentSchema(MYSQL* connection)
+	{
+		return tableHasColumn(connection, "creature_template", "equipment_id")
+		    && tableExists(connection, "creature_equip_template")
+		    && tableHasColumn(connection, "creature_equip_template", "entry")
+		    && tableHasColumn(connection, "creature_equip_template", "equipentry1")
+		    && tableHasColumn(connection, "creature_equip_template", "equipentry2")
+		    && tableHasColumn(connection, "creature_equip_template", "equipentry3")
+		    && tableExists(connection, "item_template")
+		    && tableHasColumn(connection, "item_template", "entry")
+		    && tableHasColumn(connection, "item_template", "display_id")
+		    && tableHasColumn(connection, "item_template", "inventory_type");
+	}
+
+	std::string creatureEquipmentSelectExpr(bool has_equipment_schema)
+	{
+		if (!has_equipment_schema)
+		{
+			return "0 AS mainhand_display_id, 0 AS offhand_display_id, 0 AS ranged_display_id, "
+			       "0 AS mainhand_inventory_type, 0 AS offhand_inventory_type, 0 AS ranged_inventory_type";
+		}
+
+		return "COALESCE(it1.display_id, 0) AS mainhand_display_id, "
+		       "COALESCE(it2.display_id, 0) AS offhand_display_id, "
+		       "COALESCE(it3.display_id, 0) AS ranged_display_id, "
+		       "COALESCE(it1.inventory_type, 0) AS mainhand_inventory_type, "
+		       "COALESCE(it2.inventory_type, 0) AS offhand_inventory_type, "
+		       "COALESCE(it3.inventory_type, 0) AS ranged_inventory_type";
+	}
+
+	std::string creatureEquipmentJoinExpr(bool has_equipment_schema)
+	{
+		if (!has_equipment_schema)
+		{
+			return {};
+		}
+
+		return "LEFT JOIN creature_equip_template cet ON cet.entry = ct.equipment_id "
+		       "LEFT JOIN item_template it1 ON it1.entry = cet.equipentry1 "
+		       "LEFT JOIN item_template it2 ON it2.entry = cet.equipentry2 "
+		       "LEFT JOIN item_template it3 ON it3.entry = cet.equipentry3 ";
+	}
+
 	std::string buildCreatureDisplayExpr(MYSQL* connection, bool* needs_creature_addon_join, bool* has_mount_display_col)
 	{
 		std::vector<std::string> parts;
@@ -250,6 +323,11 @@ namespace
 			*has_mount_display_col = has_ca_mount;
 		}
 
+		if (parts.empty())
+		{
+			return "0 AS displayid";
+		}
+
 		std::stringstream expr;
 		expr << "COALESCE(";
 		for (std::size_t i = 0; i < parts.size(); ++i)
@@ -261,6 +339,54 @@ namespace
 			}
 		}
 		expr << ") AS displayid";
+		return expr.str();
+	}
+
+	std::string firstTemplateColumnExpr(MYSQL* connection,
+	                                    std::initializer_list<char const*> column_names,
+	                                    char const* fallback)
+	{
+		for (auto const* column_name : column_names)
+		{
+			if (tableHasColumn(connection, "creature_template", column_name))
+			{
+				return std::string("ct.") + column_name;
+			}
+		}
+
+		return fallback;
+	}
+
+	std::string buildCreatureTemplateDisplayExpr(MYSQL* connection)
+	{
+		std::vector<std::string> parts;
+		for (auto const* column_name : {"display_id1", "displayid1",
+		                                "display_id2", "displayid2",
+		                                "display_id3", "displayid3",
+		                                "display_id4", "displayid4"})
+		{
+			if (tableHasColumn(connection, "creature_template", column_name))
+			{
+				parts.emplace_back(std::string("NULLIF(ct.") + column_name + ", 0)");
+			}
+		}
+
+		if (parts.empty())
+		{
+			return "0 AS display_id";
+		}
+
+		std::stringstream expr;
+		expr << "COALESCE(";
+		for (std::size_t i = 0; i < parts.size(); ++i)
+		{
+			expr << parts[i];
+			if (i + 1 < parts.size())
+			{
+				expr << ", ";
+			}
+		}
+		expr << ", 0) AS display_id";
 		return expr.str();
 	}
 }
@@ -388,6 +514,7 @@ namespace mysql
 		bool needs_creature_addon_join = false;
 		bool has_mount_display_col = false;
 		bool has_template_scale_col = tableHasColumn(connection.get(), "creature_template", "scale");
+		bool const has_equipment_schema = hasCreatureEquipmentSchema(connection.get());
 		auto display_expr = buildCreatureDisplayExpr(connection.get(), &needs_creature_addon_join, &has_mount_display_col);
 		auto mount_expr = has_mount_display_col
 			? "COALESCE(CASE WHEN ca.mount_display_id > 0 THEN ca.mount_display_id ELSE 0 END, 0) AS mount_display_id"
@@ -401,10 +528,12 @@ namespace mysql
 			<< "SELECT c.guid, c.id, c.map, c.position_x, c.position_y, c.position_z, c.orientation, ct.name, "
 			<< template_scale_expr << ", "
 			<< display_expr << ", "
-			<< mount_expr << " "
+			<< mount_expr << ", "
+			<< creatureEquipmentSelectExpr(has_equipment_schema) << " "
 			<< "FROM creature c "
 			<< "INNER JOIN creature_template ct ON ct.entry = c.id "
 			<< (needs_creature_addon_join ? "LEFT JOIN creature_addon ca ON ca.guid = c.guid " : "")
+			<< creatureEquipmentJoinExpr(has_equipment_schema)
 			<< "WHERE c.map = " << mapID << " "
 			<< "ORDER BY ct.name, c.guid";
 
@@ -444,6 +573,12 @@ namespace mysql
 			record.template_scale = parseFloat(row[8]);
 			record.display_id = parseUnsigned(row[9]);
 			record.mount_display_id = parseUnsigned(row[10]);
+			record.mainhand_display_id = parseUnsigned(row[11]);
+			record.offhand_display_id = parseUnsigned(row[12]);
+			record.ranged_display_id = parseUnsigned(row[13]);
+			record.mainhand_inventory_type = parseUnsigned(row[14]);
+			record.offhand_inventory_type = parseUnsigned(row[15]);
+			record.ranged_inventory_type = parseUnsigned(row[16]);
 			records.push_back(record);
 		}
 
@@ -467,6 +602,7 @@ namespace mysql
 		bool needs_creature_addon_join = false;
 		bool has_mount_display_col = false;
 		bool has_template_scale_col = tableHasColumn(connection.get(), "creature_template", "scale");
+		bool const has_equipment_schema = hasCreatureEquipmentSchema(connection.get());
 		auto display_expr = buildCreatureDisplayExpr(connection.get(), &needs_creature_addon_join, &has_mount_display_col);
 		auto mount_expr = has_mount_display_col
 			? "COALESCE(CASE WHEN ca.mount_display_id > 0 THEN ca.mount_display_id ELSE 0 END, 0) AS mount_display_id"
@@ -481,10 +617,12 @@ namespace mysql
 			<< "SELECT c.guid, c.id, c.map, c.position_x, c.position_y, c.position_z, c.orientation, ct.name, "
 			<< template_scale_expr << ", "
 			<< display_expr << ", "
-			<< mount_expr << " "
+			<< mount_expr << ", "
+			<< creatureEquipmentSelectExpr(has_equipment_schema) << " "
 			<< "FROM creature c "
 			<< "INNER JOIN creature_template ct ON ct.entry = c.id "
 			<< (needs_creature_addon_join ? "LEFT JOIN creature_addon ca ON ca.guid = c.guid " : "")
+			<< creatureEquipmentJoinExpr(has_equipment_schema)
 			<< "WHERE ct.name LIKE '%" << escaped_search << "%' OR CAST(c.id AS CHAR) = '" << escaped_search << "' "
 			<< "ORDER BY ct.name, c.map, c.guid "
 			<< "LIMIT " << limit;
@@ -525,6 +663,103 @@ namespace mysql
 			record.template_scale = parseFloat(row[8]);
 			record.display_id = parseUnsigned(row[9]);
 			record.mount_display_id = parseUnsigned(row[10]);
+			record.mainhand_display_id = parseUnsigned(row[11]);
+			record.offhand_display_id = parseUnsigned(row[12]);
+			record.ranged_display_id = parseUnsigned(row[13]);
+			record.mainhand_inventory_type = parseUnsigned(row[14]);
+			record.offhand_inventory_type = parseUnsigned(row[15]);
+			record.ranged_inventory_type = parseUnsigned(row[16]);
+			records.push_back(record);
+		}
+
+		mysql_free_result(result);
+		return records;
+	}
+
+	std::vector<CreatureTemplateRecord> getCreatureTemplates(std::size_t limit, std::string* error)
+	{
+		auto connection = connect(error);
+		if (!connection)
+		{
+			return {};
+		}
+
+		if (!tableExists(connection.get(), "creature_template")
+		    || !tableHasColumn(connection.get(), "creature_template", "entry")
+		    || !tableHasColumn(connection.get(), "creature_template", "name"))
+		{
+			if (error)
+			{
+				*error = "creature_template table is missing required entry/name columns";
+			}
+			return {};
+		}
+
+		auto faction_expr = firstTemplateColumnExpr(connection.get(),
+		                                           {"faction", "faction_A", "faction_a", "factionAlliance", "factionHorde"},
+		                                           "0");
+		auto creature_type_expr = firstTemplateColumnExpr(connection.get(), {"type", "creature_type", "creatureType"}, "0");
+		auto rank_expr = firstTemplateColumnExpr(connection.get(), {"rank"}, "0");
+		auto npc_flags_expr = firstTemplateColumnExpr(connection.get(), {"npcflag", "npc_flags", "npcFlags"}, "0");
+		auto type_flags_expr = firstTemplateColumnExpr(connection.get(), {"type_flags", "typeFlags"}, "0");
+		auto flags_extra_expr = firstTemplateColumnExpr(connection.get(), {"flags_extra", "flagsExtra"}, "0");
+		auto scale_expr = firstTemplateColumnExpr(connection.get(), {"scale"}, "1");
+		auto display_expr = buildCreatureTemplateDisplayExpr(connection.get());
+
+		std::stringstream statement;
+		statement
+			<< "SELECT ct.entry, ct.name, "
+			<< "COALESCE(" << faction_expr << ", 0) AS faction, "
+			<< "COALESCE(" << creature_type_expr << ", 0) AS creature_type, "
+			<< "COALESCE(" << rank_expr << ", 0) AS rank, "
+			<< "COALESCE(" << npc_flags_expr << ", 0) AS npc_flags, "
+			<< "COALESCE(" << type_flags_expr << ", 0) AS type_flags, "
+			<< "COALESCE(" << flags_extra_expr << ", 0) AS flags_extra, "
+			<< display_expr << ", "
+			<< "COALESCE(NULLIF(" << scale_expr << ", 0), 1) AS template_scale "
+			<< "FROM creature_template ct "
+			<< "ORDER BY ct.entry "
+			<< "LIMIT " << limit;
+
+		if (mysql_query(connection.get(), statement.str().c_str()) != 0)
+		{
+			if (error)
+			{
+				*error = mysql_error(connection.get());
+			}
+			return {};
+		}
+
+		MYSQL_RES* result = mysql_store_result(connection.get());
+		if (!result)
+		{
+			if (error)
+			{
+				*error = mysql_error(connection.get());
+			}
+			return {};
+		}
+
+		std::vector<CreatureTemplateRecord> records;
+		records.reserve(static_cast<std::size_t>(mysql_num_rows(result)));
+
+		while (MYSQL_ROW row = mysql_fetch_row(result))
+		{
+			CreatureTemplateRecord record;
+			record.entry = parseUnsigned(row[0]);
+			record.name = parseString(row[1]);
+			record.faction = parseUnsigned(row[2]);
+			record.creature_type = parseUnsigned(row[3]);
+			record.rank = parseUnsigned(row[4]);
+			record.npc_flags = parseUnsigned(row[5]);
+			record.type_flags = parseUnsigned(row[6]);
+			record.flags_extra = parseUnsigned(row[7]);
+			record.display_id = parseUnsigned(row[8]);
+			record.template_scale = parseFloat(row[9]);
+			if (record.template_scale <= 0.0f)
+			{
+				record.template_scale = 1.0f;
+			}
 			records.push_back(record);
 		}
 
