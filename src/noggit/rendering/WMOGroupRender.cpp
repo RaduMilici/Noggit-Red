@@ -387,8 +387,12 @@ void WMOGroupRender::initRenderBatches()
 
     std::uint32_t flags = 0;
 
-    if (_wmo_group->use_outdoor_lights
-        && (_wmo_group->header.flags.exterior_lit || _wmo_group->header.flags.exterior))
+    // Match reference noggit3: exterior-lit is driven purely by the group's exterior /
+    // exterior_lit flags. The extra use_outdoor_lights gate suppressed it for groups
+    // flagged indoor+vertex-color that still have exterior-facing batches; the MOCV fixup
+    // zeroes vertex color on those exterior batches, so without ExteriorLit they were lit
+    // only by 0.20*ambient -> burnt (fully on 3.3.5a Stormwind, partially in vanilla).
+    if (_wmo_group->header.flags.exterior_lit || _wmo_group->header.flags.exterior)
     {
       flags |= WMORenderBatchFlags::eWMOBatch_ExteriorLit;
     }
