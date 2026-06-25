@@ -387,7 +387,8 @@ void WMOGroupRender::initRenderBatches()
 
     std::uint32_t flags = 0;
 
-    if (_wmo_group->header.flags.exterior_lit || _wmo_group->header.flags.exterior)
+    if (_wmo_group->use_outdoor_lights
+        && (_wmo_group->header.flags.exterior_lit || _wmo_group->header.flags.exterior))
     {
       flags |= WMORenderBatchFlags::eWMOBatch_ExteriorLit;
     }

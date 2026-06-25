@@ -282,7 +282,10 @@ void main()
   }
   else
   {
-      currColor = AmbientColor_FogEnd.xyz;
+      // Unlit materials ignore scene lighting entirely (fullbright). Multiplying the
+      // texture by ambient (as before) turned emissive models such as lava waterfalls
+      // and fire black inside dark caves, where ambient is near zero.
+      currColor = vec3(1.0f, 1.0f, 1.0f);
       accumlatedLight = vec3(0.0f, 0.0f, 0.0f);
   }
 

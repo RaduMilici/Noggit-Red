@@ -5,10 +5,16 @@
 #include <opengl/scoped.hpp>
 
 #include <memory>
+#include <string>
 
 namespace BlizzardArchive
 {
   class ClientFile;
+}
+
+namespace Noggit::Rendering
+{
+  class LiquidTextureManager;
 }
 
 struct CImVector
@@ -100,18 +106,28 @@ struct LiquidVertex {
 class wmo_liquid
 {
 public:
-  wmo_liquid(BlizzardArchive::ClientFile* f, WMOLiquidHeader const& header, int group_liquid, bool use_dbc_type, bool is_ocean);
+  wmo_liquid(BlizzardArchive::ClientFile* f,
+             WMOLiquidHeader const& header,
+             int group_liquid,
+             bool use_dbc_type,
+             bool is_ocean,
+             std::string const& wmo_path);
   wmo_liquid(wmo_liquid const& other);
 
   void upload(OpenGL::Scoped::use_program& water_shader);
+  void draw(glm::mat4x4 const& transform,
+            OpenGL::Scoped::use_program& water_shader,
+            Noggit::Rendering::LiquidTextureManager& texture_manager,
+            int animtime);
 
 private:
-  int initGeometry(BlizzardArchive::ClientFile* f);
+  int initGeometry(BlizzardArchive::ClientFile* f, std::string const& wmo_path);
 
   glm::vec3 pos;
   bool mTransparency;
   int xtiles, ytiles;
   int _liquid_id;
+  std::string _debug_wmo_path;
 
   std::vector<float> depths;
   std::vector<glm::vec2> tex_coords;

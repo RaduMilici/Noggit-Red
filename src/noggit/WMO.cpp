@@ -857,6 +857,7 @@ void WMOGroup::load()
           , header.group_liquid
           , (bool)wmo->flags.use_liquid_type_dbc_id
           , (bool)header.flags.ocean
+          , fname
       );
 
       // creating the wmo liquid doesn't move the position
@@ -1054,9 +1055,10 @@ void WMOGroup::fix_vertex_color_alpha()
     // I removed the color = color/2 because it's just multiplied by 2 in the shader afterward in blizzard's code
     if (i >= interior_batchs_start)
     {
-      r += ((r * a / 64.f) - wmo_ambient_color.x);
-      g += ((g * a / 64.f) - wmo_ambient_color.y);
-      r += ((b * a / 64.f) - wmo_ambient_color.z);
+      constexpr float normalized_alpha_scale = 255.f / 64.f;
+      r = (r + (r * a * normalized_alpha_scale) - wmo_ambient_color.x) * 0.5f;
+      g = (g + (g * a * normalized_alpha_scale) - wmo_ambient_color.y) * 0.5f;
+      b = (b + (b * a * normalized_alpha_scale) - wmo_ambient_color.z) * 0.5f;
     }
     else
     {
@@ -1064,14 +1066,14 @@ void WMOGroup::fix_vertex_color_alpha()
       g -= wmo_ambient_color.y;
       b -= wmo_ambient_color.z;
 
-      r = (r * (1.f - a));
-      g = (g * (1.f - a));
-      b = (b * (1.f - a));
+      r = (r * (1.f - a)) * 0.5f;
+      g = (g * (1.f - a)) * 0.5f;
+      b = (b * (1.f - a)) * 0.5f;
     }
 
-    color.x = std::min(255.f, std::max(0.f, r));
-    color.y = std::min(255.f, std::max(0.f, g));
-    color.z = std::min(255.f, std::max(0.f, b));
+    color.x = std::min(1.f, std::max(0.f, r));
+    color.y = std::min(1.f, std::max(0.f, g));
+    color.z = std::min(1.f, std::max(0.f, b));
     color.w = 1.f; // default value used in the shader so I simplified it here,
                    // it can be overriden by the 2nd mocv chunk
   }
@@ -1138,9 +1140,9 @@ void WMOGroup::intersect (math::ray const& ray, std::vector<float>* results) con
   }
 }
 
-/*
 void WMOGroup::drawLiquid ( glm::mat4x4 const& transform
-                          , liquid_render& render
+                          , OpenGL::Scoped::use_program& water_shader
+                          , Noggit::Rendering::LiquidTextureManager& texture_manager
                           , bool // draw_fog
                           , int animtime
                           )
@@ -1149,15 +1151,16 @@ void WMOGroup::drawLiquid ( glm::mat4x4 const& transform
   //! \todo  culling for liquid boundingbox or something
   if (lq) 
   { 
+    OpenGL::Scoped::bool_setter<GL_DEPTH_TEST, GL_TRUE> const depth_test;
     gl.enable(GL_BLEND);
+    gl.blendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     gl.depthMask(GL_TRUE);
 
-    lq->draw ( transform, render, animtime);
+    lq->draw(transform, water_shader, texture_manager, animtime);
 
     gl.disable(GL_BLEND);
   }
 }
-*/
 
 void WMOGroup::setupFog (bool draw_fog, std::function<void (bool)> setup_fog)
 {

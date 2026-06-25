@@ -49,6 +49,7 @@
 namespace mysql
 {
   std::vector<CreatureSpawnRecord> getCreatureSpawns(std::size_t mapID, std::string* error);
+  std::vector<GameObjectSpawnRecord> getGameObjectSpawns(std::size_t mapID, std::string* error);
 }
 #endif
 
@@ -1572,6 +1573,13 @@ namespace
       std::vector<std::pair<std::size_t, std::string>> overrides;
       overrides.reserve(slot_fields.size());
       bool has_explicit_texture_variation = false;
+      std::ostringstream debug_details;
+
+      if (creature_texture_debug_enabled())
+      {
+        debug_details << "display=" << display_id
+                      << " modelDir='" << model_dir << "'";
+      }
 
       for (auto const& slot_field : slot_fields)
       {
@@ -1585,6 +1593,12 @@ namespace
           }
           overrides.emplace_back(slot_field.first, std::move(texture));
         }
+      }
+
+      if (creature_texture_debug_enabled())
+      {
+        debug_details << " explicitVariation=" << (has_explicit_texture_variation ? 1 : 0);
+        debug_details << " explicitOverrides=[" << format_texture_override_list(overrides) << "]";
       }
 
       auto extra_display_id = display.getUInt(CreatureDisplayInfoDB::ExtendedDisplayInfoID);
@@ -1646,6 +1660,13 @@ namespace
         catch (DBCFile::NotFound const&)
         {
         }
+      }
+
+      if (creature_texture_debug_enabled())
+      {
+        debug_details << " finalOverrides=[" << format_texture_override_list(overrides) << "]";
+        LogDebug << "Creature stable texture overrides: " << debug_details.str() << std::endl;
+        append_creature_geoset_trace("stable-texture", debug_details.str());
       }
 
       return overrides;
@@ -2352,13 +2373,39 @@ namespace
       auto model_id = display.getUInt(CreatureDisplayInfoDB::ModelID);
       auto model = gCreatureModelDataDB.getByID(model_id);
 
+      float display_scale = display.getFloat(CreatureDisplayInfoDB::CreatureModelScale);
       float model_scale = model.getFloat(CreatureModelDataDB::ModelScale);
-      float scale = model_scale > 0.0f ? model_scale : 1.0f;
+      float scale = (display_scale > 0.0f ? display_scale : 1.0f)
+                  * (model_scale > 0.0f ? model_scale : 1.0f);
       return std::clamp(scale, ModelInstance::min_scale(), ModelInstance::max_scale());
     }
     catch (DBCFile::NotFound const&)
     {
       return 1.0f;
+    }
+  }
+
+  std::string resolve_gameobject_model_path(std::uint32_t display_id)
+  {
+    if (!display_id)
+    {
+      return {};
+    }
+
+    try
+    {
+      auto display = gGameObjectDisplayInfoDB.getByID(display_id);
+      auto model_name = normalize_model_filename(display.getString(GameObjectDisplayInfoDB::ModelName));
+      if (model_name.empty())
+      {
+        return {};
+      }
+
+      return model_name;
+    }
+    catch (DBCFile::NotFound const&)
+    {
+      return {};
     }
   }
 }
@@ -2605,6 +2652,65 @@ bool World::reloadCreatureSpawns()
                          + ", emptyModelName: " + std::to_string(empty_model_name)
                          + ", modelCreateFail: " + std::to_string(model_construct_failures) + ")";
   LogDebug << _creature_spawn_status << std::endl;
+
+  std::string gameobject_error;
+  auto gameobject_rows = mysql::getGameObjectSpawns(mapIndex._map_id, &gameobject_error);
+  if (!gameobject_error.empty())
+  {
+    LogDebug << "Gameobject spawn load failed: " << gameobject_error << std::endl;
+  }
+
+  std::size_t gameobject_resolved_models = 0;
+  std::size_t gameobject_missing_display_id = 0;
+  std::size_t gameobject_missing_model = 0;
+  _gameobject_spawns.reserve(gameobject_rows.size());
+  for (auto const& row : gameobject_rows)
+  {
+    GameObjectSpawnOverlay spawn;
+    spawn.guid = row.guid;
+    spawn.entry = row.entry;
+    spawn.display_id = row.display_id;
+    spawn.name = row.name;
+    spawn.pos = server_to_client_position(row.position_x,
+              row.position_y,
+              row.position_z,
+              mapIndex.hasAGlobalWMO());
+    spawn.orientation = server_to_client_orientation(row.orientation);
+    spawn.animation_time_offset = static_cast<int>(((row.guid * 1664525u) + (row.entry * 1013904223u)) % 3500u);
+    spawn.template_scale = row.template_scale > 0.0f ? row.template_scale : 1.0f;
+
+    if (spawn.display_id)
+    {
+      spawn.model_path = resolve_gameobject_model_path(spawn.display_id);
+      if (!spawn.model_path.empty())
+      {
+        ++gameobject_resolved_models;
+      }
+      else
+      {
+        ++gameobject_missing_model;
+      }
+    }
+    else
+    {
+      ++gameobject_missing_display_id;
+    }
+
+    _gameobject_spawns.emplace_back(std::move(spawn));
+  }
+
+  if (!gameobject_rows.empty() || !gameobject_error.empty())
+  {
+    _creature_spawn_status += "; gameobjects loaded: " + std::to_string(_gameobject_spawns.size())
+                            + " (models: " + std::to_string(gameobject_resolved_models)
+                            + ", noDisplayId: " + std::to_string(gameobject_missing_display_id)
+                            + ", noModel: " + std::to_string(gameobject_missing_model) + ")";
+    LogDebug << "Gameobject spawns loaded: " << _gameobject_spawns.size()
+             << " (models: " << gameobject_resolved_models
+             << ", noDisplayId: " << gameobject_missing_display_id
+             << ", noModel: " << gameobject_missing_model << ")"
+             << std::endl;
+  }
   return true;
 #else
   _creature_spawn_status = "Creature spawns unavailable: build without MySQL support";
@@ -2785,6 +2891,54 @@ bool World::ensureCreatureSpawnModel(CreatureSpawnOverlay& spawn)
   return false;
 }
 
+bool World::ensureGameObjectSpawnModel(GameObjectSpawnOverlay& spawn)
+{
+  if (spawn.model_instance.has_value())
+  {
+    return true;
+  }
+
+  if (spawn.model_create_failed || spawn.model_path.empty())
+  {
+    return false;
+  }
+
+  if (spawn.model_path.ends_with(".wmo"))
+  {
+    spawn.model_create_failed = true;
+    LogDebug << "Gameobject WMO overlay skipped: guid=" << spawn.guid
+             << " entry=" << spawn.entry
+             << " display_id=" << spawn.display_id
+             << " path=" << spawn.model_path
+             << std::endl;
+    return false;
+  }
+
+  try
+  {
+    BlizzardArchive::Listfile::FileKey const file_key(spawn.model_path);
+    spawn.model_instance.emplace(file_key, _context);
+    spawn.model_instance->pos = spawn.pos;
+    spawn.model_instance->dir = glm::vec3(0.0f, spawn.orientation, 0.0f);
+    spawn.model_instance->scale = std::clamp(spawn.template_scale,
+                                             ModelInstance::min_scale(),
+                                             ModelInstance::max_scale());
+    spawn.model_instance->updateTransformMatrix();
+    return true;
+  }
+  catch (std::exception const& ex)
+  {
+    spawn.model_create_failed = true;
+    LogDebug << "Gameobject spawn model load failed: guid=" << spawn.guid
+             << " entry=" << spawn.entry
+             << " display_id=" << spawn.display_id
+             << " path=" << spawn.model_path
+             << " error=" << ex.what() << std::endl;
+  }
+
+  return false;
+}
+
 std::vector<std::pair<std::size_t, std::string>> World::applyCreatureSpawnModelAppearance(CreatureSpawnOverlay const& spawn,
                                                                                          ModelInstance& model_instance,
                                                                                          Noggit::NoggitRenderContext context) const
@@ -2816,6 +2970,7 @@ std::vector<std::pair<std::size_t, std::string>> World::applyCreatureSpawnModelA
 void World::clearCreatureSpawns()
 {
   _creature_spawns.clear();
+  _gameobject_spawns.clear();
   _creature_spawns_loaded = false;
 }
 
@@ -3889,6 +4044,87 @@ unsigned int World::getAreaID (glm::vec3 const& pos)
 {
   ZoneScoped;
   return for_maybe_chunk_at (pos, [&] (MapChunk* chunk) { return chunk->getAreaID(); }).value_or(-1);
+}
+
+unsigned int World::getWMOAreaID(glm::vec3 const& pos)
+{
+  ZoneScoped;
+
+  auto contains = [](std::pair<glm::vec3, glm::vec3> const& extents, glm::vec3 const& point)
+  {
+    return point.x >= extents.first.x && point.x <= extents.second.x
+        && point.y >= extents.first.y && point.y <= extents.second.y
+        && point.z >= extents.first.z && point.z <= extents.second.z;
+  };
+
+  auto find_area = [](std::uint32_t wmo_id, std::uint16_t name_set, int group_id) -> unsigned int
+  {
+    for (DBCFile::Iterator i = gWMOAreaTableDB.begin(); i != gWMOAreaTableDB.end(); ++i)
+    {
+      if (i->getUInt(WMOAreaTableDB::WmoId) == wmo_id
+          && i->getUInt(WMOAreaTableDB::NameSetId) == name_set
+          && i->getInt(WMOAreaTableDB::WMOGroupID) == group_id)
+      {
+        unsigned int const area_id = i->getUInt(WMOAreaTableDB::AreaTableRefId);
+        if (area_id != 0)
+        {
+          return area_id;
+        }
+      }
+    }
+
+    return static_cast<unsigned int>(-1);
+  };
+
+  unsigned int area_id = static_cast<unsigned int>(-1);
+
+  _model_instance_storage.for_each_wmo_instance([&](WMOInstance& wmo_instance)
+  {
+    if (!wmo_instance.finishedLoading() || wmo_instance.wmo->loading_failed())
+    {
+      return;
+    }
+
+    auto const& wmo_extents = wmo_instance.getExtents();
+    if (!contains({wmo_extents[0], wmo_extents[1]}, pos))
+    {
+      return;
+    }
+
+    auto const& extents = wmo_instance.getGroupExtents();
+    int default_group_id = -1;
+
+    for (auto const& group_extents : extents)
+    {
+      if (!contains(group_extents.second, pos))
+      {
+        continue;
+      }
+
+      auto const group_index = group_extents.first;
+      if (group_index >= 0 && group_index < static_cast<int>(wmo_instance.wmo->groups.size()))
+      {
+        default_group_id = static_cast<int>(wmo_instance.wmo->groups[group_index].wmo_area_table_group_id());
+        area_id = find_area(wmo_instance.wmo->WmoId, wmo_instance.mNameset, default_group_id);
+        if (area_id == static_cast<unsigned int>(-1)
+            && default_group_id != group_index)
+        {
+          area_id = find_area(wmo_instance.wmo->WmoId, wmo_instance.mNameset, group_index);
+        }
+        if (area_id != static_cast<unsigned int>(-1))
+        {
+          return;
+        }
+      }
+    }
+
+    area_id = find_area(wmo_instance.wmo->WmoId, wmo_instance.mNameset, -1);
+  }, [&]()
+  {
+    return area_id != static_cast<unsigned int>(-1);
+  });
+
+  return area_id;
 }
 
 void World::clearHeight(glm::vec3 const& pos)

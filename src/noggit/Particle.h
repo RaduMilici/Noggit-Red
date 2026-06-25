@@ -8,6 +8,8 @@
 #include <opengl/scoped.hpp>
 #include <opengl/shader.fwd.hpp>
 
+#include <array>
+#include <cstdint>
 #include <list>
 #include <memory>
 #include <vector>
@@ -76,6 +78,9 @@ class ParticleSystem
   std::vector<TexCoordSet> tiles;
   void initTile(glm::vec2 *tc, int num);
   bool billboard;
+  bool classic;
+  std::uint32_t debug_update_log_count = 0;
+  std::uint32_t debug_draw_log_count = 0;
 
   float rem;
   //bool transform;
@@ -89,6 +94,8 @@ public:
 
   ParticleSystem(Model*, const BlizzardArchive::ClientFile& f, const ModelParticleEmitterDef &mta,
                  int *globals, Noggit::NoggitRenderContext context);
+  ParticleSystem(Model*, const BlizzardArchive::ClientFile& f, const ClassicModelParticleEmitterDef& mta,
+                 int* globals, Noggit::NoggitRenderContext context);
 
   ParticleSystem(ParticleSystem const& other);
   ParticleSystem(ParticleSystem&&);

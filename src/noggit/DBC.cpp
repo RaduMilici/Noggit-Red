@@ -53,6 +53,7 @@ CharacterFacialHairStylesDB gCharacterFacialHairStylesDB;
 CharacterHairGeosetsDB gCharacterHairGeosetsDB;
 CharacterSectionsDB gCharacterSectionsDB;
 WMOAreaTableDB gWMOAreaTableDB;
+GameObjectDisplayInfoDB gGameObjectDisplayInfoDB;
 
 void OpenDBs(std::shared_ptr<BlizzardArchive::ClientData> clientData)
 {
@@ -115,6 +116,14 @@ void OpenDBs(std::shared_ptr<BlizzardArchive::ClientData> clientData)
     LogError << "Failed to open CharSections.dbc: " << e.what() << std::endl;
   }
   gWMOAreaTableDB.open(clientData);
+  try
+  {
+    gGameObjectDisplayInfoDB.open(clientData);
+  }
+  catch (std::exception const& e)
+  {
+    LogError << "Failed to open GameObjectDisplayInfo.dbc: " << e.what() << std::endl;
+  }
 }
 
 

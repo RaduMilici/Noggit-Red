@@ -38,6 +38,8 @@
       <file alias="wmo_fs">../src/noggit/rendering/glsl/wmo_frag.glsl</file>
       <file alias="liquid_vs">../src/noggit/rendering/glsl/liquid_vert.glsl</file>
       <file alias="liquid_fs">../src/noggit/rendering/glsl/liquid_frag.glsl</file>
+      <file alias="wmo_liquid_vs">../src/noggit/rendering/glsl/wmo_liquid_vert.glsl</file>
+      <file alias="wmo_liquid_fs">../src/noggit/rendering/glsl/wmo_liquid_frag.glsl</file>
       <file alias="mfbo_vs">../src/noggit/rendering/glsl/mfbo_vert.glsl</file>
       <file alias="mfbo_fs">../src/noggit/rendering/glsl/mfbo_frag.glsl</file>
       <file alias="cursor_vs">../src/noggit/rendering/glsl/cursor_vert.glsl</file>

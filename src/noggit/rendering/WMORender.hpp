@@ -16,6 +16,8 @@ class WMO;
 
 namespace Noggit::Rendering
 {
+  class LiquidTextureManager;
+
   class WMORender : public BaseRender
   {
   public:
@@ -25,6 +27,8 @@ namespace Noggit::Rendering
     void unload() override;
 
     void draw(OpenGL::Scoped::use_program& wmo_shader
+        , OpenGL::program* wmo_liquid_program
+        , LiquidTextureManager* liquid_texture_manager
         , glm::mat4x4 const& model_view
         , glm::mat4x4 const& projection
         , glm::mat4x4 const& transform_matrix

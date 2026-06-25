@@ -175,6 +175,10 @@ struct ModelTexAnimDef {
   AnimationBlock trans, rot, scale;
 };
 
+struct ClassicModelTexAnimDef {
+  ClassicAnimationBlock trans, rot, scale;
+};
+
 struct ModelVertex {
   glm::vec3 position;
   uint8_t weights[4];
@@ -341,6 +345,74 @@ struct ModelParticleEmitterDef {
   AnimationBlock Gravity2; // A second gravity? Its strong.
   ModelParticleParams p;
   AnimationBlock en;
+};
+
+struct ClassicParticleColor
+{
+  std::uint8_t red;
+  std::uint8_t green;
+  std::uint8_t blue;
+  std::uint8_t alpha;
+};
+
+struct ClassicModelParticleParams
+{
+  float midPoint;
+  ClassicParticleColor colorValues[3];
+  float scalesValues[3];
+  std::uint16_t lifespanUVAnim[3];
+  std::uint16_t decayUVAnim[3];
+  std::uint16_t tailUVAnim[2];
+  std::uint16_t tailDecayUVAnim[2];
+  float tailLength;
+  float twinkleSpeed;
+  float twinklePercent;
+  float twinkleScaleMin;
+  float twinkleScaleMax;
+  float burstMultiplier;
+  float drag;
+  float spin;
+  glm::vec3 tumbleMin;
+  glm::vec3 tumbleMax;
+  glm::vec3 windVector;
+  float windTime;
+  float followSpeed1;
+  float followScale1;
+  float followSpeed2;
+  float followScale2;
+  std::uint32_t nSplinePoints;
+  std::uint32_t ofsSplinePoints;
+};
+
+struct ClassicModelParticleEmitterDef {
+  int32_t id;
+  int32_t flags;
+  glm::vec3 pos;
+  int16_t bone;
+  int16_t texture;
+  int32_t nModelFileName;
+  int32_t ofsModelFileName;
+  int32_t nParticleFileName;
+  int32_t ofsParticleFileName;
+  uint16_t blend;
+  uint16_t EmitterType;
+  uint8_t ParticleType;
+  uint8_t HeadorTail;
+  int16_t TextureTileRotation;
+  int16_t cols;
+  int16_t rows;
+  ClassicAnimationBlock EmissionSpeed;
+  ClassicAnimationBlock SpeedVariation;
+  ClassicAnimationBlock VerticalRange;
+  ClassicAnimationBlock HorizontalRange;
+  ClassicAnimationBlock Gravity;
+  ClassicAnimationBlock Lifespan;
+  ClassicAnimationBlock EmissionRate;
+  ClassicAnimationBlock EmissionAreaLength;
+  ClassicAnimationBlock EmissionAreaWidth;
+  ClassicAnimationBlock Gravity2;
+  ClassicModelParticleParams p;
+  ClassicAnimationBlock en;
 };
 
 

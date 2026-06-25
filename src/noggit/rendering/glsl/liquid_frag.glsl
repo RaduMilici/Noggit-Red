@@ -92,6 +92,78 @@ vec4 get_tex_color(vec2 tex_coord, uint tex_sampler, int array_index)
   return vec4(0);
 }
 
+vec4 get_tex_color_biased(vec2 tex_coord, uint tex_sampler, int array_index, float bias)
+{
+  if (tex_sampler == 0)
+  {
+    return texture(texture_samplers[0], vec3(tex_coord, array_index), bias).rgba;
+  }
+  else if (tex_sampler == 1)
+  {
+    return texture(texture_samplers[1], vec3(tex_coord, array_index), bias).rgba;
+  }
+  else if (tex_sampler == 2)
+  {
+    return texture(texture_samplers[2], vec3(tex_coord, array_index), bias).rgba;
+  }
+  else if (tex_sampler == 3)
+  {
+    return texture(texture_samplers[3], vec3(tex_coord, array_index), bias).rgba;
+  }
+  else if (tex_sampler == 4)
+  {
+    return texture(texture_samplers[4], vec3(tex_coord, array_index), bias).rgba;
+  }
+  else if (tex_sampler == 5)
+  {
+    return texture(texture_samplers[5], vec3(tex_coord, array_index), bias).rgba;
+  }
+  else if (tex_sampler == 6)
+  {
+    return texture(texture_samplers[6], vec3(tex_coord, array_index), bias).rgba;
+  }
+  else if (tex_sampler == 7)
+  {
+    return texture(texture_samplers[7], vec3(tex_coord, array_index), bias).rgba;
+  }
+  else if (tex_sampler == 8)
+  {
+    return texture(texture_samplers[8], vec3(tex_coord, array_index), bias).rgba;
+  }
+  else if (tex_sampler == 9)
+  {
+    return texture(texture_samplers[9], vec3(tex_coord, array_index), bias).rgba;
+  }
+  else if (tex_sampler == 10)
+  {
+    return texture(texture_samplers[10], vec3(tex_coord, array_index), bias).rgba;
+  }
+  else if (tex_sampler == 11)
+  {
+    return texture(texture_samplers[11], vec3(tex_coord, array_index), bias).rgba;
+  }
+  else if (tex_sampler == 12)
+  {
+    return texture(texture_samplers[12], vec3(tex_coord, array_index), bias).rgba;
+  }
+  else if (tex_sampler == 13)
+  {
+    return texture(texture_samplers[13], vec3(tex_coord, array_index), bias).rgba;
+  }
+
+  return vec4(0);
+}
+
+vec4 get_magma_color(vec2 tex_coord, uint tex_sampler, int array_index)
+{
+  // Match reference noggit3: use the per-vertex magma UV directly (no down-scale, no LOD
+  // bias) so the lava shows its detailed crust pattern, and scroll by the LiquidType
+  // animation direction so it flows. (Frame cycling via tex_frame handles the churn.)
+  vec2 scroll = vec2(anim_uv.x * animtime / 2880.0,
+                     anim_uv.y * animtime / 2880.0);
+  return get_tex_color(tex_coord + scroll, tex_sampler, array_index);
+}
+
 vec2 rot2(vec2 p, float degree)
 {
   float a = radians(degree);
@@ -100,8 +172,14 @@ vec2 rot2(vec2 p, float degree)
 
 void main()
 {
-  // lava || slime
-  if(type == 2 || type == 3)
+  if(type == 2)
+  {
+    out_color = get_magma_color(tex_coord_, tex_array, tex_frame);
+    // Lava is opaque; liquid pass blends, so raw texture alpha darkened lava over the cave.
+    out_color.a = 1.0;
+  }
+  // slime
+  else if(type == 3)
   {
     out_color = get_tex_color(tex_coord_ + vec2(anim_uv.x*animtime / 2880.0, anim_uv.y*animtime / 2880.0), tex_array, tex_frame);
   }
@@ -132,7 +210,7 @@ void main()
     }
   }
 
-  if (FogColor_FogOn.w != 0)
+  if (FogColor_FogOn.w != 0 && type != 2) // reference applies no fog to lava
   {
     float start = AmbientColor_FogEnd.w * DiffuseColor_FogStart.w;
 

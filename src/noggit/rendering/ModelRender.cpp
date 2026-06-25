@@ -63,6 +63,20 @@ namespace
     return model->file_key().filepath().starts_with("character/");
   }
 
+  bool should_log_model_render_passes(Model const* model)
+  {
+    if (!capture_debug_enabled() || !model || !model->file_key().hasFilepath())
+    {
+      return false;
+    }
+
+    auto const& path = model->file_key().filepath();
+    return capture_debug_enabled()
+        && (path.find("darkironnode") != std::string::npos
+            || path.find("elementalearth") != std::string::npos
+            || path.find("firelord") != std::string::npos);
+  }
+
   void append_classic_character_render_trace(std::string const& message)
   {
     if (!model_texture_debug_enabled())
@@ -169,6 +183,41 @@ namespace
       && blend_mode == static_cast<uint16_t>(M2Blend::Add)
       && pass.texture_count == 2;
   }
+
+  bool is_classic_effect_shell_model(Model const* model)
+  {
+    if (!model || !model->usesClassicLayout() || !model->file_key().hasFilepath())
+    {
+      return false;
+    }
+
+    auto const& path = model->file_key().filepath();
+    if (path.starts_with("world/generic/passivedoodads/particleemitters/"))
+    {
+      return true;
+    }
+
+    return path == "world/khazmodan/ironforge/passivedoodads/lavasteam/lavasteam.m2"
+        || path == "world/khazmodan/ironforge/passivedoodads/lavasteam/lavasteam_low.m2";
+  }
+
+  ModelPixelShader classic_default_pixel_shader_for_blend(std::uint16_t blend_mode)
+  {
+    switch (static_cast<M2Blend>(blend_mode))
+    {
+      case M2Blend::Opaque:
+        return ModelPixelShader::Combiners_Opaque;
+      case M2Blend::Mod2x:
+        return ModelPixelShader::Combiners_Mod2x;
+      case M2Blend::Alpha_Key:
+      case M2Blend::Alpha:
+      case M2Blend::No_Add_Alpha:
+      case M2Blend::Add:
+      case M2Blend::Mod:
+      default:
+        return ModelPixelShader::Combiners_Mod;
+    }
+  }
 }
 
 ModelRender::ModelRender(Model* model)
@@ -263,6 +312,8 @@ void ModelRender::draw(glm::mat4x4 const& model_view
     return;
   }
 
+  bool const skip_mesh_passes = is_classic_effect_shell_model(_model);
+
   if (!no_cull && !instance.isInFrustum(frustum) && !instance.isInRenderDist(cull_distance, camera, display))
   {
     return;
@@ -273,6 +324,17 @@ void ModelRender::draw(glm::mat4x4 const& model_view
     upload();
   }
 
+  if (capture_debug_enabled() && _model->file_key().filepath().find("blackrocklavafall") != std::string::npos)
+  {
+    LogDebug << "LAVAFALL draw() model='" << _model->file_key().stringRepr()
+             << "' animated=" << _model->animated
+             << " animcalc=" << _model->animcalc
+             << " perInstance=" << _model->_per_instance_animation
+             << " skipMeshPasses=" << skip_mesh_passes
+             << " gatePass=" << (_model->animated && (!_model->animcalc || _model->_per_instance_animation))
+             << std::endl;
+  }
+
   if (_model->animated && (!_model->animcalc || _model->_per_instance_animation))
   {
     auto const anim_id = instance.forcedAnimationId() >= 0 ? instance.forcedAnimationId() : 0;
@@ -281,6 +343,11 @@ void ModelRender::draw(glm::mat4x4 const& model_view
   }
 
   OpenGL::Scoped::vao_binder const _(_vao);
+
+  if (skip_mesh_passes)
+  {
+    return;
+  }
 
   m2_shader.uniform("transform", instance.transformMatrix());
 
@@ -338,6 +405,7 @@ void ModelRender::draw(glm::mat4x4 const& model_view
 )
 {
   ZoneScopedN(NOGGIT_CURRENT_FUNCTION);
+  bool const skip_mesh_passes = is_classic_effect_shell_model(_model);
 
   {
     ZoneScopedN("Model::draw() : uploads")
@@ -382,6 +450,17 @@ void ModelRender::draw(glm::mat4x4 const& model_view
 
   {
     ZoneScopedN("Model::draw() : drawing")
+
+    if (capture_debug_enabled() && _model->file_key().filepath().find("blackrocklavafall") != std::string::npos)
+    {
+      LogDebug << "LAVAFALL instanced model='" << _model->file_key().stringRepr()
+               << "' instances=" << instances.size()
+               << " animated=" << _model->animated
+               << " animcalc=" << _model->animcalc
+               << " perInstance=" << _model->_per_instance_animation
+               << " gatePass=" << (_model->animated && (!_model->animcalc || _model->_per_instance_animation))
+               << std::endl;
+    }
 
     if (_model->animated && (!_model->animcalc || _model->_per_instance_animation))
     {
@@ -435,6 +514,11 @@ void ModelRender::draw(glm::mat4x4 const& model_view
       OpenGL::Scoped::buffer_binder<GL_ARRAY_BUFFER> const transform_binder (_transform_buffer);
       gl.bufferData(GL_ARRAY_BUFFER, instances.size() * sizeof(::glm::mat4x4), instances.data(), GL_DYNAMIC_DRAW);
       //m2_shader.attrib("transform", 0, 1);
+    }
+
+    if (skip_mesh_passes)
+    {
+      return;
     }
 
     if (_model->animBones)
@@ -1020,6 +1104,55 @@ void ModelRender::initRenderPasses(ModelView const* view, ModelTexUnit const* te
     pass.vertex_start = model_geosets[geoset].vstart;
     pass.vertex_end = pass.vertex_start + model_geosets[geoset].vcount;
 
+    if (should_log_model_render_passes(_model))
+    {
+      auto const& renderflag = _model->_render_flags[tex_unit[j].renderflag_index];
+      std::ostringstream texture_summary;
+      for (std::size_t texture_index = 0; texture_index < tex_unit[j].texture_count; ++texture_index)
+      {
+        if (texture_index != 0)
+        {
+          texture_summary << ", ";
+        }
+
+        auto const lookup_index = tex_unit[j].texture_combo_index + texture_index;
+        texture_summary << "lookup" << lookup_index;
+        if (lookup_index < _model->_texture_lookup.size())
+        {
+          auto const texture = _model->_texture_lookup[lookup_index];
+          texture_summary << "->tex" << texture;
+          if (texture < _model->_textureFilenames.size())
+          {
+            texture_summary << ":'" << _model->_textureFilenames[texture] << "'";
+          }
+          if (texture < _model->_specialTextures.size())
+          {
+            texture_summary << " special=" << _model->_specialTextures[texture];
+          }
+        }
+      }
+
+      LogDebug << "M2 render pass model='" << _model->file_key().stringRepr()
+               << "' pass=" << j
+               << " geoset=" << geoset
+               << " geosetId=" << pass.geoset_id
+               << " indices=[" << pass.index_start << "+" << pass.index_count << "]"
+               << " vertices=[" << pass.vertex_start << ".." << pass.vertex_end << ")"
+               << " renderflag=" << tex_unit[j].renderflag_index
+               << " flags={unlit:" << renderflag.flags.unlit
+               << ", unfogged:" << renderflag.flags.unfogged
+               << ", twoSided:" << renderflag.flags.two_sided
+               << ", billboard:" << renderflag.flags.billboard
+               << ", zBuffered:" << renderflag.flags.z_buffered
+               << "} blend=" << renderflag.blend
+               << " textureCount=" << tex_unit[j].texture_count
+               << " textures=[" << texture_summary.str() << "]"
+               << " colorIndex=" << tex_unit[j].color_index
+               << " transparencyCombo=" << tex_unit[j].transparency_combo_index
+               << " shaderId=" << tex_unit[j].shader_id
+               << std::endl;
+    }
+
     _render_passes.push_back(std::move(pass));
   }
 
@@ -1140,7 +1273,7 @@ bool ModelRenderPass::prepareDraw(OpenGL::Scoped::use_program& m2_shader, Model 
 
   if (m->_uses_classic_layout && !pixel_shader)
   {
-    pixel_shader = ModelPixelShader::Combiners_Opaque;
+    pixel_shader = classic_default_pixel_shader_for_blend(renderflag.blend);
   }
 
   // emissive colors
@@ -1161,10 +1294,15 @@ bool ModelRenderPass::prepareDraw(OpenGL::Scoped::use_program& m2_shader, Model 
   if (transparency_combo_index != 0xFFFF && transparency_combo_index < m->_transparency_lookup.size())
   {
     auto transparency_index = m->_transparency_lookup[transparency_combo_index];
-    if (transparency_index < m->_transparency.size())
+    if (transparency_index >= 0
+        && static_cast<std::size_t>(transparency_index) < m->_transparency.size())
     {
-      auto& transparency (m->_transparency[transparency_index].trans);
-      if (transparency.uses (0))
+      auto& transparency (m->_transparency[static_cast<std::size_t>(transparency_index)].trans);
+      if (transparency.uses (m->_current_anim_seq))
+      {
+        mesh_color.w = mesh_color.w * transparency.getValue(m->_current_anim_seq, m->_anim_time, m->_global_animtime);
+      }
+      else if (transparency.uses (0))
       {
         mesh_color.w = mesh_color.w * transparency.getValue(0, m->_anim_time, m->_global_animtime);
       }
@@ -1172,7 +1310,7 @@ bool ModelRenderPass::prepareDraw(OpenGL::Scoped::use_program& m2_shader, Model 
   }
 
   // exit and return false before affecting the opengl render state
-  if (!((mesh_color.w > 0) && (color_index == -1 || emissive_color.w > 0)))
+  if (mesh_color.w <= 0.0f)
   {
     return false;
   }
@@ -1297,6 +1435,27 @@ bool ModelRenderPass::prepareDraw(OpenGL::Scoped::use_program& m2_shader, Model 
   }
   static const glm::mat4x4 unit(glm::mat4x4(1));
 
+  static int _lavafall_log_counter = 0;
+  if ((capture_debug_enabled() || std::getenv("NOGGIT_MODEL_TEXTURE_DEBUG") != nullptr)
+      && m->file_key().hasFilepath()
+      && m->file_key().filepath().find("lavafall") != std::string::npos
+      && (_lavafall_log_counter++ % 200 == 0))
+  {
+    glm::vec3 t(-999.f);
+    if (tex_anim_lookup != -1 && static_cast<size_t>(tex_anim_lookup) < m->_texture_animations.size())
+    {
+      t = glm::vec3(m->_texture_animations[tex_anim_lookup].mat[3]);
+    }
+    LogDebug << "LAVAFALL texmat model='" << m->file_key().stringRepr()
+             << "' uvAnim0=" << uv_animations[0]
+             << " lookupSize=" << m->_texture_animation_lookups.size()
+             << " texAnimLookup=" << tex_anim_lookup
+             << " texAnimsSize=" << m->_texture_animations.size()
+             << " gAnim=" << m->_global_animtime << " animTime=" << m->_anim_time
+             << " matT=(" << t.x << "," << t.y << "," << t.z << ")"
+             << std::endl;
+  }
+
   if (tex_anim_lookup != -1 && static_cast<size_t>(tex_anim_lookup) < m->_texture_animations.size())
   {
     m2_shader.uniform("tex_matrix_1", m->_texture_animations[tex_anim_lookup].mat);
@@ -1356,6 +1515,7 @@ bool ModelRenderPass::bindTexture(size_t index, Model* m, ModelInstance const* i
   }
 
   scoped_blp_texture_reference const* selected_texture = nullptr;
+  bool unresolved_special_texture = false;
 
   if (m->_specialTextures[tex] != -1)
   {
@@ -1377,6 +1537,8 @@ bool ModelRenderPass::bindTexture(size_t index, Model* m, ModelInstance const* i
         selected_texture = &replacement->second;
       }
     }
+
+    unresolved_special_texture = !selected_texture;
   }
 
   if (!selected_texture)
@@ -1393,14 +1555,29 @@ bool ModelRenderPass::bindTexture(size_t index, Model* m, ModelInstance const* i
     if (using_placeholder && (m->_logged_missing_special_texture_mask & special_bit) == 0)
     {
       m->_logged_missing_special_texture_mask |= special_bit;
-      LogDebug << "M2 special texture fallback model='" << m->file_key().stringRepr()
+      LogDebug << "M2 unresolved special texture model='" << m->file_key().stringRepr()
                << "' textureIndex=" << tex
                << " specialType=" << special_type
                << " hasInstance=" << (instance ? 1 : 0)
                << " classicLayout=" << m->usesClassicLayout()
-               << " placeholder='tileset/generic/black.blp'"
                << std::endl;
     }
+  }
+
+  if (unresolved_special_texture)
+  {
+    return false;
+  }
+
+  bool const using_black_placeholder = selected_texture == &m->_textures[tex]
+                                    && tex < m->_textureFilenames.size()
+                                    && m->_textureFilenames[tex] == "tileset/generic/black.blp";
+  bool const non_opaque_classic_pass = m->_uses_classic_layout
+                                    && blend_mode != static_cast<uint16_t>(M2Blend::Opaque)
+                                    && blend_mode != static_cast<uint16_t>(M2Blend::Alpha_Key);
+  if (using_black_placeholder && non_opaque_classic_pass)
+  {
+    return false;
   }
 
   auto& texture = *selected_texture;

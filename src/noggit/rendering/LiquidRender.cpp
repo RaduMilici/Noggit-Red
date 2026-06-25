@@ -151,10 +151,10 @@ void LiquidRender::updateLayerData(LiquidTextureManager* tex_manager)
             if (logged_missing_liquid_profiles < 40)
             {
               LogError << "Turtle water: missing liquid profile " << layer.liquidID()
-                       << ", using fallback profile " << tex_frames.begin()->first << std::endl;
+                       << ", skipping layer chunk" << std::endl;
               logged_missing_liquid_profiles++;
             }
-            tex_profile_it = tex_frames.begin();
+            continue;
           }
 
           std::tuple<GLuint, glm::vec2, int, unsigned> const& tex_profile = tex_profile_it->second;

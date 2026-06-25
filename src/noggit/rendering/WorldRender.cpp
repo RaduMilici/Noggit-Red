@@ -15,7 +15,9 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <fstream>
 #include <set>
+#include <sstream>
 
 using namespace Noggit::Rendering;
 
@@ -49,6 +51,187 @@ namespace
     }();
 
     return enabled;
+  }
+
+  bool capture_lighting_trace_enabled()
+  {
+    static bool const enabled = []
+    {
+      if (char const* value = std::getenv("NOGGIT_CAPTURE_LIGHTING_TRACE"))
+      {
+        return std::string(value) != "0";
+      }
+
+      return false;
+    }();
+
+    return enabled;
+  }
+
+  bool classic_effect_debug_enabled()
+  {
+    static bool const enabled = []
+    {
+      if (char const* value = std::getenv("NOGGIT_CLASSIC_EFFECT_DEBUG"))
+      {
+        return std::string(value) != "0";
+      }
+
+      return false;
+    }();
+
+    return enabled;
+  }
+
+  bool is_classic_effect_model_path(std::string const& path)
+  {
+    if (path.starts_with("world/generic/passivedoodads/particleemitters/"))
+    {
+      return true;
+    }
+
+    return path == "world/khazmodan/ironforge/passivedoodads/lavasteam/lavasteam.m2"
+        || path == "world/khazmodan/ironforge/passivedoodads/lavasteam/lavasteam_low.m2";
+  }
+
+  bool should_trace_gameobject_spawn(World::GameObjectSpawnOverlay const& spawn, float distance)
+  {
+    if (!capture_debug_enabled())
+    {
+      return false;
+    }
+
+    if (distance < 160.0f)
+    {
+      return true;
+    }
+
+    if (spawn.model_path.find("darkiron") != std::string::npos)
+    {
+      return true;
+    }
+
+    return spawn.name.find("Dark Iron") != std::string::npos
+        || spawn.name.find("dark iron") != std::string::npos;
+  }
+
+  void trace_gameobject_spawn(char const* stage,
+                              World::GameObjectSpawnOverlay const& spawn,
+                              float distance,
+                              char const* reason = nullptr,
+                              ModelInstance const* instance = nullptr)
+  {
+    if (!should_trace_gameobject_spawn(spawn, distance))
+    {
+      return;
+    }
+
+    static std::set<std::string> logged_gameobject_stages;
+    std::string key = std::to_string(spawn.guid) + ":" + stage;
+    if (!logged_gameobject_stages.insert(std::move(key)).second)
+    {
+      return;
+    }
+
+    std::ostringstream line;
+    line << "Gameobject spawn render trace stage=" << stage
+         << " guid=" << spawn.guid
+         << " entry=" << spawn.entry
+         << " display=" << spawn.display_id
+         << " name='" << spawn.name << "'"
+         << " model='" << spawn.model_path << "'"
+         << " pos={" << spawn.pos.x << ", " << spawn.pos.y << ", " << spawn.pos.z << "}"
+         << " distance=" << distance
+         << " templateScale=" << spawn.template_scale
+         << " createFailed=" << (spawn.model_create_failed ? 1 : 0)
+         << " hasInstance=" << (spawn.model_instance.has_value() ? 1 : 0);
+
+    if (reason)
+    {
+      line << " reason='" << reason << "'";
+    }
+
+    if (instance)
+    {
+      line << " instanceScale=" << instance->scale
+           << " modelLoaded=" << (instance->model->finishedLoading() ? 1 : 0)
+           << " loadingFailed=" << (instance->model->loading_failed() ? 1 : 0)
+           << " extentsMin={" << instance->extents[0].x << ", " << instance->extents[0].y << ", " << instance->extents[0].z << "}"
+           << " extentsMax={" << instance->extents[1].x << ", " << instance->extents[1].y << ", " << instance->extents[1].z << "}";
+    }
+
+    LogDebug << line.str() << std::endl;
+  }
+
+  bool should_trace_creature_spawn(World::CreatureSpawnOverlay const& spawn, float distance)
+  {
+    if (!capture_debug_enabled())
+    {
+      return false;
+    }
+
+    if (distance < 220.0f)
+    {
+      return true;
+    }
+
+    if (spawn.model_path.find("garr") != std::string::npos
+        || spawn.model_path.find("firesworn") != std::string::npos)
+    {
+      return true;
+    }
+
+    return spawn.name.find("Garr") != std::string::npos
+        || spawn.name.find("Firesworn") != std::string::npos;
+  }
+
+  void trace_creature_spawn(char const* stage,
+                            World::CreatureSpawnOverlay const& spawn,
+                            float distance,
+                            char const* reason = nullptr,
+                            ModelInstance const* instance = nullptr)
+  {
+    if (!should_trace_creature_spawn(spawn, distance))
+    {
+      return;
+    }
+
+    static std::set<std::string> logged_creature_stages;
+    std::string key = std::to_string(spawn.guid) + ":" + stage;
+    if (!logged_creature_stages.insert(std::move(key)).second)
+    {
+      return;
+    }
+
+    std::ostringstream line;
+    line << "Creature spawn render trace stage=" << stage
+         << " guid=" << spawn.guid
+         << " entry=" << spawn.entry
+         << " display=" << spawn.display_id
+         << " name='" << spawn.name << "'"
+         << " model='" << spawn.model_path << "'"
+         << " pos={" << spawn.pos.x << ", " << spawn.pos.y << ", " << spawn.pos.z << "}"
+         << " distance=" << distance
+         << " templateScale=" << spawn.template_scale
+         << " modelScale=" << spawn.model_scale
+         << " createFailed=" << (spawn.model_create_failed ? 1 : 0)
+         << " hasInstance=" << (spawn.model_instance.has_value() ? 1 : 0);
+
+    if (reason)
+    {
+      line << " reason='" << reason << "'";
+    }
+
+    if (instance)
+    {
+      line << " instanceScale=" << instance->scale
+           << " modelLoaded=" << (instance->model->finishedLoading() ? 1 : 0)
+           << " loadingFailed=" << (instance->model->loading_failed() ? 1 : 0)
+           << " extentsMin={" << instance->extents[0].x << ", " << instance->extents[0].y << ", " << instance->extents[0].z << "}"
+           << " extentsMax={" << instance->extents[1].x << ", " << instance->extents[1].y << ", " << instance->extents[1].z << "}";
+    }
+
+    LogDebug << line.str() << std::endl;
   }
 
   float creature_spawn_model_draw_distance()
@@ -89,6 +272,21 @@ namespace
     return distance;
   }
 
+  bool creature_spawn_markers_enabled()
+  {
+    static bool const enabled = []
+    {
+      if (char const* value = std::getenv("NOGGIT_CREATURE_MARKERS"))
+      {
+        return std::string(value) != "0";
+      }
+
+      return true;
+    }();
+
+    return enabled;
+  }
+
   std::size_t creature_spawn_model_create_budget()
   {
     static std::size_t const budget = []
@@ -107,16 +305,6 @@ namespace
     }();
 
     return budget;
-  }
-
-  bool is_too_dark(glm::vec3 const& color, float minimum)
-  {
-    return color.x + color.y + color.z < minimum;
-  }
-
-  glm::vec3 ensure_min_light(glm::vec3 color, glm::vec3 const& fallback, float minimum)
-  {
-    return is_too_dark(color, minimum) ? fallback : color;
   }
 
   ModelAttachmentDef const* find_attachment_def(Model const* model, int attachment_id)
@@ -221,6 +409,11 @@ namespace
         continue;
       }
 
+      if (spawn.model_path != model_path)
+      {
+        continue;
+      }
+
       float overlay_radius = std::max(0.5f, spawn.template_scale * spawn.model_scale);
       if (spawn.model_instance.has_value())
       {
@@ -273,7 +466,8 @@ namespace
     }
 
     if (model_path == "creature/humanmalepeasant/humanmalepeasant.m2"
-        || model_path == "creature/humanfemalepeasant/humanfemalepeasant.m2")
+        || model_path == "creature/humanfemalepeasant/humanfemalepeasant.m2"
+        || model_path == "creature/elementalearth/elementalearth.m2")
     {
       std::ostringstream key;
       key << model_path << '|' << model_instance.uid;
@@ -852,6 +1046,8 @@ void WorldRender::draw (glm::mat4x4 const& model_view
         if (draw_hidden_models || !is_hidden)
         {
           instance->draw(wmo_program
+              , draw_water ? _wmo_liquid_program.get() : nullptr
+              , draw_water ? &_liquid_texture_manager : nullptr
               , model_view
               , projection
               , frustum
@@ -952,6 +1148,7 @@ void WorldRender::draw (glm::mat4x4 const& model_view
 
   bool draw_doodads_wmo = draw_wmo && draw_wmo_doodads;
   bool draw_creature_spawns = !minimap_render && _world->drawCreatureSpawns();
+  bool draw_gameobject_spawns = draw_creature_spawns;
   float const creature_spawn_model_distance = creature_spawn_model_draw_distance();
   float const creature_spawn_marker_distance = creature_spawn_marker_draw_distance();
   // M2s / models
@@ -974,6 +1171,11 @@ void WorldRender::draw (glm::mat4x4 const& model_view
 
     if (draw_doodads_wmo)
     {
+      if (draw_creature_spawns)
+      {
+        _world->ensureCreatureSpawnsLoaded();
+      }
+
       if (capture_debug_enabled())
       {
         LogDebug << "WorldRender::draw wmo doodad inject begin wmos=" << wmos_to_draw.size() << std::endl;
@@ -1001,6 +1203,14 @@ void WorldRender::draw (glm::mat4x4 const& model_view
             continue;
           }
 
+          if (capture_debug_enabled() && doodad->model->file_key().hasFilepath()
+              && doodad->model->file_key().filepath().find("blackrocklavafall") != std::string::npos)
+          {
+            LogDebug << "LAVAFALL inject model='" << doodad->model->file_key().stringRepr()
+                     << "' hidden=" << doodad->model->is_hidden()
+                     << std::endl;
+          }
+
           models_to_draw[doodad->model.get()].push_back(doodad->transformMatrix());
         }
       }
@@ -1026,8 +1236,12 @@ void WorldRender::draw (glm::mat4x4 const& model_view
       std::size_t const model_create_budget = creature_spawn_model_create_budget();
       for (auto& spawn : _world->creatureSpawns())
       {
-        if (glm::distance(camera_pos, spawn.pos) > creature_spawn_model_distance)
+        float const creature_distance = glm::distance(camera_pos, spawn.pos);
+        trace_creature_spawn("candidate", spawn, creature_distance);
+
+        if (creature_distance > creature_spawn_model_distance)
         {
+          trace_creature_spawn("skip-distance", spawn, creature_distance, "draw distance");
           continue;
         }
 
@@ -1035,19 +1249,23 @@ void WorldRender::draw (glm::mat4x4 const& model_view
         {
           if (models_created_this_frame >= model_create_budget)
           {
+            trace_creature_spawn("skip-budget", spawn, creature_distance, "create budget");
             continue;
           }
 
           if (!_world->ensureCreatureSpawnModel(spawn))
           {
+            trace_creature_spawn("create-failed", spawn, creature_distance, "ensureCreatureSpawnModel failed");
             continue;
           }
 
           ++models_created_this_frame;
+          trace_creature_spawn("created", spawn, creature_distance, nullptr, &*spawn.model_instance);
         }
 
         if (!spawn.model_instance.has_value())
         {
+          trace_creature_spawn("skip-no-instance", spawn, creature_distance, "missing instance");
           continue;
         }
 
@@ -1055,15 +1273,82 @@ void WorldRender::draw (glm::mat4x4 const& model_view
         mi.ensureExtents();
         if (!mi.model->finishedLoading() || mi.model->loading_failed())
         {
+          trace_creature_spawn("skip-load", spawn, creature_distance, "model not loaded", &mi);
           continue;
         }
 
         if (!mi.isInFrustum(frustum))
         {
+          trace_creature_spawn("skip-frustum", spawn, creature_distance, "frustum", &mi);
           continue;
         }
 
         creature_spawn_instances_to_draw.push_back({spawn.guid, &mi, &spawn});
+        trace_creature_spawn("draw-queued", spawn, creature_distance, nullptr, &mi);
+      }
+    }
+
+    if (draw_gameobject_spawns)
+    {
+      _world->ensureCreatureSpawnsLoaded();
+      ZoneScopedN("World::draw() : Inject gameobject spawn models");
+      std::size_t models_created_this_frame = 0;
+      std::size_t const model_create_budget = creature_spawn_model_create_budget();
+      for (auto& spawn : _world->gameObjectSpawns())
+      {
+        float const gameobject_distance = glm::distance(camera_pos, spawn.pos);
+        trace_gameobject_spawn("candidate", spawn, gameobject_distance);
+
+        if (gameobject_distance > creature_spawn_model_distance)
+        {
+          trace_gameobject_spawn("skip-distance", spawn, gameobject_distance, "draw distance");
+          continue;
+        }
+
+        if (!spawn.model_instance.has_value())
+        {
+          if (models_created_this_frame >= model_create_budget)
+          {
+            trace_gameobject_spawn("skip-budget", spawn, gameobject_distance, "create budget");
+            continue;
+          }
+
+          if (!_world->ensureGameObjectSpawnModel(spawn))
+          {
+            trace_gameobject_spawn("create-failed", spawn, gameobject_distance, "ensureGameObjectSpawnModel failed");
+            continue;
+          }
+
+          ++models_created_this_frame;
+          trace_gameobject_spawn("created", spawn, gameobject_distance, nullptr, &*spawn.model_instance);
+        }
+
+        if (!spawn.model_instance.has_value())
+        {
+          trace_gameobject_spawn("skip-no-instance", spawn, gameobject_distance, "missing instance");
+          continue;
+        }
+
+        auto& mi = *spawn.model_instance;
+        mi.ensureExtents();
+        if (!mi.model->finishedLoading() || mi.model->loading_failed())
+        {
+          trace_gameobject_spawn("skip-load", spawn, gameobject_distance, "model not loaded", &mi);
+          continue;
+        }
+
+        if (!mi.isInFrustum(frustum))
+        {
+          trace_gameobject_spawn("skip-frustum", spawn, gameobject_distance, "frustum", &mi);
+          continue;
+        }
+
+        if (draw_model_animations)
+        {
+          mi.model->animcalc = false;
+        }
+        models_to_draw[mi.model.get()].push_back(mi.transformMatrix());
+        trace_gameobject_spawn("draw-queued", spawn, gameobject_distance, nullptr, &mi);
       }
     }
 
@@ -1136,6 +1421,16 @@ void WorldRender::draw (glm::mat4x4 const& model_view
               continue;
           }
 
+          if (capture_debug_enabled() && pair.first->file_key().hasFilepath()
+              && pair.first->file_key().filepath().find("blackrocklavafall") != std::string::npos)
+          {
+            LogDebug << "LAVAFALL bucket model='" << pair.first->file_key().stringRepr()
+                     << "' instances=" << pair.second.size()
+                     << " hidden=" << pair.first->is_hidden()
+                     << " willDraw=" << (draw_hidden_models || !pair.first->is_hidden())
+                     << std::endl;
+          }
+
           if (draw_hidden_models || !pair.first->is_hidden())
           {
             if (capture_debug_enabled())
@@ -1146,6 +1441,34 @@ void WorldRender::draw (glm::mat4x4 const& model_view
                        << " animated=" << pair.first->animated
                        << " animBones=" << pair.first->animBones
                        << std::endl;
+            }
+
+            if (classic_effect_debug_enabled() && pair.first->file_key().hasFilepath())
+            {
+              auto const& model_path = pair.first->file_key().filepath();
+              if (is_classic_effect_model_path(model_path))
+              {
+                static std::set<std::string> logged_effect_buckets;
+                if (logged_effect_buckets.insert(model_path).second)
+                {
+                  std::ostringstream effect_line;
+                  effect_line << "WorldRender::classic effect bucket model='"
+                              << model_path
+                              << "' instances=" << pair.second.size();
+
+                  std::size_t const preview_count = std::min<std::size_t>(pair.second.size(), 8);
+                  for (std::size_t preview_index = 0; preview_index < preview_count; ++preview_index)
+                  {
+                    auto const translation = glm::vec3(pair.second[preview_index][3]);
+                    effect_line << " p" << preview_index << "={"
+                                << translation.x << ", "
+                                << translation.y << ", "
+                                << translation.z << "}";
+                  }
+
+                  LogDebug << effect_line.str() << std::endl;
+                }
+              }
             }
 
             pair.first->renderer()->draw( model_view
@@ -1161,6 +1484,12 @@ void WorldRender::draw (glm::mat4x4 const& model_view
                 , display
             );
             _world->_n_rendered_objects += pair.second.size();
+
+            if (draw_model_animations
+                && (!pair.first->_particles.empty() || !pair.first->_ribbons.empty()))
+            {
+              model_with_particles[pair.first] = pair.second.size();
+            }
 
             if (capture_debug_enabled())
             {
@@ -1410,7 +1739,7 @@ void WorldRender::draw (glm::mat4x4 const& model_view
       _world->ensureCreatureSpawnsLoaded();
     }
 
-    if (draw_creature_spawns && !_world->creatureSpawns().empty())
+    if (draw_creature_spawns && creature_spawn_markers_enabled() && !_world->creatureSpawns().empty())
     {
       ZoneScopedN("World::draw() : Draw creature spawn markers");
       OpenGL::Scoped::bool_setter<GL_CULL_FACE, GL_FALSE> const disable_cull_face;
@@ -1585,21 +1914,22 @@ void WorldRender::draw (glm::mat4x4 const& model_view
       water_shader.uniform("use_transform", 1);
     }
   }
-  /*
   // model particles
   if (draw_model_animations && !model_with_particles.empty())
   {
     OpenGL::Scoped::bool_setter<GL_CULL_FACE, GL_FALSE> const cull;
+    OpenGL::Scoped::bool_setter<GL_DEPTH_TEST, GL_TRUE> const depth_test;
     OpenGL::Scoped::depth_mask_setter<GL_FALSE> const depth_mask;
 
     OpenGL::Scoped::use_program particles_shader {*_m2_particles_program.get()};
 
     particles_shader.uniform("model_view_projection", mvp);
     OpenGL::texture::set_active_texture(0);
+    particles_shader.uniform("tex", 0);
 
     for (auto& it : model_with_particles)
     {
-      it.first->draw_particles(model_view, particles_shader, it.second);
+      it.first->renderer()->drawParticles(glm::transpose(model_view), particles_shader, it.second);
     }
   }
 
@@ -1617,11 +1947,9 @@ void WorldRender::draw (glm::mat4x4 const& model_view
 
     for (auto& it : model_with_particles)
     {
-      it.first->draw_ribbons(ribbon_shader, it.second);
+      it.first->renderer()->drawRibbons(ribbon_shader, it.second);
     }
   }
-
-   */
 
   gl.enable(GL_BLEND);
   gl.blendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
@@ -1872,6 +2200,13 @@ void WorldRender::upload()
           }
   );
 
+  _wmo_liquid_program.reset(
+      new OpenGL::program
+          { { GL_VERTEX_SHADER,   OpenGL::shader::src_from_qrc("wmo_liquid_vs") }
+              , { GL_FRAGMENT_SHADER, OpenGL::shader::src_from_qrc("wmo_liquid_fs") }
+          }
+  );
+
   _occluder_program.reset(
       new OpenGL::program
           { { GL_VERTEX_SHADER,   OpenGL::shader::src_from_qrc("occluder_vs") }
@@ -1983,6 +2318,15 @@ void WorldRender::upload()
   }
 
   {
+    OpenGL::Scoped::use_program wmo_liquid_render {*_wmo_liquid_program.get()};
+    static std::vector<int> samplers {2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
+
+    wmo_liquid_render.bind_uniform_block("matrices", 0);
+    wmo_liquid_render.bind_uniform_block("lighting", 1);
+    wmo_liquid_render.uniform("texture_samplers", samplers);
+  }
+
+  {
     OpenGL::Scoped::use_program mfbo_shader {*_mfbo_program.get()};
     mfbo_shader.bind_uniform_block("matrices", 0);
   }
@@ -2012,6 +2356,7 @@ void WorldRender::unload()
   _m2_box_program.reset();
   _wmo_program.reset();
   _liquid_program.reset();
+  _wmo_liquid_program.reset();
 
   _cursor_render.unload();
   _sphere_render.unload();
@@ -2050,9 +2395,19 @@ void WorldRender::updateLightingUniformBlock(bool draw_fog, glm::vec3 const& cam
   int daytime = static_cast<int>(_world->time) % 2880;
 
   int area_light_id = 0;
+  unsigned int wmo_area_id = static_cast<unsigned int>(-1);
+  unsigned int terrain_area_id = static_cast<unsigned int>(-1);
+  unsigned int area_id = static_cast<unsigned int>(-1);
   try
   {
-    unsigned int area_id = _world->getAreaID(camera_pos);
+    wmo_area_id = _world->getWMOAreaID(camera_pos);
+    terrain_area_id = _world->getAreaID(camera_pos);
+    area_id = wmo_area_id;
+    if (area_id == static_cast<unsigned int>(-1))
+    {
+      area_id = terrain_area_id;
+    }
+
     if (area_id != static_cast<unsigned int>(-1)
         && gAreaDB.getFieldCount() > AreaDB::LightId
         && gAreaDB.CheckIfIdExists(area_id))
@@ -2077,10 +2432,6 @@ void WorldRender::updateLightingUniformBlock(bool draw_fog, glm::vec3 const& cam
   glm::vec3 river_color_light = _skies->color_set[RIVER_COLOR_LIGHT];
   glm::vec3 river_color_dark = _skies->color_set[RIVER_COLOR_DARK];
 
-  diffuse = ensure_min_light(diffuse, {0.82f, 0.78f, 0.70f}, 0.20f);
-  ambient = ensure_min_light(ambient, {0.45f, 0.50f, 0.55f}, 0.20f);
-  fog_color = ensure_min_light(fog_color, {0.70f, 0.78f, 0.86f}, 0.10f);
-
   float fog_start = _skies->fog_distance_start();
   float fog_end = _skies->fog_distance_end();
   if (fog_end <= 1.0f)
@@ -2097,6 +2448,25 @@ void WorldRender::updateLightingUniformBlock(bool draw_fog, glm::vec3 const& cam
   _lighting_ubo_data.OceanColorDark = { ocean_color_dark.x,ocean_color_dark.y,ocean_color_dark.z, _skies->ocean_deep_alpha()};
   _lighting_ubo_data.RiverColorLight = { river_color_light.x,river_color_light.y,river_color_light.z, _skies->river_shallow_alpha()};
   _lighting_ubo_data.RiverColorDark = { river_color_dark.x,river_color_dark.y,river_color_dark.z, _skies->river_deep_alpha()};
+
+  if (capture_lighting_trace_enabled())
+  {
+    std::ofstream trace("I:\\Twow-local\\server_dev\\noggit_captures\\lighting_trace.txt", std::ios::app);
+    trace << "pos=(" << camera_pos.x << "," << camera_pos.y << "," << camera_pos.z << ")"
+          << " time=" << daytime
+          << " draw_fog=" << (draw_fog ? 1 : 0)
+          << " wmo_area=" << wmo_area_id
+          << " terrain_area=" << terrain_area_id
+          << " final_area=" << area_id
+          << " area_light=" << area_light_id
+          << " diffuse=(" << diffuse.x << "," << diffuse.y << "," << diffuse.z << ")"
+          << " ambient=(" << ambient.x << "," << ambient.y << "," << ambient.z << ")"
+          << " fog=(" << fog_color.x << "," << fog_color.y << "," << fog_color.z << ")"
+          << " fog_start=" << fog_start
+          << " fog_end=" << fog_end
+          << " fog_rate=" << _skies->fogRate()
+          << '\n';
+  }
 
   gl.bindBuffer(GL_UNIFORM_BUFFER, _lighting_ubo);
   gl.bufferSubData(GL_UNIFORM_BUFFER, 0, sizeof(OpenGL::LightingUniformBlock), &_lighting_ubo_data);

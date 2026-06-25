@@ -109,14 +109,16 @@ vec3 apply_lighting(vec3 material)
 {
   vec3 ambient_term;
   vec3 diffuse_term;
-  vec3 vertex_color = bool(flags & eWMOBatch_HasMOCV) ? f_vertex_color.rgb : vec3(0.);
+  bool has_mocv = bool(flags & eWMOBatch_HasMOCV);
+  bool exterior_lit = bool(flags & eWMOBatch_ExteriorLit);
+  vec3 vertex_color = has_mocv ? f_vertex_color.rgb : vec3(0.);
 
   if(bool(flags & eWMOBatch_Unlit))
   {
     ambient_term = vec3(0.0);
     diffuse_term = vec3(0.0);
   }
-  else if(bool(flags & eWMOBatch_ExteriorLit))
+  else if(exterior_lit)
   {
     ambient_term = AmbientColor_FogEnd.xyz;
     diffuse_term = DiffuseColor_FogStart.xyz;
@@ -124,7 +126,7 @@ vec3 apply_lighting(vec3 material)
   else
   {
     ambient_term = max(ambient_color, AmbientColor_FogEnd.xyz * 0.20);
-    diffuse_term = DiffuseColor_FogStart.xyz * 0.12;
+    diffuse_term = has_mocv ? vec3(0.0) : DiffuseColor_FogStart.xyz * 0.12;
   }
 
   // apply world lighting
@@ -134,15 +136,22 @@ vec3 apply_lighting(vec3 material)
 
   if(!bool(flags & eWMOBatch_Unlit))
   {
-    float nDotL = clamp(dot(normalize(f_normal), -normalize(vec3(-LightDir_FogRate.x, LightDir_FogRate.z, -LightDir_FogRate.y))), 0.0, 1.0);
+    if(has_mocv && !exterior_lit)
+    {
+      currColor = ambient_term + vertex_color;
+    }
+    else
+    {
+      float nDotL = clamp(dot(normalize(f_normal), -normalize(vec3(-LightDir_FogRate.x, LightDir_FogRate.z, -LightDir_FogRate.y))), 0.0, 1.0);
 
-    vec3 ambientColor = ambient_term + vertex_color;
+      vec3 ambientColor = ambient_term + vertex_color;
 
-    vec3 skyColor = (ambientColor * 1.10000002);
-    vec3 groundColor = (ambientColor * 0.699999988);
+      vec3 skyColor = (ambientColor * 1.10000002);
+      vec3 groundColor = (ambientColor * 0.699999988);
 
-    currColor = mix(groundColor, skyColor, 0.5 + (0.5 * nDotL));
-    lDiffuse = diffuse_term * nDotL;
+      currColor = mix(groundColor, skyColor, 0.5 + (0.5 * nDotL));
+      lDiffuse = diffuse_term * nDotL;
+    }
   }
   else
   {

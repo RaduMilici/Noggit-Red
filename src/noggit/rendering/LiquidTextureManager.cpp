@@ -5,7 +5,9 @@
 #include "noggit/DBC.h"
 #include "noggit/application/NoggitApplication.hpp"
 
-#include <array>
+#include <cstdlib>
+#include <cstring>
+#include <unordered_set>
 
 using namespace Noggit::Rendering;
 
@@ -28,53 +30,85 @@ namespace
 
     switch (type)
     {
-      case 0:
-        return "XTextures\\lava\\lava.";
       case 2:
+        return "XTextures\\lava\\lava.";
+      case 3:
         return "XTextures\\slime\\slime.";
       default:
         return "XTextures\\river\\lake_a.";
     }
   }
 
-  std::array<unsigned char, 4> fallback_liquid_color(unsigned liquid_type_id, int type)
+  std::string liquid_texture_base_from_dbc(std::string texture_filename)
   {
-    switch (liquid_type_id)
+    // Real (3.3.5a/WotLK) LiquidType.dbc stores a %d frame placeholder, e.g.
+    // "XTextures\LavaGreen\lavagreen.%d.blp". Our frame loader appends "1.blp","2.blp",...
+    // to a base, so the base is everything before %d. Without this the literal %d survived,
+    // the existence check failed, no profile was created, and every lava layer was skipped.
+    auto const placeholder = texture_filename.find("%d");
+    if (placeholder != std::string::npos)
     {
-      case 2:
-        return {35, 88, 130, 190};
-      case 3:
-        return {255, 92, 24, 220};
-      case 4:
-      case 21:
-        return {35, 155, 65, 210};
-      default:
-        break;
+      return texture_filename.substr(0, placeholder);
     }
 
-    if (type == 0)
+    if (texture_filename.size() >= 6
+        && texture_filename.substr(texture_filename.size() - 6) == ".1.blp")
     {
-      return {255, 92, 24, 220};
-    }
-    if (type == 2)
-    {
-      return {35, 155, 65, 210};
+      texture_filename.resize(texture_filename.size() - 5);
+      return texture_filename;
     }
 
-    return {45, 120, 170, 170};
+    if (texture_filename.size() >= 5
+        && texture_filename.substr(texture_filename.size() - 5) == "1.blp")
+    {
+      texture_filename.resize(texture_filename.size() - 5);
+      return texture_filename;
+    }
+
+    if (texture_filename.size() >= 4
+        && texture_filename.substr(texture_filename.size() - 4) == ".blp")
+    {
+      texture_filename.resize(texture_filename.size() - 4);
+      return texture_filename;
+    }
+
+    return texture_filename;
   }
 
-  void upload_fallback_liquid_profile(tsl::robin_map<unsigned, std::tuple<GLuint, glm::vec2, int, unsigned>>& texture_frames_map, unsigned liquid_type_id, int type)
+  bool liquid_debug_enabled()
   {
-    GLuint array = 0;
-    gl.genTextures(1, &array);
-    gl.bindTexture(GL_TEXTURE_2D_ARRAY, array);
-    auto color = fallback_liquid_color(liquid_type_id, type);
-    gl.texImage3D(GL_TEXTURE_2D_ARRAY, 0, GL_RGBA8, 1, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, color.data());
-    gl.texParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAX_LEVEL, 0);
-    gl.texParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    gl.texParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    texture_frames_map[liquid_type_id] = std::make_tuple(array, glm::vec2(0.f, 0.f), type, 1);
+    static bool const enabled = []()
+    {
+      char const* capture_debug = std::getenv("NOGGIT_CAPTURE_DEBUG");
+      if (capture_debug && *capture_debug && std::strcmp(capture_debug, "0") != 0)
+      {
+        return true;
+      }
+
+      char const* liquid_debug = std::getenv("NOGGIT_LIQUID_DEBUG");
+      return liquid_debug && *liquid_debug && std::strcmp(liquid_debug, "0") != 0;
+    }();
+
+    return enabled;
+  }
+
+  void apply_real_classic_liquid_aliases(tsl::robin_map<unsigned, std::tuple<GLuint, glm::vec2, int, unsigned>>& texture_frames_map)
+  {
+    auto set_shader_type = [&texture_frames_map](unsigned liquid_type_id, int type)
+    {
+      auto profile = texture_frames_map.find(liquid_type_id);
+      if (profile != texture_frames_map.end())
+      {
+        texture_frames_map[liquid_type_id] = std::make_tuple(std::get<0>(profile->second),
+                                                             std::get<1>(profile->second),
+                                                             type,
+                                                             std::get<3>(profile->second));
+      }
+    };
+
+    set_shader_type(3, 2);
+    set_shader_type(4, 3);
+    set_shader_type(21, 3);
   }
 }
 
@@ -95,9 +129,8 @@ void LiquidTextureManager::upload()
     const DBCFile::Record record = gLiquidTypeDB.getRecord(i);
     size_t const field_count = gLiquidTypeDB.getFieldCount();
     unsigned liquid_type_id = record.getInt(LiquidTypeDB::ID);
-    int type = field_count > LiquidTypeDB::Type ? record.getInt(LiquidTypeDB::Type) : 3;
+    int type = field_count > LiquidTypeDB::Type ? record.getInt(LiquidTypeDB::Type) : 0;
     glm::vec2 anim = {1.f, 0.f};
-    int shader_type = field_count > LiquidTypeDB::ShaderType ? record.getInt(LiquidTypeDB::ShaderType) : 3;
 
     if (field_count > LiquidTypeDB::AnimationY)
     {
@@ -105,27 +138,24 @@ void LiquidTextureManager::upload()
     }
 
     std::string filename;
+    char const* texture_source = "dbc";
 
     if (field_count <= LiquidTypeDB::TextureFilenames)
     {
       filename = classic_liquid_texture(liquid_type_id, type);
-    }
-    else if (shader_type == 3)
-    {
-      filename = "XTextures\\river\\lake_a.";
-      anim = glm::vec2(1.f, 0.f);
+      texture_source = "classic-layout";
     }
     else
-    [[likely]]
     {
-      try
+      std::string db_string_template = record.getString(LiquidTypeDB::TextureFilenames);
+      if (db_string_template.empty())
       {
-        std::string db_string_template = record.getString(LiquidTypeDB::TextureFilenames);
-        filename = db_string_template.substr(0, db_string_template.length() - 6);
+        filename = classic_liquid_texture(liquid_type_id, type);
+        texture_source = "classic-empty-texture";
       }
-      catch (...)
+      else
       {
-        filename = "XTextures\\river\\lake_a.";
+        filename = liquid_texture_base_from_dbc(db_string_template);
       }
     }
 
@@ -135,14 +165,11 @@ void LiquidTextureManager::upload()
 
     if (!client_data->exists(filename + "1.blp"))
     {
-      filename = "XTextures\\river\\lake_a.";
-    }
-
-    if (!client_data->exists(filename + "1.blp"))
-    {
       gl.deleteTextures(1, &array);
-      upload_fallback_liquid_profile(_texture_frames_map, liquid_type_id, type);
-      LogError << "Using fallback liquid texture for type " << liquid_type_id << std::endl;
+      LogError << "Skipping liquid type " << liquid_type_id
+               << ": missing client texture '" << filename << "1.blp'"
+               << " from " << texture_source
+               << std::endl;
       continue;
     }
 
@@ -208,21 +235,28 @@ void LiquidTextureManager::upload()
       tex.uploadToArray(j);
     }
 
-    gl.texParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAX_LEVEL, mip_level - 3);
+    gl.texParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAX_LEVEL, mip_level - 1);
     gl.texParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
     gl.texParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
 
     _texture_frames_map[liquid_type_id] = std::make_tuple(array, anim, type, n_frames);
+    if (liquid_debug_enabled())
+    {
+      LogDebug << "Loaded liquid profile id=" << liquid_type_id
+               << " type=" << type
+               << " texture='" << filename << "'"
+               << " source=" << texture_source
+               << " frames=" << n_frames
+               << " anim=(" << anim.x << ", " << anim.y << ")"
+               << std::endl;
+    }
   }
+
+  apply_real_classic_liquid_aliases(_texture_frames_map);
 
   if (_texture_frames_map.empty())
   {
-    upload_fallback_liquid_profile(_texture_frames_map, 1, 3);
-    upload_fallback_liquid_profile(_texture_frames_map, 2, 3);
-    upload_fallback_liquid_profile(_texture_frames_map, 3, 0);
-    upload_fallback_liquid_profile(_texture_frames_map, 4, 2);
-    upload_fallback_liquid_profile(_texture_frames_map, 21, 2);
-    LogError << "Turtle water: installed built-in Classic liquid profiles" << std::endl;
+    LogError << "No liquid profiles loaded; liquid rendering skipped until real client textures are available." << std::endl;
   }
 
   _uploaded = true;
@@ -230,10 +264,14 @@ void LiquidTextureManager::upload()
 
 void LiquidTextureManager::unload()
 {
+  std::unordered_set<GLuint> deleted_arrays;
   for (auto& pair : _texture_frames_map)
   {
     GLuint array = std::get<0>(pair.second);
-    gl.deleteTextures(1, &array);
+    if (array && deleted_arrays.insert(array).second)
+    {
+      gl.deleteTextures(1, &array);
+    }
   }
 
   _texture_frames_map.clear();

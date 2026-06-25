@@ -5,7 +5,6 @@
 #include <noggit/Log.h>
 #include <noggit/Model.h>
 #include <noggit/ModelInstance.h>
-#include <noggit/TextureManager.h> // TextureManager, Texture
 #include <noggit/World.h>
 #include <opengl/scoped.hpp>
 #include <opengl/shader.hpp>
@@ -16,9 +15,12 @@
 #include <algorithm>
 #include <cassert>
 #include <cctype>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <map>
+#include <optional>
 #include <string>
 #include <glm/gtx/euler_angles.hpp>
 #include <glm/gtx/quaternion.hpp>
@@ -26,6 +28,8 @@
 
 namespace
 {
+  bool classic_m2_debug_enabled();
+
   bool is_null_asset_reference(std::string filename)
   {
     auto const is_trimmed_char = [](unsigned char character)
@@ -68,6 +72,19 @@ namespace
     return false;
   }
 
+  bool should_log_classic_skin_model(BlizzardArchive::Listfile::FileKey const& file_key)
+  {
+    if (!classic_m2_debug_enabled() || !file_key.hasFilepath())
+    {
+      return false;
+    }
+
+    auto const& path = file_key.filepath();
+    return path.find("elementalearth") != std::string::npos
+        || path.find("firelord") != std::string::npos
+        || path.find("darkironnode") != std::string::npos;
+  }
+
   bool classic_m2_debug_enabled()
   {
     static bool const enabled = []()
@@ -88,6 +105,72 @@ namespace
     }();
 
     return enabled;
+  }
+
+  bool is_classic_effect_shell_model_path(std::string const& path)
+  {
+    return path.starts_with("world/generic/passivedoodads/particleemitters/")
+        || path == "world/khazmodan/ironforge/passivedoodads/lavasteam/lavasteam.m2"
+        || path == "world/khazmodan/ironforge/passivedoodads/lavasteam/lavasteam_low.m2";
+  }
+
+  bool is_classic_volcanic_vent_model_path(std::string const& path)
+  {
+    return path == "world/azeroth/burningsteppes/passivedoodads/volcanicvents/volcanicventsmall01.m2"
+        || path == "world/azeroth/burningsteppes/passivedoodads/volcanicvents/volcanicventmed01.m2"
+        || path == "world/azeroth/burningsteppes/passivedoodads/volcanicvents/volcanicventlarge01.m2";
+  }
+
+  bool classic_effect_debug_enabled()
+  {
+    static bool const enabled = []()
+    {
+      char const* effect_debug = std::getenv("NOGGIT_CLASSIC_EFFECT_DEBUG");
+      if (effect_debug && *effect_debug && std::strcmp(effect_debug, "0") != 0)
+      {
+        return true;
+      }
+
+      return classic_m2_debug_enabled();
+    }();
+
+    return enabled;
+  }
+
+  bool classic_effect_particle_parse_enabled_for_model(Model const* model)
+  {
+    if (!model || !model->usesClassicLayout() || !model->file_key().hasFilepath())
+    {
+      return false;
+    }
+
+    auto const& path = model->file_key().filepath();
+    if (path.starts_with("character/") || path.starts_with("creature/"))
+    {
+      return false;
+    }
+
+    return true;
+  }
+
+  int16_t clamp_classic_particle_int16(int16_t value, int low, int high)
+  {
+    return static_cast<int16_t>(std::clamp(static_cast<int>(value), low, high));
+  }
+
+  void sanitize_classic_particle_animation_block(ClassicAnimationBlock& block,
+                                                std::uint32_t global_sequence_count)
+  {
+    if (block.seq < -1 || static_cast<std::uint32_t>(block.seq) >= global_sequence_count)
+    {
+      block.seq = -1;
+    }
+
+    if (block.type < Animation::Interpolation::Type::NONE
+        || block.type > Animation::Interpolation::Type::HERMITE)
+    {
+      block.type = Animation::Interpolation::Type::NONE;
+    }
   }
 
   struct ClassicModelHeader
@@ -245,6 +328,52 @@ namespace
     return !count || (offset < file.getSize() && count <= (file.getSize() - offset) / element_size);
   }
 
+  std::string read_embedded_model_string(BlizzardArchive::ClientFile const& file,
+                                         std::uint32_t offset,
+                                         std::uint32_t length)
+  {
+    if (!length || offset >= file.getSize() || length > file.getSize() - offset)
+    {
+      return {};
+    }
+
+    char const* string_ptr = file.getBuffer() + offset;
+    std::size_t string_length = length;
+    if (string_length > 0 && string_ptr[string_length - 1] == '\0')
+    {
+      --string_length;
+    }
+
+    return std::string(string_ptr, string_length);
+  }
+
+  std::string normalize_embedded_particle_texture_filename(std::string filename,
+                                                           std::string const& model_path)
+  {
+    if (is_null_asset_reference(filename))
+    {
+      return {};
+    }
+
+    std::replace(filename.begin(), filename.end(), '\\', '/');
+
+    if (filename.rfind('.') == std::string::npos)
+    {
+      filename += ".blp";
+    }
+
+    if (filename.find('/') == std::string::npos)
+    {
+      auto const separator = model_path.rfind('/');
+      if (separator != std::string::npos)
+      {
+        filename = model_path.substr(0, separator + 1) + filename;
+      }
+    }
+
+    return filename;
+  }
+
   bool m2_header_ranges_fit(BlizzardArchive::ClientFile const& file, ModelHeader const& header)
   {
     return range_fits(file, header.ofsGlobalSequences, header.nGlobalSequences, sizeof(int))
@@ -307,6 +436,7 @@ namespace
         && range_fits(file, header.ofsBones, header.nBones, sizeof(ClassicModelBoneDef))
         && range_fits(file, header.ofsKeyBoneLookup, header.nKeyBoneLookup, sizeof(int16_t))
         && range_fits(file, header.ofsTransparency, header.nTransparency, sizeof(ClassicModelTransDef))
+        && range_fits(file, header.ofsTexAnims, header.nTexAnims, sizeof(ClassicModelTexAnimDef))
         && range_fits(file, header.ofsAttachments, header.nAttachments, sizeof(ClassicModelAttachmentDef))
         && range_fits(file, header.ofsAttachLookup, header.nAttachLookup, sizeof(int16_t));
   }
@@ -501,11 +631,16 @@ void Model::finishLoading()
   if (_uses_classic_layout)
   {
     bool const has_classic_runtime_bones = initClassicStaticBones(f);
-    animated = has_classic_runtime_bones;
+    // Classic models can have texture animations (UV scroll: lava falls, flowing water,
+    // etc.). animTextures was hardcoded false, so the texanim load block in initAnimated
+    // never ran -> _texture_animations stayed empty -> tex_matrix was always identity ->
+    // every classic UV animation rendered frozen. Drive it from the header instead, and
+    // mark the model animated so initAnimated runs even without runtime bones.
+    animTextures = header.nTexAnims > 0;
+    animated = has_classic_runtime_bones || animTextures;
     animGeometry = has_classic_runtime_bones;
     animBones = has_classic_runtime_bones;
-    animTextures = false;
-    _per_instance_animation = has_classic_runtime_bones;
+    _per_instance_animation = has_classic_runtime_bones || animTextures;
   }
   else
   {
@@ -524,6 +659,8 @@ void Model::finishLoading()
              << " animTextures=" << animTextures
              << " perInstance=" << _per_instance_animation
              << " bones=" << header.nBones
+             << " nAnimations=" << header.nAnimations
+             << " nTexAnims=" << header.nTexAnims
              << " vertices=" << header.nVertices
              << " views=" << header.nViews
              << (_uses_classic_layout ? " embeddedViewOffset=" : " globalSequences=")
@@ -638,26 +775,40 @@ void Model::waitForChildrenLoaded()
 
 bool Model::isAnimated(const BlizzardArchive::ClientFile& f)
 {
-  // see if we have any animated bones
-  ModelBoneDef const* bo = reinterpret_cast<ModelBoneDef const*>(f.getBuffer() + header.ofsBones);
-
   animGeometry = false;
   animBones = false;
   _per_instance_animation = false;
 
   ModelVertex const* verts = reinterpret_cast<ModelVertex const*>(f.getBuffer() + header.ofsVertices);
-  for (size_t i = 0; i<header.nVertices && !animGeometry; ++i) 
+  auto const bone_flags = [this, &f](std::uint8_t bone_index) -> std::uint32_t
   {
-    for (size_t b = 0; b<4; b++) 
+    if (bone_index >= header.nBones)
     {
-      if (verts[i].weights[b]>0) 
-      {
-        ModelBoneDef const& bb = bo[verts[i].bones[b]];
-        bool billboard = (bb.flags & (0x78)); // billboard | billboard_lock_[xyz]
+      return 0;
+    }
 
-        if ((bb.flags & 0x200) || billboard) 
+    if (_uses_classic_layout)
+    {
+      auto const* bones = reinterpret_cast<ClassicModelBoneDef const*>(f.getBuffer() + header.ofsBones);
+      return bones[bone_index].flags;
+    }
+
+    auto const* bones = reinterpret_cast<ModelBoneDef const*>(f.getBuffer() + header.ofsBones);
+    return bones[bone_index].flags;
+  };
+
+  for (size_t i = 0; i < header.nVertices && !animGeometry; ++i)
+  {
+    for (size_t b = 0; b < 4; b++)
+    {
+      if (verts[i].weights[b] > 0)
+      {
+        auto const flags = bone_flags(verts[i].bones[b]);
+        bool const billboard = (flags & (0x78)); // billboard | billboard_lock_[xyz]
+
+        if ((flags & 0x200) || billboard)
         {
-          if (billboard) 
+          if (billboard)
           {
             // if we have billboarding, the model will need per-instance animation
             _per_instance_animation = true;
@@ -675,13 +826,30 @@ bool Model::isAnimated(const BlizzardArchive::ClientFile& f)
   }
   else
   {
-    for (size_t i = 0; i<header.nBones; ++i)
+    if (_uses_classic_layout)
     {
-      ModelBoneDef const& bb = bo[i];
-      if (bb.translation.type || bb.rotation.type || bb.scaling.type)
+      auto const* bo = reinterpret_cast<ClassicModelBoneDef const*>(f.getBuffer() + header.ofsBones);
+      for (size_t i = 0; i < header.nBones; ++i)
       {
-        animBones = true;
-        break;
+        ClassicModelBoneDef const& bb = bo[i];
+        if (bb.translation.type || bb.rotation.type || bb.scaling.type)
+        {
+          animBones = true;
+          break;
+        }
+      }
+    }
+    else
+    {
+      auto const* bo = reinterpret_cast<ModelBoneDef const*>(f.getBuffer() + header.ofsBones);
+      for (size_t i = 0; i < header.nBones; ++i)
+      {
+        ModelBoneDef const& bb = bo[i];
+        if (bb.translation.type || bb.rotation.type || bb.scaling.type)
+        {
+          animBones = true;
+          break;
+        }
       }
     }
   }
@@ -704,12 +872,26 @@ bool Model::isAnimated(const BlizzardArchive::ClientFile& f)
   // animated opacity
   if (header.nTransparency)
   {
-    ModelTransDef const* trs = reinterpret_cast<ModelTransDef const*>(f.getBuffer() + header.ofsTransparency);
-    for (size_t i = 0; i<header.nTransparency; ++i)
+    if (_uses_classic_layout)
     {
-      if (trs[i].trans.type != 0)
+      ClassicModelTransDef const* trs = reinterpret_cast<ClassicModelTransDef const*>(f.getBuffer() + header.ofsTransparency);
+      for (size_t i = 0; i < header.nTransparency; ++i)
       {
-        return true;
+        if (trs[i].trans.type != 0)
+        {
+          return true;
+        }
+      }
+    }
+    else
+    {
+      ModelTransDef const* trs = reinterpret_cast<ModelTransDef const*>(f.getBuffer() + header.ofsTransparency);
+      for (size_t i = 0; i < header.nTransparency; ++i)
+      {
+        if (trs[i].trans.type != 0)
+        {
+          return true;
+        }
       }
     }
   }
@@ -753,7 +935,7 @@ void Model::initCommon(const BlizzardArchive::ClientFile& f)
   ModelTextureDef const* texdef = reinterpret_cast<ModelTextureDef const*>(f.getBuffer() + header.ofsTextures);
   _textureFilenames.resize(header.nTextures);
   _specialTextures.resize(header.nTextures);
-  int classic_missing_texture_fallbacks = 0;
+  int classic_missing_texture_placeholders = 0;
 
   for (size_t i = 0; i < header.nTextures; ++i)
   {
@@ -782,7 +964,7 @@ void Model::initCommon(const BlizzardArchive::ClientFile& f)
       if (is_null_asset_reference(_textureFilenames[i]))
       {
         _textureFilenames[i] = "tileset/generic/black.blp";
-        classic_missing_texture_fallbacks++;
+        classic_missing_texture_placeholders++;
         continue;
       }
 
@@ -790,7 +972,7 @@ void Model::initCommon(const BlizzardArchive::ClientFile& f)
           && !Noggit::Application::NoggitApplication::instance()->clientData()->exists(_textureFilenames[i]))
       {
         _textureFilenames[i] = "tileset/generic/black.blp";
-        classic_missing_texture_fallbacks++;
+        classic_missing_texture_placeholders++;
       }
     }
     else
@@ -806,7 +988,7 @@ void Model::initCommon(const BlizzardArchive::ClientFile& f)
       // Preserve the actual texture type so that _replaceTextures overrides set
       // by reloadCreatureSpawns() are found in bindTexture.  Covers both monster
       // textures (types 11-13) and humanoid baked-skin textures (type 1) and
-      // anything else.  If no override is registered the fallback is still
+      // anything else.  If no override is registered the placeholder is still
       // black.blp, identical to the old behaviour.
       _specialTextures[i] = texdef[i].type;
       _textureFilenames[i] = "tileset/generic/black.blp";
@@ -826,9 +1008,9 @@ void Model::initCommon(const BlizzardArchive::ClientFile& f)
     }
   }
 
-  if (_uses_classic_layout && classic_missing_texture_fallbacks > 0)
+  if (_uses_classic_layout && classic_missing_texture_placeholders > 0)
   {
-    LogError << "Classic M2 texture fallback " << classic_missing_texture_fallbacks
+    LogError << "Classic M2 texture placeholder " << classic_missing_texture_placeholders
              << " texture(s) for " << _file_key.stringRepr() << std::endl;
   }
 
@@ -948,25 +1130,12 @@ void Model::initCommon(const BlizzardArchive::ClientFile& f)
 
   if (_uses_classic_layout && header.nTransparency)
   {
-    _classic_transparency_values.reserve(header.nTransparency);
+    _transparency.reserve(header.nTransparency);
     ClassicModelTransDef const* trDefs = reinterpret_cast<ClassicModelTransDef const*>(f.getBuffer() + header.ofsTransparency);
-    Animation::Conversion<int16_t, float> convert_alpha;
 
     for (size_t i = 0; i < header.nTransparency; ++i)
     {
-      float alpha = 1.0f;
-
-      if (trDefs[i].trans.nKeys && range_fits(f, trDefs[i].trans.ofsKeys, trDefs[i].trans.nKeys, sizeof(int16_t)))
-      {
-        int16_t const* keys = reinterpret_cast<int16_t const*>(f.getBuffer() + trDefs[i].trans.ofsKeys);
-        alpha = 0.0f;
-        for (size_t key_index = 0; key_index < trDefs[i].trans.nKeys; ++key_index)
-        {
-          alpha = std::max(alpha, convert_alpha(keys[key_index]));
-        }
-      }
-
-      _classic_transparency_values.push_back(alpha);
+      _transparency.emplace_back(f, trDefs[i], _global_sequences.data());
     }
   }
   else if (header.nTransparency)
@@ -992,6 +1161,7 @@ void Model::initCommon(const BlizzardArchive::ClientFile& f)
     {
       auto classic_views = reinterpret_cast<ClassicModelView const*>(f.getBuffer() + _embedded_view_offset);
       ClassicModelView const* classic_view = nullptr;
+      uint32_t classic_view_index = 0;
       for (uint32_t view_index = 0; view_index < header.nViews; ++view_index)
       {
         ClassicModelView const* candidate = classic_views + view_index;
@@ -1004,16 +1174,27 @@ void Model::initCommon(const BlizzardArchive::ClientFile& f)
           continue;
         }
 
-        if (!classic_view || candidate->n_triangle > classic_view->n_triangle)
-        {
-          classic_view = candidate;
-        }
+        classic_view = candidate;
+        classic_view_index = view_index;
+        break;
       }
 
       if (!classic_view)
       {
         LogError << "No valid embedded skin view for '" << _file_key.stringRepr() << "'" << std::endl;
         return;
+      }
+
+      if (classic_m2_debug_enabled())
+      {
+        LogDebug << "Classic embedded skin view model='" << _file_key.stringRepr()
+                 << "' selected=" << classic_view_index
+                 << " lod=" << classic_view->lod
+                 << " indices=" << classic_view->n_index
+                 << " triangles=" << classic_view->n_triangle
+                 << " submeshes=" << classic_view->n_submesh
+                 << " textureUnits=" << classic_view->n_texture_unit
+                 << std::endl;
       }
 
       std::memcpy(embedded_view.id, "SKIN", 4);
@@ -1073,13 +1254,12 @@ void Model::initCommon(const BlizzardArchive::ClientFile& f)
       model_geosets = classic_model_geosets.data();
 
       if (!_logged_classic_character_geosets
-          && file_key().hasFilepath()
-          && file_key().filepath().starts_with("character/")
-          && classic_m2_debug_enabled())
+          && ((file_key().hasFilepath() && file_key().filepath().starts_with("character/"))
+              || should_log_classic_skin_model(file_key())))
       {
         _logged_classic_character_geosets = true;
         std::ostringstream geoset_log;
-        geoset_log << "Classic character geosets model='" << file_key().stringRepr() << "'";
+        geoset_log << "Classic skin geosets model='" << file_key().stringRepr() << "'";
         for (size_t geoset_index = 0; geoset_index < classic_model_geosets.size(); ++geoset_index)
         {
           auto const& geoset = classic_model_geosets[geoset_index];
@@ -1089,6 +1269,10 @@ void Model::initCommon(const BlizzardArchive::ClientFile& f)
                      << " vcount=" << geoset.vcount
                      << " istart=" << geoset.istart
                      << " icount=" << geoset.icount
+                     << " boneCount=" << geoset.d3
+                     << " boneStart=" << geoset.d4
+                     << " boneInfluences=" << geoset.d5
+                     << " rootBone=" << geoset.d6
                      << "]";
         }
         LogDebug << geoset_log.str() << std::endl;
@@ -1121,21 +1305,64 @@ void Model::initCommon(const BlizzardArchive::ClientFile& f)
       {
         auto vertex_properties = reinterpret_cast<uint8_t const*>(view_file->getBuffer() + view->ofs_vertex_property);
         auto bone_lookup = reinterpret_cast<uint16_t const*>(f.getBuffer() + header.ofsBoneLookup);
+        bool const log_classic_skin_details = should_log_classic_skin_model(file_key());
 
         for (size_t geoset_index = 0; geoset_index < view->n_submesh; ++geoset_index)
         {
           auto const& geoset = model_geosets[geoset_index];
           size_t const vertex_end = std::min<size_t>(view->n_index, static_cast<size_t>(geoset.vstart) + geoset.vcount);
           uint16_t const influences = std::min<uint16_t>(4, geoset.d5);
+          std::size_t vertices_with_weights = 0;
+          std::size_t vertices_with_zero_weights = 0;
+          std::size_t invalid_bone_lookup_count = 0;
+          std::size_t remapped_bone_count = 0;
+          std::ostringstream remap_detail_log;
+          if (log_classic_skin_details)
+          {
+            remap_detail_log << "Classic skin bone remap details model='" << file_key().stringRepr()
+                             << "' submesh=" << geoset_index
+                             << " samples=";
+          }
 
           for (size_t vertex = geoset.vstart; vertex < vertex_end; ++vertex)
           {
+            auto const original_vertex = _vertices[vertex];
+            bool const has_weight = _vertices[vertex].weights[0] || _vertices[vertex].weights[1]
+                                 || _vertices[vertex].weights[2] || _vertices[vertex].weights[3];
+            if (has_weight)
+            {
+              ++vertices_with_weights;
+            }
+            else
+            {
+              ++vertices_with_zero_weights;
+            }
+
             for (uint16_t bone = 0; bone < influences; ++bone)
             {
               uint16_t const bone_lookup_index = static_cast<uint16_t>(geoset.d4 + vertex_properties[vertex * 4 + bone]);
               if (bone_lookup_index < header.nBoneLookup && bone_lookup[bone_lookup_index] < header.nBones)
               {
-                _vertices[vertex].bones[bone] = static_cast<uint8_t>(bone_lookup[bone_lookup_index]);
+                auto remapped_bone = static_cast<uint8_t>(bone_lookup[bone_lookup_index]);
+                if (file_key().hasFilepath()
+                    && file_key().filepath().find("elementalearth") != std::string::npos
+                    && influences == 1
+                    && bone == 0
+                    && remapped_bone == 0
+                    && vertex_properties[vertex * 4] != 0
+                    && geoset.d6 < header.nBones)
+                {
+                  remapped_bone = static_cast<uint8_t>(geoset.d6);
+                }
+                if (_vertices[vertex].bones[bone] != remapped_bone)
+                {
+                  ++remapped_bone_count;
+                }
+                _vertices[vertex].bones[bone] = remapped_bone;
+              }
+              else
+              {
+                ++invalid_bone_lookup_count;
               }
             }
 
@@ -1144,6 +1371,51 @@ void Model::initCommon(const BlizzardArchive::ClientFile& f)
               _vertices[vertex].weights[bone] = 0;
               _vertices[vertex].bones[bone] = 0;
             }
+
+            if (log_classic_skin_details && vertex < static_cast<size_t>(geoset.vstart) + 4)
+            {
+              remap_detail_log << " [v=" << vertex
+                               << " src=" << indexLookup[vertex]
+                               << " props=("
+                               << static_cast<int>(vertex_properties[vertex * 4])
+                               << "," << static_cast<int>(vertex_properties[vertex * 4 + 1])
+                               << "," << static_cast<int>(vertex_properties[vertex * 4 + 2])
+                               << "," << static_cast<int>(vertex_properties[vertex * 4 + 3])
+                               << ") oldBones=("
+                               << static_cast<int>(original_vertex.bones[0])
+                               << "," << static_cast<int>(original_vertex.bones[1])
+                               << "," << static_cast<int>(original_vertex.bones[2])
+                               << "," << static_cast<int>(original_vertex.bones[3])
+                               << ") weights=("
+                               << static_cast<int>(original_vertex.weights[0])
+                               << "," << static_cast<int>(original_vertex.weights[1])
+                               << "," << static_cast<int>(original_vertex.weights[2])
+                               << "," << static_cast<int>(original_vertex.weights[3])
+                               << ") newBones=("
+                               << static_cast<int>(_vertices[vertex].bones[0])
+                               << "," << static_cast<int>(_vertices[vertex].bones[1])
+                               << "," << static_cast<int>(_vertices[vertex].bones[2])
+                               << "," << static_cast<int>(_vertices[vertex].bones[3])
+                               << ")]";
+            }
+          }
+
+          if (log_classic_skin_details)
+          {
+            LogDebug << "Classic skin bone remap model='" << file_key().stringRepr()
+                     << "' submesh=" << geoset_index
+                     << " id=" << geoset.id
+                     << " vertices=[" << geoset.vstart << ".." << vertex_end << ")"
+                     << " boneStart=" << geoset.d4
+                     << " boneCount=" << geoset.d3
+                     << " influences=" << influences
+                     << " rootBone=" << geoset.d6
+                     << " weightedVertices=" << vertices_with_weights
+                     << " zeroWeightVertices=" << vertices_with_zero_weights
+                     << " remappedBones=" << remapped_bone_count
+                     << " invalidBoneLookups=" << invalid_bone_lookup_count
+                     << std::endl;
+            LogDebug << remap_detail_log.str() << std::endl;
           }
         }
       }
@@ -1361,20 +1633,169 @@ void Model::initAnimated(const BlizzardArchive::ClientFile& f)
   if (animTextures) 
   {
     _texture_animations.reserve(header.nTexAnims);
-    ModelTexAnimDef const* ta = reinterpret_cast<ModelTexAnimDef const*>(f.getBuffer() + header.ofsTexAnims);
-    for (size_t i=0; i<header.nTexAnims; ++i) {
-      _texture_animations.emplace_back (f, ta[i], _global_sequences.data());
+    if (_uses_classic_layout)
+    {
+      ClassicModelTexAnimDef const* ta = reinterpret_cast<ClassicModelTexAnimDef const*>(f.getBuffer() + header.ofsTexAnims);
+      for (size_t i = 0; i < header.nTexAnims; ++i)
+      {
+        _texture_animations.emplace_back(f, ta[i], _global_sequences.data());
+      }
+    }
+    else
+    {
+      ModelTexAnimDef const* ta = reinterpret_cast<ModelTexAnimDef const*>(f.getBuffer() + header.ofsTexAnims);
+      for (size_t i = 0; i < header.nTexAnims; ++i)
+      {
+        _texture_animations.emplace_back(f, ta[i], _global_sequences.data());
+      }
     }
   }
 
-  
-  // Vanilla/classic emitter structs are not WotLK-compatible. Rendering the
-  // animated mesh is safer than reading particle data with the wrong layout.
+  bool parsed_classic_effect_particles = false;
+  if (classic_effect_particle_parse_enabled_for_model(this) && header.nParticleEmitters)
+  {
+    if (range_fits(f, header.ofsParticleEmitters, header.nParticleEmitters, sizeof(ClassicModelParticleEmitterDef)))
+    {
+      auto const* pdefs = reinterpret_cast<ClassicModelParticleEmitterDef const*>(f.getBuffer() + header.ofsParticleEmitters);
+      _particles.reserve(_particles.size() + header.nParticleEmitters);
+
+      auto const resolve_embedded_particle_texture = [&](ClassicModelParticleEmitterDef const& emitter)
+        -> std::optional<std::uint16_t>
+      {
+        auto* client_data = Noggit::Application::NoggitApplication::instance()->clientData();
+        auto const model_path = _file_key.hasFilepath() ? _file_key.filepath() : std::string();
+
+        for (auto const& raw_filename : {
+               read_embedded_model_string(f, emitter.ofsParticleFileName, emitter.nParticleFileName),
+               read_embedded_model_string(f, emitter.ofsModelFileName, emitter.nModelFileName)})
+        {
+          auto texture_filename = normalize_embedded_particle_texture_filename(raw_filename, model_path);
+          if (texture_filename.empty())
+          {
+            continue;
+          }
+
+          if (!client_data->exists(texture_filename))
+          {
+            continue;
+          }
+
+          auto existing_texture = std::find(_textureFilenames.begin(), _textureFilenames.end(), texture_filename);
+          if (existing_texture != _textureFilenames.end())
+          {
+            return static_cast<std::uint16_t>(std::distance(_textureFilenames.begin(), existing_texture));
+          }
+
+          if (_textureFilenames.size() >= static_cast<std::size_t>(std::numeric_limits<std::uint16_t>::max()))
+          {
+            return std::nullopt;
+          }
+
+          _textureFilenames.push_back(texture_filename);
+          _specialTextures.push_back(-1);
+          return static_cast<std::uint16_t>(_textureFilenames.size() - 1);
+        }
+
+        return std::nullopt;
+      };
+
+      for (std::size_t i = 0; i < header.nParticleEmitters; ++i)
+      {
+        ClassicModelParticleEmitterDef emitter = pdefs[i];
+        if (emitter.texture < 0
+            || static_cast<std::size_t>(emitter.texture) >= _textureFilenames.size())
+        {
+          if (auto embedded_texture = resolve_embedded_particle_texture(emitter))
+          {
+            emitter.texture = static_cast<int16_t>(*embedded_texture);
+          }
+          else
+          {
+            if (classic_effect_debug_enabled())
+            {
+              LogDebug << "Skipping classic M2 particle emitter model='" << _file_key.stringRepr()
+                       << "' index=" << i
+                       << " reason=invalidTexture"
+                       << " texture=" << emitter.texture
+                       << " textureCount=" << _textureFilenames.size()
+                       << " particleFile='"
+                       << read_embedded_model_string(f, emitter.ofsParticleFileName, emitter.nParticleFileName)
+                       << "' modelFile='"
+                       << read_embedded_model_string(f, emitter.ofsModelFileName, emitter.nModelFileName)
+                       << "'"
+                       << std::endl;
+            }
+            continue;
+          }
+        }
+
+        emitter.rows = clamp_classic_particle_int16(emitter.rows, 1, 16);
+        emitter.cols = clamp_classic_particle_int16(emitter.cols, 1, 16);
+        emitter.blend = static_cast<std::uint16_t>(std::clamp(static_cast<int>(emitter.blend), 0, 4));
+        if (emitter.EmitterType != 1 && emitter.EmitterType != 2)
+        {
+          emitter.EmitterType = 1;
+        }
+        sanitize_classic_particle_animation_block(emitter.EmissionSpeed, header.nGlobalSequences);
+        sanitize_classic_particle_animation_block(emitter.SpeedVariation, header.nGlobalSequences);
+        sanitize_classic_particle_animation_block(emitter.VerticalRange, header.nGlobalSequences);
+        sanitize_classic_particle_animation_block(emitter.HorizontalRange, header.nGlobalSequences);
+        sanitize_classic_particle_animation_block(emitter.Gravity, header.nGlobalSequences);
+        sanitize_classic_particle_animation_block(emitter.Lifespan, header.nGlobalSequences);
+        sanitize_classic_particle_animation_block(emitter.EmissionRate, header.nGlobalSequences);
+        sanitize_classic_particle_animation_block(emitter.EmissionAreaLength, header.nGlobalSequences);
+        sanitize_classic_particle_animation_block(emitter.EmissionAreaWidth, header.nGlobalSequences);
+        sanitize_classic_particle_animation_block(emitter.Gravity2, header.nGlobalSequences);
+        sanitize_classic_particle_animation_block(emitter.en, header.nGlobalSequences);
+
+        try
+        {
+          _particles.emplace_back(this, f, emitter, _global_sequences.data(), _context);
+          parsed_classic_effect_particles = true;
+
+          if (classic_effect_debug_enabled())
+          {
+            LogDebug << "Loaded classic M2 particle emitter model='" << _file_key.stringRepr()
+                     << "' index=" << i
+                     << " texture=" << emitter.texture
+                     << " textureFile='" << _textureFilenames[static_cast<std::size_t>(emitter.texture)] << "'"
+                     << " type=" << static_cast<int>(emitter.EmitterType)
+                     << " particleType=" << static_cast<int>(emitter.ParticleType)
+                     << " headOrTail=" << static_cast<int>(emitter.HeadorTail)
+                     << " flags=" << emitter.flags
+                     << " blend=" << static_cast<int>(emitter.blend)
+                     << " tiles=" << emitter.cols << "x" << emitter.rows
+                     << std::endl;
+          }
+        }
+        catch (std::exception const& error)
+        {
+          if (classic_effect_debug_enabled())
+          {
+            LogDebug << "Skipping classic M2 particle emitter model='" << _file_key.stringRepr()
+                     << "' index=" << i
+                     << " error=" << error.what()
+                     << std::endl;
+          }
+        }
+      }
+    }
+    else if (classic_effect_debug_enabled())
+    {
+      LogDebug << "Classic M2 particle range rejected model='" << _file_key.stringRepr()
+               << "' particles=" << header.nParticleEmitters
+               << " offset=" << header.ofsParticleEmitters
+               << " fileSize=" << f.getSize()
+               << std::endl;
+    }
+  }
+
   if (_uses_classic_layout
       && classic_m2_debug_enabled()
-      && (header.nParticleEmitters || header.nRibbonEmitters || header.nLights))
+      && (header.nParticleEmitters || header.nRibbonEmitters || header.nLights)
+      && _particles.empty())
   {
-    LogDebug << "Skipping classic M2 effects model='" << _file_key.stringRepr()
+    LogDebug << "Classic M2 effects not loaded model='" << _file_key.stringRepr()
              << "' particles=" << header.nParticleEmitters
              << " ribbons=" << header.nRibbonEmitters
              << " lights=" << header.nLights << std::endl;
@@ -1481,8 +1902,22 @@ void Model::animate(glm::mat4x4 const& model_view, int anim_id, int anim_time)
   {
     if (_animations_seq_per_id.empty() || _animations_seq_per_id[anim_id].empty())
     {
+      _current_anim_seq = 0;
+      _anim_time = 0;
+      _global_animtime = anim_time;
       calcClassicStaticBones(model_view);
       _renderer.updateBoneMatrices();
+      for (auto& particle : _particles)
+      {
+        particle.setup(_current_anim_seq, _anim_time, _global_animtime);
+      }
+      // Texture animations (lava falls, scrolling streams, fire) are usually driven by
+      // global sequences and must keep advancing even though this classic model has no
+      // skeletal animation sequences. Without this loop they stay frozen.
+      for (auto& tex_anim : _texture_animations)
+      {
+        tex_anim.calc(_current_anim_seq, _anim_time, _global_animtime);
+      }
       return;
     }
   }
@@ -1492,6 +1927,10 @@ void Model::animate(glm::mat4x4 const& model_view, int anim_id, int anim_time)
   }
 
   int tmax = _animation_length[anim_id];
+  if (tmax <= 0)
+  {
+    tmax = 1;
+  }
   int t = anim_time % tmax;
   int current_sub_anim = 0;
   int time_for_anim = t;
@@ -1597,7 +2036,6 @@ void Model::animate(glm::mat4x4 const& model_view, int anim_id, int anim_time)
     }
   }
 
-  /*
   for (auto& particle : _particles)
   {
     // random time distribution for teh win ..?
@@ -1605,16 +2043,16 @@ void Model::animate(glm::mat4x4 const& model_view, int anim_id, int anim_time)
     particle.setup(_current_anim_seq, pt, _global_animtime);
   }
 
-  for (size_t i = 0; i<header.nRibbonEmitters; ++i) 
+  for (std::size_t i = 0; i < _ribbons.size(); ++i)
   {
     _ribbons[i].setup(_current_anim_seq, t, _global_animtime);
   }
 
-   */
-
   for (auto& tex_anim : _texture_animations)
   {
-    tex_anim.calc(_current_anim_seq, t, _anim_time);
+    // global-sequence texture anims (lava falls etc.) advance on the continuous global
+    // clock, not the model's looped animation time (which getValue ignores for them).
+    tex_anim.calc(_current_anim_seq, t, _global_animtime);
   }
 }
 
@@ -1641,6 +2079,10 @@ ModelColor::ModelColor(const BlizzardArchive::ClientFile& f, const ModelColorDef
 {}
 
 ModelTransparency::ModelTransparency(const BlizzardArchive::ClientFile& f, const ModelTransDef &mcd, int *global)
+  : trans (mcd.trans, f, global)
+{}
+
+ModelTransparency::ModelTransparency(const BlizzardArchive::ClientFile& f, const ClassicModelTransDef &mcd, int *global)
   : trans (mcd.trans, f, global)
 {}
 
@@ -1688,6 +2130,13 @@ void ModelLight::setup(int time, OpenGL::light, int animtime)
 }
 
 TextureAnim::TextureAnim (const BlizzardArchive::ClientFile& f, const ModelTexAnimDef &mta, int *global)
+  : trans (mta.trans, f, global)
+  , rot (mta.rot, f, global)
+  , scale (mta.scale, f, global)
+  , mat (glm::mat4x4())
+{}
+
+TextureAnim::TextureAnim (const BlizzardArchive::ClientFile& f, const ClassicModelTexAnimDef &mta, int *global)
   : trans (mta.trans, f, global)
   , rot (mta.rot, f, global)
   , scale (mta.scale, f, global)
@@ -1796,7 +2245,7 @@ void Bone::calcMatrix(glm::mat4x4 const& model_view
       }
       glm::vec3 rot_euler = glm::eulerAngles(q);
 
-      glm::vec3 test_rot_vec = glm::vec3(rot_euler[2], 
+      glm::vec3 test_rot_vec = glm::vec3(rot_euler[2],
         -(rot_euler[1] + glm::radians(180.f)),
         -(rot_euler[0] + glm::radians(180.f)));
 
@@ -1936,13 +2385,26 @@ void Model::lightsOff(OpenGL::light lbase)
 
 void Model::updateEmitters(float dt)
 {
-  return;
-
   if (finished)
   {
     for (auto& particle : _particles)
     {
       particle.update (dt);
+    }
+
+    // Texture animations (lava falls, scrolling streams) are global-sequence driven and
+    // must advance every frame. Some classic models (e.g. blackrocklavafalls) are never
+    // added to the mesh draw bucket, so Model::animate() never runs for them and their
+    // texture-anim matrices stay frozen. updateEmitters runs for every loaded model, so
+    // drive the texture animations here on a continuous accumulated clock.
+    if (!_texture_animations.empty())
+    {
+      _emitter_anim_accum_ms += dt * 1000.0f;
+      int const animtime = static_cast<int>(_emitter_anim_accum_ms);
+      for (auto& tex_anim : _texture_animations)
+      {
+        tex_anim.calc(_current_anim_seq, _anim_time, animtime);
+      }
     }
   }
 }

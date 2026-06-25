@@ -46,7 +46,7 @@ vec2 sphere_map(vec3 vert, vec3 norm)
   return ((normalize(temp).xy * 0.5) + vec2(0.5));
 }
 
-vec2 get_texture_uv(int tex_unit_lookup, vec3 vert, vec3 norm)
+vec2 get_texture_uv(int tex_unit_lookup, vec3 vert, vec3 norm, mat4 tex_matrix)
 {
   if(tex_unit_lookup == 0)
   {
@@ -54,11 +54,11 @@ vec2 get_texture_uv(int tex_unit_lookup, vec3 vert, vec3 norm)
   }
   else if(tex_unit_lookup == 1)
   {
-    return (transpose(tex_matrix_1) * vec4(texcoord1, 0.0, 1.0)).xy;
+    return (tex_matrix * vec4(texcoord1, 0.0, 1.0)).xy;
   }
   else if(tex_unit_lookup == 2)
   {
-    return (transpose(tex_matrix_2) * vec4(texcoord2, 0.0, 1.0)).xy;
+    return (tex_matrix * vec4(texcoord2, 0.0, 1.0)).xy;
   }
   else
   {
@@ -89,26 +89,37 @@ void main()
 
   if (anim_bones)
   {
-    boneTransformMat += (float(bones_weight.x) / 255.0) * get_bone_matrix(bones_indices.x);
-    boneTransformMat += (float(bones_weight.y) / 255.0) * get_bone_matrix(bones_indices.y);
-    boneTransformMat += (float(bones_weight.z) / 255.0) * get_bone_matrix(bones_indices.z);
-    boneTransformMat += (float(bones_weight.w) / 255.0) * get_bone_matrix(bones_indices.w);
+    float total_weight = float(bones_weight.x + bones_weight.y + bones_weight.z + bones_weight.w);
+    if (total_weight > 0.0)
+    {
+      boneTransformMat += (float(bones_weight.x) / total_weight) * get_bone_matrix(bones_indices.x);
+      boneTransformMat += (float(bones_weight.y) / total_weight) * get_bone_matrix(bones_indices.y);
+      boneTransformMat += (float(bones_weight.z) / total_weight) * get_bone_matrix(bones_indices.z);
+      boneTransformMat += (float(bones_weight.w) / total_weight) * get_bone_matrix(bones_indices.w);
+    }
+    else
+    {
+      boneTransformMat = mat4(1);
+    }
   }
   else
   {
     boneTransformMat = mat4(1);
   }
 
-  mat4 cameraMatrix = model_view * transform * boneTransformMat;
-  mat3 normMatrix = mat3(transform * boneTransformMat);
+  mat4 modelMatrix = transform * boneTransformMat;
+  mat4 cameraMatrix = model_view * modelMatrix;
+  mat3 normMatrix = mat3(modelMatrix);
+  mat3 cameraNormMatrix = mat3(cameraMatrix);
 
   vec4 vertex = cameraMatrix * pos;
 
   // important to normalize because of the scaling !!
   norm = normalize(normMatrix * normal);
+  vec3 camera_norm = normalize(cameraNormMatrix * normal);
 
-  uv1 = get_texture_uv(tex_unit_lookup_1, vertex.xyz, norm);
-  uv2 = get_texture_uv(tex_unit_lookup_2, vertex.xyz, norm);
+  uv1 = get_texture_uv(tex_unit_lookup_1, vertex.xyz, camera_norm, tex_matrix_1);
+  uv2 = get_texture_uv(tex_unit_lookup_2, vertex.xyz, camera_norm, tex_matrix_2);
 
   camera_dist = -vertex.z;
   gl_Position = projection * vertex;

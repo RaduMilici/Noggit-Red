@@ -31,6 +31,7 @@ class Model;
 
 namespace Noggit::Rendering
 {
+  class LiquidTextureManager;
   class WMOGroupRender;
   class WMORender;
 }
@@ -171,14 +172,12 @@ public:
 
   void load();
 
-  /*
   void drawLiquid ( glm::mat4x4 const& transform
-                  , liquid_render& render
+                  , OpenGL::Scoped::use_program& water_shader
+                  , Noggit::Rendering::LiquidTextureManager& texture_manager
                   , bool draw_fog
                   , int animtime
                   );
-
-  */
 
   void setupFog (bool draw_fog, std::function<void (bool)> setup_fog);
 
@@ -209,6 +208,9 @@ public:
 
   [[nodiscard]]
   bool is_indoor() const { return header.flags.indoor; }
+
+  [[nodiscard]]
+  std::uint32_t wmo_area_table_group_id() const { return header.id; }
 
   [[nodiscard]]
   Noggit::Rendering::WMOGroupRender* renderer() { return &_renderer; };

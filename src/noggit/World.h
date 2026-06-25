@@ -100,6 +100,27 @@ public:
     CreatureSpawnOverlay& operator=(CreatureSpawnOverlay const&) = delete;
   };
 
+  struct GameObjectSpawnOverlay
+  {
+    std::uint32_t guid = 0;
+    std::uint32_t entry = 0;
+    std::uint32_t display_id = 0;
+    std::string name;
+    glm::vec3 pos = glm::vec3(0.0f);
+    float orientation = 0.0f;
+    int animation_time_offset = 0;
+    float template_scale = 1.0f;
+    std::string model_path;
+    bool model_create_failed = false;
+    std::optional<ModelInstance> model_instance;
+
+    GameObjectSpawnOverlay() = default;
+    GameObjectSpawnOverlay(GameObjectSpawnOverlay&&) noexcept = default;
+    GameObjectSpawnOverlay& operator=(GameObjectSpawnOverlay&&) noexcept = default;
+    GameObjectSpawnOverlay(GameObjectSpawnOverlay const&) = delete;
+    GameObjectSpawnOverlay& operator=(GameObjectSpawnOverlay const&) = delete;
+  };
+
 protected:
   std::vector<selection_type> _current_selection;
   // std::unordered_map<std::string, std::vector<ModelInstance*>> _models_by_filename;
@@ -137,6 +158,7 @@ public:
   void update_models_emitters(float dt);
 
   unsigned int getAreaID (glm::vec3 const&);
+  unsigned int getWMOAreaID(glm::vec3 const&);
   void setAreaID(glm::vec3 const& pos, int id, bool adt,  float radius = -1.0f);
 
   Noggit::NoggitRenderContext getRenderContext() { return _context; };
@@ -452,6 +474,7 @@ public:
   void ensureCreatureSpawnsLoaded();
   void clearCreatureSpawns();
   bool ensureCreatureSpawnModel(CreatureSpawnOverlay& spawn);
+  bool ensureGameObjectSpawnModel(GameObjectSpawnOverlay& spawn);
   std::vector<std::pair<std::size_t, std::string>> applyCreatureSpawnModelAppearance(CreatureSpawnOverlay const& spawn,
                                                                                      ModelInstance& model_instance,
                                                                                      Noggit::NoggitRenderContext context) const;
@@ -464,6 +487,8 @@ public:
   std::string const& creatureSpawnStatus() const { return _creature_spawn_status; }
   std::vector<CreatureSpawnOverlay>& creatureSpawns() { return _creature_spawns; }
   std::vector<CreatureSpawnOverlay> const& creatureSpawns() const { return _creature_spawns; }
+  std::vector<GameObjectSpawnOverlay>& gameObjectSpawns() { return _gameobject_spawns; }
+  std::vector<GameObjectSpawnOverlay> const& gameObjectSpawns() const { return _gameobject_spawns; }
   CreatureSpawnOverlay* findCreatureSpawn(std::uint32_t guid);
   CreatureSpawnOverlay const* findCreatureSpawn(std::uint32_t guid) const;
 
@@ -488,6 +513,7 @@ protected:
   bool _creature_spawns_load_attempted = false;
   std::string _creature_spawn_status;
   std::vector<CreatureSpawnOverlay> _creature_spawns;
+  std::vector<GameObjectSpawnOverlay> _gameobject_spawns;
 
   std::array<std::pair<std::pair<int, int>, MapTile*>, 64 * 64 > _loaded_tiles_buffer;
 

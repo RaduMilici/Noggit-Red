@@ -51,6 +51,8 @@ WMOInstance::WMOInstance(BlizzardArchive::Listfile::FileKey const& file_key, Nog
 
 
 void WMOInstance::draw ( OpenGL::Scoped::use_program& wmo_shader
+                       , OpenGL::program* wmo_liquid_program
+                       , Noggit::Rendering::LiquidTextureManager* liquid_texture_manager
                        , glm::mat4x4 const& model_view
                        , glm::mat4x4 const& projection
                        , math::frustum const& frustum
@@ -107,6 +109,8 @@ void WMOInstance::draw ( OpenGL::Scoped::use_program& wmo_shader
     wmo_shader.uniform("transform", _transform_mat);
 
     wmo->renderer()->draw( wmo_shader
+              , wmo_liquid_program
+              , liquid_texture_manager
               , model_view
               , projection
               , _transform_mat

@@ -98,6 +98,7 @@ public:
 
   void calc(int anim, int time, int animtime);
   TextureAnim(const BlizzardArchive::ClientFile& f, const ModelTexAnimDef &mta, int *global);
+  TextureAnim(const BlizzardArchive::ClientFile& f, const ClassicModelTexAnimDef &mta, int *global);
 };
 
 struct ModelColor {
@@ -111,6 +112,7 @@ struct ModelTransparency {
   Animation::M2Value<float, int16_t> trans;
 
   ModelTransparency(const BlizzardArchive::ClientFile& f, const ModelTransDef &mtd, int *global);
+  ModelTransparency(const BlizzardArchive::ClientFile& f, const ClassicModelTransDef &mtd, int *global);
 };
 
 
@@ -139,6 +141,8 @@ class Model : public AsyncObject
   friend class Noggit::Rendering::ModelRender;
   friend struct Noggit::Rendering::ModelRenderPass;
   friend class Noggit::Rendering::WorldRender;
+  friend class ParticleSystem;
+  friend class RibbonEmitter;
 
 public:
   template<typename T>
@@ -285,6 +289,7 @@ private:
 
   std::vector<int> _global_sequences;
   std::vector<TextureAnim> _texture_animations;
+  float _emitter_anim_accum_ms = 0.f; // continuous clock to drive texture anims for models that never reach animate()
   std::vector<int16_t> _texture_animation_lookups;
   std::vector<uint16_t> _texture_lookup;
 
@@ -293,7 +298,6 @@ private:
   // ===============================
   std::vector<ModelColor> _colors;
   std::vector<ModelTransparency> _transparency;
-  std::vector<float> _classic_transparency_values;
   std::vector<int16_t> _transparency_lookup;
   std::vector<ModelLight> _lights;
 

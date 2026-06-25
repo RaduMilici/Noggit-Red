@@ -560,6 +560,7 @@ private:
   void translateSelectedCreatureSpawns(glm::vec3 const& delta);
   void updateSelectedCreatureSpawnPosition(glm::vec3 const& pos);
   void showSelectedCreatureSpawnMenu(QPoint const& global_pos);
+  void discardPendingCreatureSpawns();
   void saveDirtyCreatureSpawns();
   void jumpToCreatureListItem(QListWidgetItem* item);
 

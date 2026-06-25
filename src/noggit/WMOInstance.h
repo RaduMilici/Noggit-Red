@@ -10,6 +10,11 @@
 
 struct ENTRY_MODF;
 
+namespace Noggit::Rendering
+{
+  class LiquidTextureManager;
+}
+
 class WMOInstance : public SceneObject
 {
 public:
@@ -84,6 +89,8 @@ public:
   }
 
   void draw ( OpenGL::Scoped::use_program& wmo_shader
+            , OpenGL::program* wmo_liquid_program
+            , Noggit::Rendering::LiquidTextureManager* liquid_texture_manager
             , glm::mat4x4 const& model_view
             , glm::mat4x4 const& projection
             , math::frustum const& frustum

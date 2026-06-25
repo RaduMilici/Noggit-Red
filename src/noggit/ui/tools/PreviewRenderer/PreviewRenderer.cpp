@@ -46,6 +46,9 @@ PreviewRenderer::PreviewRenderer(int width, int height, Noggit::NoggitRenderCont
   OpenGL::context::scoped_setter const context_set (::gl, &_offscreen_context);
 
   _light_dir = glm::vec3(0.0f, 1.0f, 0.0f);
+  _diffuse_light = {1.0f, 0.532352924f, 0.0f};
+  _ambient_light = {0.407770514f, 0.508424163f, 0.602650642f};
+  _background_color = {0.5f, 0.5f, 0.5f};
 }
 
 void PreviewRenderer::setModel(std::string const &filename)
@@ -113,13 +116,33 @@ void PreviewRenderer::setModelOffscreen(std::string const& filename)
 void PreviewRenderer::resetCamera(float x, float y, float z, float roll, float yaw, float pitch)
 {
   _camera.reset(x, y, z, roll, yaw, pitch);
-  float radius = 0.f;
 
   std::vector<glm::vec3> extents = calcSceneExtents();
-  _camera.position = (extents[0] + extents[1]) / 2.0f;
-  radius = std::max(glm::distance(_camera.position, extents[0]), glm::distance(_camera.position, extents[1]));
+  auto const valid_vec = [](glm::vec3 const& value)
+  {
+    return std::isfinite(value.x) && std::isfinite(value.y) && std::isfinite(value.z);
+  };
 
-  float distance_factor = abs( radius / sin(_camera.fov()._ / 2.f));
+  if (!valid_vec(extents[0]) || !valid_vec(extents[1])
+      || extents[0].x > extents[1].x
+      || extents[0].y > extents[1].y
+      || extents[0].z > extents[1].z)
+  {
+    return;
+  }
+
+  _camera.position = (extents[0] + extents[1]) / 2.0f;
+  float radius = std::max(glm::distance(_camera.position, extents[0]), glm::distance(_camera.position, extents[1]));
+  if (!std::isfinite(radius) || radius < 1.0f)
+  {
+    radius = 1.0f;
+  }
+
+  float distance_factor = std::abs(radius / std::sin(_camera.fov()._ / 2.f));
+  if (!std::isfinite(distance_factor))
+  {
+    distance_factor = radius * 2.0f;
+  }
   _camera.move_forward_factor(-1.f, distance_factor);
 
 }
@@ -189,7 +212,7 @@ void PreviewRenderer::draw()
         wmo_instance.wmo->waitForChildrenLoaded();
         wmo_instance.ensureExtents();
         wmo_instance.draw(
-            wmo_program, model_view(), projection(), frustum, culldistance,
+            wmo_program, nullptr, nullptr, model_view(), projection(), frustum, culldistance,
             _camera.position, _draw_boxes.get(), _draw_models.get() 
             , false, std::vector<selection_type>(), 0, false, display_mode::in_3D, true
         );
@@ -219,53 +242,70 @@ void PreviewRenderer::draw()
     if (_draw_animated.get())
       ModelManager::resetAnim();
 
-    OpenGL::Scoped::use_program m2_shader {*_m2_instanced_program.get()};
-
-    OpenGL::M2RenderState model_render_state;
-    model_render_state.tex_arrays = { 0, 0 };
-    model_render_state.tex_indices = { 0, 0 };
-    model_render_state.tex_unit_lookups = { 0, 0 };
-    gl.blendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-    gl.disable(GL_BLEND);
-    gl.depthMask(GL_TRUE);
-    m2_shader.uniform("blend_mode", 0);
-    m2_shader.uniform("unfogged", static_cast<int>(model_render_state.unfogged));
-    m2_shader.uniform("unlit", static_cast<int>(model_render_state.unlit));
-    m2_shader.uniform("tex_unit_lookup_1", 0);
-    m2_shader.uniform("tex_unit_lookup_2", 0);
-    m2_shader.uniform("masked_additive", 0);
-    m2_shader.uniform("pixel_shader", 0);
-
-    std::vector<glm::mat4x4> instance_mtx{ glm::mat4x4(1)};
-
-    for (auto& model_instance : _model_instances)
+    auto setup_m2_render_state = [](OpenGL::Scoped::use_program& m2_shader,
+                                    OpenGL::M2RenderState& model_render_state)
     {
-      model_instance.model->wait_until_loaded();
-      model_instance.model->waitForChildrenLoaded();
+      model_render_state.tex_arrays = { 0, 0 };
+      model_render_state.tex_indices = { 0, 0 };
+      model_render_state.tex_unit_lookups = { 0, 0 };
+      gl.blendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+      gl.disable(GL_BLEND);
+      gl.depthMask(GL_TRUE);
+      gl.enable(GL_CULL_FACE);
+      m2_shader.uniform("blend_mode", 0);
+      m2_shader.uniform("unfogged", static_cast<int>(model_render_state.unfogged));
+      m2_shader.uniform("unlit", static_cast<int>(model_render_state.unlit));
+      m2_shader.uniform("tex_unit_lookup_1", 0);
+      m2_shader.uniform("tex_unit_lookup_2", 0);
+      m2_shader.uniform("masked_additive", 0);
+      m2_shader.uniform("pixel_shader", 0);
+    };
 
-      model_instance.model->renderer()->draw(
-        mv
-        , model_instance
-        , m2_shader
-        , model_render_state
-        , frustum
-        , culldistance
-        , _camera.position
-        , _animtime
-        , display_mode::in_3D
-      );
+    if (!_model_instances.empty())
+    {
+      OpenGL::Scoped::use_program m2_shader {*_m2_program.get()};
+
+      OpenGL::M2RenderState model_render_state;
+      setup_m2_render_state(m2_shader, model_render_state);
+
+      for (auto& model_instance : _model_instances)
+      {
+        model_instance.model->wait_until_loaded();
+        model_instance.model->waitForChildrenLoaded();
+
+        model_instance.model->renderer()->draw(
+          mv
+          , model_instance
+          , m2_shader
+          , model_render_state
+          , frustum
+          , culldistance
+          , _camera.position
+          , _animtime
+          , display_mode::in_3D
+        );
+      }
     }
 
-    for (auto& it : _wmo_doodads)
+    if (!_wmo_doodads.empty())
     {
-      instance_mtx.clear();
-      
-      for (auto& instance : it.second)
-      {
-        instance_mtx.push_back(instance->transformMatrix());
-      }
+      OpenGL::Scoped::use_program m2_shader {*_m2_instanced_program.get()};
 
-      it.second[0]->model->renderer()->draw(
+      OpenGL::M2RenderState model_render_state;
+      setup_m2_render_state(m2_shader, model_render_state);
+
+      std::vector<glm::mat4x4> instance_mtx;
+
+      for (auto& it : _wmo_doodads)
+      {
+        instance_mtx.clear();
+
+        for (auto& instance : it.second)
+        {
+          instance_mtx.push_back(instance->transformMatrix());
+        }
+
+        it.second[0]->model->renderer()->draw(
           mv
           , instance_mtx
           , m2_shader
@@ -277,7 +317,8 @@ void PreviewRenderer::draw()
           , _draw_boxes.get()
           , model_boxes_to_draw
           , display_mode::in_3D
-      );
+        );
+      }
     }
 
 
@@ -382,9 +423,9 @@ std::vector<glm::vec3> PreviewRenderer::calcSceneExtents()
                          std::numeric_limits<float>::max(),
                          std::numeric_limits<float>::max()};
 
-  glm::vec3 max = {std::numeric_limits<float>::min(),
-                         std::numeric_limits<float>::min(),
-                         std::numeric_limits<float>::min()};
+  glm::vec3 max = {std::numeric_limits<float>::lowest(),
+                         std::numeric_limits<float>::lowest(),
+                         std::numeric_limits<float>::lowest()};
 
   for (auto& instance : _model_instances)
   {
@@ -634,8 +675,6 @@ void PreviewRenderer::upload()
     liquid_render.uniform("texture_samplers", samplers);
 
   }
-
-  setModel("world/wmo/azeroth/buildings/human_farm/farm.wmo");
 
   auto background_color = _settings->value("assetBrowser/background_color",
     QVariant::fromValue(QColor(127, 127, 127))).value<QColor>();

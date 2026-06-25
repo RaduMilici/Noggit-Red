@@ -423,13 +423,19 @@ SkyParam::SkyParam(int paramId, Noggit::NoggitRenderContext context)
     {
         DBCFile::Record light_param = gLightParamsDB.getByID(paramId);
         int skybox_id = light_param.getInt(LightParamsDB::skybox);
+        bool const classic_light_params = gLightParamsDB.getFieldCount() == 9;
+        std::size_t const glow_field = classic_light_params ? 3 : LightParamsDB::glow;
+        std::size_t const river_shallow_field = classic_light_params ? 4 : LightParamsDB::water_shallow_alpha;
+        std::size_t const river_deep_field = classic_light_params ? 5 : LightParamsDB::water_deep_alpha;
+        std::size_t const ocean_shallow_field = classic_light_params ? 6 : LightParamsDB::ocean_shallow_alpha;
+        std::size_t const ocean_deep_field = classic_light_params ? 7 : LightParamsDB::ocean_deep_alpha;
 
         _highlight_sky = light_param.getInt(LightParamsDB::highlightSky);
-        _river_shallow_alpha = light_param.getFloat(LightParamsDB::water_shallow_alpha);
-        _river_deep_alpha = light_param.getFloat(LightParamsDB::water_deep_alpha);
-        _ocean_shallow_alpha = light_param.getFloat(LightParamsDB::ocean_shallow_alpha);
-        _ocean_deep_alpha = light_param.getFloat(LightParamsDB::ocean_deep_alpha);
-        _glow = light_param.getFloat(LightParamsDB::glow);
+        _glow = light_param.getFloat(glow_field);
+        _river_shallow_alpha = light_param.getFloat(river_shallow_field);
+        _river_deep_alpha = light_param.getFloat(river_deep_field);
+        _ocean_shallow_alpha = light_param.getFloat(ocean_shallow_field);
+        _ocean_deep_alpha = light_param.getFloat(ocean_deep_field);
 
         if (skybox_id)
         {

@@ -35,6 +35,7 @@
 #include <QtNetwork/QTcpSocket>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <sstream>
 #include <QSysInfo>
 #include <QStandardPaths>
@@ -94,6 +95,16 @@ namespace Noggit::Ui::Windows
       }
 
       return sampled == 0 || non_dark < sampled / 100;
+    }
+
+    bool captureLightingTraceEnabled()
+    {
+      if (char const* value = std::getenv("NOGGIT_CAPTURE_LIGHTING_TRACE"))
+      {
+        return std::string(value) != "0";
+      }
+
+      return false;
     }
   }
 
@@ -515,6 +526,37 @@ namespace Noggit::Ui::Windows
                << std::endl;
     }
 
+    if (char const* value = std::getenv("NOGGIT_CAPTURE_DRAW_FOG"))
+    {
+      _map_view->_draw_fog.set(std::string(value) != "0");
+    }
+
+    if (camera_position)
+    {
+      unsigned int const wmo_area_id = _map_view->getWorld()->getWMOAreaID(*camera_position);
+      unsigned int const terrain_area_id = _map_view->getWorld()->getAreaID(*camera_position);
+      unsigned int const area_id = wmo_area_id != static_cast<unsigned int>(-1) ? wmo_area_id : terrain_area_id;
+      int area_light_id = 0;
+
+      if (area_id != static_cast<unsigned int>(-1)
+          && gAreaDB.getFieldCount() > AreaDB::LightId
+          && gAreaDB.CheckIfIdExists(area_id))
+      {
+        area_light_id = gAreaDB.getByID(area_id).getInt(AreaDB::LightId);
+      }
+
+      std::ofstream trace("I:\\Twow-local\\server_dev\\noggit_captures\\lighting_trace.txt", std::ios::app);
+      trace << "capture-pre-render"
+            << " trace_env=" << (captureLightingTraceEnabled() ? 1 : 0)
+            << " pos=(" << camera_position->x << "," << camera_position->y << "," << camera_position->z << ")"
+            << " draw_fog=" << (_map_view->_draw_fog.get() ? 1 : 0)
+            << " wmo_area=" << wmo_area_id
+            << " terrain_area=" << terrain_area_id
+            << " final_area=" << area_id
+            << " area_light=" << area_light_id
+            << '\n';
+    }
+
     LogDebug << "capture-world-creatures: render frame begin" << std::endl;
     bool const capture_debug = []()
     {
@@ -527,6 +569,13 @@ namespace Noggit::Ui::Windows
     if (capture_debug)
     {
       LogDebug << "capture-world-creatures direct framebuffer render" << std::endl;
+    }
+    _map_view->setCameraDirty();
+    for (int i = 0; i < 40; ++i)
+    {
+      _map_view->getWorld()->animtime += 100.0f;
+      _map_view->getWorld()->update_models_emitters(0.1f);
+      qApp->processEvents();
     }
     _map_view->setCameraDirty();
     LogDebug << "capture-world-creatures: render frame done" << std::endl;

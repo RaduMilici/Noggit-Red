@@ -357,6 +357,23 @@ namespace
 		return fallback;
 	}
 
+	std::string firstColumnExpr(MYSQL* connection,
+	                            char const* table_name,
+	                            char const* alias,
+	                            std::initializer_list<char const*> column_names,
+	                            char const* fallback)
+	{
+		for (auto const* column_name : column_names)
+		{
+			if (tableHasColumn(connection, table_name, column_name))
+			{
+				return std::string(alias) + "." + column_name;
+			}
+		}
+
+		return fallback;
+	}
+
 	std::string buildCreatureTemplateDisplayExpr(MYSQL* connection)
 	{
 		std::vector<std::string> parts;
@@ -368,6 +385,36 @@ namespace
 			if (tableHasColumn(connection, "creature_template", column_name))
 			{
 				parts.emplace_back(std::string("NULLIF(ct.") + column_name + ", 0)");
+			}
+		}
+
+		if (parts.empty())
+		{
+			return "0 AS display_id";
+		}
+
+		std::stringstream expr;
+		expr << "COALESCE(";
+		for (std::size_t i = 0; i < parts.size(); ++i)
+		{
+			expr << parts[i];
+			if (i + 1 < parts.size())
+			{
+				expr << ", ";
+			}
+		}
+		expr << ", 0) AS display_id";
+		return expr.str();
+	}
+
+	std::string buildGameObjectDisplayExpr(MYSQL* connection)
+	{
+		std::vector<std::string> parts;
+		for (auto const* column_name : {"displayId", "displayid", "display_id", "displayID"})
+		{
+			if (tableHasColumn(connection, "gameobject_template", column_name))
+			{
+				parts.emplace_back(std::string("NULLIF(gt.") + column_name + ", 0)");
 			}
 		}
 
@@ -579,6 +626,97 @@ namespace mysql
 			record.mainhand_inventory_type = parseUnsigned(row[14]);
 			record.offhand_inventory_type = parseUnsigned(row[15]);
 			record.ranged_inventory_type = parseUnsigned(row[16]);
+			records.push_back(record);
+		}
+
+		mysql_free_result(result);
+		return records;
+  }
+
+	std::vector<GameObjectSpawnRecord> getGameObjectSpawns(std::size_t mapID, std::string* error)
+	{
+		auto connection = connect(error);
+		if (!connection)
+		{
+			return {};
+		}
+
+		if (!tableExists(connection.get(), "gameobject")
+		    || !tableExists(connection.get(), "gameobject_template")
+		    || !tableHasColumn(connection.get(), "gameobject", "guid")
+		    || !tableHasColumn(connection.get(), "gameobject", "id")
+		    || !tableHasColumn(connection.get(), "gameobject", "map")
+		    || !tableHasColumn(connection.get(), "gameobject_template", "entry"))
+		{
+			if (error)
+			{
+				*error = "gameobject/gameobject_template tables are missing required columns";
+			}
+			return {};
+		}
+
+		auto name_expr = firstColumnExpr(connection.get(),
+		                                "gameobject_template",
+		                                "gt",
+		                                {"name", "Name"},
+		                                "''");
+		auto scale_expr = firstColumnExpr(connection.get(),
+		                                 "gameobject_template",
+		                                 "gt",
+		                                 {"size", "scale"},
+		                                 "1");
+		auto display_expr = buildGameObjectDisplayExpr(connection.get());
+
+		std::stringstream statement;
+		statement
+			<< "SELECT go.guid, go.id, go.map, go.position_x, go.position_y, go.position_z, go.orientation, "
+			<< "COALESCE(" << name_expr << ", '') AS name, "
+			<< "COALESCE(NULLIF(" << scale_expr << ", 0), 1) AS template_scale, "
+			<< display_expr << " "
+			<< "FROM gameobject go "
+			<< "INNER JOIN gameobject_template gt ON gt.entry = go.id "
+			<< "WHERE go.map = " << mapID << " "
+			<< "ORDER BY name, go.guid";
+
+		if (mysql_query(connection.get(), statement.str().c_str()) != 0)
+		{
+			if (error)
+			{
+				*error = mysql_error(connection.get());
+			}
+			return {};
+		}
+
+		MYSQL_RES* result = mysql_store_result(connection.get());
+		if (!result)
+		{
+			if (error)
+			{
+				*error = mysql_error(connection.get());
+			}
+			return {};
+		}
+
+		std::vector<GameObjectSpawnRecord> records;
+		records.reserve(static_cast<std::size_t>(mysql_num_rows(result)));
+
+		while (MYSQL_ROW row = mysql_fetch_row(result))
+		{
+			GameObjectSpawnRecord record;
+			record.guid = parseUnsigned(row[0]);
+			record.entry = parseUnsigned(row[1]);
+			record.map = parseUnsigned(row[2]);
+			record.position_x = parseFloat(row[3]);
+			record.position_y = parseFloat(row[4]);
+			record.position_z = parseFloat(row[5]);
+			record.orientation = parseFloat(row[6]);
+			record.name = parseString(row[7]);
+			record.template_scale = parseFloat(row[8]);
+			record.display_id = parseUnsigned(row[9]);
+			if (record.template_scale <= 0.0f)
+			{
+				record.template_scale = 1.0f;
+			}
 			records.push_back(record);
 		}
 

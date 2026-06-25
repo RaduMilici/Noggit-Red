@@ -479,7 +479,18 @@ void MapView::set_editing_mode(editing_mode mode)
 
 void MapView::setToolPropertyWidgetVisibility(editing_mode mode)
 {
-  _tool_panel_dock->setCurrentIndex(static_cast<int>(mode));
+  bool const creature_mode = mode == editing_mode::creature;
+  _main_window->setCorner(Qt::BottomRightCorner,
+                          creature_mode ? Qt::BottomDockWidgetArea : Qt::RightDockWidgetArea);
+
+  if (_tool_panel_dock)
+  {
+    _tool_panel_dock->setVisible(!ui_hidden && !creature_mode);
+    if (!creature_mode)
+    {
+      _tool_panel_dock->setCurrentIndex(static_cast<int>(mode));
+    }
+  }
 
   auto set_creature_docks_visible = [](bool visible, std::initializer_list<QDockWidget*> docks)
   {
@@ -520,6 +531,23 @@ void MapView::setToolPropertyWidgetVisibility(editing_mode mode)
                                {_creature_browser_dock,
                                 _creature_editor_dock,
                                 _creature_model_picker_dock});
+    if (!ui_hidden && _show_creature_browser.get())
+    {
+      if (_creature_browser_dock && _creature_editor_dock)
+      {
+        _main_window->resizeDocks({_creature_browser_dock, _creature_editor_dock},
+                                  {3, 1},
+                                  Qt::Vertical);
+      }
+      if (_creature_browser_dock)
+      {
+        _main_window->resizeDocks({_creature_browser_dock}, {330}, Qt::Horizontal);
+      }
+      if (_creature_model_picker_dock)
+      {
+        _main_window->resizeDocks({_creature_model_picker_dock}, {260}, Qt::Vertical);
+      }
+    }
     break;
   case editing_mode::paint:
     _texture_browser_dock->setVisible(!ui_hidden && _settings->value("map_view/texture_browser", false).toBool());
@@ -1121,7 +1149,7 @@ void MapView::setupCreatureEditorUi()
       static_cast<float>(_spawn_edit_x->value()),
       static_cast<float>(_spawn_edit_y->value()),
       static_cast<float>(_spawn_edit_z->value()));
-    spawn->orientation = static_cast<float>(glm::radians(_spawn_edit_orientation->value()));
+    spawn->orientation = static_cast<float>(_spawn_edit_orientation->value());
     spawn->dirty = spawn->pending_create
                 || glm::distance(spawn->pos, spawn->original_pos) > 0.01f
                 || std::abs(spawn->orientation - spawn->original_orientation) > 0.01f;
@@ -1198,14 +1226,15 @@ void MapView::setupCreatureBrowserUi()
   connect(&_show_creature_browser, &Noggit::BoolToggleProperty::changed,
           [this](bool visible)
           {
-            if (ui_hidden)
+            bool const show = visible && !ui_hidden && terrainMode == editing_mode::creature;
+            if (ui_hidden && visible)
             {
               return;
             }
 
             if (_creature_actions_overlay)
             {
-              _creature_actions_overlay->setVisible(visible);
+              _creature_actions_overlay->setVisible(show);
             }
 
             for (auto* dock : {_creature_browser_dock,
@@ -1214,7 +1243,7 @@ void MapView::setupCreatureBrowserUi()
             {
               if (dock)
               {
-                dock->setVisible(visible);
+                dock->setVisible(show);
               }
             }
           });
@@ -1287,7 +1316,7 @@ void MapView::setupCreatureActionsUi()
   connect(revert_button, &QPushButton::clicked,
           [this]()
           {
-            refreshCreatureSpawnOverlay(true);
+            discardPendingCreatureSpawns();
           });
 }
 
@@ -1410,8 +1439,10 @@ void MapView::setupCreatureModelPickerUi()
       model_id = display.getUInt(CreatureDisplayInfoDB::ModelID);
       auto model = gCreatureModelDataDB.getByID(model_id);
       model_path = normalize_picker_path(model.getString(CreatureModelDataDB::ModelName));
-      auto const scale = model.getFloat(CreatureModelDataDB::ModelScale);
-      model_scale = scale > 0.0f ? scale : 1.0f;
+      auto const display_scale = display.getFloat(CreatureDisplayInfoDB::CreatureModelScale);
+      auto const model_data_scale = model.getFloat(CreatureModelDataDB::ModelScale);
+      model_scale = (display_scale > 0.0f ? display_scale : 1.0f)
+                  * (model_data_scale > 0.0f ? model_data_scale : 1.0f);
       return !model_path.empty();
     }
     catch (DBCFile::NotFound const&)
@@ -3401,7 +3432,7 @@ void MapView::refreshCreatureEditorKnobs()
   _spawn_edit_x->setValue(static_cast<double>(spawn->pos.x));
   _spawn_edit_y->setValue(static_cast<double>(spawn->pos.y));
   _spawn_edit_z->setValue(static_cast<double>(spawn->pos.z));
-  _spawn_edit_orientation->setValue(static_cast<double>(glm::degrees(spawn->orientation)));
+  _spawn_edit_orientation->setValue(static_cast<double>(spawn->orientation));
 
   for (auto* w : {_spawn_edit_x, _spawn_edit_y, _spawn_edit_z, _spawn_edit_orientation})
   {
@@ -3688,6 +3719,91 @@ void MapView::showSelectedCreatureSpawnMenu(QPoint const& global_pos)
   {
     saveDirtyCreatureSpawns();
   }
+}
+
+void MapView::discardPendingCreatureSpawns()
+{
+  auto dirty_count = _world->dirtyCreatureSpawnCount();
+  if (dirty_count == 0)
+  {
+    _main_window->statusBar()->showMessage("No creature spawn changes to discard", 4000);
+    updateCreatureBrowserStatus();
+    return;
+  }
+
+  _selected_creature_spawn_guid = std::nullopt;
+  _hovered_creature_spawn_guid = std::nullopt;
+  _dragging_creature_spawn = false;
+  _creature_drag_anchor_pos = std::nullopt;
+  _creature_drag_initial_positions.clear();
+
+  std::size_t removed_new = 0;
+  std::size_t reverted_existing = 0;
+
+  try
+  {
+    makeCurrent();
+    OpenGL::context::scoped_setter const _ (::gl, context());
+
+    auto& spawns = _world->creatureSpawns();
+    for (auto& spawn : spawns)
+    {
+      spawn.selected = false;
+      spawn.hovered = false;
+
+      if (!spawn.dirty || spawn.pending_create)
+      {
+        continue;
+      }
+
+      spawn.pos = spawn.original_pos;
+      spawn.orientation = spawn.original_orientation;
+      spawn.dirty = false;
+      if (spawn.model_instance)
+      {
+        spawn.model_instance->pos = spawn.pos;
+        spawn.model_instance->dir = glm::vec3(0.0f, spawn.orientation, 0.0f);
+        spawn.model_instance->recalcExtents();
+      }
+      ++reverted_existing;
+    }
+
+    auto pending_begin = std::remove_if(spawns.begin(), spawns.end(),
+      [&removed_new](World::CreatureSpawnOverlay const& spawn)
+      {
+        if (!spawn.pending_create)
+        {
+          return false;
+        }
+
+        ++removed_new;
+        return true;
+      });
+    spawns.erase(pending_begin, spawns.end());
+  }
+  catch (std::exception const& ex)
+  {
+    _main_window->statusBar()->showMessage(QString("Failed to discard creature spawn changes: %1").arg(ex.what()), 7000);
+    updateCreatureBrowserStatus();
+    return;
+  }
+  catch (...)
+  {
+    _main_window->statusBar()->showMessage("Failed to discard creature spawn changes: unknown error", 7000);
+    updateCreatureBrowserStatus();
+    return;
+  }
+
+  rebuildCreatureBrowserList(false);
+  refreshCreatureEditorKnobs();
+  updateDatabaseStatus();
+  _needs_redraw = true;
+
+  _main_window->statusBar()->showMessage(
+    QString("Discarded %1 pending creature spawn(s), reverted %2 edited spawn(s)")
+      .arg(removed_new)
+      .arg(reverted_existing),
+    5000);
 }
 
 void MapView::saveDirtyCreatureSpawns()
@@ -5853,10 +5969,10 @@ void MapView::tick (float dt)
   // _minimap->update(); // causes massive performance issues
 
   _world->time += this->mTimespeed * dt;
-  if (_draw_model_animations.get())
-  {
-    _world->animtime += dt * 1000.0f;
-  }
+  // animtime must advance every frame (matches reference noggit3). It drives liquid
+  // texture-frame cycling (lava/water churn) which must animate regardless of the model
+  // animation toggle. Gating it here is what froze all lava.
+  _world->animtime += dt * 1000.0f;
 
   lightEditor->UpdateWorldTime();
 

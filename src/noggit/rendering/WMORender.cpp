@@ -3,6 +3,8 @@
 #include "WMORender.hpp"
 #include <noggit/WMO.h>
 
+#include <vector>
+
 using namespace Noggit::Rendering;
 
 WMORender::WMORender(WMO* wmo)
@@ -24,6 +26,8 @@ void WMORender::unload()
 }
 
 void WMORender::draw(OpenGL::Scoped::use_program& wmo_shader
+    , OpenGL::program* wmo_liquid_program
+    , LiquidTextureManager* liquid_texture_manager
     , glm::mat4x4 const& model_view
     , glm::mat4x4 const& projection
     , glm::mat4x4 const& transform_matrix
@@ -48,6 +52,9 @@ void WMORender::draw(OpenGL::Scoped::use_program& wmo_shader
 
   wmo_shader.uniform("ambient_color",glm::vec3(_wmo->ambient_light_color));
 
+  std::vector<WMOGroup*> visible_groups;
+  visible_groups.reserve(_wmo->groups.size());
+
   for (auto& group : _wmo->groups)
   {
       if (interior_only && !group.is_indoor())
@@ -55,30 +62,36 @@ void WMORender::draw(OpenGL::Scoped::use_program& wmo_shader
           continue;
       }
 
-    /*
     if (!group.is_visible(transform_matrix, frustum, cull_distance, camera, display))
     {
       continue;
     }
 
-     */
+    visible_groups.push_back(&group);
+  }
 
-    group.renderer()->draw(wmo_shader
+  for (auto* group : visible_groups)
+  {
+    group->renderer()->draw(wmo_shader
         , frustum
         , cull_distance
         , camera
         , draw_fog
         , world_has_skies
     );
+  }
 
-    /*
-    group.drawLiquid ( transform_matrix_transposed
-                     , render
-                     , draw_fog
-                     , animtime
-                     );
-
-                     */
+  if (wmo_liquid_program && liquid_texture_manager)
+  {
+    OpenGL::Scoped::use_program wmo_liquid_shader{*wmo_liquid_program};
+    for (auto* group : visible_groups)
+    {
+      group->drawLiquid(transform_matrix,
+                        wmo_liquid_shader,
+                        *liquid_texture_manager,
+                        draw_fog,
+                        animtime);
+    }
   }
 
   if (boundingbox)

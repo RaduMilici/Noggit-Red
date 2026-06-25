@@ -117,6 +117,7 @@ namespace Noggit::Rendering
     std::unique_ptr<OpenGL::program> _m2_box_program;
     std::unique_ptr<OpenGL::program> _wmo_program;
     std::unique_ptr<OpenGL::program> _liquid_program;
+    std::unique_ptr<OpenGL::program> _wmo_liquid_program;
     std::unique_ptr<OpenGL::program> _occluder_program;
 
     // horizon && skies && lighting
