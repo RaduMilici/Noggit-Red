@@ -181,7 +181,7 @@ void LiquidTextureManager::upload()
     const unsigned mip_level = tex.mip_level();
     const bool is_uncompressed = !tex.compression_format();
 
-    constexpr unsigned N_FRAMES = 30;
+    constexpr unsigned N_FRAMES = 60; // reference noggit3 allows up to 60 liquid frames
 
     if (is_uncompressed)
     {
@@ -207,7 +207,7 @@ void LiquidTextureManager::upload()
       }
     }
 
-    unsigned n_frames = 30;
+    unsigned n_frames = N_FRAMES;
     for (int j = 0; j < N_FRAMES; ++j)
     {
       if (!client_data->exists(filename + std::to_string((j + 1)) + ".blp"))
@@ -252,7 +252,13 @@ void LiquidTextureManager::upload()
     }
   }
 
-  apply_real_classic_liquid_aliases(_texture_frames_map);
+  // The classic id->shader-type aliases (ids 3/4/21 -> magma/slime) are a vanilla 1.12
+  // crutch. Only apply them for the classic DBC layout so they can never clobber a real
+  // (3.3.5a) LiquidType.dbc, which carries a correct Type field and the TextureFilenames column.
+  if (gLiquidTypeDB.getFieldCount() <= LiquidTypeDB::TextureFilenames)
+  {
+    apply_real_classic_liquid_aliases(_texture_frames_map);
+  }
 
   if (_texture_frames_map.empty())
   {

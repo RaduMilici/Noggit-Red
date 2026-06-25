@@ -491,7 +491,7 @@ void wmo_liquid::draw ( glm::mat4x4 const& transform
   auto const& [texture_array, anim_uv, liquid_type, frame_count] = texture_profile->second;
   int const frame = frame_count == 0
     ? 0
-    : static_cast<int>((static_cast<unsigned>(std::max(animtime, 0)) / 100u) % frame_count);
+    : static_cast<int>((static_cast<unsigned>(std::max(animtime, 0)) / 60u) % frame_count); // ~16.7fps, matches ADT/reference
 
   water_shader.uniform ("transform", transform);
   water_shader.uniform ("animtime", static_cast<float>(animtime));
