@@ -19,6 +19,7 @@
 #include <noggit/ui/RotationEditor.h>
 #include <noggit/ui/TexturePicker.h>
 #include <noggit/ui/TexturingGUI.h>
+#include <noggit/ui/ZoneMusicPlayer.hpp>
 #include <noggit/ui/Toolbar.h> // Noggit::Ui::toolbar
 #include <noggit/ui/Water.h>
 #include <noggit/ui/ZoneIDBrowser.h>
@@ -1353,6 +1354,12 @@ void MapView::setupCreatureModelPickerUi()
   filter_layout->addStretch();
   root_layout->addLayout(filter_layout);
 
+  auto search_box = new QLineEdit(container);
+  search_box->setPlaceholderText("Search by entry id or name...");
+  search_box->setClearButtonEnabled(true);
+  search_box->setToolTip("Filter the list by creature_template entry id or name (case-insensitive).");
+  root_layout->addWidget(search_box);
+
   auto splitter = new QSplitter(Qt::Horizontal, container);
   _creature_model_tree = new QTreeWidget(splitter);
   _creature_model_tree->setHeaderHidden(true);
@@ -1497,6 +1504,16 @@ void MapView::setupCreatureModelPickerUi()
 
   auto passes_filters = [=](TemplatePickerEntry const& entry)
   {
+    auto const needle = search_box->text().trimmed();
+    if (!needle.isEmpty())
+    {
+      QString const name = QString::fromStdString(entry.name);
+      QString const id = QString::number(entry.entry);
+      if (!name.contains(needle, Qt::CaseInsensitive) && !id.contains(needle))
+      {
+        return false;
+      }
+    }
     if (elite_only->isChecked() && !(entry.rank == 1u || entry.rank == 2u))
     {
       return false;
@@ -1758,6 +1775,7 @@ void MapView::setupCreatureModelPickerUi()
   connect(boss_only, &QCheckBox::stateChanged, rebuild_template_tree);
   connect(civilian_only, &QCheckBox::stateChanged, rebuild_template_tree);
   connect(trainer_only, &QCheckBox::stateChanged, rebuild_template_tree);
+  connect(search_box, &QLineEdit::textChanged, rebuild_template_tree);
   connect(add_button, &QPushButton::clicked, add_pending_spawn);
   preview->on_double_click = add_pending_spawn;
 
@@ -2825,6 +2843,7 @@ void MapView::setupViewMenu()
   ADD_TOGGLE (view_menu, "WMO doodads", Qt::Key_F2, _draw_wmo_doodads);
   ADD_TOGGLE (view_menu, "Terrain",     Qt::Key_F3, _draw_terrain);
   ADD_TOGGLE (view_menu, "Water",       Qt::Key_F4, _draw_water);
+  ADD_TOGGLE (view_menu, "Bloom",       Qt::Key_F5, _draw_bloom);
   ADD_TOGGLE (view_menu, "WMOs",        Qt::Key_F6, _draw_wmo);
 
   ADD_TOGGLE_POST (view_menu, "Lines", Qt::Key_F7, _draw_lines,
@@ -4617,6 +4636,12 @@ MapView::MapView( math::degrees camera_yaw0
   LogDebug << "MapView::MapView before createGUI" << std::endl;
   createGUI();
   LogDebug << "MapView::MapView after createGUI" << std::endl;
+
+  // Zone music: a hidden dropdown widget (shown from the toolbar music button) that plays the current
+  // zone's background music, switching playlists as the camera crosses zone boundaries (see tick()).
+  // Enable/disable lives in the dropdown's own checkbox.
+  _zone_music_player = new Noggit::Ui::ZoneMusicPlayer(this);
+  _zone_music_player->setVisible(false);
   if (capture_debug_enabled())
   {
     LogDebug << "MapView::MapView end capture_probe=" << _capture_probe
@@ -6053,8 +6078,19 @@ void MapView::tick (float dt)
 
   updateDetailInfos();
 
+  unsigned int const current_area_id = _world->getAreaID (_camera.position);
   _status_area->setText
-    (QString::fromStdString (gAreaDB.getAreaName (_world->getAreaID (_camera.position))));
+    (QString::fromStdString (gAreaDB.getAreaName (current_area_id)));
+
+  // Drive zone music from the current area + time of day (day ~ 6:00..18:00). Only while enabled (the
+  // dropdown checkbox), so nothing music-related (incl. the QtMultimedia backend) runs when off.
+  if (_zone_music_player && _zone_music_player->enabled())
+  {
+    int const minutes = (static_cast<int>(_world->time) % 2880) / 2;
+    bool const is_day = (minutes >= 6 * 60 && minutes < 18 * 60);
+    // World resolves WMOAreaTable.ZoneMusic (dungeons/caves) first, then the AreaTable parent chain.
+    _zone_music_player->update_zone(_world->getZoneMusic(_camera.position), is_day);
+  }
 
   {
     int time ((static_cast<int>(_world->time) % 2880) / 2);
@@ -6471,6 +6507,7 @@ void MapView::draw_map()
                , _draw_occlusion_boxes.get()
                ,false
                , _draw_wmo_exterior.get()
+               , _draw_bloom.get()
                );
 
   // reset after each world::draw call

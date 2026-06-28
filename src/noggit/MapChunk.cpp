@@ -319,7 +319,15 @@ MapChunk::MapChunk(MapTile* maintile, BlizzardArchive::ClientFile* f, bool bigAl
       std::vector<mclq> layers(1);
       f->read(layers.data(), sizeof(mclq));
 
-      mt->Water.getChunk(px, py)->from_mclq(layers);
+      // The MCNK header liquid flags are the authoritative liquid type (0 = none -> let from_mclq
+      // fall back to the per-tile nibble). Read them BEFORE they're cleared below.
+      int mcnk_liquid_id = 0;
+      if (header_flags.flags.lq_magma)      mcnk_liquid_id = 3;
+      else if (header_flags.flags.lq_slime) mcnk_liquid_id = 4;
+      else if (header_flags.flags.lq_ocean) mcnk_liquid_id = 2;
+      else if (header_flags.flags.lq_river) mcnk_liquid_id = 1;
+
+      mt->Water.getChunk(px, py)->from_mclq(layers, mcnk_liquid_id);
     }
 
     // remove the liquid flags as it'll be saved as MH2O

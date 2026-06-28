@@ -151,7 +151,14 @@ wmo_liquid::wmo_liquid(BlizzardArchive::ClientFile* f,
   , ytiles(header.B)
   , _debug_wmo_path(wmo_path)
 {
-  int liquid = initGeometry(f, wmo_path);
+  // Lava (LIQUID_Green_Lava) WMOs store authored per-vertex magma s/t flow UVs on EVERY
+  // liquid vertex, but the per-tile `tile.liquid & 2` bit is unreliable on these maps:
+  // many lava tiles have it clear and were wrongly routed to the water UV path (flat (i,j)
+  // grid coords) — so most Molten Core lava rendered as a uniform scrolling sheet while only
+  // the tiles that happened to have the bit set flowed. Force the magma UV path for lava so
+  // all tiles use their authored flow UVs.
+  bool const force_magma_uv = (group_liquid == LIQUID_Green_Lava);
+  int liquid = initGeometry(f, wmo_path, force_magma_uv);
 
   // see: https://wowdev.wiki/WMO#how_to_determine_LiquidTypeRec_to_use
   if (use_dbc_type)
@@ -220,7 +227,7 @@ wmo_liquid::wmo_liquid(wmo_liquid const& other)
 }
 
 
-int wmo_liquid::initGeometry(BlizzardArchive::ClientFile* f, std::string const& wmo_path)
+int wmo_liquid::initGeometry(BlizzardArchive::ClientFile* f, std::string const& wmo_path, bool force_magma_uv)
 {
   LiquidVertex const* map = reinterpret_cast<LiquidVertex const*>(f->getPointer());
   SMOLTile const* tiles = reinterpret_cast<SMOLTile const*>(f->getPointer() + (xtiles + 1)*(ytiles + 1) * sizeof(LiquidVertex));
@@ -286,7 +293,7 @@ int wmo_liquid::initGeometry(BlizzardArchive::ClientFile* f, std::string const& 
 
         size_t p = j*(xtiles + 1) + i;
 
-        if (!(tile.liquid & 2))
+        if (!force_magma_uv && !(tile.liquid & 2))
         {
           auto record_water_depth = [&](std::size_t vertex_index)
           {
@@ -493,11 +500,21 @@ void wmo_liquid::draw ( glm::mat4x4 const& transform
     ? 0
     : static_cast<int>((static_cast<unsigned>(std::max(animtime, 0)) / 60u) % frame_count); // ~16.7fps, matches ADT/reference
 
+  // Lava flow tuning. magma_flow_dir is the scroll direction in UV space; magma_flow_speed is
+  // UV units per ms. The LiquidType anim direction (anim_uv ~ (1,0)) scrolls along the authored
+  // U axis, which runs ACROSS the lava channels -> reads as side-to-side. The authored V axis
+  // runs ALONG the channels, so scroll there for downstream "oozing down the river" flow.
+  // Speed: old hard-coded rate was anim/2880 per ms; 0.25/2880 is a quarter of that.
+  glm::vec2 const magma_flow_dir = glm::vec2(0.0f, 1.0f);
+  float const magma_flow_speed = 0.25f / 2880.0f;
+
   water_shader.uniform ("transform", transform);
   water_shader.uniform ("animtime", static_cast<float>(animtime));
   water_shader.uniform ("tex_frame", frame);
   water_shader.uniform ("liquid_type", liquid_type);
   water_shader.uniform ("anim_uv", anim_uv);
+  water_shader.uniform ("magma_flow_dir", magma_flow_dir);
+  water_shader.uniform ("magma_flow_speed", magma_flow_speed);
   water_shader.uniform ("debug_liquid_color", wmo_liquid_debug_color_enabled()
                                                   ? debug_color_from_path(_debug_wmo_path)
                                                   : glm::vec4(0.0f));

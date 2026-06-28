@@ -70,6 +70,7 @@ namespace Noggit::Rendering
         , bool draw_occlusion_boxes = false
         , bool minimap_render = false
         , bool draw_wmo_exterior = true
+        , bool draw_bloom = false
     );
 
     bool saveMinimap (TileIndex const& tile_idx
@@ -103,6 +104,11 @@ namespace Noggit::Rendering
     void setupChunkBuffers();
     void setupLiquidChunkBuffers();
 
+    // Bloom post-process: (re)create the offscreen targets for the given viewport size, and run the
+    // bright-pass -> blur -> composite once the scene has been rendered into the scene target.
+    void ensureBloomTargets(int w, int h);
+    void renderBloomAndComposite(GLuint target_fbo, int w, int h);
+
     World* _world;
     float _cull_distance;
     float _view_distance;
@@ -119,6 +125,17 @@ namespace Noggit::Rendering
     std::unique_ptr<OpenGL::program> _liquid_program;
     std::unique_ptr<OpenGL::program> _wmo_liquid_program;
     std::unique_ptr<OpenGL::program> _occluder_program;
+
+    // bloom post-process
+    std::unique_ptr<OpenGL::program> _bloom_bright_program;
+    std::unique_ptr<OpenGL::program> _bloom_blur_program;
+    std::unique_ptr<OpenGL::program> _bloom_composite_program;
+    bool _bloom_initialized = false;
+    int _bloom_w = -1, _bloom_h = -1, _bloom_bw = 0, _bloom_bh = 0;
+    GLuint _bloom_vao = 0;
+    GLuint _bloom_scene_fbo = 0, _bloom_scene_color = 0, _bloom_scene_depth = 0;
+    GLuint _bloom_fbo[2] = {0, 0};
+    GLuint _bloom_tex[2] = {0, 0};
 
     // horizon && skies && lighting
     std::unique_ptr<Noggit::map_horizon::render> _horizon_render;

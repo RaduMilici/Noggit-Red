@@ -5,6 +5,7 @@ in vec2 uv1;
 in vec2 uv2;
 in float camera_dist;
 in vec3 norm;
+in vec3 m2_world_pos;
 
 out vec4 out_color;
 
@@ -18,7 +19,27 @@ layout (std140) uniform lighting
     vec4 OceanColorDark;
     vec4 RiverColorLight;
     vec4 RiverColorDark;
+    vec4 PointLightParams;     // .x = active point-light count
+    vec4 PointLightPos[16];    // xyz = world pos, w = radius
+    vec4 PointLightColor[16];  // xyz = colour * intensity
 };
+
+vec3 point_lights(vec3 world_pos, vec3 n)
+{
+  vec3 accum = vec3(0.0);
+  int count = int(PointLightParams.x);
+  for (int i = 0; i < count; ++i)
+  {
+    vec3 to_l = PointLightPos[i].xyz - world_pos;
+    float dist = length(to_l);
+    float radius = max(PointLightPos[i].w, 0.001);
+    float atten = clamp(1.0 - dist / radius, 0.0, 1.0);
+    atten *= atten;
+    float ndotl = max(dot(n, to_l / max(dist, 0.0001)), 0.0);
+    accum += PointLightColor[i].xyz * ndotl * atten;
+  }
+  return accum;
+}
 
 uniform vec4 mesh_color;
 uniform int blend_mode;
@@ -231,9 +252,20 @@ void main()
     vec4 texture2 = texture(tex2, vec3(uv2, tex2_index));
         if (masked_additive != 0)
         {
-            float masked_alpha = texture1.a * texture2.a;
-            color.rgb = (mesh_color.rgb * texture1.rgb) * masked_alpha;
-            color.a = mesh_color.a * masked_alpha;
+            // Keep the original dust mask so low-dust regions stay TRANSPARENT (showing the cave
+            // behind, not black sheets) -- only brighten the visible additive beam so the shaft reads
+            // brighter like in-game.
+            // This batch's 2nd texture is just a *_Mask (Lightray_Dusty_02_Mask) -- WMV ignores it and
+            // renders the beam (Lightray_Dusty_02). That beam texture has a DARK background with bright
+            // sparkles, meant to be drawn additively. Our pass alpha-blends, so the dark background
+            // showed as an opaque black "space" sheet. Use the beam's LUMINANCE as the alpha: dark
+            // background -> transparent, bright sparkles/beam -> visible. Reads as a translucent beam
+            // with bright white sparkles, no black sheet, under additive OR alpha blend.
+            // Transparent dusty beam: render with the beam's LUMINANCE as alpha so the dark background
+            // stays transparent (only the bright dust/beam texels show), drawn additively. The trailing
+            // factor is the lightray dust "texture opacity" lever -- lower it to make the dust fainter.
+            color.rgb = mesh_color.rgb * texture1.rgb;
+            color.a = mesh_color.a * max(texture1.r, max(texture1.g, texture1.b)) * 0.10;
         }
         else
         {
@@ -247,9 +279,17 @@ void main()
     vec4 texture2 = texture(tex2, vec3(uv2, tex2_index));
         if (masked_additive != 0)
         {
-            float masked_alpha = texture2.a * texture1.a;
-            color.rgb = (mesh_color.rgb * texture1.rgb) * masked_alpha;
-            color.a = mesh_color.a * masked_alpha;
+            // This batch's 2nd texture is just a *_Mask (Lightray_Dusty_02_Mask) -- WMV ignores it and
+            // renders the beam (Lightray_Dusty_02). That beam texture has a DARK background with bright
+            // sparkles, meant to be drawn additively. Our pass alpha-blends, so the dark background
+            // showed as an opaque black "space" sheet. Use the beam's LUMINANCE as the alpha: dark
+            // background -> transparent, bright sparkles/beam -> visible. Reads as a translucent beam
+            // with bright white sparkles, no black sheet, under additive OR alpha blend.
+            // Transparent dusty beam: render with the beam's LUMINANCE as alpha so the dark background
+            // stays transparent (only the bright dust/beam texels show), drawn additively. The trailing
+            // factor is the lightray dust "texture opacity" lever -- lower it to make the dust fainter.
+            color.rgb = mesh_color.rgb * texture1.rgb;
+            color.a = mesh_color.a * max(texture1.r, max(texture1.g, texture1.b)) * 0.10;
         }
         else
         {
@@ -278,7 +318,7 @@ void main()
       vec3 groundColor = (ambientColor * 0.699999988);
 
       currColor = mix(groundColor, skyColor, 0.5 + (0.5 * nDotL));
-      lDiffuse = DiffuseColor_FogStart.xyz * nDotL;
+      lDiffuse = DiffuseColor_FogStart.xyz * nDotL + point_lights(m2_world_pos, normalize(norm));
   }
   else
   {
@@ -307,27 +347,19 @@ void main()
 
     float fogFactor = 1.0 - f4;
 
-    vec3 fog;
+    // Additive passes (Add=4, No_Add_Alpha=3) add light, so in fog they must fade to NOTHING (black)
+    // rather than toward the fog colour -- otherwise a distant light shaft / glow stays as a bright
+    // cutout floating in the haze instead of dissolving into it. Everything else fades to fog colour.
+    vec3 fog_target = (blend_mode == 4 || blend_mode == 3) ? vec3(0.0) : FogColor_FogOn.rgb;
+    color.rgb = mix(color.rgb, fog_target, fogFactor);
 
-    // see https://wowdev.wiki/M2/Rendering#Fog_Modes
-    if(fog_mode == 1)
+    // Opaque / alpha-key doodads: write the bloom mask into alpha so fog-brightened doodads stop
+    // blooming (the bloom bright-pass keeps only alpha > 0). Transparent passes keep their blend
+    // alpha; additive ones already fade to black above so they don't bloom under fog anyway.
+    if (blend_mode == 0 || blend_mode == 1)
     {
-      fog = FogColor_FogOn.rgb;
+      color.a = 1.0 - fogFactor;
     }
-    else if(fog_mode == 2)
-    {
-      fog = vec3(0.);
-    }
-    else if(fog_mode == 3)
-    {
-      fog = vec3(1.);
-    }
-    else if(fog_mode == 4)
-    {
-      fog = vec3(0.5);
-    }
-
-    color.rgb = mix(color.rgb, FogColor_FogOn.rgb, fogFactor);
   }
 
   out_color = color;

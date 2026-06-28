@@ -11,7 +11,28 @@ layout (std140) uniform lighting
   vec4 OceanColorDark;
   vec4 RiverColorLight;
   vec4 RiverColorDark;
+  vec4 PointLightParams;     // .x = active point-light count
+  vec4 PointLightPos[16];    // xyz = world pos, w = radius
+  vec4 PointLightColor[16];  // xyz = colour * intensity
 };
+
+// Accumulated diffuse contribution of the emitter point lights (campfires etc.) at a world point.
+vec3 point_lights(vec3 world_pos, vec3 n)
+{
+  vec3 accum = vec3(0.0);
+  int count = int(PointLightParams.x);
+  for (int i = 0; i < count; ++i)
+  {
+    vec3 to_l = PointLightPos[i].xyz - world_pos;
+    float dist = length(to_l);
+    float radius = max(PointLightPos[i].w, 0.001);
+    float atten = clamp(1.0 - dist / radius, 0.0, 1.0);
+    atten *= atten;
+    float ndotl = max(dot(n, to_l / max(dist, 0.0001)), 0.0);
+    accum += PointLightColor[i].xyz * ndotl * atten;
+  }
+  return accum;
+}
 
 layout (std140) uniform overlay_params
 {
@@ -260,8 +281,8 @@ void main()
     out_color.rgb *= vary_mccv;
   }
 
-  // apply world lighting
-  out_color.rgb = clamp(out_color.rgb * (currColor + lDiffuse + spc), 0.0, 1.0);
+  // apply world lighting (+ emitter point lights)
+  out_color.rgb = clamp(out_color.rgb * (currColor + lDiffuse + spc + point_lights(vary_position, normalized_normal)), 0.0, 1.0);
 
   // apply overlays
   if(draw_paintability_overlay != 0 && instances[instanceID].ChunkHoles_DrawImpass_TexLayerCount_CantPaint.a != 0)
@@ -443,4 +464,7 @@ void main()
     out_color.rgb = mix(cursor_color.rgb, out_color.rgb, alpha);*/
   }
 
+  // Terrain opts OUT of bloom: write alpha 0 as the bloom mask (the bright-pass keeps only alpha > 0).
+  // Bright/white ground then never blooms, while sky, models and light shafts (alpha > 0) still do.
+  out_color.a = 0.0;
 }

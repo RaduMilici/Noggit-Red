@@ -324,17 +324,6 @@ void ModelRender::draw(glm::mat4x4 const& model_view
     upload();
   }
 
-  if (capture_debug_enabled() && _model->file_key().filepath().find("blackrocklavafall") != std::string::npos)
-  {
-    LogDebug << "LAVAFALL draw() model='" << _model->file_key().stringRepr()
-             << "' animated=" << _model->animated
-             << " animcalc=" << _model->animcalc
-             << " perInstance=" << _model->_per_instance_animation
-             << " skipMeshPasses=" << skip_mesh_passes
-             << " gatePass=" << (_model->animated && (!_model->animcalc || _model->_per_instance_animation))
-             << std::endl;
-  }
-
   if (_model->animated && (!_model->animcalc || _model->_per_instance_animation))
   {
     auto const anim_id = instance.forcedAnimationId() >= 0 ? instance.forcedAnimationId() : 0;
@@ -450,17 +439,6 @@ void ModelRender::draw(glm::mat4x4 const& model_view
 
   {
     ZoneScopedN("Model::draw() : drawing")
-
-    if (capture_debug_enabled() && _model->file_key().filepath().find("blackrocklavafall") != std::string::npos)
-    {
-      LogDebug << "LAVAFALL instanced model='" << _model->file_key().stringRepr()
-               << "' instances=" << instances.size()
-               << " animated=" << _model->animated
-               << " animcalc=" << _model->animcalc
-               << " perInstance=" << _model->_per_instance_animation
-               << " gatePass=" << (_model->animated && (!_model->animcalc || _model->_per_instance_animation))
-               << std::endl;
-    }
 
     if (_model->animated && (!_model->animcalc || _model->_per_instance_animation))
     {
@@ -1435,40 +1413,55 @@ bool ModelRenderPass::prepareDraw(OpenGL::Scoped::use_program& m2_shader, Model 
   }
   static const glm::mat4x4 unit(glm::mat4x4(1));
 
-  static int _lavafall_log_counter = 0;
-  if ((capture_debug_enabled() || std::getenv("NOGGIT_MODEL_TEXTURE_DEBUG") != nullptr)
+  // Lightray cones: the two mesh passes are distinct layers, identified by their primary texture.
+  //   layer 1 = Lightray_Dusty_01: STATIC stretched depth anchor (vRange 0..1, no scroll).
+  //   layer 2 = Lightray_Dusty_02 (+_Mask): the scrolling dust, low opacity, masked.
+  // The model's authored tex-anim lookups resolve to -1, so we drive the scroll here from the
+  // model's animated texture matrix and leave layer 1 on identity. lightray_layer is read by
+  // m2_frag's masked-additive branch to pick the per-layer opacity/mask behaviour.
+  // Volumetric light-ray cones have a second pass -- the dark dusty texture -- whose tex-anim lookup
+  // slot resolves to -1, so it renders frozen. In-game that dusty layer scrolls downward (the
+  // "falling dust" of the shaft). Fall it back to the model's first texture animation so it flows.
+  // Scoped to volumetric lights so no other model's intentionally-static pass is affected.
+  // Only the 2-texture dusty pass (Dusty_02 + its mask) scrolls. The 1-texture pass (Dusty_01) is the
+  // static stretched depth anchor and must stand still, so gate the scroll fallback on texture_count.
+  if (tex_anim_lookup == -1
+      && texture_count > 1
+      && !m->_texture_animations.empty()
       && m->file_key().hasFilepath()
-      && m->file_key().filepath().find("lavafall") != std::string::npos
-      && (_lavafall_log_counter++ % 200 == 0))
+      && m->file_key().filepath().find("volumetriclight") != std::string::npos)
   {
-    glm::vec3 t(-999.f);
-    if (tex_anim_lookup != -1 && static_cast<size_t>(tex_anim_lookup) < m->_texture_animations.size())
-    {
-      t = glm::vec3(m->_texture_animations[tex_anim_lookup].mat[3]);
-    }
-    LogDebug << "LAVAFALL texmat model='" << m->file_key().stringRepr()
-             << "' uvAnim0=" << uv_animations[0]
-             << " lookupSize=" << m->_texture_animation_lookups.size()
-             << " texAnimLookup=" << tex_anim_lookup
-             << " texAnimsSize=" << m->_texture_animations.size()
-             << " gAnim=" << m->_global_animtime << " animTime=" << m->_anim_time
-             << " matT=(" << t.x << "," << t.y << "," << t.z << ")"
-             << std::endl;
+    tex_anim_lookup = 0;
   }
+
+  bool const is_volumetric_light = m->file_key().hasFilepath()
+                                && m->file_key().filepath().find("volumetriclight") != std::string::npos;
 
   if (tex_anim_lookup != -1 && static_cast<size_t>(tex_anim_lookup) < m->_texture_animations.size())
   {
     m2_shader.uniform("tex_matrix_1", m->_texture_animations[tex_anim_lookup].mat);
     if (texture_count > 1)
     {
-      tex_anim_lookup = -1;
+      int16_t tex_anim_lookup_2 = -1;
       if (uv_animations[1] < m->_texture_animation_lookups.size())
       {
-        tex_anim_lookup = m->_texture_animation_lookups[uv_animations[1]];
+        tex_anim_lookup_2 = m->_texture_animation_lookups[uv_animations[1]];
       }
-      if (tex_anim_lookup != -1 && static_cast<size_t>(tex_anim_lookup) < m->_texture_animations.size())
+      // Volumetric light dust: the second texture layer's lookup is also -1 (frozen). Animate it too,
+      // and shift it half a texture in V so the two scrolling layers overlap and fill each other's
+      // wrap gap (a continuous stream rather than gappy "patchy showers").
+      if (tex_anim_lookup_2 == -1 && is_volumetric_light && !m->_texture_animations.empty())
       {
-        m2_shader.uniform("tex_matrix_2", m->_texture_animations[tex_anim_lookup].mat);
+        tex_anim_lookup_2 = 0;
+      }
+      if (tex_anim_lookup_2 != -1 && static_cast<size_t>(tex_anim_lookup_2) < m->_texture_animations.size())
+      {
+        glm::mat4x4 mat2 = m->_texture_animations[tex_anim_lookup_2].mat;
+        if (is_volumetric_light)
+        {
+          mat2[3].y += 0.5f;
+        }
+        m2_shader.uniform("tex_matrix_2", mat2);
       }
       else
       {

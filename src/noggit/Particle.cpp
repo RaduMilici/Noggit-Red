@@ -385,6 +385,40 @@ ParticleSystem::ParticleSystem(Model* model_
   }
   log_classic_particle_ramp_probe(model, mta.p, colors, sizes);
 
+  // The dusty light-ray's white motes are authored microscopically (~0.006 units) -- invisible
+  // against the bright shaft. In-game they're small but visible scattered specks drifting down.
+  // Scale them up modestly for volumetric-light models only so they actually read (paired with the
+  // pre-warm in update(), which populates and scatters them along the shaft). Path-scoped so no
+  // other classic emitter (torches/smoke) is touched.
+  if (model->file_key().hasFilepath()
+      && model->file_key().filepath().find("volumetriclight") != std::string::npos)
+  {
+    // The authored motes are microscopic (~0.006 units) -- they spawn but are invisible. Scale them
+    // up so the falling dust specks actually read in the shaft. Tune this multiplier for mote size.
+    for (float& size : sizes)
+    {
+      size = std::clamp(size * 10.0f, 0.001f, CLASSIC_PARTICLE_MAX_SIZE);
+    }
+    // Force an explicit birth->death opacity gradient so the motes are full at the TOP (spawn) and
+    // fade to 0 by the BOTTOM (death) as they drift down the shaft. The authored ramp was flat, so
+    // they held the same opacity the whole way. p.color = lifeRamp(colors[0],[1],[2]) over life, so
+    // these three alphas define the gradient. top_alpha is the tunable knob for the spawn opacity.
+    float const top_alpha = 0.5f;
+    if (colors.size() >= 3)
+    {
+      colors[0].a = top_alpha;        // birth / top
+      colors[1].a = top_alpha * 0.5f; // mid
+      colors[2].a = 0.0f;             // death / bottom
+    }
+    else
+    {
+      for (glm::vec4& ramp_color : colors)
+      {
+        ramp_color.a *= 0.1f;
+      }
+    }
+  }
+
   for (int i = 0; i < rows * cols; ++i)
   {
     TexCoordSet tc;
@@ -510,6 +544,34 @@ void ParticleSystem::initTile(glm::vec2 *tc, int num)
 
 void ParticleSystem::update(float dt)
 {
+  // Pre-warm continuous emitters to steady state on first tick so ambient effects (dusty light-ray
+  // motes, smoke) appear already populated/scattered instead of slowly filling from empty over a
+  // full lifespan. Recursive calls see the guard set and skip the pre-warm.
+  if (!_prewarmed)
+  {
+    _prewarmed = true;
+    if (emitter)
+    {
+      float warm_life = sane_positive_particle_value(lifespan.getValue(manim, mtime, manimtime), 0.0f);
+      if (classic)
+      {
+        warm_life = std::min(warm_life, CLASSIC_PARTICLE_MAX_LIFESPAN);
+      }
+      if (warm_life > 0.05f)
+      {
+        constexpr int prewarm_steps = 40;
+        float const step_dt = warm_life / static_cast<float>(prewarm_steps);
+        for (int s = 0; s < prewarm_steps; ++s)
+        {
+          // Jitter each step so particles don't all spawn at identical intervals (which lands them
+          // in evenly-spaced rows -- a visible grid). frand() in [0,1) -> 0.25x..1.75x, averaging 1x
+          // so the total simulated span still ~= one lifespan.
+          update(step_dt * (0.25f + 1.5f * misc::frand()));
+        }
+      }
+    }
+  }
+
   std::size_t const particles_before_update = particles.size();
   int spawned_this_update = 0;
   float debug_rate = 0.0f;
@@ -528,6 +590,13 @@ void ParticleSystem::update(float dt)
     {
       frate = std::min(frate, CLASSIC_PARTICLE_MAX_RATE);
       flife = std::min(flife, CLASSIC_PARTICLE_MAX_LIFESPAN);
+    }
+    // Volumetric light dust: spawn far fewer motes -- the shaft wants a sparse drift of specks, not a
+    // dense column. Scoped to volumetric lights so torches/smoke keep their authored density.
+    if (model->file_key().hasFilepath()
+        && model->file_key().filepath().find("volumetriclight") != std::string::npos)
+    {
+      frate *= 0.2f;
     }
     debug_rate = frate;
     debug_life = flife;
@@ -995,6 +1064,7 @@ void ParticleSystem::draw( glm::mat4x4 const& model_view
 
   shader.uniform("alpha_test", alpha_test);
   shader.uniform("billboard", (int)billboard);
+  shader.uniform("particle_blend", static_cast<int>(blend)); // for blend-aware fog in the shader
 
   OpenGL::Scoped::vao_binder const _ (_vao);
 

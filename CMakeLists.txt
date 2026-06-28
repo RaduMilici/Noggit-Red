@@ -342,6 +342,14 @@ if (UNIX)
   TARGET_LINK_LIBRARIES (noggit ${BZIP2_LIBRARIES})
 ENDIF()
 
+# Emit PDB symbols even in Release so crash callstacks (StackWalker / dumps) can be symbolized.
+# /Zi adds debug info without changing codegen; /DEBUG emits the .pdb and /OPT:REF /OPT:ICF keep
+# the Release optimizations that /DEBUG would otherwise turn off.
+if(MSVC)
+  target_compile_options(noggit PRIVATE $<$<CONFIG:Release>:/Zi>)
+  target_link_options(noggit PRIVATE $<$<CONFIG:Release>:/DEBUG /OPT:REF /OPT:ICF>)
+endif()
+
 
 TARGET_LINK_LIBRARIES (noggit
   ${OPENGL_LIBRARIES}

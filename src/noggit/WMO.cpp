@@ -1044,6 +1044,16 @@ void WMOGroup::fix_vertex_color_alpha()
     wmo_ambient_color.w = 0.f;
   }
 
+  // A near-white MOHD ambient (e.g. the Timbermaw instance, authored (1,1,1)) is effectively a
+  // "no extra ambient" sentinel: the baked MOCV already carries the full interior lighting.
+  // Subtracting white here would clamp every interior vertex to black, and the shader's ambient
+  // re-add would then flood the whole interior to full brightness (the washed-out "too bright"
+  // look). Detect that and preserve the baked MOCV untouched instead -- the shader applies a
+  // matching tiny floor rather than white. WMOs with a real authored ambient are unaffected.
+  bool const neutral_ambient = wmo_ambient_color.x > 0.95f
+                            && wmo_ambient_color.y > 0.95f
+                            && wmo_ambient_color.z > 0.95f;
+
   for (int i = 0; i < _vertex_colors.size(); ++i)
   {
     auto& color = _vertex_colors[i];
@@ -1052,10 +1062,28 @@ void WMOGroup::fix_vertex_color_alpha()
     float b = color.z;
     float a = color.w;
 
+    constexpr float normalized_alpha_scale = 255.f / 64.f;
+
     // I removed the color = color/2 because it's just multiplied by 2 in the shader afterward in blizzard's code
-    if (i >= interior_batchs_start)
+    if (neutral_ambient)
     {
-      constexpr float normalized_alpha_scale = 255.f / 64.f;
+      // Preserve the artist-baked MOCV as the interior lighting (only the exterior-batch alpha
+      // attenuation is kept) -- no ambient subtraction, no halving.
+      if (i >= interior_batchs_start)
+      {
+        r = r + (r * a * normalized_alpha_scale);
+        g = g + (g * a * normalized_alpha_scale);
+        b = b + (b * a * normalized_alpha_scale);
+      }
+      else
+      {
+        r = r * (1.f - a);
+        g = g * (1.f - a);
+        b = b * (1.f - a);
+      }
+    }
+    else if (i >= interior_batchs_start)
+    {
       r = (r + (r * a * normalized_alpha_scale) - wmo_ambient_color.x) * 0.5f;
       g = (g + (g * a * normalized_alpha_scale) - wmo_ambient_color.y) * 0.5f;
       b = (b + (b * a * normalized_alpha_scale) - wmo_ambient_color.z) * 0.5f;

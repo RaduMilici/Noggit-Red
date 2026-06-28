@@ -1,7 +1,9 @@
 #include <noggit/errorHandling.h>
 #include <noggit/Log.h>
 
+#include <atomic>
 #include <csignal>
+#include <iostream>
 #include <string>
 #include <vector>
 
@@ -10,6 +12,22 @@
 #else
   #include <win/StackWalker.h>
   #include <errhandlingapi.h>
+
+namespace
+{
+  // StackWalker writes to OutputDebugString/printf by default, which vanish in a GUI build (no
+  // console). Route every line to std::cerr instead -- InitLogging redirects std::cerr to log.txt,
+  // so the crash callstack lands in the log. Flush each line so nothing is lost when we crash.
+  class LogStackWalker : public StackWalker
+  {
+  protected:
+    void OnOutput(LPCSTR szText) override
+    {
+      std::cerr << szText;
+      std::cerr.flush();
+    }
+  };
+}
 #endif
 
 namespace Noggit
@@ -34,7 +52,7 @@ namespace Noggit
 
     free (strings);
 #else
-    StackWalker sw;
+    LogStackWalker sw;
     sw.ShowCallstack();
 #endif
   }
@@ -137,6 +155,44 @@ namespace Noggit
 
       return EXCEPTION_CONTINUE_SEARCH;
     }
+
+    // Vectored exception handler: runs on the FAULTING thread the instant a hardware exception is
+    // raised -- before SEH unwinding, before any __fastfail, and it can't be replaced the way
+    // SetUnhandledExceptionFilter can (Qt etc.). Crucially we walk from ep->ContextRecord, so the
+    // logged callstack is the actual CRASH site (not this handler's frame). Output goes to log.txt
+    // via LogStackWalker. Only fatal hardware codes, capped, so handled first-chance faults don't
+    // spam -- the unhandled crash is the last one logged before the process dies.
+    LONG WINAPI vectored_exception_handler(EXCEPTION_POINTERS* ep)
+    {
+      DWORD const code = ep->ExceptionRecord->ExceptionCode;
+      bool const fatal =
+           code == EXCEPTION_ACCESS_VIOLATION
+        || code == EXCEPTION_ILLEGAL_INSTRUCTION
+        || code == EXCEPTION_STACK_OVERFLOW
+        || code == EXCEPTION_INT_DIVIDE_BY_ZERO
+        || code == EXCEPTION_PRIV_INSTRUCTION
+        || code == EXCEPTION_IN_PAGE_ERROR
+        || code == EXCEPTION_ARRAY_BOUNDS_EXCEEDED
+        || code == EXCEPTION_DATATYPE_MISALIGNMENT;
+
+      if (fatal)
+      {
+        static std::atomic<int> logged{0};
+        if (logged.fetch_add(1) < 8)
+        {
+          std::cerr << "\n=== [VEH] fatal exception 0x" << std::hex << code
+                    << " at " << ep->ExceptionRecord->ExceptionAddress << std::dec
+                    << " (thread " << GetCurrentThreadId() << ") ===\n";
+          std::cerr.flush();
+          LogStackWalker sw;
+          sw.ShowCallstack(GetCurrentThread(), ep->ContextRecord);
+          std::cerr << "=== [VEH] end callstack ===\n";
+          std::cerr.flush();
+        }
+      }
+
+      return EXCEPTION_CONTINUE_SEARCH;
+    }
 #endif
 
   }
@@ -144,6 +200,7 @@ namespace Noggit
   void RegisterErrorHandlers()
   {
 #ifdef _WIN32
+    AddVectoredExceptionHandler(1 /*call first*/, vectored_exception_handler);
     SetUnhandledExceptionFilter(windows_exception_handler);
 #endif
 

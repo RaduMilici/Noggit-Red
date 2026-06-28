@@ -575,7 +575,10 @@ void map_horizon::render::draw( glm::mat4x4 const& model_view
   std::vector<uint32_t> indices;
 
   const TileIndex current_index(camera);
-  const int lrr = 2;
+  // Horizon (low-res far terrain) radius follows the cull/view distance instead of a fixed 2 tiles,
+  // so it can't render PAST the view distance (the fixed radius made fog appear to "render further"
+  // than with fog off). +1 tile so the low-res fill still reaches the cull edge.
+  const int lrr = std::max(1, std::min(static_cast<int>(std::ceil(cull_distance / TILESIZE)) + 1, 16));
 
   for (size_t y (current_index.z - lrr); y <= current_index.z + lrr; ++y)
   {

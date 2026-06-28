@@ -29,7 +29,9 @@ public:
   ChunkWater& operator= (ChunkWater const&) = delete;
   ChunkWater& operator= (ChunkWater&&) = delete;
 
-  void from_mclq(std::vector<mclq>& layers);
+  // mcnk_liquid_id: authoritative liquid id from the MCNK header flags (lq_magma/slime/ocean/
+  // river), or 0 if the header specifies none -> then the per-tile MCLQ nibble is used.
+  void from_mclq(std::vector<mclq>& layers, int mcnk_liquid_id = 0);
   void fromFile(BlizzardArchive::ClientFile& f, size_t basePos);
   void save(sExtendableArray& adt, int base_pos, int& header_pos, int& current_pos);
 

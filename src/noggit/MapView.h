@@ -64,6 +64,11 @@ namespace Noggit
     class ViewToolbar;
   }
 
+  namespace Ui
+  {
+    class ZoneMusicPlayer;
+  }
+
   namespace Ui::Tools
   {
     class BrushStack;
@@ -155,6 +160,7 @@ public:
   Noggit::BoolToggleProperty _draw_terrain = {true};
   Noggit::BoolToggleProperty _draw_wmo = {true};
   Noggit::BoolToggleProperty _draw_water = {true};
+  Noggit::BoolToggleProperty _draw_bloom = {true};
   Noggit::BoolToggleProperty _draw_wmo_doodads = {true};
   Noggit::BoolToggleProperty _draw_wmo_exterior = { true };
   Noggit::BoolToggleProperty _draw_models = {true};
@@ -162,6 +168,7 @@ public:
   Noggit::BoolToggleProperty _draw_hole_lines = {false};
   Noggit::BoolToggleProperty _draw_models_with_box = {false};
   Noggit::BoolToggleProperty _draw_fog = {false};
+  Noggit::Ui::ZoneMusicPlayer* _zone_music_player = nullptr;
   Noggit::BoolToggleProperty _draw_hidden_models = {false};
   Noggit::BoolToggleProperty _draw_occlusion_boxes = {false};
   Noggit::BoolToggleProperty _game_mode_camera = { false };

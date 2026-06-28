@@ -2,8 +2,13 @@
 
 #include "WMORender.hpp"
 #include <noggit/WMO.h>
+#include <noggit/Log.h>
 
+#include <cstdlib>
+#include <set>
+#include <string>
 #include <vector>
+#include <QtCore/QSettings>
 
 using namespace Noggit::Rendering;
 
@@ -52,6 +57,22 @@ void WMORender::draw(OpenGL::Scoped::use_program& wmo_shader
 
   wmo_shader.uniform("ambient_color",glm::vec3(_wmo->ambient_light_color));
 
+  // "Open" WMOs -- those with any exterior group, e.g. cave mouths like timbermaw_exterior -- let the
+  // outdoor zone light spill into their interior groups near the opening. The real client does this
+  // through portals; we have none, so the shader approximates it by lifting interior ambient toward
+  // the outdoor ambient. Gate it on the WMO actually being open: a fully enclosed dungeon (0 exterior
+  // groups, e.g. the Timbermaw instance) keeps its dark authored interior and stays moody.
+  bool wmo_open = false;
+  for (auto const& g : _wmo->groups)
+  {
+    if (g.is_exterior() || g.is_exterior_lit())
+    {
+      wmo_open = true;
+      break;
+    }
+  }
+  wmo_shader.uniform("wmo_open", wmo_open ? 1 : 0);
+
   std::vector<WMOGroup*> visible_groups;
   visible_groups.reserve(_wmo->groups.size());
 
@@ -84,6 +105,25 @@ void WMORender::draw(OpenGL::Scoped::use_program& wmo_shader
   if (wmo_liquid_program && liquid_texture_manager)
   {
     OpenGL::Scoped::use_program wmo_liquid_shader{*wmo_liquid_program};
+    // Dev water-opacity lever (Settings slider -> water/transparency). WMO liquid is a separate
+    // shader from ADT, so it needs the uniform set here too (e.g. Timbermaw water is WMO liquid).
+    wmo_liquid_shader.uniform("water_alpha_mult", QSettings().value("water/transparency", 1.0f).toFloat());
+
+    // Overlapping EXTERIOR water planes (e.g. Timbermaw has 11 stacked planes at the same level)
+    // alpha-blend on top of each other and multiply darker. Draw each water pixel only ONCE via
+    // the stencil buffer (cleared to 0 per frame in WorldRender): first plane to cover a pixel
+    // passes (stencil 0) and writes 1; later planes there fail (stencil == 1) and are skipped.
+    // Scoped to exterior water so INTERIOR liquid (e.g. Molten Core lava) is never stencil-tested.
+    // Toggleable via Settings (water/wmo_stencil, default on) for dev/debugging.
+    bool const dedupe_overlap = !interior_only
+                              && QSettings().value("water/wmo_stencil", true).toBool();
+    if (dedupe_overlap)
+    {
+      gl.enable(GL_STENCIL_TEST);
+      gl.stencilFunc(GL_NOTEQUAL, 1, 0xFF);
+      gl.stencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
+    }
+
     for (auto* group : visible_groups)
     {
       group->drawLiquid(transform_matrix,
@@ -91,6 +131,11 @@ void WMORender::draw(OpenGL::Scoped::use_program& wmo_shader
                         *liquid_texture_manager,
                         draw_fog,
                         animtime);
+    }
+
+    if (dedupe_overlap)
+    {
+      gl.disable(GL_STENCIL_TEST);
     }
   }
 
@@ -120,7 +165,6 @@ void WMORender::draw(OpenGL::Scoped::use_program& wmo_shader
 
   }
 }
-
 
 bool WMORender::drawSkybox(const glm::mat4x4& model_view, const glm::vec3& camera_pos,
                            OpenGL::Scoped::use_program& m2_shader, const math::frustum& frustum,

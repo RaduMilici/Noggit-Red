@@ -121,7 +121,7 @@ public:
             int animtime);
 
 private:
-  int initGeometry(BlizzardArchive::ClientFile* f, std::string const& wmo_path);
+  int initGeometry(BlizzardArchive::ClientFile* f, std::string const& wmo_path, bool force_magma_uv);
 
   glm::vec3 pos;
   bool mTransparency;

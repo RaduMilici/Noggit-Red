@@ -929,6 +929,15 @@ void Model::initCommon(const BlizzardArchive::ClientFile& f)
   {
     v.position = fixCoordSystem(v.position);
     v.normal = fixCoordSystem(v.normal);
+
+    // Classic (1.12) M2 vertices have only ONE texcoord; the 8 bytes we read as the second texcoord
+    // are unused/garbage (WoW Model Viewer, which renders these correctly, reads a single texcoord +
+    // 8 unused bytes). Two-texture passes (e.g. the dusty light-ray cone) sampled that garbage uv2 ->
+    // a broken/stretched second layer. Mirror the valid first texcoord into the second for classic.
+    if (_uses_classic_layout)
+    {
+      v.texcoords[1] = v.texcoords[0];
+    }
   }
 
   // textures
@@ -1344,15 +1353,25 @@ void Model::initCommon(const BlizzardArchive::ClientFile& f)
               if (bone_lookup_index < header.nBoneLookup && bone_lookup[bone_lookup_index] < header.nBones)
               {
                 auto remapped_bone = static_cast<uint8_t>(bone_lookup[bone_lookup_index]);
-                if (file_key().hasFilepath()
+                // Classic creature M2 vertices already carry correct GLOBAL bone indices.
+                // The per-view bone-lookup remap appears to corrupt them on these models
+                // (it rewrote ~408 body vertices to different bones than their originals),
+                // making part of the mesh follow the wrong bone and freeze at a different
+                // pose -> the doubled creature. Prefer the vertex's original global bone.
+                // Scoped to elementalearth for now to verify before generalizing.
+                bool const keep_original_global_bone =
+                    file_key().hasFilepath()
                     && file_key().filepath().find("elementalearth") != std::string::npos
-                    && influences == 1
-                    && bone == 0
-                    && remapped_bone == 0
-                    && vertex_properties[vertex * 4] != 0
-                    && geoset.d6 < header.nBones)
+                    && _vertices[vertex].bones[bone] < header.nBones;
+                if (keep_original_global_bone)
                 {
-                  remapped_bone = static_cast<uint8_t>(geoset.d6);
+                  remapped_bone = _vertices[vertex].bones[bone];
+                }
+                else if (remapped_bone == 0
+                    && vertex_properties[vertex * 4 + bone] != 0
+                    && _vertices[vertex].bones[bone] < header.nBones)
+                {
+                  remapped_bone = _vertices[vertex].bones[bone];
                 }
                 if (_vertices[vertex].bones[bone] != remapped_bone)
                 {
@@ -1440,6 +1459,28 @@ void Model::initCommon(const BlizzardArchive::ClientFile& f)
     for (size_t i = 0; i<view->n_submesh; ++i)
     {
       showGeosets[i] = true;
+    }
+
+    // Vanilla creature/elementalearth.m2 (Lava Surger/Elemental/Firesworn/Garr/...) is built
+    // from a structured "core" body PLUS a redundant outer "rock shell" rooted on independent
+    // (parent == -1) bones. The shell's classic translation tracks are all-zero for the idle
+    // anim while the core body bobs, so the shell stays frozen at bind and visibly separates =
+    // the long-standing "double surger" (one animated, one static). The core already contains
+    // the full creature, so drop the duplicate shell. Scoped to this model by filepath; keyed
+    // off each submesh's root bone being a parent == -1 rock bone so it survives geoset reorder.
+    if (_uses_classic_layout && file_key().hasFilepath()
+        && file_key().filepath().find("elementalearth") != std::string::npos
+        && range_fits(f, header.ofsBones, header.nBones, sizeof(ClassicModelBoneDef)))
+    {
+      auto const* raw_bones = reinterpret_cast<ClassicModelBoneDef const*>(f.getBuffer() + header.ofsBones);
+      for (size_t i = 0; i < view->n_submesh; ++i)
+      {
+        uint16_t const root_bone = model_geosets[i].d6;
+        if (root_bone < header.nBones && raw_bones[root_bone].parent < 0)
+        {
+          showGeosets[i] = false;
+        }
+      }
     }
 
     _render_flags = M2Array<ModelRenderFlags>(f, header.ofsRenderFlags, header.nRenderFlags);
@@ -1840,6 +1881,22 @@ void Model::initAnimated(const BlizzardArchive::ClientFile& f)
     for (size_t i=0; i<header.nLights; ++i)
       _lights.emplace_back (f, lDefs[i], _global_sequences.data());
   }
+  // Classic (1.12) lights were never loaded -- so torch/lava/light-ray emitters cast no light. Load
+  // them here using the classic light layout (212-byte ClassicModelLightDef). Bound-checked since the
+  // classic range validator doesn't cover the light block.
+  else if (_uses_classic_layout && header.nLights
+           && static_cast<std::uint64_t>(header.ofsLights)
+                + static_cast<std::uint64_t>(header.nLights) * sizeof(ClassicModelLightDef)
+              <= f.getSize())
+  {
+    _lights.reserve(header.nLights);
+    ClassicModelLightDef const* lDefs =
+      reinterpret_cast<ClassicModelLightDef const*>(f.getBuffer() + header.ofsLights);
+    for (size_t i = 0; i < header.nLights; ++i)
+    {
+      _lights.emplace_back (f, lDefs[i], _global_sequences.data());
+    }
+  }
 
   animcalc = false;
 }
@@ -2099,6 +2156,20 @@ ModelLight::ModelLight(const BlizzardArchive::ClientFile& f, const ModelLightDef
   , ambIntensity (mld.ambIntensity, f, global)
 {}
 
+// Classic (1.12) light: same leading fields, animated tracks in the older ClassicAnimationBlock form.
+ModelLight::ModelLight(const BlizzardArchive::ClientFile& f, const ClassicModelLightDef &mld, int *global)
+  : type (mld.type)
+  , parent (mld.bone)
+  , pos (fixCoordSystem(mld.pos))
+  , tpos (fixCoordSystem(mld.pos))
+  , dir (::glm::vec3(0,1,0))
+  , tdir (::glm::vec3(0,1,0))
+  , diffColor (mld.color, f, global)
+  , ambColor (mld.ambColor, f, global)
+  , diffIntensity (mld.intensity, f, global)
+  , ambIntensity (mld.ambIntensity, f, global)
+{}
+
 void ModelLight::setup(int time, OpenGL::light, int animtime)
 {
 	auto ambient = ambColor.getValue(0, time, animtime) * ambIntensity.getValue(0, time, animtime);
@@ -2197,7 +2268,7 @@ void Bone::calcMatrix(glm::mat4x4 const& model_view
   bool const has_rotation = _uses_classic_rotation ? classic_rot.uses(anim) : rot.uses(anim);
 
   if ( flags.transformed
-    || flags.billboard 
+    || flags.billboard
     || flags.cylindrical_billboard_lock_x 
     || flags.cylindrical_billboard_lock_y 
     || flags.cylindrical_billboard_lock_z
@@ -2296,7 +2367,7 @@ void Bone::calcMatrix(glm::mat4x4 const& model_view
   {
     mat = m;
   }
-  
+
   // transform matrix for normal vectors ... ??
   if (has_rotation)
   {
@@ -2400,7 +2471,18 @@ void Model::updateEmitters(float dt)
     if (!_texture_animations.empty())
     {
       _emitter_anim_accum_ms += dt * 1000.0f;
-      int const animtime = static_cast<int>(_emitter_anim_accum_ms);
+
+      // Volumetric light-ray dust scrolls extremely slowly with the raw authored track (~0.04 UV/s),
+      // which reads as static in the editor even though it's technically animating; in-game the dusty
+      // texture visibly streams down the shaft. Run the scroll clock faster for these models so the
+      // dust actually flows. Scoped by path so lava falls / water / other UV anims keep real timing.
+      float tex_clock = _emitter_anim_accum_ms;
+      if (_file_key.hasFilepath()
+          && _file_key.filepath().find("volumetriclight") != std::string::npos)
+      {
+        tex_clock *= 2.0f;
+      }
+      int const animtime = static_cast<int>(tex_clock);
       for (auto& tex_anim : _texture_animations)
       {
         tex_anim.calc(_current_anim_seq, _anim_time, animtime);

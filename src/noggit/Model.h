@@ -133,6 +133,7 @@ struct ModelLight {
   //Animation::M2Value<bool> Enabled;
 
   ModelLight(const BlizzardArchive::ClientFile&  f, const ModelLightDef &mld, int *global);
+  ModelLight(const BlizzardArchive::ClientFile&  f, const ClassicModelLightDef &mld, int *global);
   void setup(int time, OpenGL::light l, int animtime);
 };
 
@@ -236,6 +237,9 @@ public:
   std::vector<uint16_t> _indices;
 
   std::optional<FakeGeometry> _fake_geometry;
+
+  // Emitter lights (campfires etc.) so the world renderer can collect them as scene point lights.
+  [[nodiscard]] std::vector<ModelLight>& lights() { return _lights; }
 
 private:
   struct ClassicStaticBone

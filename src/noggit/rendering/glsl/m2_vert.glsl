@@ -20,6 +20,7 @@ out vec2 uv1;
 out vec2 uv2;
 out float camera_dist;
 out vec3 norm;
+out vec3 m2_world_pos;
 
 layout (std140) uniform matrices
 {
@@ -113,6 +114,7 @@ void main()
   mat3 cameraNormMatrix = mat3(cameraMatrix);
 
   vec4 vertex = cameraMatrix * pos;
+  m2_world_pos = (modelMatrix * pos).xyz;
 
   // important to normalize because of the scaling !!
   norm = normalize(normMatrix * normal);

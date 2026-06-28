@@ -280,6 +280,22 @@ struct ModelLightDef {
   AnimationBlock Enabled;
 };
 
+// Classic (1.12, M2 version 256) light definition: same leading fields, but the animated tracks use
+// the older ClassicAnimationBlock layout (28 bytes, with the extra nRanges/ofsRanges) instead of the
+// WotLK AnimationBlock (20 bytes). Total size = 2 + 2 + 12 + 7*28 = 212 bytes.
+struct ClassicModelLightDef {
+  int16_t type;
+  int16_t bone;
+  glm::vec3 pos;
+  ClassicAnimationBlock ambColor;
+  ClassicAnimationBlock ambIntensity;
+  ClassicAnimationBlock color;
+  ClassicAnimationBlock intensity;
+  ClassicAnimationBlock attStart;
+  ClassicAnimationBlock attEnd;
+  ClassicAnimationBlock Enabled;
+};
+
 struct ModelCameraDef {
   int32_t id;
   float fov, farclip, nearclip;

@@ -40,6 +40,10 @@ namespace Noggit::Rendering
     std::uint32_t index_count = 0;
     std::uint32_t n_used_samplers = 0;
     bool backface_cull = false;
+    // WMO material blend mode (MOMT): 0 opaque, 1 alpha-key, 2 alpha, 3 additive, 4 mod, 5 mod2x...
+    // Batches only merge into a draw call when this matches, so each draw call is one blend mode and
+    // the draw can do opaque first, then the blended (additive/alpha) batches in a second pass.
+    int blend_mode = 0;
   };
 
   class WMOGroupRender : public BaseRender

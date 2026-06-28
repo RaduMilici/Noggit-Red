@@ -82,6 +82,10 @@ class ParticleSystem
   std::uint32_t debug_update_log_count = 0;
   std::uint32_t debug_draw_log_count = 0;
 
+  // Pre-warm guard: simulate one lifespan on first tick so ambient emitters (dusty light-ray motes,
+  // smoke) are already populated/scattered instead of slowly filling in from empty after a load.
+  bool _prewarmed = false;
+
   float rem;
   //bool transform;
 

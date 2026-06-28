@@ -3,7 +3,11 @@
 #include <noggit/ui/tools/ViewToolbar/Ui/ViewToolbar.hpp>
 #include <noggit/ui/tools/ActionHistoryNavigator/ActionHistoryNavigator.hpp>
 #include <noggit/ui/FontAwesome.hpp>
+#include <noggit/ui/ZoneMusicPlayer.hpp>
 #include <QSlider>
+#include <QLabel>
+#include <QVBoxLayout>
+#include <QPushButton>
 #include <QtCore/QSettings>
 
 using namespace Noggit::Ui;
@@ -98,6 +102,7 @@ ViewToolbar::ViewToolbar(MapView *mapView, ViewToolbar *tb)
     add_tool_icon(mapView, &mapView->_draw_wmo_exterior, tr("WMO exterior"), FontNoggit::UI_TOGGLE, tb);
     add_tool_icon(mapView, &mapView->_draw_terrain, tr("Terrain"), FontNoggit::VISIBILITY_TERRAIN, tb);
     add_tool_icon(mapView, &mapView->_draw_water, tr("Water"), FontNoggit::VISIBILITY_WATER, tb);
+    add_tool_icon(mapView, &mapView->_draw_bloom, tr("Bloom"), FontNoggit::VISIBILITY_LIGHT, tb);
 
     addSeparator();
 
@@ -148,6 +153,79 @@ ViewToolbar::ViewToolbar(MapView *mapView, ViewToolbar *tb)
     tile_view_btn->setToolTip("2D View");
     addWidget(tile_view_btn);
     */
+
+    // Time-of-day control: a clock button that drops down a slider to scrub the in-game time and see
+    // the lighting/fog change live (daytime is recomputed from World::time every frame).
+    auto time_btn = new QPushButton(this);
+    time_btn->setIcon(FontNoggitIcon{ FontNoggit::TIME_NORMAL });
+    time_btn->setToolTip("Time of day");
+    addWidget(time_btn);
+
+    auto time_popup = new QWidget(this);
+    time_popup->setMinimumWidth(260);
+    auto time_layout = new QVBoxLayout(time_popup);
+    auto time_label = new QLabel("12:00", time_popup);
+    time_label->setAlignment(Qt::AlignCenter);
+    auto time_slider = new QSlider(Qt::Horizontal, time_popup);
+    time_slider->setMinimum(0);
+    time_slider->setMaximum(1439); // minutes in a day (0:00 .. 23:59)
+    time_layout->addWidget(time_label);
+    time_layout->addWidget(time_slider);
+    time_popup->setVisible(false);
+
+    auto fmt_time = [](int minutes)
+    {
+        return QString("%1:%2").arg(minutes / 60, 2, 10, QChar('0')).arg(minutes % 60, 2, 10, QChar('0'));
+    };
+
+    connect(time_slider, &QSlider::valueChanged, [mapView, time_label, fmt_time](int minutes)
+        {
+            // World::time runs 0..2880 (half-minutes); minutes = (time % 2880) / 2, so time = minutes * 2.
+            mapView->getWorld()->time = static_cast<float>(minutes * 2);
+            time_label->setText(fmt_time(minutes));
+            mapView->update(); // request a redraw so the lighting change shows immediately
+        });
+
+    connect(time_btn, &QPushButton::clicked,
+        [this, time_btn, time_popup, time_slider, time_label, mapView, fmt_time]()
+        {
+            // Sync the slider to the world's current time whenever the popup opens.
+            int minutes = (static_cast<int>(mapView->getWorld()->time) % 2880) / 2;
+            {
+                QSignalBlocker const block(time_slider);
+                time_slider->setValue(minutes);
+            }
+            time_label->setText(fmt_time(minutes));
+
+            QPoint new_pos = mapToGlobal(QPoint(time_btn->pos().x(), time_btn->pos().y() + 30));
+            time_popup->setGeometry(new_pos.x(), new_pos.y(), time_popup->width(), time_popup->height());
+            time_popup->setWindowFlags(Qt::Popup);
+            time_popup->show();
+        });
+
+    // Zone music controls: a dropdown showing the current zone's playlist (click a song to play it,
+    // the playing track is highlighted) plus a volume slider. The Zone-music toggle button above
+    // enables/disables automatic playback as you cross zone boundaries.
+    auto music_btn = new QPushButton(this);
+    music_btn->setIcon(FontAwesomeIcon(FontAwesome::music));
+    music_btn->setToolTip("Zone music controls");
+    addWidget(music_btn);
+
+    connect(music_btn, &QPushButton::clicked,
+            [this, music_btn, mapView]()
+            {
+                auto* panel = mapView->_zone_music_player;
+                if (!panel)
+                {
+                    return;
+                }
+                QPoint new_pos = mapToGlobal(QPoint(music_btn->pos().x(), music_btn->pos().y() + 30));
+                auto const hint = panel->sizeHint();
+                panel->setGeometry(new_pos.x(), new_pos.y(),
+                                   std::max(hint.width(), 280), std::max(hint.height(), 220));
+                panel->setWindowFlags(Qt::Popup);
+                panel->show();
+            });
 
     auto undo_stack_btn = new QPushButton(this);
     undo_stack_btn->setIcon(FontAwesomeIcon(FontAwesome::undo));

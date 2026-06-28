@@ -16,6 +16,27 @@ namespace
   {
     return {static_cast<float>(px) / 4.f, static_cast<float>(pz) / 4.f};
   }
+
+  // WoW LiquidType.dbc ids run in groups of four — water, ocean, magma, slime — repeated for the
+  // slow / fast / wmo / ... variants (e.g. 7 = "slow magma" in Blackrock, 5 = "slow water"). The
+  // vanilla DBC only defines the base ids (1-4, +21), so an MH2O layer authored with a variant id
+  // wasn't found and used to fall back to 1 = water -> lava rendered as blue water. Map an unknown
+  // id to its base type instead so it still renders as the correct liquid (3.3.5a "just worked"
+  // because its DBC defines the variants; this gives vanilla parity).
+  int resolve_liquid_id(int liquid_id)
+  {
+    if (liquid_id >= 1 && gLiquidTypeDB.CheckIfIdExists(liquid_id))
+    {
+      return liquid_id;
+    }
+    if (liquid_id < 1)
+    {
+      return 1;
+    }
+    int const base[4] = { 1, 2, 3, 4 }; // water, ocean, magma, slime
+    int const mapped = base[(liquid_id - 1) % 4];
+    return gLiquidTypeDB.CheckIfIdExists(mapped) ? mapped : 1;
+  }
 }
 
 liquid_layer::liquid_layer(ChunkWater* chunk, glm::vec3 const& base, float height, int liquid_id)
@@ -27,8 +48,7 @@ liquid_layer::liquid_layer(ChunkWater* chunk, glm::vec3 const& base, float heigh
   , pos(base)
   , _chunk(chunk)
 {
-  if (!gLiquidTypeDB.CheckIfIdExists(_liquid_id))
-    _liquid_id = 1;
+  _liquid_id = resolve_liquid_id(_liquid_id);
 
   for (int z = 0; z < 9; ++z)
   {
@@ -58,8 +78,7 @@ liquid_layer::liquid_layer(ChunkWater* chunk, glm::vec3 const& base, mclq& liqui
   , pos(base)
   , _chunk(chunk)
 {
-  if (!gLiquidTypeDB.CheckIfIdExists(_liquid_id))
-    _liquid_id = 1;
+  _liquid_id = resolve_liquid_id(_liquid_id);
 
   changeLiquidID(_liquid_id);
 
@@ -118,8 +137,7 @@ liquid_layer::liquid_layer(ChunkWater* chunk
   , _chunk(chunk)
 {
   // check if liquid id is valid or some downported maps will crash
-  if (!gLiquidTypeDB.CheckIfIdExists(_liquid_id))
-    _liquid_id = 1;
+  _liquid_id = resolve_liquid_id(_liquid_id);
 
   int offset = 0;
   for (int z = 0; z < info.height; ++z)

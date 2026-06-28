@@ -17,6 +17,7 @@ uniform float animtime;
 uniform int draw_shadows;
 uniform sampler2DArray shadowmap;
 uniform sampler2DArray texture_samplers[14] ;
+uniform float water_alpha_mult; // dev opacity lever (1 = unchanged)
 
 in float depth_;
 in vec2 tex_coord_;
@@ -159,8 +160,9 @@ vec4 get_magma_color(vec2 tex_coord, uint tex_sampler, int array_index)
   // Match reference noggit3: use the per-vertex magma UV directly (no down-scale, no LOD
   // bias) so the lava shows its detailed crust pattern, and scroll by the LiquidType
   // animation direction so it flows. (Frame cycling via tex_frame handles the churn.)
-  vec2 scroll = vec2(anim_uv.x * animtime / 2880.0,
-                     anim_uv.y * animtime / 2880.0);
+  // Quarter-speed lava flow (matches WMO magma_flow_speed = 0.25/2880; divisor x4 = quarter rate).
+  vec2 scroll = vec2(anim_uv.x * animtime / 11520.0,
+                     anim_uv.y * animtime / 11520.0);
   return get_tex_color(tex_coord + scroll, tex_sampler, array_index);
 }
 
@@ -181,33 +183,35 @@ void main()
   // slime
   else if(type == 3)
   {
-    out_color = get_tex_color(tex_coord_ + vec2(anim_uv.x*animtime / 2880.0, anim_uv.y*animtime / 2880.0), tex_array, tex_frame);
+    // Slime scroll at quarter speed, matching lava (divisor x4: 2880 -> 11520).
+    out_color = get_tex_color(tex_coord_ + vec2(anim_uv.x*animtime / 11520.0, anim_uv.y*animtime / 11520.0), tex_array, tex_frame);
   }
   else
   {
+    // Seamless in-game-style water (matches reference noggit3): depth-tinted ocean/river color
+    // plus the water texture, additive. Deliberately NO per-chunk terrain shadow multiply (that
+    // sampled a different shadowmap layer per chunk -> hard tile-boundary patches) and NO extra
+    // ambient/diffuse lighting multiply (that muddied the color and mismatched the in-game look).
+    // Per-vertex depth is smooth, so adjacent tiles now blend without seams.
     vec2 uv = rot2(tex_coord_ * anim_uv.x, anim_uv.y);
 
     vec4 texel = get_tex_color(uv, tex_array, tex_frame);
+
+    // depth_ is now the RAW water depth (world units above the bottom, terrain-derived &
+    // continuous). Map it two independent ways:
+    //  - color_depth: a BROAD gradient so the water is light near the coast and only fades to
+    //    the dark deep "fatigue" color far out (the shore lightening the in-game ocean has).
+    //  - alpha_depth: a STEEPER ramp to opaque so the per-tile seafloor terrain stays hidden in
+    //    deeper water (no "tile" seams) while shallow water near shore still shows the bottom.
+    float color_depth = clamp(depth_ * 0.012, 0.0, 1.0); // ~light -> dark over ~80 units
+    float alpha_depth = clamp(depth_ * 0.08,  0.0, 1.0); // ~opaque by ~12 units
+
     vec4 lerp = (type == 1)
-              ? mix (OceanColorLight, OceanColorDark, depth_)
-              : mix (RiverColorLight, RiverColorDark, depth_)
+              ? mix (OceanColorLight, OceanColorDark, color_depth)
+              : mix (RiverColorLight, RiverColorDark, color_depth)
               ;
 
-    vec3 normal = vec3(0.0, 1.0, 0.0);
-    float nDotL = clamp(dot(normal, -normalize(LightDir_FogRate.xyz)), 0.0, 1.0);
-    vec3 skyColor = AmbientColor_FogEnd.xyz * 1.10000002;
-    vec3 groundColor = AmbientColor_FogEnd.xyz * 0.699999988;
-    vec3 ambient = mix(groundColor, skyColor, 0.5 + (0.5 * nDotL));
-    vec3 diffuse = DiffuseColor_FogStart.xyz * nDotL;
-
-    vec3 base_color = mix(lerp.rgb, texel.rgb, 0.35);
-    out_color = vec4(clamp(base_color * (ambient + diffuse), 0.0, 1.0), lerp.a);
-
-    if (draw_shadows != 0)
-    {
-      float shadow_alpha = texture(shadowmap, vec3(shadow_uv, shadow_chunk_index)).r;
-      out_color.rgb *= 1.0 - shadow_alpha;
-    }
+    out_color = vec4(clamp(texel.rgb + lerp.rgb, 0.0, 1.0), max(lerp.a, alpha_depth) * water_alpha_mult);
   }
 
   if (FogColor_FogOn.w != 0 && type != 2) // reference applies no fog to lava

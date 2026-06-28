@@ -159,6 +159,13 @@ public:
 
   unsigned int getAreaID (glm::vec3 const&);
   unsigned int getWMOAreaID(glm::vec3 const&);
+  // ZoneMusic id for a position: WMOAreaTable.ZoneMusic when inside a WMO (dungeons/caves), else the
+  // AreaTable parent chain. 0 = no music authored.
+  unsigned int getWMOZoneMusic(glm::vec3 const&);
+  int getZoneMusic(glm::vec3 const&);
+  // If the camera is inside a WMO group that has authored interior fog (MFOG), fills color/start/end
+  // and returns true. Used to apply that fog to the whole scene (terrain, doodads, light shafts).
+  bool getInteriorFog(glm::vec3 const& pos, glm::vec3& out_color, float& out_start, float& out_end);
   void setAreaID(glm::vec3 const& pos, int id, bool adt,  float radius = -1.0f);
 
   Noggit::NoggitRenderContext getRenderContext() { return _context; };

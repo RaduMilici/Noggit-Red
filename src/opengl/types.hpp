@@ -26,6 +26,9 @@ namespace OpenGL
     glm::mat4x4 projection;
   };
 
+  // Emitter point lights (campfires, braziers, ...) carried to the terrain/WMO/M2 shaders.
+  static constexpr int MAX_POINT_LIGHTS = 16;
+
   struct LightingUniformBlock
   {
     glm::vec4 DiffuseColor_FogStart;
@@ -36,6 +39,11 @@ namespace OpenGL
     glm::vec4 OceanColorDark;
     glm::vec4 RiverColorLight;
     glm::vec4 RiverColorDark;
+    // point lights: .x of PointLightParams = active count. Per light: world pos.xyz + radius in .w
+    // (PointLightPos), colour already scaled by intensity in .xyz (PointLightColor).
+    glm::vec4 PointLightParams;
+    glm::vec4 PointLightPos[MAX_POINT_LIGHTS];
+    glm::vec4 PointLightColor[MAX_POINT_LIGHTS];
   };
 
   struct TerrainParamsUniformBlock

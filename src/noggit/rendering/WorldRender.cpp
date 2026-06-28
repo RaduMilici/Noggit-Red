@@ -236,21 +236,20 @@ namespace
 
   float creature_spawn_model_draw_distance()
   {
-    static float const distance = []
+    // Dev env override still wins.
+    if (char const* value = std::getenv("NOGGIT_CREATURE_MODEL_DRAW_DISTANCE"))
     {
-      if (char const* value = std::getenv("NOGGIT_CREATURE_MODEL_DRAW_DISTANCE"))
+      auto const parsed = std::strtof(value, nullptr);
+      if (std::isfinite(parsed) && parsed > 0.0f)
       {
-        auto const parsed = std::strtof(value, nullptr);
-        if (std::isfinite(parsed) && parsed > 0.0f)
-        {
-          return parsed;
-        }
+        return parsed;
       }
+    }
 
-      return 120.0f;
-    }();
-
-    return distance;
+    // Live Settings slider (creature/draw_distance). Read each frame so the slider applies
+    // immediately. Default 120 (the previous hard-coded value).
+    float const v = QSettings().value("creature/draw_distance", 120.0f).toFloat();
+    return (std::isfinite(v) && v > 0.0f) ? v : 120.0f;
   }
 
   float creature_spawn_marker_draw_distance()
@@ -305,6 +304,56 @@ namespace
     }();
 
     return budget;
+  }
+
+  bool light_effect_debug_enabled()
+  {
+    static bool const enabled = []
+    {
+      if (char const* value = std::getenv("NOGGIT_LIGHT_DEBUG"))
+      {
+        return std::string(value) != "0";
+      }
+
+      return false;
+    }();
+
+    return enabled;
+  }
+
+  // True for M2 models that have at least one additive pass (No_Add_Alpha / Add) and NO solid
+  // (Opaque / Alpha_Key) pass — i.e. pure additive glows (god rays / lightshafts). Drawn AFTER the
+  // water so it doesn't paint over them. NOTE: deliberately NOT broadened to all translucent-only
+  // models — deferring Alpha effects like waterfalls and collecting their particles crashed in
+  // ParticleSystem::draw (the deferred mesh path left their transform buffer in a bad state).
+  bool is_pure_additive_light_effect(Model* model)
+  {
+    if (!model)
+    {
+      return false;
+    }
+
+    auto const& passes = model->renderer()->renderPasses();
+    if (passes.empty())
+    {
+      return false;
+    }
+
+    bool has_additive = false;
+    for (auto const& pass : passes)
+    {
+      auto const blend = static_cast<M2Blend>(pass.blend_mode);
+      if (blend == M2Blend::Opaque || blend == M2Blend::Alpha_Key)
+      {
+        return false;
+      }
+      if (blend == M2Blend::Add || blend == M2Blend::No_Add_Alpha)
+      {
+        has_additive = true;
+      }
+    }
+
+    return has_additive;
   }
 
   ModelAttachmentDef const* find_attachment_def(Model const* model, int attachment_id)
@@ -491,7 +540,7 @@ WorldRender::WorldRender(World* world)
 : BaseRender()
 , _world(world)
 , _liquid_texture_manager(world->_context)
-, _view_distance(world->_settings->value("view_distance", 1000.f).toFloat())
+, _view_distance(world->_settings->value("view_distance", 2000.f).toFloat())
 , _cull_distance(0.f)
 {
 }
@@ -534,6 +583,7 @@ void WorldRender::draw (glm::mat4x4 const& model_view
     , bool draw_occlusion_boxes
     , bool minimap_render
     , bool draw_wmo_exterior
+    , bool draw_bloom
 )
 {
 
@@ -564,6 +614,23 @@ void WorldRender::draw (glm::mat4x4 const& model_view
     updateLightingUniformBlock(draw_fog, camera_pos);
   else
     updateLightingUniformBlockMinimap(minimap_render_settings);
+
+  // Bloom: render the whole 3D scene into an offscreen colour target first, so afterwards we can pull
+  // out the bright areas, blur them and add them back (the glow/bleed of bright sky openings, light
+  // shafts, additive glows). Only for the main 3D viewport -- never the minimap or 2D mode.
+  bool const do_bloom = draw_bloom && !minimap_render && display == display_mode::in_3D;
+  GLint bloom_prev_fbo = 0;
+  GLint bloom_vp[4] = {0, 0, 0, 0};
+  if (do_bloom)
+  {
+    gl.getIntegerv(GL_FRAMEBUFFER_BINDING, &bloom_prev_fbo);
+    gl.getIntegerv(GL_VIEWPORT, bloom_vp);
+    ensureBloomTargets(bloom_vp[2], bloom_vp[3]);
+    gl.bindFramebuffer(GL_FRAMEBUFFER, _bloom_scene_fbo);
+    gl.viewport(0, 0, _bloom_w, _bloom_h);
+    gl.clearColor(0.f, 0.f, 0.f, 1.f);
+    gl.clear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+  }
 
   // setup render settings for minimap
   if (minimap_render)
@@ -717,10 +784,22 @@ void WorldRender::draw (glm::mat4x4 const& model_view
     }
   }
 
-  _cull_distance= draw_fog ? _skies->fog_distance_end() : _view_distance;
+  // Read the object view distance LIVE each frame (not just once in the ctor) so changing the
+  // Settings "View Distance" field applies immediately without a map reload. This governs how far
+  // objects/WMOs (e.g. the lighthouse) render when fog is off (fog end caps it when fog is on).
+  _view_distance = _world->_settings->value("view_distance", 2000.f).toFloat();
+  // Render distance is capped at the user's view distance. With fog ON we still cull at the fog end
+  // when that's NEARER (no point drawing what the fog hides), but a fog end larger than the view
+  // distance must NOT push the render distance past it -- otherwise enabling fog renders further than
+  // the view distance allows.
+  _cull_distance = draw_fog
+                 ? std::min(_skies->fog_distance_end(), _view_distance)
+                 : _view_distance;
 
-  // Draw verylowres heightmap
-  if (!_world->mapIndex.hasAGlobalWMO() && draw_fog && draw_terrain)
+  // Draw verylowres heightmap (distant horizon backdrop). Toggleable live via Settings
+  // ("render_horizon", default on) so it can be disabled to stop fog rendering distant mesh.
+  bool const draw_horizon = _world->_settings->value("render_horizon", true).toBool();
+  if (!_world->mapIndex.hasAGlobalWMO() && draw_fog && draw_terrain && draw_horizon)
   {
     ZoneScopedN("World::draw() : Draw horizon");
     _horizon_render->draw (model_view, projection, &_world->mapIndex, _skies->color_set[FOG_COLOR], _cull_distance, frustum, camera_pos, display);
@@ -838,6 +917,9 @@ void WorldRender::draw (glm::mat4x4 const& model_view
   }
 
   std::unordered_map<Model*, std::size_t> model_with_particles;
+
+  // Pure-additive light effects (god rays / lighthouse beams) deferred to draw AFTER the water.
+  std::vector<Model*> deferred_light_effects;
 
   tsl::robin_map<Model*, std::vector<glm::mat4x4>> models_to_draw;
   struct CreatureSpawnInstanceDraw
@@ -982,6 +1064,13 @@ void WorldRender::draw (glm::mat4x4 const& model_view
       OpenGL::Scoped::use_program wmo_program{*_wmo_program.get()};
 
       wmo_program.uniform("camera", glm::vec3(camera_pos.x, camera_pos.y, camera_pos.z));
+
+      // Clear stencil to 0 on the bound render target so the WMO water "draw once per pixel"
+      // stencil (applied to EXTERIOR water in WMORender::draw) starts clean each frame. This
+      // stops overlapping same-level water planes (e.g. Timbermaw) from stacking and multiplying
+      // darker. Harmless no-op if the framebuffer has no stencil buffer.
+      gl.clearStencil(0);
+      gl.clear(GL_STENCIL_BUFFER_BIT);
 
       // make this check per WMO or global WMO with tiles may not work
       bool disable_cull = false;
@@ -1203,14 +1292,6 @@ void WorldRender::draw (glm::mat4x4 const& model_view
             continue;
           }
 
-          if (capture_debug_enabled() && doodad->model->file_key().hasFilepath()
-              && doodad->model->file_key().filepath().find("blackrocklavafall") != std::string::npos)
-          {
-            LogDebug << "LAVAFALL inject model='" << doodad->model->file_key().stringRepr()
-                     << "' hidden=" << doodad->model->is_hidden()
-                     << std::endl;
-          }
-
           models_to_draw[doodad->model.get()].push_back(doodad->transformMatrix());
         }
       }
@@ -1421,18 +1502,41 @@ void WorldRender::draw (glm::mat4x4 const& model_view
               continue;
           }
 
-          if (capture_debug_enabled() && pair.first->file_key().hasFilepath()
-              && pair.first->file_key().filepath().find("blackrocklavafall") != std::string::npos)
-          {
-            LogDebug << "LAVAFALL bucket model='" << pair.first->file_key().stringRepr()
-                     << "' instances=" << pair.second.size()
-                     << " hidden=" << pair.first->is_hidden()
-                     << " willDraw=" << (draw_hidden_models || !pair.first->is_hidden())
-                     << std::endl;
-          }
-
           if (draw_hidden_models || !pair.first->is_hidden())
           {
+            // Diagnostic (NOGGIT_LIGHT_DEBUG=1): dump each model bucket's path + per-pass blend
+            // modes once, so a beam/glow that isn't being deferred can be identified by name.
+            if (light_effect_debug_enabled() && pair.first->file_key().hasFilepath())
+            {
+              static std::set<std::string> logged_light_buckets;
+              auto const& lp = pair.first->file_key().filepath();
+              if (logged_light_buckets.insert(lp).second)
+              {
+                std::ostringstream blends;
+                for (auto const& pass : pair.first->renderer()->renderPasses())
+                  blends << static_cast<int>(pass.blend_mode) << " ";
+                LogDebug << "WorldRender::light model='" << lp
+                         << "' passes=[" << blends.str() << "] deferred="
+                         << (is_pure_additive_light_effect(pair.first) ? 1 : 0) << std::endl;
+              }
+            }
+
+            // Pure-additive glows (god rays / lighthouse beams) draw AFTER the water so it doesn't
+            // paint over them. BUT only defer those with NO particle/ribbon emitters: the deferred
+            // mesh pass doesn't prime the per-model transform buffer the way the particle pass
+            // expects, so routing a deferred model's particles through it leaves that buffer invalid
+            // (GL_INVALID_OPERATION -> driver crash). Models with particles (e.g. the dusty
+            // light-rays) stay on the normal path so their falling dust still draws -- they're
+            // interior god-rays with no water to be occluded by anyway. The lighthouse beam has no
+            // particles, so it still defers and still renders on top of the water.
+            if (is_pure_additive_light_effect(pair.first)
+                && pair.first->_particles.empty()
+                && pair.first->_ribbons.empty())
+            {
+              deferred_light_effects.push_back(pair.first);
+              continue;
+            }
+
             if (capture_debug_enabled())
             {
               LogDebug << "WorldRender::draw instanced m2 bucket begin model='"
@@ -1914,43 +2018,8 @@ void WorldRender::draw (glm::mat4x4 const& model_view
       water_shader.uniform("use_transform", 1);
     }
   }
-  // model particles
-  if (draw_model_animations && !model_with_particles.empty())
-  {
-    OpenGL::Scoped::bool_setter<GL_CULL_FACE, GL_FALSE> const cull;
-    OpenGL::Scoped::bool_setter<GL_DEPTH_TEST, GL_TRUE> const depth_test;
-    OpenGL::Scoped::depth_mask_setter<GL_FALSE> const depth_mask;
-
-    OpenGL::Scoped::use_program particles_shader {*_m2_particles_program.get()};
-
-    particles_shader.uniform("model_view_projection", mvp);
-    OpenGL::texture::set_active_texture(0);
-    particles_shader.uniform("tex", 0);
-
-    for (auto& it : model_with_particles)
-    {
-      it.first->renderer()->drawParticles(glm::transpose(model_view), particles_shader, it.second);
-    }
-  }
-
-
-  if (draw_model_animations && !model_with_particles.empty())
-  {
-    OpenGL::Scoped::bool_setter<GL_CULL_FACE, GL_FALSE> const cull;
-    OpenGL::Scoped::depth_mask_setter<GL_FALSE> const depth_mask;
-
-    OpenGL::Scoped::use_program ribbon_shader {*_m2_ribbons_program.get()};
-
-    ribbon_shader.uniform("model_view_projection", mvp);
-
-    gl.blendFunc(GL_SRC_ALPHA, GL_ONE);
-
-    for (auto& it : model_with_particles)
-    {
-      it.first->renderer()->drawRibbons(ribbon_shader, it.second);
-    }
-  }
-
+  // Draw water BEFORE the additive model particles/ribbons and the deferred light effects, so
+  // those additive glows paint OVER the (now opaque-in-deep-water) water instead of being hidden.
   gl.enable(GL_BLEND);
   gl.blendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
@@ -1966,11 +2035,24 @@ void WorldRender::draw (glm::mat4x4 const& model_view
     // draw the water on both sides
     OpenGL::Scoped::bool_setter<GL_CULL_FACE, GL_FALSE> const cull;
 
+    // Translucent water must NOT write depth. Solids drawn earlier already populated the depth
+    // buffer (so water is still correctly occluded by piers/terrain in front of it). By leaving
+    // the depth buffer at the solid geometry, the additive light effects drawn AFTER the water
+    // test only against solids -> a lighthouse beam shows fully over the water surface (even the
+    // part below it) yet is still hidden behind the mountain. If water wrote depth, the beam's
+    // below-surface span would be depth-rejected ("pokes out only where it can").
+    OpenGL::Scoped::depth_mask_setter<GL_FALSE> const no_depth_write;
+
     OpenGL::Scoped::use_program water_shader{ *_liquid_program.get()};
 
     gl.bindVertexArray(_liquid_chunk_vao);
 
     water_shader.uniform ("use_transform", 0);
+
+    // Dev water-opacity lever (settings: water/transparency, 0..1; 1 = unchanged). Read live so
+    // dragging the Settings slider updates the water immediately.
+    water_shader.uniform ("water_alpha_mult"
+                          , _world->_settings->value("water/transparency", 1.0f).toFloat());
 
     for (auto& pair : _world->_loaded_tiles_buffer)
     {
@@ -1999,6 +2081,95 @@ void WorldRender::draw (glm::mat4x4 const& model_view
     if (capture_debug_enabled())
     {
       LogDebug << "WorldRender::draw water end" << std::endl;
+    }
+  }
+
+  // Deferred pure-additive light effects (god rays / lighthouse beams), drawn AFTER the water so
+  // the opaque deep water no longer paints over them. prepareDraw applies each pass's additive
+  // blend + no-depth-write, so they brighten the water surface instead of being occluded by it.
+  if (!deferred_light_effects.empty())
+  {
+    OpenGL::Scoped::use_program m2_shader {*_m2_instanced_program.get()};
+
+    OpenGL::M2RenderState model_render_state;
+    model_render_state.tex_arrays = {0, 0};
+    model_render_state.tex_indices = {0, 0};
+    model_render_state.tex_unit_lookups = {0, 0};
+    gl.blendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    gl.disable(GL_BLEND);
+    gl.depthMask(GL_TRUE);
+    gl.enable(GL_CULL_FACE);
+    m2_shader.uniform("blend_mode", 0);
+    m2_shader.uniform("unfogged", static_cast<int>(model_render_state.unfogged));
+    m2_shader.uniform("unlit",  static_cast<int>(model_render_state.unlit));
+    m2_shader.uniform("tex_unit_lookup_1", 0);
+    m2_shader.uniform("tex_unit_lookup_2", 0);
+    m2_shader.uniform("pixel_shader", 0);
+
+    std::unordered_map<Model*, std::size_t> unused_boxes;
+
+    for (Model* model : deferred_light_effects)
+    {
+      auto const it = models_to_draw.find(model);
+      if (it == models_to_draw.end())
+        continue;
+
+      model->renderer()->draw( model_view
+          , it->second
+          , m2_shader
+          , model_render_state
+          , frustum
+          , _cull_distance
+          , camera_pos
+          , _world->animtime
+          , false
+          , unused_boxes
+          , display
+      );
+      _world->_n_rendered_objects += it->second.size();
+    }
+
+    // Restore the default opaque state for anything drawn afterwards.
+    gl.disable(GL_BLEND);
+    gl.enable(GL_CULL_FACE);
+    gl.depthMask(GL_TRUE);
+  }
+
+  // model particles (drawn after water so additive glows appear on top of the water surface)
+  if (draw_model_animations && !model_with_particles.empty())
+  {
+    OpenGL::Scoped::bool_setter<GL_CULL_FACE, GL_FALSE> const cull;
+    OpenGL::Scoped::bool_setter<GL_DEPTH_TEST, GL_TRUE> const depth_test;
+    OpenGL::Scoped::depth_mask_setter<GL_FALSE> const depth_mask;
+
+    OpenGL::Scoped::use_program particles_shader {*_m2_particles_program.get()};
+
+    particles_shader.uniform("model_view_projection", mvp);
+    particles_shader.uniform("camera", camera_pos); // for per-particle fog distance
+    OpenGL::texture::set_active_texture(0);
+    particles_shader.uniform("tex", 0);
+
+    for (auto& it : model_with_particles)
+    {
+      it.first->renderer()->drawParticles(glm::transpose(model_view), particles_shader, it.second);
+    }
+  }
+
+
+  if (draw_model_animations && !model_with_particles.empty())
+  {
+    OpenGL::Scoped::bool_setter<GL_CULL_FACE, GL_FALSE> const cull;
+    OpenGL::Scoped::depth_mask_setter<GL_FALSE> const depth_mask;
+
+    OpenGL::Scoped::use_program ribbon_shader {*_m2_ribbons_program.get()};
+
+    ribbon_shader.uniform("model_view_projection", mvp);
+
+    gl.blendFunc(GL_SRC_ALPHA, GL_ONE);
+
+    for (auto& it : model_with_particles)
+    {
+      it.first->renderer()->drawRibbons(ribbon_shader, it.second);
     }
   }
 
@@ -2115,6 +2286,145 @@ void WorldRender::draw (glm::mat4x4 const& model_view
           _sphere_render.draw(mvp, CurrentSky->pos, diffuse, CurrentSky->r2, 32, 18, alpha_light_sphere, false, draw_wireframe_light_sphere);
       }
   }
+
+  // Bloom: scene is fully rendered into the offscreen target now -> extract bright, blur, and
+  // composite (scene + bloom) back onto the framebuffer that was bound when we entered (Qt's).
+  if (do_bloom)
+  {
+    renderBloomAndComposite(static_cast<GLuint>(bloom_prev_fbo), bloom_vp[2], bloom_vp[3]);
+  }
+}
+
+void WorldRender::ensureBloomTargets(int w, int h)
+{
+  if (w < 1) w = 1;
+  if (h < 1) h = 1;
+  int const bw = std::max(1, w / 2);
+  int const bh = std::max(1, h / 2);
+
+  if (!_bloom_initialized)
+  {
+    _bloom_bright_program.reset(new OpenGL::program
+      { { GL_VERTEX_SHADER,   OpenGL::shader::src_from_qrc("bloom_quad_vs") }
+      , { GL_FRAGMENT_SHADER, OpenGL::shader::src_from_qrc("bloom_bright_fs") } });
+    _bloom_blur_program.reset(new OpenGL::program
+      { { GL_VERTEX_SHADER,   OpenGL::shader::src_from_qrc("bloom_quad_vs") }
+      , { GL_FRAGMENT_SHADER, OpenGL::shader::src_from_qrc("bloom_blur_fs") } });
+    _bloom_composite_program.reset(new OpenGL::program
+      { { GL_VERTEX_SHADER,   OpenGL::shader::src_from_qrc("bloom_quad_vs") }
+      , { GL_FRAGMENT_SHADER, OpenGL::shader::src_from_qrc("bloom_composite_fs") } });
+
+    gl.genVertexArrays(1, &_bloom_vao);
+    gl.genFramebuffers(1, &_bloom_scene_fbo);
+    gl.genTextures(1, &_bloom_scene_color);
+    gl.genRenderbuffers(1, &_bloom_scene_depth);
+    gl.genFramebuffers(2, _bloom_fbo);
+    gl.genTextures(2, _bloom_tex);
+
+    _bloom_initialized = true;
+    _bloom_w = _bloom_h = -1; // force the (re)allocation below
+  }
+
+  if (_bloom_w == w && _bloom_h == h)
+  {
+    return;
+  }
+
+  _bloom_w = w;
+  _bloom_h = h;
+  _bloom_bw = bw;
+  _bloom_bh = bh;
+
+  auto alloc_color = [](GLuint tex, int tw, int th)
+  {
+    gl.bindTexture(GL_TEXTURE_2D, tex);
+    gl.texImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, tw, th, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    gl.texParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    gl.texParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    gl.texParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    gl.texParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+  };
+
+  gl.activeTexture(GL_TEXTURE0);
+
+  // full-res scene colour + a combined depth/STENCIL buffer. The stencil is required by the WMO
+  // water-overlap dedupe -- without it that pass silently no-ops when rendering into the bloom FBO.
+  alloc_color(_bloom_scene_color, w, h);
+  gl.bindRenderbuffer(GL_RENDERBUFFER, _bloom_scene_depth);
+  gl.renderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, w, h);
+  gl.bindFramebuffer(GL_FRAMEBUFFER, _bloom_scene_fbo);
+  gl.framebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, _bloom_scene_color, 0);
+  gl.framebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, _bloom_scene_depth);
+
+  // half-res ping-pong targets for the blur
+  for (int i = 0; i < 2; ++i)
+  {
+    alloc_color(_bloom_tex[i], bw, bh);
+    gl.bindFramebuffer(GL_FRAMEBUFFER, _bloom_fbo[i]);
+    gl.framebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, _bloom_tex[i], 0);
+  }
+}
+
+void WorldRender::renderBloomAndComposite(GLuint target_fbo, int w, int h)
+{
+  gl.disable(GL_DEPTH_TEST);
+  gl.disable(GL_BLEND);
+  gl.bindVertexArray(_bloom_vao);
+
+  // 1) bright pass: full-res scene colour -> half-res _bloom_tex[0]
+  gl.bindFramebuffer(GL_FRAMEBUFFER, _bloom_fbo[0]);
+  gl.viewport(0, 0, _bloom_bw, _bloom_bh);
+  {
+    OpenGL::Scoped::use_program p{*_bloom_bright_program};
+    gl.activeTexture(GL_TEXTURE0);
+    gl.bindTexture(GL_TEXTURE_2D, _bloom_scene_color);
+    p.uniform("scene", 0);
+    // High threshold so only near-white pixels (sky openings, light-shaft cores, the globe's bright
+    // top) bloom -- NOT the merely-bright sunlit terrain, which was washing the whole ground white.
+    p.uniform("threshold", 0.50f);
+    gl.drawArraysInstanced(GL_TRIANGLES, 0, 3, 1);
+  }
+
+  // 2) separable gaussian blur, ping-ponging between the two half-res targets
+  bool horizontal = true;
+  int const passes = 6; // 3 H/V pairs -- tighter blur so bloom doesn't smear across the terrain
+  for (int i = 0; i < passes; ++i)
+  {
+    int const src = horizontal ? 0 : 1;
+    int const dst = horizontal ? 1 : 0;
+    gl.bindFramebuffer(GL_FRAMEBUFFER, _bloom_fbo[dst]);
+    gl.viewport(0, 0, _bloom_bw, _bloom_bh);
+
+    OpenGL::Scoped::use_program p{*_bloom_blur_program};
+    gl.activeTexture(GL_TEXTURE0);
+    gl.bindTexture(GL_TEXTURE_2D, _bloom_tex[src]);
+    p.uniform("image", 0);
+    p.uniform("horizontal", horizontal ? 1 : 0);
+    p.uniform("texel", glm::vec2(1.f / static_cast<float>(_bloom_bw), 1.f / static_cast<float>(_bloom_bh)));
+    gl.drawArraysInstanced(GL_TRIANGLES, 0, 3, 1);
+
+    horizontal = !horizontal;
+  }
+  // even number of passes -> final blurred result is back in _bloom_tex[0]
+
+  // 3) composite scene + bloom -> the framebuffer that was bound on entry (Qt's default), full res
+  gl.bindFramebuffer(GL_FRAMEBUFFER, target_fbo);
+  gl.viewport(0, 0, w, h);
+  {
+    OpenGL::Scoped::use_program p{*_bloom_composite_program};
+    gl.activeTexture(GL_TEXTURE0);
+    gl.bindTexture(GL_TEXTURE_2D, _bloom_scene_color);
+    p.uniform("scene", 0);
+    gl.activeTexture(GL_TEXTURE1);
+    gl.bindTexture(GL_TEXTURE_2D, _bloom_tex[0]);
+    p.uniform("bloom", 1);
+    p.uniform("intensity", 1.0f);
+    gl.drawArraysInstanced(GL_TRIANGLES, 0, 3, 1);
+  }
+
+  gl.activeTexture(GL_TEXTURE0);
+  gl.bindVertexArray(0);
+  gl.enable(GL_DEPTH_TEST);
 }
 
 void WorldRender::upload()
@@ -2287,6 +2597,12 @@ void WorldRender::upload()
     m2_shader_instanced.uniform("tex2", 2);
   }
 
+  {
+    // Particles read the lighting UBO for fog (so smoke/dust fades into the haze like other geometry).
+    OpenGL::Scoped::use_program particles_shader {*_m2_particles_program.get()};
+    particles_shader.bind_uniform_block("lighting", 1);
+  }
+
   /*
   {
     OpenGL::Scoped::use_program particles_shader {*_m2_particles_program.get()};
@@ -2440,6 +2756,34 @@ void WorldRender::updateLightingUniformBlock(bool draw_fog, glm::vec3 const& cam
     fog_end = 500.0f;
   }
 
+  // Inside a WMO with authored interior fog (MFOG)? The client applies that fog to the WHOLE scene
+  // inside, not just the WMO geometry. Override the global fog so terrain, doodads, the WMO and light
+  // shafts all fade together (otherwise only the WMO fogs and doodads/shafts float clear in front).
+  if (draw_fog)
+  {
+    try
+    {
+      glm::vec3 wmo_fog_color;
+      float wmo_fog_start = 0.f, wmo_fog_end = 0.f;
+      if (_world->getInteriorFog(camera_pos, wmo_fog_color, wmo_fog_start, wmo_fog_end))
+      {
+        // Warm the (cool) authored interior fog so it doesn't chill the atmosphere. Keep the model's
+        // authored distance/density. Tune: the warm channel multiplier.
+        fog_color = glm::clamp(wmo_fog_color * glm::vec3(1.25f, 1.02f, 0.78f), 0.0f, 1.0f);
+        fog_end = wmo_fog_end;
+        // The global fog formula treats fog_start as a FRACTION of fog_end (start = fog_end * fog_start),
+        // but MFOG fogstart is an absolute distance -- convert to the fraction so the math matches and
+        // near geometry isn't fully fogged (which painted the whole interior flat fog colour).
+        fog_start = (wmo_fog_end > 0.001f) ? std::clamp(wmo_fog_start / wmo_fog_end, 0.0f, 0.99f) : 0.25f;
+      }
+    }
+    catch (...)
+    {
+      // WMO extents/fog access can throw mid-load (same reason getWMOAreaID is guarded); ignore and
+      // keep the outdoor fog this frame.
+    }
+  }
+
   _lighting_ubo_data.DiffuseColor_FogStart = {diffuse.x,diffuse.y,diffuse.z, fog_start};
   _lighting_ubo_data.AmbientColor_FogEnd = {ambient.x,ambient.y,ambient.z, fog_end};
   _lighting_ubo_data.FogColor_FogOn = {fog_color.x,fog_color.y,fog_color.z, static_cast<float>(draw_fog)};
@@ -2468,6 +2812,50 @@ void WorldRender::updateLightingUniformBlock(bool draw_fog, glm::vec3 const& cam
           << '\n';
   }
 
+  // Collect emitter point lights (campfires etc.) near the camera so the terrain / WMO / M2 shaders
+  // can add their warm falloff. M2 lights are sparse in 1.12 (mostly campfires); we keep the nearest
+  // MAX_POINT_LIGHTS to the camera. (M2 attenuation range isn't parsed, so we use a default radius.)
+  {
+    struct CollectedLight { glm::vec3 pos; glm::vec3 color; float radius; float dist2; };
+    std::vector<CollectedLight> collected;
+
+    _world->_model_instance_storage.for_each_m2_instance([&] (ModelInstance& inst)
+    {
+      Model* m = inst.model.get();
+      if (!m || !m->finishedLoading() || m->lights().empty())
+      {
+        return;
+      }
+      glm::mat4x4 const transform = inst.transformMatrix();
+      for (auto& l : m->lights())
+      {
+        glm::vec3 const world = glm::vec3(transform * glm::vec4(l.pos, 1.0f));
+        glm::vec3 const col = l.diffColor.getValue(0, 0, 0) * l.diffIntensity.getValue(0, 0, 0);
+        glm::vec3 const d = world - camera_pos;
+        collected.push_back({world, col, 18.0f, glm::dot(d, d)});
+      }
+    });
+
+    std::sort(collected.begin(), collected.end(),
+              [] (CollectedLight const& a, CollectedLight const& b) { return a.dist2 < b.dist2; });
+
+    int const count = std::min(static_cast<int>(collected.size()), OpenGL::MAX_POINT_LIGHTS);
+    _lighting_ubo_data.PointLightParams = glm::vec4(static_cast<float>(count), 0.f, 0.f, 0.f);
+    for (int i = 0; i < OpenGL::MAX_POINT_LIGHTS; ++i)
+    {
+      if (i < count)
+      {
+        _lighting_ubo_data.PointLightPos[i] = glm::vec4(collected[i].pos, collected[i].radius);
+        _lighting_ubo_data.PointLightColor[i] = glm::vec4(collected[i].color, 0.f);
+      }
+      else
+      {
+        _lighting_ubo_data.PointLightPos[i] = glm::vec4(0.f);
+        _lighting_ubo_data.PointLightColor[i] = glm::vec4(0.f);
+      }
+    }
+  }
+
   gl.bindBuffer(GL_UNIFORM_BUFFER, _lighting_ubo);
   gl.bufferSubData(GL_UNIFORM_BUFFER, 0, sizeof(OpenGL::LightingUniformBlock), &_lighting_ubo_data);
 }
@@ -2487,6 +2875,7 @@ void WorldRender::updateLightingUniformBlockMinimap(MinimapRenderSettings* setti
   _lighting_ubo_data.OceanColorDark = settings->ocean_color_dark;
   _lighting_ubo_data.RiverColorLight = settings->river_color_light;
   _lighting_ubo_data.RiverColorDark = settings->river_color_dark;
+  _lighting_ubo_data.PointLightParams = glm::vec4(0.f); // no emitter point lights on the minimap
 
   gl.bindBuffer(GL_UNIFORM_BUFFER, _lighting_ubo);
   gl.bufferSubData(GL_UNIFORM_BUFFER, 0, sizeof(OpenGL::LightingUniformBlock), &_lighting_ubo_data);

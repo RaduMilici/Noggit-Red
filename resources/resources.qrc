@@ -62,5 +62,9 @@
       <file alias="cylinder_fs">../src/noggit/rendering/glsl/cylinder_frag.glsl</file>
 	  <file alias="line_vs">../src/noggit/rendering/glsl/line_vert.glsl</file>
 	  <file alias="line_fs">../src/noggit/rendering/glsl/line_frag.glsl</file>
+      <file alias="bloom_quad_vs">../src/noggit/rendering/glsl/bloom_quad_vert.glsl</file>
+      <file alias="bloom_bright_fs">../src/noggit/rendering/glsl/bloom_bright_frag.glsl</file>
+      <file alias="bloom_blur_fs">../src/noggit/rendering/glsl/bloom_blur_frag.glsl</file>
+      <file alias="bloom_composite_fs">../src/noggit/rendering/glsl/bloom_composite_frag.glsl</file>
     </qresource>
 </RCC>

@@ -18,14 +18,20 @@ ChunkWater::ChunkWater(MapChunk* chunk, TileWater* water_tile, float x, float z,
 {
 }
 
-void ChunkWater::from_mclq(std::vector<mclq>& layers)
+void ChunkWater::from_mclq(std::vector<mclq>& layers, int mcnk_liquid_id)
 {
   glm::vec3 pos(xbase, 0.0f, zbase);
 
   if (!Render.has_value()) Render.emplace();
   for (mclq& liquid : layers)
   {
-    int liquid_id = 1;
+    // The MCNK header liquid flag is AUTHORITATIVE (e.g. Elwynn lakes/rivers carry lq_river/
+    // lq_ocean, so they stay water). Only when the header gives nothing (mcnk_liquid_id == 0 --
+    // custom/converted chunks like Draco'dar lava) fall back to the per-tile MCLQ nibble, where
+    // bit 0x04 = magma. This stops the over-eager nibble heuristic from turning Elwynn water into
+    // lava while still rescuing the flag-less Blackrock lava.
+    int liquid_id = mcnk_liquid_id > 0 ? mcnk_liquid_id : 1;
+    bool const derive_from_tiles = (mcnk_liquid_id <= 0);
     bool has_visible_liquid = false;
 
     for (int z = 0; z < 8; ++z)
@@ -43,17 +49,22 @@ void ChunkWater::from_mclq(std::vector<mclq>& layers)
         if (visible)
         {
           has_visible_liquid = true;
-          if (liquid_type == 6)
+          if (derive_from_tiles)
           {
-            liquid_id = 3;
-          }
-          else if (liquid_type == 3 && liquid_id != 3)
-          {
-            liquid_id = 4;
-          }
-          else if (liquid_type == 1 && liquid_id == 1)
-          {
-            liquid_id = 2;
+            // Fallback per-tile nibble: bit 0x04 = magma (Blackrock lava is types 4 AND 6),
+            // 3 = slime, 1 = ocean, else water.
+            if (liquid_type & 0x04)
+            {
+              liquid_id = 3;
+            }
+            else if (liquid_type == 3 && liquid_id != 3)
+            {
+              liquid_id = 4;
+            }
+            else if (liquid_type == 1 && liquid_id == 1)
+            {
+              liquid_id = 2;
+            }
           }
         }
       }

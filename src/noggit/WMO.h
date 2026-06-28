@@ -210,6 +210,15 @@ public:
   bool is_indoor() const { return header.flags.indoor; }
 
   [[nodiscard]]
+  bool is_exterior() const { return header.flags.exterior; }
+
+  [[nodiscard]]
+  bool is_exterior_lit() const { return header.flags.exterior_lit; }
+
+  [[nodiscard]]
+  bool has_mocv() const { return header.flags.has_vertex_color; }
+
+  [[nodiscard]]
   std::uint32_t wmo_area_table_group_id() const { return header.id; }
 
   [[nodiscard]]

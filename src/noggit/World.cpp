@@ -4046,6 +4046,73 @@ unsigned int World::getAreaID (glm::vec3 const& pos)
   return for_maybe_chunk_at (pos, [&] (MapChunk* chunk) { return chunk->getAreaID(); }).value_or(-1);
 }
 
+bool World::getInteriorFog(glm::vec3 const& pos, glm::vec3& out_color, float& out_start, float& out_end)
+{
+  auto contains = [](std::pair<glm::vec3, glm::vec3> const& extents, glm::vec3 const& point)
+  {
+    return point.x >= extents.first.x && point.x <= extents.second.x
+        && point.y >= extents.first.y && point.y <= extents.second.y
+        && point.z >= extents.first.z && point.z <= extents.second.z;
+  };
+
+  bool found = false;
+  _model_instance_storage.for_each_wmo_instance([&](WMOInstance& wmo_instance)
+  {
+    if (found || !wmo_instance.finishedLoading() || wmo_instance.wmo->loading_failed())
+    {
+      return;
+    }
+
+    auto const& wmo_extents = wmo_instance.getExtents();
+    if (!contains({wmo_extents[0], wmo_extents[1]}, pos))
+    {
+      return;
+    }
+
+    bool inside_group = false;
+    for (auto const& group_extents : wmo_instance.getGroupExtents())
+    {
+      if (contains(group_extents.second, pos))
+      {
+        inside_group = true;
+        break;
+      }
+    }
+    if (!inside_group)
+    {
+      return;
+    }
+
+    // Only ENCLOSED WMOs (no exterior groups) override the scene fog. An open WMO such as a city
+    // (Stormwind) has exterior groups and must keep the outdoor fog -- otherwise its interior MFOG
+    // floods the whole open city with dense/bright fog (white-out).
+    for (auto const& g : wmo_instance.wmo->groups)
+    {
+      if (g.is_exterior() || g.is_exterior_lit())
+      {
+        return;
+      }
+    }
+
+    for (auto const& wf : wmo_instance.wmo->fogs)
+    {
+      if (wf.fogend > 1.0f)
+      {
+        out_color = glm::vec3(wf.color);
+        out_start = wf.fogstart;
+        out_end = wf.fogend;
+        found = true;
+        return;
+      }
+    }
+  }, [&]()
+  {
+    return found;
+  });
+
+  return found;
+}
+
 unsigned int World::getWMOAreaID(glm::vec3 const& pos)
 {
   ZoneScoped;
@@ -4125,6 +4192,138 @@ unsigned int World::getWMOAreaID(glm::vec3 const& pos)
   });
 
   return area_id;
+}
+
+unsigned int World::getWMOZoneMusic(glm::vec3 const& pos)
+{
+  // Mirrors getWMOAreaID's group resolution, but returns the matched WMOAreaTable row's ZoneMusic
+  // (column 7) -- WMO interiors (dungeons/caves) carry their music here, not in AreaTable.
+  auto contains = [](std::pair<glm::vec3, glm::vec3> const& extents, glm::vec3 const& point)
+  {
+    return point.x >= extents.first.x && point.x <= extents.second.x
+        && point.y >= extents.first.y && point.y <= extents.second.y
+        && point.z >= extents.first.z && point.z <= extents.second.z;
+  };
+
+  auto find_music = [](std::uint32_t wmo_id, std::uint16_t name_set, int group_id, bool& found) -> unsigned int
+  {
+    for (DBCFile::Iterator i = gWMOAreaTableDB.begin(); i != gWMOAreaTableDB.end(); ++i)
+    {
+      if (i->getUInt(WMOAreaTableDB::WmoId) == wmo_id
+          && i->getUInt(WMOAreaTableDB::NameSetId) == name_set
+          && i->getInt(WMOAreaTableDB::WMOGroupID) == group_id)
+      {
+        found = true;
+        return i->getUInt(WMOAreaTableDB::ZoneMusic);
+      }
+    }
+    found = false;
+    return 0;
+  };
+
+  unsigned int music = 0;
+  bool resolved = false;
+
+  _model_instance_storage.for_each_wmo_instance([&](WMOInstance& wmo_instance)
+  {
+    if (resolved || !wmo_instance.finishedLoading() || wmo_instance.wmo->loading_failed())
+    {
+      return;
+    }
+
+    auto const& wmo_extents = wmo_instance.getExtents();
+    if (!contains({wmo_extents[0], wmo_extents[1]}, pos))
+    {
+      return;
+    }
+
+    for (auto const& group_extents : wmo_instance.getGroupExtents())
+    {
+      if (!contains(group_extents.second, pos))
+      {
+        continue;
+      }
+
+      auto const group_index = group_extents.first;
+      if (group_index >= 0 && group_index < static_cast<int>(wmo_instance.wmo->groups.size()))
+      {
+        int const default_group_id = static_cast<int>(wmo_instance.wmo->groups[group_index].wmo_area_table_group_id());
+        bool found = false;
+        unsigned int zm = find_music(wmo_instance.wmo->WmoId, wmo_instance.mNameset, default_group_id, found);
+        if (!found && default_group_id != group_index)
+        {
+          zm = find_music(wmo_instance.wmo->WmoId, wmo_instance.mNameset, group_index, found);
+        }
+        if (found)
+        {
+          music = zm;
+          resolved = true;
+          return;
+        }
+      }
+    }
+
+    bool found = false;
+    unsigned int const zm = find_music(wmo_instance.wmo->WmoId, wmo_instance.mNameset, -1, found);
+    if (found)
+    {
+      music = zm;
+      resolved = true;
+    }
+  }, [&]()
+  {
+    return resolved;
+  });
+
+  return music;
+}
+
+int World::getZoneMusic(glm::vec3 const& pos)
+{
+  static bool s_zm_dbg = std::getenv("NOGGIT_LIGHT_DEBUG") != nullptr;
+
+  // 1) WMO interior music (WMOAreaTable.ZoneMusic) -- dungeons/caves (Timbermaw, Wailing Caverns).
+  unsigned int wmo_music = 0;
+  try { wmo_music = getWMOZoneMusic(pos); } catch (...) {}
+  if (wmo_music > 0)
+  {
+    if (s_zm_dbg) { LogError << "ZONEMUSIC via WMOAreaTable -> " << wmo_music << std::endl; }
+    return static_cast<int>(wmo_music);
+  }
+
+  // 2) Area chains: WMO area then terrain area, walking up ParentAreaID for inherited zone music.
+  auto walk = [&](unsigned int area_id) -> int
+  {
+    try
+    {
+      if (gAreaDB.getFieldCount() <= AreaDB::ZoneMusic) { return 0; }
+      unsigned int a = area_id;
+      for (int guard = 0; a != 0 && a != static_cast<unsigned int>(-1) && guard < 16; ++guard)
+      {
+        if (!gAreaDB.CheckIfIdExists(a)) { break; }
+        auto const rec = gAreaDB.getByID(a);
+        int const zm = static_cast<int>(rec.getUInt(AreaDB::ZoneMusic));
+        if (zm > 0) { return zm; }
+        a = rec.getUInt(AreaDB::Region);
+      }
+    }
+    catch (...) {}
+    return 0;
+  };
+
+  unsigned int wmo_area = static_cast<unsigned int>(-1);
+  unsigned int terrain_area = static_cast<unsigned int>(-1);
+  try { wmo_area = getWMOAreaID(pos); } catch (...) {}
+  try { terrain_area = getAreaID(pos); } catch (...) {}
+
+  int music = walk(wmo_area);
+  if (music == 0 && terrain_area != wmo_area) { music = walk(terrain_area); }
+
+  if (s_zm_dbg)
+  {
+    LogError << "ZONEMUSIC wmoArea=" << wmo_area << " terrainArea=" << terrain_area << " -> " << music << std::endl;
+  }
+  return music;
 }
 
 void World::clearHeight(glm::vec3 const& pos)

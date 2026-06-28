@@ -16,6 +16,8 @@
 #include <QtWidgets/QPushButton>
 #include <QtWidgets/QRadioButton>
 #include <QtWidgets/QComboBox>
+#include <QtWidgets/QSlider>
+#include <QtWidgets/QCheckBox>
 #include <QDir>
 #include <QApplication>
 
@@ -147,6 +149,109 @@ namespace Noggit
                       QString(tr("FPS limitation, current : %1")).arg(value));
               });
 
+      // Water opacity dev lever (live): 0 = fully transparent, 100 = current/opaque.
+      // Writes water/transparency (0..1); WorldRender reads it each frame and feeds the
+      // liquid shader, so dragging this updates the water immediately for tuning.
+      {
+        auto* water_label = new QLabel(this);
+        auto* water_slider = new QSlider(Qt::Horizontal, this);
+        water_slider->setObjectName("_water_opacity_slider");
+        water_slider->setMinimum(0);
+        water_slider->setMaximum(100);
+        int const init_val = static_cast<int>(_settings->value("water/transparency", 1.0f).toFloat() * 100.f + 0.5f);
+        water_slider->setValue(std::clamp(init_val, 0, 100));
+        water_label->setText(tr("Water opacity (dev): %1%").arg(water_slider->value()));
+        ui->verticalLayout_7->addWidget(water_label);
+        ui->verticalLayout_7->addWidget(water_slider);
+        connect(water_slider, &QSlider::valueChanged, [this, water_label](int v)
+                {
+                  water_label->setText(tr("Water opacity (dev): %1%").arg(v));
+                  _settings->setValue("water/transparency", v / 100.0f);
+                  _settings->sync();
+                });
+      }
+
+      // Object render distance (live): how far ADT objects + WMOs render. Same setting as the
+      // "View Distance" field above (view_distance); WorldRender reads it every frame. A slider is
+      // just easier to drag than the spinbox. Capped at farZ (2048) since the far plane clips beyond.
+      {
+        auto* od_label = new QLabel(this);
+        auto* od_slider = new QSlider(Qt::Horizontal, this);
+        od_slider->setObjectName("_object_render_distance_slider");
+        od_slider->setMinimum(200);
+        od_slider->setMaximum(2048);
+        int const init_od = static_cast<int>(_settings->value("view_distance", 2000.f).toFloat());
+        od_slider->setValue(std::clamp(init_od, 200, 2048));
+        od_label->setText(tr("Object render distance: %1").arg(od_slider->value()));
+        ui->verticalLayout_7->addWidget(od_label);
+        ui->verticalLayout_7->addWidget(od_slider);
+        connect(od_slider, &QSlider::valueChanged, [this, od_label](int v)
+                {
+                  od_label->setText(tr("Object render distance: %1").arg(v));
+                  _settings->setValue("view_distance", static_cast<float>(v));
+                  if (ui->viewDistanceField) ui->viewDistanceField->setValue(v); // keep the field in sync
+                  _settings->sync();
+                });
+      }
+
+      // Creature draw distance (live): how far creature spawns render their 3D models.
+      {
+        auto* cd_label = new QLabel(this);
+        auto* cd_slider = new QSlider(Qt::Horizontal, this);
+        cd_slider->setObjectName("_creature_draw_distance_slider");
+        cd_slider->setMinimum(50);
+        cd_slider->setMaximum(2000);
+        int const init_cd = _settings->value("creature/draw_distance", 120.0f).toFloat();
+        cd_slider->setValue(std::clamp(init_cd, 50, 2000));
+        cd_label->setText(tr("Creature draw distance: %1").arg(cd_slider->value()));
+        ui->verticalLayout_7->addWidget(cd_label);
+        ui->verticalLayout_7->addWidget(cd_slider);
+        connect(cd_slider, &QSlider::valueChanged, [this, cd_label](int v)
+                {
+                  cd_label->setText(tr("Creature draw distance: %1").arg(v));
+                  _settings->setValue("creature/draw_distance", static_cast<float>(v));
+                  _settings->sync();
+                });
+      }
+
+      // WMO water overlap dedupe (stencil) toggle (live): ON = overlapping exterior WMO water
+      // planes (e.g. Timbermaw) draw each pixel only once so they don't stack/darken; OFF = legacy
+      // behaviour (every plane blended). Read live by WMORender each frame.
+      {
+        auto* wmo_stencil_cb = new QCheckBox(tr("WMO water overlap dedupe (stencil)"), this);
+        wmo_stencil_cb->setObjectName("_wmo_water_stencil_checkbox");
+        wmo_stencil_cb->setChecked(_settings->value("water/wmo_stencil", true).toBool());
+        ui->verticalLayout_7->addWidget(wmo_stencil_cb);
+        connect(wmo_stencil_cb, &QCheckBox::toggled, [this](bool checked)
+                {
+                  _settings->setValue("water/wmo_stencil", checked);
+                  _settings->sync();
+                });
+      }
+
+      // Distant horizon backdrop toggle (live): ON = draw the low-res far terrain silhouette beyond
+      // the detailed terrain (only appears with fog); OFF = no backdrop, so enabling fog never renders
+      // distant mesh past the view distance. Read live by WorldRender each frame.
+      {
+        auto* horizon_cb = new QCheckBox(tr("Render distant horizon backdrop"), this);
+        horizon_cb->setObjectName("_render_horizon_checkbox");
+        horizon_cb->setChecked(_settings->value("render_horizon", true).toBool());
+        ui->verticalLayout_7->addWidget(horizon_cb);
+        connect(horizon_cb, &QCheckBox::toggled, [this](bool checked)
+                {
+                  _settings->setValue("render_horizon", checked);
+                  _settings->sync();
+                });
+      }
+
+      // Make the View Distance field apply LIVE: WorldRender reads view_distance every frame, so
+      // changing this field moves the object/WMO render distance immediately (no Apply / reload).
+      connect(ui->viewDistanceField, qOverload<double>(&QDoubleSpinBox::valueChanged), [this](double v)
+              {
+                _settings->setValue("view_distance", static_cast<float>(v));
+                _settings->sync();
+              });
+
       ui->_wireframe_color->setColor(Qt::white);
 
       connect(ui->saveButton, &QPushButton::clicked, [this]
@@ -180,7 +285,7 @@ namespace Noggit
     {
       ui->importPathField->setText(_settings->value("project/import_file", "import.txt").toString());
       ui->wmvLogPathField->setText(_settings->value("project/wmv_log_file").toString());
-      ui->viewDistanceField->setValue(_settings->value("view_distance", 1000.f).toFloat());
+      ui->viewDistanceField->setValue(_settings->value("view_distance", 2000.f).toFloat());
       ui->farZField->setValue(_settings->value("farZ", 2048.f).toFloat());
       ui->_undock_tool_properties->setChecked(
           _settings->value("undock_tool_properties/enabled", true).toBool());

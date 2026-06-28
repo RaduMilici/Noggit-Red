@@ -111,7 +111,9 @@ void WMOGroupRender::upload()
     }
 
     bool create_draw_call = false;
-    if (draw_call && draw_call->backface_cull == backface_cull && batch.index_start == draw_call->index_start + draw_call->index_count)
+    if (draw_call && draw_call->backface_cull == backface_cull
+        && draw_call->blend_mode == static_cast<int>(mat.blend_mode)
+        && batch.index_start == draw_call->index_start + draw_call->index_count)
     {
       // identify if we can fit this batch into current draw_call
       unsigned n_required_slots = use_tex2 ? 2 : 1;
@@ -187,6 +189,7 @@ void WMOGroupRender::upload()
       draw_call->index_count = 0;
       draw_call->n_used_samplers = use_tex2 ? 2 : 1;
       draw_call->backface_cull = backface_cull;
+      draw_call->blend_mode = static_cast<int>(mat.blend_mode);
 
       draw_call->samplers[0] = _render_batches[batch_counter].tex_array0;
       _render_batches[batch_counter].tex_array0 = 0;
@@ -339,7 +342,7 @@ void WMOGroupRender::draw(OpenGL::Scoped::use_program& wmo_shader
   bool backface_cull = true;
   gl.enable(GL_CULL_FACE);
 
-  for (auto& draw_call : _draw_calls)
+  auto issue_draw_call = [&](WMOCombinedDrawCall& draw_call)
   {
     if (backface_cull != draw_call.backface_cull)
     {
@@ -365,7 +368,56 @@ void WMOGroupRender::draw(OpenGL::Scoped::use_program& wmo_shader
     }
 
     gl.drawElements (GL_TRIANGLES, draw_call.index_count, GL_UNSIGNED_SHORT, reinterpret_cast<void*>(sizeof(std::uint16_t)*draw_call.index_start));
+  };
 
+  // Pass 1: opaque + alpha-key materials (blend modes 0/1) -- depth write on, no GL blend, as before.
+  for (auto& draw_call : _draw_calls)
+  {
+    if (draw_call.blend_mode > 1)
+    {
+      continue;
+    }
+    issue_draw_call(draw_call);
+  }
+
+  // Pass 2: blended materials (additive / alpha / modulate -- e.g. the skybox-mimic "globe" domes and
+  // glow geometry). These were previously drawn opaque, so additive materials rendered as flat, dim
+  // surfaces instead of brightening/bleeding over what's behind them. Apply the material's actual GL
+  // blend and stop writing depth so they composite over the opaque scene. Additive is order-
+  // independent; alpha/mod can have minor ordering artifacts without a full sort, but that's still a
+  // big improvement over rendering them opaque.
+  bool has_blended = false;
+  for (auto const& draw_call : _draw_calls)
+  {
+    if (draw_call.blend_mode > 1) { has_blended = true; break; }
+  }
+
+  if (has_blended)
+  {
+    gl.enable(GL_BLEND);
+    gl.depthMask(GL_FALSE);
+
+    for (auto& draw_call : _draw_calls)
+    {
+      if (draw_call.blend_mode <= 1)
+      {
+        continue;
+      }
+
+      switch (draw_call.blend_mode)
+      {
+        case 2:  gl.blendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA); break; // alpha
+        case 3:  gl.blendFunc(GL_SRC_ALPHA, GL_ONE);                 break; // additive
+        case 4:  gl.blendFunc(GL_DST_COLOR, GL_ZERO);                break; // modulate
+        case 5:  gl.blendFunc(GL_DST_COLOR, GL_SRC_COLOR);           break; // mod2x
+        default: gl.blendFunc(GL_SRC_ALPHA, GL_ONE);                 break; // unknown -> additive
+      }
+
+      issue_draw_call(draw_call);
+    }
+
+    gl.depthMask(GL_TRUE);
+    gl.disable(GL_BLEND);
   }
 
 }
