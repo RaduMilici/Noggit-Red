@@ -41,6 +41,7 @@
 #include <limits>
 #include <array>
 #include <cstdint>
+#include <cmath>
 
 #include <glm/gtc/quaternion.hpp>
 #include <glm/gtx/quaternion.hpp>
@@ -1764,7 +1765,15 @@ namespace
 
   float server_to_client_orientation(float orientation)
   {
-    return glm::degrees(orientation) - 180.0f;
+    // Normalize to [0, 360) so it round-trips through client_to_server_* and fits the editor's 0..360
+    // spinbox (the raw degrees(o)-180 lands in -180..180, or beyond for un-normalized DB angles, which
+    // the spinbox would clamp). Same rotation either way.
+    float degrees = std::fmod(glm::degrees(orientation) - 180.0f, 360.0f);
+    if (degrees < 0.0f)
+    {
+      degrees += 360.0f;
+    }
+    return degrees;
   }
 
   std::vector<std::pair<std::size_t, std::string>> resolve_creature_texture_overrides(std::uint32_t display_id,
@@ -2676,6 +2685,8 @@ bool World::reloadCreatureSpawns()
               row.position_z,
               mapIndex.hasAGlobalWMO());
     spawn.orientation = server_to_client_orientation(row.orientation);
+    spawn.original_pos = spawn.pos;
+    spawn.original_orientation = spawn.orientation;
     spawn.animation_time_offset = static_cast<int>(((row.guid * 1664525u) + (row.entry * 1013904223u)) % 3500u);
     spawn.template_scale = row.template_scale > 0.0f ? row.template_scale : 1.0f;
 
@@ -2982,6 +2993,31 @@ void World::ensureCreatureSpawnsLoaded()
   }
 }
 
+void World::ensureCreaturePatrolPathsLoaded()
+{
+  if (_patrol_paths_load_attempted)
+  {
+    return;
+  }
+  _patrol_paths_load_attempted = true;
+
+#ifdef USE_MYSQL_UID_STORAGE
+  std::string error;
+  auto points = mysql::getCreaturePatrolPaths(mapIndex._map_id, &error);
+  bool const global_wmo = mapIndex.hasAGlobalWMO();
+
+  for (auto const& wp : points)
+  {
+    _creature_patrol_paths[wp.guid].push_back(
+      server_to_client_position(wp.position_x, wp.position_y, wp.position_z, global_wmo));
+  }
+
+  LogDebug << "Creature patrol paths loaded: " << _creature_patrol_paths.size() << " path(s), "
+           << points.size() << " waypoint(s)"
+           << (error.empty() ? std::string() : (std::string(" (error: ") + error + ")")) << std::endl;
+#endif
+}
+
 std::size_t World::creatureSpawnModelCount() const
 {
   return static_cast<std::size_t>(std::count_if(_creature_spawns.begin(), _creature_spawns.end(),
@@ -3020,6 +3056,55 @@ World::CreatureSpawnOverlay const* World::findCreatureSpawn(std::uint32_t guid) 
     });
 
   return it != _creature_spawns.end() ? &*it : nullptr;
+}
+
+void World::ensureGameObjectSpawnsLoaded()
+{
+  // GameObjects are loaded together with creatures, so just make sure that load has run.
+  if (!_creature_spawns_loaded && !_creature_spawns_load_attempted)
+  {
+    reloadCreatureSpawns();
+  }
+}
+
+std::size_t World::gameObjectSpawnModelCount() const
+{
+  return static_cast<std::size_t>(std::count_if(_gameobject_spawns.begin(), _gameobject_spawns.end(),
+    [](GameObjectSpawnOverlay const& spawn)
+    {
+      return !spawn.model_path.empty() && !spawn.model_create_failed;
+    }));
+}
+
+std::size_t World::dirtyGameObjectSpawnCount() const
+{
+  return static_cast<std::size_t>(std::count_if(_gameobject_spawns.begin(), _gameobject_spawns.end(),
+    [](GameObjectSpawnOverlay const& spawn)
+    {
+      return spawn.dirty;
+    }));
+}
+
+World::GameObjectSpawnOverlay* World::findGameObjectSpawn(std::uint32_t guid)
+{
+  auto it = std::find_if(_gameobject_spawns.begin(), _gameobject_spawns.end(),
+    [guid](GameObjectSpawnOverlay const& spawn)
+    {
+      return spawn.guid == guid;
+    });
+
+  return it != _gameobject_spawns.end() ? &*it : nullptr;
+}
+
+World::GameObjectSpawnOverlay const* World::findGameObjectSpawn(std::uint32_t guid) const
+{
+  auto it = std::find_if(_gameobject_spawns.begin(), _gameobject_spawns.end(),
+    [guid](GameObjectSpawnOverlay const& spawn)
+    {
+      return spawn.guid == guid;
+    });
+
+  return it != _gameobject_spawns.end() ? &*it : nullptr;
 }
 
 void World::LoadSavedSelectionGroups()
@@ -4046,6 +4131,40 @@ unsigned int World::getAreaID (glm::vec3 const& pos)
   return for_maybe_chunk_at (pos, [&] (MapChunk* chunk) { return chunk->getAreaID(); }).value_or(-1);
 }
 
+unsigned int World::getZoneId(glm::vec3 const& pos)
+{
+  unsigned int area = getAreaID(pos);
+  if (area == static_cast<unsigned int>(-1) || area == 0)
+  {
+    return area;
+  }
+
+  try
+  {
+    if (gAreaDB.getFieldCount() <= AreaDB::Region)
+    {
+      return area;
+    }
+    // Walk ParentAreaID up to the top-level zone (parent == 0).
+    for (int guard = 0; guard < 16; ++guard)
+    {
+      if (!gAreaDB.CheckIfIdExists(area))
+      {
+        break;
+      }
+      unsigned int const parent = gAreaDB.getByID(area).getUInt(AreaDB::Region);
+      if (parent == 0)
+      {
+        break;
+      }
+      area = parent;
+    }
+  }
+  catch (...) {}
+
+  return area;
+}
+
 bool World::getInteriorFog(glm::vec3 const& pos, glm::vec3& out_color, float& out_start, float& out_end)
 {
   auto contains = [](std::pair<glm::vec3, glm::vec3> const& extents, glm::vec3 const& point)
@@ -4237,12 +4356,17 @@ unsigned int World::getWMOZoneMusic(glm::vec3 const& pos)
       return;
     }
 
+    // The WMO's outer AABB is loose -- for a big city WMO it can cover a large chunk of nearby
+    // terrain. Only treat the camera as "inside" this WMO if it falls within one of the group AABBs;
+    // otherwise this isn't the building we're standing in and its music must not apply.
+    bool inside_group = false;
     for (auto const& group_extents : wmo_instance.getGroupExtents())
     {
       if (!contains(group_extents.second, pos))
       {
         continue;
       }
+      inside_group = true;
 
       auto const group_index = group_extents.first;
       if (group_index >= 0 && group_index < static_cast<int>(wmo_instance.wmo->groups.size()))
@@ -4254,7 +4378,7 @@ unsigned int World::getWMOZoneMusic(glm::vec3 const& pos)
         {
           zm = find_music(wmo_instance.wmo->WmoId, wmo_instance.mNameset, group_index, found);
         }
-        if (found)
+        if (found && zm > 0)
         {
           music = zm;
           resolved = true;
@@ -4263,13 +4387,53 @@ unsigned int World::getWMOZoneMusic(glm::vec3 const& pos)
       }
     }
 
-    bool found = false;
-    unsigned int const zm = find_music(wmo_instance.wmo->WmoId, wmo_instance.mNameset, -1, found);
-    if (found)
+    if (!inside_group)
     {
-      music = zm;
-      resolved = true;
+      return; // inside the AABB but not actually inside the building -> not this WMO's music
     }
+
+    {
+      bool found = false;
+      unsigned int const zm = find_music(wmo_instance.wmo->WmoId, wmo_instance.mNameset, -1, found);
+      if (found && zm > 0)
+      {
+        music = zm;
+        resolved = true;
+        return;
+      }
+    }
+
+    // Camera is inside this WMO but the matched group/root rows carry no music. City WMOs (Ironforge,
+    // Stormwind) often define the music on a sibling group's WMOAreaTable row, so fall back to the
+    // first non-zero ZoneMusic across ALL rows of this WMO -- its whole-building music.
+    static bool const s_wmo_dbg = std::getenv("NOGGIT_LIGHT_DEBUG") != nullptr;
+    unsigned int whole_wmo_music = 0;
+    for (DBCFile::Iterator i = gWMOAreaTableDB.begin(); i != gWMOAreaTableDB.end(); ++i)
+    {
+      if (i->getUInt(WMOAreaTableDB::WmoId) != wmo_instance.wmo->WmoId)
+      {
+        continue;
+      }
+      unsigned int const row_music = i->getUInt(WMOAreaTableDB::ZoneMusic);
+      if (s_wmo_dbg)
+      {
+        LogError << "ZONEMUSIC   wmoRow wmoId=" << wmo_instance.wmo->WmoId
+                 << " nameSet=" << i->getUInt(WMOAreaTableDB::NameSetId)
+                 << " groupId=" << i->getInt(WMOAreaTableDB::WMOGroupID)
+                 << " areaRef=" << i->getUInt(WMOAreaTableDB::AreaTableRefId)
+                 << " zoneMusic=" << row_music << std::endl;
+      }
+      if (whole_wmo_music == 0 && row_music > 0)
+      {
+        whole_wmo_music = row_music;
+      }
+    }
+
+    if (whole_wmo_music > 0)
+    {
+      music = whole_wmo_music;
+    }
+    resolved = true; // camera is inside this WMO -> don't keep scanning other instances
   }, [&]()
   {
     return resolved;
@@ -4303,8 +4467,15 @@ int World::getZoneMusic(glm::vec3 const& pos)
         if (!gAreaDB.CheckIfIdExists(a)) { break; }
         auto const rec = gAreaDB.getByID(a);
         int const zm = static_cast<int>(rec.getUInt(AreaDB::ZoneMusic));
+        unsigned int const parent = rec.getUInt(AreaDB::Region);
+        if (s_zm_dbg)
+        {
+          LogError << "ZONEMUSIC   walk area=" << a << " zoneMusic=" << zm
+                   << " ambience=" << rec.getUInt(AreaDB::ZoneMusic - 1)
+                   << " parent=" << parent << std::endl;
+        }
         if (zm > 0) { return zm; }
-        a = rec.getUInt(AreaDB::Region);
+        a = parent;
       }
     }
     catch (...) {}
@@ -4321,7 +4492,21 @@ int World::getZoneMusic(glm::vec3 const& pos)
 
   if (s_zm_dbg)
   {
-    LogError << "ZONEMUSIC wmoArea=" << wmo_area << " terrainArea=" << terrain_area << " -> " << music << std::endl;
+    // Log only when the resolution changes, so walking into a WMO (e.g. Ironforge) prints one clear
+    // line showing exactly which stage produced the music (or where it fell through to terrain).
+    static int s_last_wmo_music = -2, s_last_wmo_area = -2, s_last_terrain_area = -2, s_last_music = -2;
+    if (static_cast<int>(wmo_music) != s_last_wmo_music || static_cast<int>(wmo_area) != s_last_wmo_area
+        || static_cast<int>(terrain_area) != s_last_terrain_area || music != s_last_music)
+    {
+      LogError << "ZONEMUSIC wmoMusic=" << static_cast<int>(wmo_music)
+               << " wmoArea=" << static_cast<int>(wmo_area)
+               << " terrainArea=" << static_cast<int>(terrain_area)
+               << " -> final=" << music << std::endl;
+      s_last_wmo_music = static_cast<int>(wmo_music);
+      s_last_wmo_area = static_cast<int>(wmo_area);
+      s_last_terrain_area = static_cast<int>(terrain_area);
+      s_last_music = music;
+    }
   }
   return music;
 }

@@ -28,6 +28,7 @@
 #include <map>
 #include <string>
 #include <unordered_set>
+#include <unordered_map>
 #include <vector>
 #include <array>
 #include <noggit/project/ApplicationProject.h>
@@ -89,6 +90,7 @@ public:
     bool hovered = false;
     bool selected = false;
     bool pending_create = false;
+    bool pending_delete = false; // marked for deletion (Del); exported as DELETE, undoable via Ctrl+Z
     bool dirty = false;
     std::optional<ModelInstance> model_instance;
     std::vector<AttachmentModel> attachment_models;
@@ -107,11 +109,18 @@ public:
     std::uint32_t display_id = 0;
     std::string name;
     glm::vec3 pos = glm::vec3(0.0f);
+    glm::vec3 original_pos = glm::vec3(0.0f);
     float orientation = 0.0f;
+    float original_orientation = 0.0f;
     int animation_time_offset = 0;
     float template_scale = 1.0f;
     std::string model_path;
     bool model_create_failed = false;
+    bool hovered = false;
+    bool selected = false;
+    bool pending_create = false;
+    bool pending_delete = false; // marked for deletion (Del); exported as DELETE, undoable via Ctrl+Z
+    bool dirty = false;
     std::optional<ModelInstance> model_instance;
 
     GameObjectSpawnOverlay() = default;
@@ -140,6 +149,9 @@ public:
 
   // Time of the day.
   float animtime;
+  // Like animtime but only advances while model animations are enabled, so toggling animations off
+  // freezes (pauses) model/particle animation in place while liquid/terrain keep churning on animtime.
+  float model_animtime = 0.0f;
   float time;
 
   //! \brief Name of this map.
@@ -159,6 +171,9 @@ public:
 
   unsigned int getAreaID (glm::vec3 const&);
   unsigned int getWMOAreaID(glm::vec3 const&);
+  // Top-level zone id for a position (walks AreaTable ParentAreaID up from getAreaID to the zone, e.g.
+  // a sub-area in Searing Gorge resolves to Searing Gorge). Returns -1 if the tile/area isn't loaded.
+  unsigned int getZoneId(glm::vec3 const&);
   // ZoneMusic id for a position: WMOAreaTable.ZoneMusic when inside a WMO (dungeons/caves), else the
   // AreaTable parent chain. 0 = no music authored.
   unsigned int getWMOZoneMusic(glm::vec3 const&);
@@ -487,6 +502,19 @@ public:
                                                                                      Noggit::NoggitRenderContext context) const;
   void setDrawCreatureSpawns(bool state) { _draw_creature_spawns = state; }
   bool drawCreatureSpawns() const { return _draw_creature_spawns; }
+  // Selection markers (the disc under a spawn) are only drawn while that spawn's editing tool is
+  // active, even if the spawn models themselves stay visible via the view toggle.
+  void setDrawCreatureMarkers(bool state) { _draw_creature_markers = state; }
+  bool drawCreatureMarkers() const { return _draw_creature_markers; }
+  void setDrawGameObjectMarkers(bool state) { _draw_gameobject_markers = state; }
+  bool drawGameObjectMarkers() const { return _draw_gameobject_markers; }
+  // Patrol-path overlay (creature waypoint lines). Loaded lazily from the DB the first time it's
+  // shown; toggled from the creature tool's top action bar.
+  void setDrawCreaturePatrolPaths(bool state) { _draw_creature_patrol_paths = state; }
+  bool drawCreaturePatrolPaths() const { return _draw_creature_patrol_paths; }
+  void ensureCreaturePatrolPathsLoaded();
+  // guid -> ordered waypoint positions in client space (does NOT include the spawn position itself).
+  std::unordered_map<std::uint32_t, std::vector<glm::vec3>> const& creaturePatrolPaths() const { return _creature_patrol_paths; }
   bool hasCreatureSpawnsLoaded() const { return _creature_spawns_loaded; }
   std::size_t creatureSpawnCount() const { return _creature_spawns.size(); }
   std::size_t creatureSpawnModelCount() const;
@@ -498,6 +526,17 @@ public:
   std::vector<GameObjectSpawnOverlay> const& gameObjectSpawns() const { return _gameobject_spawns; }
   CreatureSpawnOverlay* findCreatureSpawn(std::uint32_t guid);
   CreatureSpawnOverlay const* findCreatureSpawn(std::uint32_t guid) const;
+
+  // GameObject editing (mirrors the creature equivalents). GameObjects are loaded alongside creatures
+  // by reloadCreatureSpawns(), so loading just ensures that ran.
+  void setDrawGameObjectSpawns(bool state) { _draw_gameobject_spawns = state; }
+  bool drawGameObjectSpawns() const { return _draw_gameobject_spawns; }
+  void ensureGameObjectSpawnsLoaded();
+  std::size_t gameObjectSpawnCount() const { return _gameobject_spawns.size(); }
+  std::size_t gameObjectSpawnModelCount() const;
+  std::size_t dirtyGameObjectSpawnCount() const;
+  GameObjectSpawnOverlay* findGameObjectSpawn(std::uint32_t guid);
+  GameObjectSpawnOverlay const* findGameObjectSpawn(std::uint32_t guid) const;
 
 protected:
   // void update_models_by_filename();
@@ -516,6 +555,12 @@ protected:
 
   Noggit::NoggitRenderContext _context;
   bool _draw_creature_spawns = false;
+  bool _draw_creature_markers = false;
+  bool _draw_gameobject_spawns = false;
+  bool _draw_gameobject_markers = false;
+  bool _draw_creature_patrol_paths = false;
+  bool _patrol_paths_load_attempted = false;
+  std::unordered_map<std::uint32_t, std::vector<glm::vec3>> _creature_patrol_paths;
   bool _creature_spawns_loaded = false;
   bool _creature_spawns_load_attempted = false;
   std::string _creature_spawn_status;

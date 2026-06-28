@@ -1237,7 +1237,8 @@ void WorldRender::draw (glm::mat4x4 const& model_view
 
   bool draw_doodads_wmo = draw_wmo && draw_wmo_doodads;
   bool draw_creature_spawns = !minimap_render && _world->drawCreatureSpawns();
-  bool draw_gameobject_spawns = draw_creature_spawns;
+  // GameObject models render in the creature tool (alongside creatures) and in the gameobject tool.
+  bool draw_gameobject_spawns = !minimap_render && (_world->drawCreatureSpawns() || _world->drawGameObjectSpawns());
   float const creature_spawn_model_distance = creature_spawn_model_draw_distance();
   float const creature_spawn_marker_distance = creature_spawn_marker_draw_distance();
   // M2s / models
@@ -1317,6 +1318,10 @@ void WorldRender::draw (glm::mat4x4 const& model_view
       std::size_t const model_create_budget = creature_spawn_model_create_budget();
       for (auto& spawn : _world->creatureSpawns())
       {
+        if (spawn.pending_delete) // marked for deletion -> don't draw
+        {
+          continue;
+        }
         float const creature_distance = glm::distance(camera_pos, spawn.pos);
         trace_creature_spawn("candidate", spawn, creature_distance);
 
@@ -1582,15 +1587,16 @@ void WorldRender::draw (glm::mat4x4 const& model_view
                 , frustum
                 , _cull_distance
                 , camera_pos
-                , _world->animtime
+                , _world->model_animtime // frozen when animations are toggled off -> models pause
                 , draw_models_with_box
                 , model_boxes_to_draw
                 , display
             );
             _world->_n_rendered_objects += pair.second.size();
 
-            if (draw_model_animations
-                && (!pair.first->_particles.empty() || !pair.first->_ribbons.empty()))
+            // Collect particle/ribbon models regardless of the animation toggle: when off we still
+            // draw them, just frozen in place (their simulation isn't advanced), instead of hiding them.
+            if (!pair.first->_particles.empty() || !pair.first->_ribbons.empty())
             {
               model_with_particles[pair.first] = pair.second.size();
             }
@@ -1686,9 +1692,11 @@ void WorldRender::draw (glm::mat4x4 const& model_view
                      << std::endl;
           }
 
-          int const creature_animtime = draw_model_animations && draw_item.spawn
-            ? static_cast<int>(_world->animtime) + draw_item.spawn->animation_time_offset
-            : static_cast<int>(_world->animtime);
+          // model_animtime freezes when animations are toggled off, so the creature pauses in place
+          // (per-instance models would otherwise keep animating off the ever-advancing animtime).
+          int const creature_animtime = draw_item.spawn
+            ? static_cast<int>(_world->model_animtime) + draw_item.spawn->animation_time_offset
+            : static_cast<int>(_world->model_animtime);
           if (draw_model_animations)
           {
             instance->model->animcalc = false;
@@ -1843,7 +1851,7 @@ void WorldRender::draw (glm::mat4x4 const& model_view
       _world->ensureCreatureSpawnsLoaded();
     }
 
-    if (draw_creature_spawns && creature_spawn_markers_enabled() && !_world->creatureSpawns().empty())
+    if (draw_creature_spawns && _world->drawCreatureMarkers() && creature_spawn_markers_enabled() && !_world->creatureSpawns().empty())
     {
       ZoneScopedN("World::draw() : Draw creature spawn markers");
       OpenGL::Scoped::bool_setter<GL_CULL_FACE, GL_FALSE> const disable_cull_face;
@@ -1868,6 +1876,10 @@ void WorldRender::draw (glm::mat4x4 const& model_view
 
       for (auto const& spawn : _world->creatureSpawns())
       {
+        if (spawn.pending_delete) // marked for deletion -> no marker
+        {
+          continue;
+        }
         float distance = glm::distance(camera_pos, spawn.pos);
         if (distance < closest_distance)
         {
@@ -1946,6 +1958,135 @@ void WorldRender::draw (glm::mat4x4 const& model_view
                  << ", closestPos={" << closest_pos.x << ", " << closest_pos.y << ", " << closest_pos.z << "}"
                  << std::endl;
         logged_creature_marker_stats = true;
+      }
+    }
+
+    // GameObject spawn markers (the disc under each gameobject) -- only in the gameobject tool.
+    if (draw_gameobject_spawns && _world->drawGameObjectMarkers() && creature_spawn_markers_enabled()
+        && !_world->gameObjectSpawns().empty())
+    {
+      ZoneScopedN("World::draw() : Draw gameobject spawn markers");
+      OpenGL::Scoped::bool_setter<GL_CULL_FACE, GL_FALSE> const disable_cull_face;
+      OpenGL::Scoped::bool_setter<GL_BLEND, GL_TRUE> const enable_blend;
+      OpenGL::Scoped::depth_mask_setter<GL_FALSE> const no_depth_write;
+
+      struct MarkerData { glm::vec3 pos; glm::vec4 color; float radius; };
+      std::vector<MarkerData> markers;
+      markers.reserve(256);
+
+      for (auto const& spawn : _world->gameObjectSpawns())
+      {
+        if (spawn.pending_delete)
+          continue;
+        if (glm::distance(camera_pos, spawn.pos) > creature_spawn_marker_distance)
+          continue;
+
+        float model_rad = 0.5f;
+        if (spawn.model_instance.has_value())
+        {
+          auto const& mi = spawn.model_instance.value();
+          if (mi.model.get() && mi.model->finishedLoading() && !mi.model->loading_failed())
+            model_rad = mi.model->rad * mi.scale;
+        }
+        float const ring_radius = std::max(0.25f, model_rad * 0.55f);
+
+        // Distinct palette from creatures (which are orange/green): gameobjects use blue/purple.
+        glm::vec4 const color = spawn.selected ? glm::vec4(0.35f, 1.0f, 0.45f, 1.0f)
+            : spawn.hovered  ? glm::vec4(0.45f, 0.85f, 1.0f, 1.0f)
+            : spawn.dirty    ? glm::vec4(1.0f,  0.9f,  0.15f, 1.0f)
+                 : glm::vec4(0.55f, 0.45f, 1.0f, 1.0f);
+        markers.push_back({spawn.pos + glm::vec3(0.0f, 0.05f, 0.0f), color, ring_radius});
+      }
+
+      gl.blendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+      gl.enable(GL_DEPTH_TEST);
+
+      gl.depthFunc(GL_LEQUAL);
+      for (auto const& m : markers)
+        _circle_render.draw(mvp, m.pos, m.color, m.radius);
+
+      gl.depthFunc(GL_GREATER);
+      for (auto const& m : markers)
+      {
+        glm::vec4 c = m.color;
+        c.a *= 0.1f;
+        _circle_render.draw(mvp, m.pos, c, m.radius);
+      }
+      gl.depthFunc(GL_LEQUAL);
+    }
+
+    // Creature patrol paths: draw a line through each patrolling creature's waypoints (spawn -> wp1
+    // -> wp2 -> ...). Only in creature mode (drawCreatureMarkers) and when the path overlay is on.
+    if (draw_creature_spawns && _world->drawCreatureMarkers() && _world->drawCreaturePatrolPaths()
+        && !_world->creatureSpawns().empty())
+    {
+      ZoneScopedN("World::draw() : Draw creature patrol paths");
+      _world->ensureCreaturePatrolPathsLoaded();
+
+      auto const& paths = _world->creaturePatrolPaths();
+      if (!paths.empty())
+      {
+        // A path becomes visible only once its creature is within the creature render distance (so it
+        // appears together with the NPC). Once shown, the whole route is drawn regardless of how far
+        // the waypoints extend.
+        float const path_show_distance = creature_spawn_model_distance;
+
+        // A small palette of bright, saturated colors that read against terrain (no greens/browns).
+        // Each creature gets a stable color from its guid so neighbouring routes stay distinguishable.
+        static glm::vec4 const palette[] = {
+          {1.00f, 0.20f, 0.20f, 0.95f}, // red
+          {1.00f, 0.55f, 0.05f, 0.95f}, // orange
+          {1.00f, 0.95f, 0.15f, 0.95f}, // yellow
+          {0.20f, 0.85f, 1.00f, 0.95f}, // cyan
+          {0.45f, 0.45f, 1.00f, 0.95f}, // blue
+          {1.00f, 0.35f, 0.95f, 0.95f}, // magenta
+          {1.00f, 1.00f, 1.00f, 0.95f}, // white
+        };
+        constexpr int palette_size = static_cast<int>(sizeof(palette) / sizeof(palette[0]));
+
+        // When one or more creatures are selected, only show the selected creatures' routes so the
+        // focused NPC's path stands out; with nothing selected, show every nearby route.
+        bool const any_selected = std::any_of(_world->creatureSpawns().begin(), _world->creatureSpawns().end(),
+          [](World::CreatureSpawnOverlay const& s) { return s.selected && !s.pending_delete; });
+
+        OpenGL::Scoped::bool_setter<GL_CULL_FACE, GL_FALSE> const disable_cull_face;
+        OpenGL::Scoped::bool_setter<GL_BLEND, GL_TRUE> const enable_blend;
+        OpenGL::Scoped::bool_setter<GL_LINE_SMOOTH, GL_TRUE> const line_smooth;
+        OpenGL::Scoped::depth_mask_setter<GL_FALSE> const no_depth_write;
+        gl.hint(GL_LINE_SMOOTH_HINT, GL_NICEST);
+        gl.blendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        gl.lineWidth(2.5f);
+        gl.enable(GL_DEPTH_TEST);
+        gl.depthFunc(GL_LEQUAL); // respect terrain occlusion -> proper line-of-sight, not drawn through
+
+        for (auto const& spawn : _world->creatureSpawns())
+        {
+          if (spawn.pending_delete)
+            continue;
+          if (any_selected && !spawn.selected) // only the selected creature's path while one is selected
+            continue;
+          if (glm::distance(camera_pos, spawn.pos) > path_show_distance)
+            continue;
+
+          auto it = paths.find(spawn.guid);
+          if (it == paths.end() || it->second.empty())
+            continue;
+
+          // Start the line at the (possibly just-moved) spawn position so it tracks live edits, then
+          // run through the authored waypoints. Lift slightly so it doesn't z-fight the ground.
+          std::vector<glm::vec3> points;
+          points.reserve(it->second.size() + 1);
+          points.push_back(spawn.pos + glm::vec3(0.0f, 0.4f, 0.0f));
+          for (auto const& wp : it->second)
+            points.push_back(wp + glm::vec3(0.0f, 0.4f, 0.0f));
+
+          if (points.size() < 2)
+            continue;
+
+          _line_render.draw(mvp, points, palette[spawn.guid % palette_size], false);
+        }
+
+        gl.lineWidth(1.0f);
       }
     }
 
@@ -2135,8 +2276,9 @@ void WorldRender::draw (glm::mat4x4 const& model_view
     gl.depthMask(GL_TRUE);
   }
 
-  // model particles (drawn after water so additive glows appear on top of the water surface)
-  if (draw_model_animations && !model_with_particles.empty())
+  // model particles (drawn after water so additive glows appear on top of the water surface).
+  // Drawn even when animations are off -> particles freeze in place (not advanced) instead of vanishing.
+  if (!model_with_particles.empty())
   {
     OpenGL::Scoped::bool_setter<GL_CULL_FACE, GL_FALSE> const cull;
     OpenGL::Scoped::bool_setter<GL_DEPTH_TEST, GL_TRUE> const depth_test;
@@ -2156,7 +2298,7 @@ void WorldRender::draw (glm::mat4x4 const& model_view
   }
 
 
-  if (draw_model_animations && !model_with_particles.empty())
+  if (!model_with_particles.empty()) // ribbons too: drawn frozen when animations are off
   {
     OpenGL::Scoped::bool_setter<GL_CULL_FACE, GL_FALSE> const cull;
     OpenGL::Scoped::depth_mask_setter<GL_FALSE> const depth_mask;
@@ -2822,7 +2964,28 @@ void WorldRender::updateLightingUniformBlock(bool draw_fog, glm::vec3 const& cam
     _world->_model_instance_storage.for_each_m2_instance([&] (ModelInstance& inst)
     {
       Model* m = inst.model.get();
-      if (!m || !m->finishedLoading() || m->lights().empty())
+      if (!m || !m->finishedLoading())
+      {
+        return;
+      }
+
+      // Dusty lightray shafts carry no authored light, so the additive beam mesh only brightens the
+      // pixels directly behind it (the floor) -- doodads/rocks under the shaft stay dark. Synthesize a
+      // soft warm point light part-way down the beam so nearby geometry actually catches the shaft's
+      // glow, via the same point-light path the terrain/WMO/M2 shaders already use.
+      if (m->file_key().hasFilepath()
+          && m->file_key().filepath().find("lightray_dusty") != std::string::npos)
+      {
+        glm::mat4x4 const transform = inst.transformMatrix();
+        // The beam mesh runs down the model's local -Y; place the light mid-lower along it.
+        glm::vec3 const world = glm::vec3(transform * glm::vec4(0.0f, -10.0f, 0.0f, 1.0f));
+        glm::vec3 const col = glm::vec3(1.0f, 0.82f, 0.5f) * 0.8f; // warm golden fill (tune intensity)
+        glm::vec3 const d = world - camera_pos;
+        collected.push_back({world, col, 22.0f, glm::dot(d, d)}); // radius 22 (tune)
+        return;
+      }
+
+      if (m->lights().empty())
       {
         return;
       }
@@ -2835,6 +2998,47 @@ void WorldRender::updateLightingUniformBlock(bool draw_fog, glm::vec3 const& cam
         collected.push_back({world, col, 18.0f, glm::dot(d, d)});
       }
     });
+
+    // Lightray shafts are usually WMO doodads (e.g. timbermaw_instance.wmo's dusty light set), which
+    // the standalone-M2 loop above never sees -- collect their synthetic light here too.
+    int lightray_lights = 0;
+    _world->_model_instance_storage.for_each_wmo_instance([&] (WMOInstance& wmo)
+    {
+      auto* doodads = wmo.get_doodads(false);
+      if (!doodads)
+      {
+        return;
+      }
+      for (auto& pair : *doodads)
+      {
+        for (auto& doodad : pair.second)
+        {
+          Model* dm = doodad.model.get();
+          if (!dm || !dm->finishedLoading() || !dm->file_key().hasFilepath()
+              || dm->file_key().filepath().find("lightray_dusty") == std::string::npos)
+          {
+            continue;
+          }
+          glm::mat4x4 const transform = doodad.transformMatrix();
+          glm::vec3 const world = glm::vec3(transform * glm::vec4(0.0f, -10.0f, 0.0f, 1.0f));
+          glm::vec3 const col = glm::vec3(1.0f, 0.82f, 0.5f) * 0.8f;
+          glm::vec3 const d = world - camera_pos;
+          collected.push_back({world, col, 22.0f, glm::dot(d, d)});
+          ++lightray_lights;
+        }
+      }
+    });
+
+    {
+      static bool s_lr_dbg = std::getenv("NOGGIT_LIGHT_DEBUG") != nullptr;
+      static int s_lr_log = 0;
+      if (s_lr_dbg && s_lr_log < 4)
+      {
+        ++s_lr_log;
+        LogError << "LIGHTRAYLIGHTS wmoDoodadBeams=" << lightray_lights
+                 << " totalCollected=" << collected.size() << std::endl;
+      }
+    }
 
     std::sort(collected.begin(), collected.end(),
               [] (CollectedLight const& a, CollectedLight const& b) { return a.dist2 < b.dist2; });

@@ -9,6 +9,17 @@
 #include <noggit/Misc.h>
 #include <math/trig.hpp>
 #include <limits>
+#include <mutex>
+
+namespace
+{
+  // A single shared guard for every SceneObject's `_tiles` list. These lists are tiny and only
+  // change as tiles stream in/out, so global serialization costs nothing in practice while making
+  // refTile/derefTile (queue + main thread) and getTiles (render thread) safe against each other.
+  // A per-object std::mutex isn't an option: ModelInstance/WMOInstance are stored by value in the
+  // world's unordered_maps, so the class must stay copyable/movable.
+  std::mutex g_scene_object_tiles_mutex;
+}
 
 SceneObject::SceneObject(SceneObjectTypes type, Noggit::NoggitRenderContext context)
 : _type(type)
@@ -92,6 +103,7 @@ void SceneObject::normalizeDirection()
 
 void SceneObject::refTile(MapTile* tile)
 {
+  std::lock_guard<std::mutex> const lock(g_scene_object_tiles_mutex);
   auto it = std::find(_tiles.begin(), _tiles.end(), tile);
   if (it == _tiles.end())
     _tiles.push_back(tile);
@@ -99,7 +111,14 @@ void SceneObject::refTile(MapTile* tile)
 
 void SceneObject::derefTile(MapTile* tile)
 {
+  std::lock_guard<std::mutex> const lock(g_scene_object_tiles_mutex);
   auto it = std::find(_tiles.begin(), _tiles.end(), tile);
   if (it != _tiles.end())
     _tiles.erase(it);
+}
+
+std::vector<MapTile*> SceneObject::getTiles() const
+{
+  std::lock_guard<std::mutex> const lock(g_scene_object_tiles_mutex);
+  return _tiles;
 }

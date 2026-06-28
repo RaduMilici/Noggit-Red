@@ -724,6 +724,69 @@ namespace mysql
 		return records;
   }
 
+	std::vector<CreaturePatrolPoint> getCreaturePatrolPaths(std::size_t mapID, std::string* error)
+	{
+		auto connection = connect(error);
+		if (!connection)
+		{
+			return {};
+		}
+
+		// Per-guid waypoints (vmangos/mangos-style `creature_movement`, keyed by creature.guid). Absent
+		// table -> no patrol data, not an error.
+		if (!tableExists(connection.get(), "creature_movement")
+		    || !tableHasColumn(connection.get(), "creature_movement", "id")
+		    || !tableHasColumn(connection.get(), "creature_movement", "point")
+		    || !tableHasColumn(connection.get(), "creature_movement", "position_x"))
+		{
+			return {};
+		}
+
+		std::stringstream statement;
+		statement
+			<< "SELECT cm.id, cm.point, cm.position_x, cm.position_y, cm.position_z "
+			<< "FROM creature_movement cm "
+			<< "INNER JOIN creature c ON c.guid = cm.id "
+			<< "WHERE c.map = " << mapID << " "
+			<< "ORDER BY cm.id, cm.point";
+
+		if (mysql_query(connection.get(), statement.str().c_str()) != 0)
+		{
+			if (error)
+			{
+				*error = mysql_error(connection.get());
+			}
+			return {};
+		}
+
+		MYSQL_RES* result = mysql_store_result(connection.get());
+		if (!result)
+		{
+			if (error)
+			{
+				*error = mysql_error(connection.get());
+			}
+			return {};
+		}
+
+		std::vector<CreaturePatrolPoint> points;
+		points.reserve(static_cast<std::size_t>(mysql_num_rows(result)));
+
+		while (MYSQL_ROW row = mysql_fetch_row(result))
+		{
+			CreaturePatrolPoint point;
+			point.guid = parseUnsigned(row[0]);
+			point.point = parseUnsigned(row[1]);
+			point.position_x = parseFloat(row[2]);
+			point.position_y = parseFloat(row[3]);
+			point.position_z = parseFloat(row[4]);
+			points.push_back(point);
+		}
+
+		mysql_free_result(result);
+		return points;
+	}
+
 	std::vector<CreatureSpawnRecord> searchCreatureSpawns(std::string const& searchTerm, std::size_t limit, std::string* error)
 	{
 		auto connection = connect(error);
@@ -894,6 +957,97 @@ namespace mysql
 			record.flags_extra = parseUnsigned(row[7]);
 			record.display_id = parseUnsigned(row[8]);
 			record.template_scale = parseFloat(row[9]);
+			if (record.template_scale <= 0.0f)
+			{
+				record.template_scale = 1.0f;
+			}
+			records.push_back(record);
+		}
+
+		mysql_free_result(result);
+		return records;
+	}
+
+	std::vector<GameObjectTemplateRecord> getGameObjectTemplates(std::size_t limit, std::string* error)
+	{
+		auto connection = connect(error);
+		if (!connection)
+		{
+			return {};
+		}
+
+		if (!tableExists(connection.get(), "gameobject_template")
+		    || !tableHasColumn(connection.get(), "gameobject_template", "entry"))
+		{
+			if (error)
+			{
+				*error = "gameobject_template table is missing required entry column";
+			}
+			return {};
+		}
+
+		auto name_expr = firstColumnExpr(connection.get(),
+		                                "gameobject_template",
+		                                "gt",
+		                                {"name", "Name"},
+		                                "''");
+		auto display_expr = firstColumnExpr(connection.get(),
+		                                   "gameobject_template",
+		                                   "gt",
+		                                   {"displayId", "display_id", "DisplayId"},
+		                                   "0");
+		auto type_expr = firstColumnExpr(connection.get(),
+		                                "gameobject_template",
+		                                "gt",
+		                                {"type", "Type"},
+		                                "0");
+		auto scale_expr = firstColumnExpr(connection.get(),
+		                                 "gameobject_template",
+		                                 "gt",
+		                                 {"size", "scale"},
+		                                 "1");
+
+		std::stringstream statement;
+		statement
+			<< "SELECT gt.entry, "
+			<< "COALESCE(" << name_expr << ", '') AS name, "
+			<< "COALESCE(" << display_expr << ", 0) AS display_id, "
+			<< "COALESCE(" << type_expr << ", 0) AS type, "
+			<< "COALESCE(NULLIF(" << scale_expr << ", 0), 1) AS template_scale "
+			<< "FROM gameobject_template gt "
+			<< "ORDER BY name, gt.entry "
+			<< "LIMIT " << limit;
+
+		if (mysql_query(connection.get(), statement.str().c_str()) != 0)
+		{
+			if (error)
+			{
+				*error = mysql_error(connection.get());
+			}
+			return {};
+		}
+
+		MYSQL_RES* result = mysql_store_result(connection.get());
+		if (!result)
+		{
+			if (error)
+			{
+				*error = mysql_error(connection.get());
+			}
+			return {};
+		}
+
+		std::vector<GameObjectTemplateRecord> records;
+		records.reserve(static_cast<std::size_t>(mysql_num_rows(result)));
+
+		while (MYSQL_ROW row = mysql_fetch_row(result))
+		{
+			GameObjectTemplateRecord record;
+			record.entry = parseUnsigned(row[0]);
+			record.name = parseString(row[1]);
+			record.display_id = parseUnsigned(row[2]);
+			record.type = parseUnsigned(row[3]);
+			record.template_scale = parseFloat(row[4]);
 			if (record.template_scale <= 0.0f)
 			{
 				record.template_scale = 1.0f;

@@ -64,8 +64,11 @@ public:
   void refTile(MapTile* tile);
   void derefTile(MapTile* tile);
 
+  // Returns a snapshot copy: _tiles is mutated from the tile-update-queue thread (refTile) and the
+  // main thread (derefTile on tile unload) while readers run on the render thread, so handing out a
+  // reference would race. See SceneObject.cpp for the shared guard.
   [[nodiscard]]
-  std::vector<MapTile*> const& getTiles() const { return _tiles; };
+  std::vector<MapTile*> getTiles() const;
 
   [[nodiscard]]
   virtual AsyncObject* instance_model() const = 0;

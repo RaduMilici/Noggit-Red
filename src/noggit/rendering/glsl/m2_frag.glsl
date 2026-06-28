@@ -327,6 +327,14 @@ void main()
       // and fire black inside dark caves, where ambient is near zero.
       currColor = vec3(1.0f, 1.0f, 1.0f);
       accumlatedLight = vec3(0.0f, 0.0f, 0.0f);
+
+      // ...but unlit OPAQUE / alpha-key props (totems, barrels, mushrooms) should still catch a light
+      // shaft's point-light glow. Limited to blend 0/1: widening to alpha/additive blends made other
+      // doodads render worse.
+      if (blend_mode == 0 || blend_mode == 1)
+      {
+        lDiffuse += point_lights(m2_world_pos, normalize(norm));
+      }
   }
 
   color.rgb = clamp(color.rgb * (currColor + lDiffuse), 0.0, 1.0);

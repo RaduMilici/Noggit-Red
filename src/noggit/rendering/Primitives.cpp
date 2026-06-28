@@ -690,12 +690,17 @@ void Square::setup_buffers()
   void Line::setup_shader(std::vector<glm::vec3> vertices, std::vector<std::uint16_t> indices)
   {
       _indice_count = (int)indices.size();
-      _program.reset(new OpenGL::program(
-          {
-              { GL_VERTEX_SHADER, OpenGL::shader::src_from_qrc("line_vs") },
-              { GL_FRAGMENT_SHADER, OpenGL::shader::src_from_qrc("line_fs") }
-          }
-      ));
+      // Compile the program only once; setup_shader runs on every draw() (the vertex data changes per
+      // line), and recreating the GL program each call would stall when drawing many lines per frame.
+      if (!_program)
+      {
+        _program.reset(new OpenGL::program(
+            {
+                { GL_VERTEX_SHADER, OpenGL::shader::src_from_qrc("line_vs") },
+                { GL_FRAGMENT_SHADER, OpenGL::shader::src_from_qrc("line_fs") }
+            }
+        ));
+      }
 
       gl.bufferData<GL_ARRAY_BUFFER, glm::vec3>(_vertices_vbo, vertices, GL_STATIC_DRAW);
       gl.bufferData<GL_ELEMENT_ARRAY_BUFFER, std::uint16_t>(_indices_vbo, indices, GL_STATIC_DRAW);

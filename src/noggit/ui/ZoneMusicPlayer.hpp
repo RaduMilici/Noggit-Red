@@ -37,21 +37,25 @@ namespace Noggit::Ui
     void update_zone(int zone_music_id, bool is_day);
 
   private:
-    void ensure_player();         // lazily create the QMediaPlayer (QtMultimedia) on first use
+    void ensure_deck(int deck);   // lazily create one of the two QMediaPlayer "decks"
     void rebuild_playlist();      // (re)load _files/_dir from _current_zone_music_id + _is_day
-    void play_index(int index);   // play a track (fades out the current one first if one is playing)
-    void start_track(int index);  // actually load + play a track and fade it in
+    void play_index(int index);   // crossfade to a track
+    void start_track(int index);  // load a track onto the idle deck and crossfade the decks
     void play_random();           // play a random track from the playlist
     void schedule_next();         // wait the silence interval, then play_random()
-    void tick_fade();             // step the volume fade in/out
+    void tick_fade();             // step the crossfade (live deck up, other deck down)
     void stop_playback();
 
-    QMediaPlayer* _player = nullptr;
+    // Two decks so a new track can fade IN while the previous one fades OUT at the same time (a real
+    // crossfade with overlap), instead of going silent between tracks. _active_deck is the live one.
+    static constexpr int DECK_COUNT = 2;
+    QMediaPlayer* _decks[DECK_COUNT] = {nullptr, nullptr};
+    QTemporaryFile* _deck_files[DECK_COUNT] = {nullptr, nullptr};
+    int _active_deck = 0;
     QTimer* _silence_timer;
-    QTimer* _fade_timer;          // drives the volume fade in/out
-    int _master_volume = 70;      // user's target volume (slider); fades go 0 <-> this
-    int _fade_pending_index = -1; // track to start once the fade-out completes (-1 = fading in)
-    QTemporaryFile* _temp_file = nullptr;
+    QTimer* _fade_timer;          // drives the crossfade
+    int _master_volume = 70;      // user's target volume (slider); the live deck fades up to this
+    bool _track_ending = false;   // guards against scheduling the next track more than once per track
     std::mt19937 _rng;
 
     bool _enabled = false;

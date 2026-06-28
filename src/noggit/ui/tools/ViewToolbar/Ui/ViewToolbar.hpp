@@ -42,6 +42,9 @@ namespace Noggit
       QVector<QWidgetAction*> _object_secondary_tool;
       
       QVector<QWidgetAction*> _light_secondary_tool;
+
+      QVector<QWidgetAction*> _creature_secondary_tool;
+
       bool drawOnlyInsideSphereLight();
       bool drawWireframeSphereLight();
       float getAlphaSphereLight();

@@ -399,6 +399,31 @@ ViewToolbar::ViewToolbar(MapView* mapView, editing_mode mode)
 
         _light_secondary_tool.push_back(_toolbar);
     }
+
+    {
+        /*
+         * CREATURE SECONDARY TOOL
+         */
+
+        SubToolBarAction* _toolbar = new SubToolBarAction();
+
+        {
+            IconAction* _icon = new IconAction(FontNoggitIcon{ FontNoggit::TOOL_OBJECT_EDITOR });
+
+            CheckBoxAction* _patrol_paths = new CheckBoxAction(tr("Patrol paths"));
+            connect(_patrol_paths->checkbox(), &QCheckBox::toggled, [mapView](bool checked)
+                    {
+                        mapView->getWorld()->setDrawCreaturePatrolPaths(checked);
+                        mapView->requestRedraw();
+                    });
+
+            _toolbar->ADD_ACTION(_icon);
+            _toolbar->ADD_ACTION(_patrol_paths);
+            _toolbar->SETUP_WIDGET(false);
+        }
+
+        _creature_secondary_tool.push_back(_toolbar);
+    }
 }
 
 void ViewToolbar::setCurrentMode(MapView* mapView, editing_mode mode)
@@ -444,6 +469,13 @@ void ViewToolbar::setCurrentMode(MapView* mapView, editing_mode mode)
         if (_light_secondary_tool.size() > 0)
         {
             setupWidget(_light_secondary_tool, true);
+            mapView->getLeftSecondaryToolbar()->show();
+        }
+        break;
+    case editing_mode::creature:
+        if (_creature_secondary_tool.size() > 0)
+        {
+            setupWidget(_creature_secondary_tool);
             mapView->getLeftSecondaryToolbar()->show();
         }
         break;
