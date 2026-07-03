@@ -104,6 +104,15 @@ namespace Noggit
       QPushButton* object_palette_btn = new QPushButton("Object palette", this);
       layout->addWidget(object_palette_btn);
 
+      // Selected-object info panel: shows the name, file path and UID of the selected M2/WMO.
+      QGroupBox* selection_info_group = new QGroupBox("Selected Object");
+      auto selection_info_layout = new QVBoxLayout(selection_info_group);
+      _selection_info = new QLabel("No object selected", this);
+      _selection_info->setWordWrap(true);
+      _selection_info->setTextInteractionFlags(Qt::TextSelectableByMouse);
+      selection_info_layout->addWidget(_selection_info);
+      layout->addWidget(selection_info_group);
+
       _wmo_group = new QGroupBox("Selected WMO Options");
       auto wmo_layout = new QFormLayout(_wmo_group);
 
@@ -896,6 +905,8 @@ namespace Noggit
     {
         _wmo_group->setDisabled(true);
         _wmo_group->hide();
+        if (_selection_info)
+            _selection_info->setText("No object selected");
 
         auto last_entry = world->get_last_selected_model();
         // for (auto& selection : selected)
@@ -907,15 +918,24 @@ namespace Noggit
             }
             auto obj = std::get<selected_object_type>(last_entry.value());
 
+            std::string path;
+            char const* type = "Object";
+
             if (obj->which() == eMODEL)
             {
-                // ModelInstance* mi = static_cast<ModelInstance*>(obj);
+                type = "M2";
+                ModelInstance* mi = static_cast<ModelInstance*>(obj);
+                if (mi->model.get() && mi->model->file_key().hasFilepath())
+                    path = mi->model->file_key().filepath();
             }
             else if (obj->which() == eWMO)
             {
+                type = "WMO";
                 _wmo_group->setDisabled(false);
                 _wmo_group->setHidden(false);
                 WMOInstance* wi = static_cast<WMOInstance*>(obj);
+                if (wi->wmo.get() && wi->wmo->file_key().hasFilepath())
+                    path = wi->wmo->file_key().filepath();
 
                 QSignalBlocker const doodadsetblocker(_doodadSetSelector);
                 _doodadSetSelector->clear();
@@ -947,6 +967,19 @@ namespace Noggit
                 }
                 _nameSetSelector->insertItems(0, namesetnames);
                 _nameSetSelector->setCurrentIndex(wi->mNameset);
+            }
+
+            if (_selection_info)
+            {
+                std::string name = path;
+                auto const slash = name.find_last_of("/\\");
+                if (slash != std::string::npos)
+                    name = name.substr(slash + 1);
+                _selection_info->setText(QString("Type: %1\nName: %2\nUID: %3\nPath: %4")
+                    .arg(type)
+                    .arg(name.c_str())
+                    .arg(obj->uid)
+                    .arg(path.c_str()));
             }
         }
     }

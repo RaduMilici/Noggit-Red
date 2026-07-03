@@ -101,6 +101,33 @@ namespace Animation
       return !data[anim].empty();
     }
 
+    // TEMP diagnostic: how did this track split into per-animation buckets (times only, so it compiles for
+    // every AnimatedType)? Reveals whether a classic track used ranges (normalized local times per anim)
+    // or dumped everything under anim 0 with raw global timestamps.
+    std::string debugBuckets() const
+    {
+      std::ostringstream o;
+      o << "gseq=" << _globalSequenceID << " interp=" << static_cast<int>(_interpolationType)
+        << " nBuckets=" << data.size();
+      for (auto const& kv : data)
+      {
+        o << " |anim=" << kv.first << " n=" << kv.second.size() << " t=[";
+        auto const it = times.find(kv.first);
+        if (it != times.end())
+        {
+          for (std::size_t i = 0; i < it->second.size() && i < 40; ++i) { o << it->second[i] << ","; }
+        }
+        o << "]";
+        if constexpr (std::is_arithmetic_v<AnimatedType>)
+        {
+          o << " v=[";
+          for (std::size_t i = 0; i < kv.second.size() && i < 40; ++i) { o << static_cast<double>(kv.second[i]) << ","; }
+          o << "]";
+        }
+      }
+      return o.str();
+    }
+
     AnimatedType getValue (AnimationIdType anim, TimestampType time, int animtime)
     {
       if (_globalSequenceID != NO_GLOBAL_SEQUENCE)
@@ -113,6 +140,19 @@ namespace Animation
         {
           time = TimestampType();
         }
+        anim = AnimationIdType();
+      }
+
+      // Classic constant/global tracks store their single key-set under animation 0 only (see the
+      // ClassicAnimationBlock ctor: nRanges == 0 -> append_range(0, ...)). A model playing any OTHER
+      // animation would read an empty track here and return a default-constructed 0. For particle
+      // emitters that meant EmissionRate / Lifespan read 0 on every non-0 animation -> emission
+      // stopped, the smoke aged out over its lifespan, and only refilled when the creature returned to
+      // animation 0 -- the "wave then gap then wave" pulsing on the arcane elementals. Fall back to
+      // animation 0's keys when the requested animation has none, so a global/constant track applies to
+      // every animation (and a non-animated WotLK track yields its static value instead of 0).
+      if (data[anim].empty() && !data[AnimationIdType()].empty())
+      {
         anim = AnimationIdType();
       }
 
@@ -145,6 +185,26 @@ namespace Animation
           return dataVector[0];
         }
 
+        // STEP tracks (NONE interpolation -- e.g. particle-emitter enabled gates) are keyed WITHIN an
+        // animation that can outlast the track's own last timestamp. Real M2 playback holds the last key's
+        // value across that tail until the ANIMATION loops; the caller already supplies animation-looped
+        // time. Re-looping by the track's own end (time %= max_time) made a trailing key permanently
+        // unreachable -- e.g. the Anomalus chest emitter's enabled track = [0..0,1] (single ON key last),
+        // so the chest sparkle never emitted. Clamp/hold the endpoints for step tracks instead. Linear/
+        // Hermite tracks (bones, colours, continuous texture scrolls that depend on the wrap) keep the
+        // modulo behaviour untouched.
+        if (_interpolationType == Animation::Interpolation::Type::NONE)
+        {
+          size_t const last = usable_count - 1;
+          size_t pos = 0;
+          for (size_t i = 0; i <= last; ++i)
+          {
+            if (time >= timestampVector[i]) { pos = i; }
+            else { break; }
+          }
+          return dataVector[pos];
+        }
+
         TimestampType max_time = timestampVector.back();
         if (max_time > 0)
         {
@@ -165,7 +225,7 @@ namespace Animation
           }
         }
 
-        if (pos >= usable_count - 1 || _interpolationType == Animation::Interpolation::Type::NONE)
+        if (pos >= usable_count - 1)
         {
           result = dataVector[pos];
         }

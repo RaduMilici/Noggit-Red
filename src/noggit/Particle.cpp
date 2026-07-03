@@ -323,6 +323,7 @@ ParticleSystem::ParticleSystem(Model* model_
   , tofs (misc::frand())
   , _context(context)
 {
+  _bone_index = mta.bone;
   read_particle_life_ramp(f, mta.p, colors, sizes);
 
   //transform = mta.flags & 1024;
@@ -376,6 +377,43 @@ ParticleSystem::ParticleSystem(Model* model_
   , tofs(misc::frand())
   , _context(context)
 {
+  _bone_index = mta.bone;
+  // Emitter spin: for a spline emitter (M2 EmitterType 3) this is how fast the emission point travels
+  // along the spline. classic models carry it in params.spin; WotLK params don't.
+  _spin = std::isfinite(mta.p.spin) ? mta.p.spin : 0.f;
+
+  // Spline path (the MC flamecircle's ring etc.). The emitter stores nSplinePoints vec3s at
+  // ofsSplinePoints; particles emit along this loop instead of from the bone origin. Read & convert to
+  // Noggit render space here so newParticle just samples the cached points.
+  if (mta.p.nSplinePoints > 0 && mta.p.nSplinePoints < 4096)
+  {
+    std::size_t const need = static_cast<std::size_t>(mta.p.ofsSplinePoints)
+                           + static_cast<std::size_t>(mta.p.nSplinePoints) * sizeof(glm::vec3);
+    if (f.getBuffer() && need <= f.getSize())
+    {
+      auto const* raw = reinterpret_cast<glm::vec3 const*>(f.getBuffer() + mta.p.ofsSplinePoints);
+      _spline_points.reserve(mta.p.nSplinePoints);
+      for (std::uint32_t i = 0; i < mta.p.nSplinePoints; ++i)
+      {
+        _spline_points.push_back(fixCoordSystem(raw[i]));
+      }
+    }
+  }
+
+  if (classic_effect_debug_enabled())
+  {
+    LogDebug << "Classic emitter spin probe model='"
+             << (model ? model->file_key().stringRepr() : std::string("<null>"))
+             << "' emitterType=" << static_cast<int>(mta.EmitterType)
+             << " spin=" << mta.p.spin
+             << " nSplinePoints=" << mta.p.nSplinePoints << " ofsSplinePoints=" << mta.p.ofsSplinePoints
+             << " splineLoaded=" << _spline_points.size()
+             << " EmissionSpeed=" << speed.getValue(0, 0, 0)
+             << " emitterPos=(" << pos.x << ", " << pos.y << ", " << pos.z << ")"
+             << " bone=" << mta.bone
+             << std::endl;
+  }
+
   colors = {glm::vec4(1.f), glm::vec4(1.f), glm::vec4(1.f)};
   sizes = {1.f, 1.f, 1.f};
   read_classic_particle_life_ramp(mta.p, mid, colors, sizes);
@@ -385,36 +423,78 @@ ParticleSystem::ParticleSystem(Model* model_
   }
   log_classic_particle_ramp_probe(model, mta.p, colors, sizes);
 
-  // The dusty light-ray's white motes are authored microscopically (~0.006 units) -- invisible
-  // against the bright shaft. In-game they're small but visible scattered specks drifting down.
-  // Scale them up modestly for volumetric-light models only so they actually read (paired with the
-  // pre-warm in update(), which populates and scatters them along the shaft). Path-scoped so no
-  // other classic emitter (torches/smoke) is touched.
-  if (model->file_key().hasFilepath()
-      && model->file_key().filepath().find("volumetriclight") != std::string::npos)
+  // Flipbook cell animation. The classic params carry lifespanUVAnim/decayUVAnim = [startCell,
+  // endCell, repeat]; the texture cell is meant to advance sequentially across the rows*cols sheet
+  // over each particle's lifetime (e.g. 4x4 life=(0,7)+decay=(8,16) = a 16-frame explosion; 8x8
+  // (0,31)+(32,63) = a full 64-frame animation). Treat the whole [life.start .. furthest end] as one
+  // sequence played over rlife. Only enable when the emitter authors a real range on a multi-cell
+  // sheet -- degenerate (0,0,1) sheets fall through to the existing random-tile behaviour (variety),
+  // so no regression for the ~22% that don't flipbook. Verified by scanning 2195 multi-cell emitters.
   {
-    // The authored motes are microscopic (~0.006 units) -- they spawn but are invisible. Scale them
-    // up so the falling dust specks actually read in the shaft. Tune this multiplier for mote size.
-    for (float& size : sizes)
+    int const cell_count = std::max(1, rows * cols);
+    int const seq_start = mta.p.lifespanUVAnim[0];
+    int const seq_end = std::max({ static_cast<int>(mta.p.lifespanUVAnim[1])
+                                 , static_cast<int>(mta.p.decayUVAnim[0])
+                                 , static_cast<int>(mta.p.decayUVAnim[1]) });
+    int const repeat = mta.p.lifespanUVAnim[2] > 0 ? mta.p.lifespanUVAnim[2] : 1;
+    if (cell_count > 1 && seq_end > seq_start && seq_start >= 0)
     {
-      size = std::clamp(size * 10.0f, 0.001f, CLASSIC_PARTICLE_MAX_SIZE);
+      _uv_animated = true;
+      _uv_seq_start = seq_start;
+      _uv_seq_end = std::min(seq_end, cell_count - 1); // clamp: tile index must stay in [0,cells-1]
+      _uv_repeat = repeat;
     }
-    // Force an explicit birth->death opacity gradient so the motes are full at the TOP (spawn) and
-    // fade to 0 by the BOTTOM (death) as they drift down the shaft. The authored ramp was flat, so
-    // they held the same opacity the whole way. p.color = lifeRamp(colors[0],[1],[2]) over life, so
-    // these three alphas define the gradient. top_alpha is the tunable knob for the spawn opacity.
-    float const top_alpha = 0.5f;
-    if (colors.size() >= 3)
+  }
+
+  // GENERAL tiny-particle visibility floor (replaces the old per-model "volumetriclight" size x10 hack).
+  // Some emitters author sub-pixel particle sizes (the volumetric-light dust sparkles are ~0.014 units)
+  // that simply vanish in the editor. Scale such emitters up to a minimum readable size, and -- for
+  // ADDITIVE blends, where the rendered brightness scales ~size^2 -- scale the alpha DOWN by f^2 so the
+  // brightness stays data-faithful (a small visible faint speck, not a bright blob). This is data-derived
+  // (the factor comes from the authored size), works for every tiny-particle effect, and needs no
+  // per-model tuning.
+  {
+    float const peak_size = std::max({ sizes[0], sizes[1], sizes[2] });
+    float const MIN_VISIBLE_SIZE = 0.06f; // min readable world size; gentler than 0.10 so fire embers
+                                          // (peak ~0.03-0.05) aren't over-enlarged into the bright core.
+    if (peak_size > 0.0f && peak_size < MIN_VISIBLE_SIZE)
     {
-      colors[0].a = top_alpha;        // birth / top
-      colors[1].a = top_alpha * 0.5f; // mid
-      colors[2].a = 0.0f;             // death / bottom
+      float const f = MIN_VISIBLE_SIZE / peak_size;
+      for (float& s : sizes)
+      {
+        s *= f;
+      }
+      // ADDITIVE blends (NoAlphaAdd 3 / Add 4 / InvAlphaAdd 7): rendered brightness scales with the
+      // particle AREA (~size^2), so enlarging a small additive speck without compensating makes it
+      // BRIGHTER. That blew out dense additive fire -- the Forgebonfire / firepit ember emitters
+      // (peak ~0.03-0.05) were floored ~2x and so ~4x too bright, stacking into the white core. Scale the
+      // alpha down by 1/f^2 so the integrated brightness stays data-faithful: a faint speck made visible,
+      // not a bright blob. (Alpha-blend dust keeps full alpha -- its brightness isn't area-additive.)
+      if (blend == 3 || blend == 4 || blend == 7)
+      {
+        float const inv_area = 1.0f / (f * f);
+        for (auto& c : colors)
+        {
+          c.a *= inv_area;
+        }
+      }
     }
-    else
+  }
+
+  // Large-area, alpha-blended ambient dust/fog (e.g. the Timbermaw furbolg dust: emission area ~8-12u,
+  // ~270 motes) fills a big volume with many overlapping semi-transparent particles. In the editor's
+  // brighter, un-fogged scene that overlap reads as near-opaque, unlike the dark in-game cave where the
+  // same motes are subtle. Scale the opacity of big-area alpha-blend emitters down so the cumulative
+  // density matches the in-game subtlety. Data-driven (emission area + alpha blend), not a per-model
+  // hack -- localized effects (torches, small dust/steam) have small areas and keep their full alpha.
+  if (blend == 2)
+  {
+    float const area = std::max(areal.getValue(0, 0, 0), areaw.getValue(0, 0, 0));
+    if (std::isfinite(area) && area > 5.0f)
     {
       for (glm::vec4& ramp_color : colors)
       {
-        ramp_color.a *= 0.1f;
+        ramp_color.a *= 0.2f;
       }
     }
   }
@@ -449,6 +529,8 @@ ParticleSystem::ParticleSystem(ParticleSystem const& other)
   , sizes(other.sizes)
   , mid(other.mid)
   , slowdown(other.slowdown)
+  , _spin(other._spin)
+  , _spline_points(other._spline_points)
   , pos(other.pos)
   , _texture_id(other._texture_id)
   , particles(other.particles)
@@ -461,6 +543,10 @@ ParticleSystem::ParticleSystem(ParticleSystem const& other)
   , rows(other.rows)
   , cols(other.cols)
   , tiles(other.tiles)
+  , _uv_animated(other._uv_animated)
+  , _uv_seq_start(other._uv_seq_start)
+  , _uv_seq_end(other._uv_seq_end)
+  , _uv_repeat(other._uv_repeat)
   , billboard(other.billboard)
   , classic(other.classic)
   , debug_update_log_count(other.debug_update_log_count)
@@ -493,6 +579,8 @@ ParticleSystem::ParticleSystem(ParticleSystem&& other)
   , sizes(other.sizes)
   , mid(other.mid)
   , slowdown(other.slowdown)
+  , _spin(other._spin)
+  , _spline_points(other._spline_points)
   , pos(other.pos)
   , _texture_id(other._texture_id)
   , particles(other.particles)
@@ -505,6 +593,10 @@ ParticleSystem::ParticleSystem(ParticleSystem&& other)
   , rows(other.rows)
   , cols(other.cols)
   , tiles(other.tiles)
+  , _uv_animated(other._uv_animated)
+  , _uv_seq_start(other._uv_seq_start)
+  , _uv_seq_end(other._uv_seq_end)
+  , _uv_repeat(other._uv_repeat)
   , billboard(other.billboard)
   , classic(other.classic)
   , debug_update_log_count(other.debug_update_log_count)
@@ -544,6 +636,12 @@ void ParticleSystem::initTile(glm::vec2 *tc, int num)
 
 void ParticleSystem::update(float dt)
 {
+  // Re-resolve the parent bone from its index (a cached Bone* goes stale after the model's bones vector is
+  // rebuilt -> parent->mat was ZERO -> particles spawned at the origin). Do it here where newParticle reads
+  // sys->parent->mat/.mrot for the spawn position + emission direction, so particles attach to and follow
+  // the animated bone.
+  parent = particle_parent_bone(model, _bone_index);
+
   // Pre-warm continuous emitters to steady state on first tick so ambient effects (dusty light-ray
   // motes, smoke) appear already populated/scattered instead of slowly filling from empty over a
   // full lifespan. Recursive calls see the guard set and skip the pre-warm.
@@ -591,13 +689,9 @@ void ParticleSystem::update(float dt)
       frate = std::min(frate, CLASSIC_PARTICLE_MAX_RATE);
       flife = std::min(flife, CLASSIC_PARTICLE_MAX_LIFESPAN);
     }
-    // Volumetric light dust: spawn far fewer motes -- the shaft wants a sparse drift of specks, not a
-    // dense column. Scoped to volumetric lights so torches/smoke keep their authored density.
-    if (model->file_key().hasFilepath()
-        && model->file_key().filepath().find("volumetriclight") != std::string::npos)
-    {
-      frate *= 0.2f;
-    }
+    // (Removed the volumetric-light rate x0.2 hand-tune: it suppressed the authored emission so the white
+    //  sparkle motes went missing. Use the real authored rate -- the bloom over-brightening that this hack
+    //  was compensating for is now fixed at the source, so the data-driven rate is correct.)
     debug_rate = frate;
     debug_life = flife;
 
@@ -611,6 +705,21 @@ void ParticleSystem::update(float dt)
     else if (enabled_uses_default_animation)
     {
       en = enabled.getValue(0, mtime, manimtime) != 0;
+    }
+
+    // [ENBUCKET] one-time per anomalus chest emitter: how did the enabled track bucket, and what time are
+    // we sampling it at?
+    if (classic && _bone_index == 64 && model && model->file_key().hasFilepath()
+        && model->file_key().filepath().find("anomalus") != std::string::npos)
+    {
+      static int enb = 0;
+      if (enb < 4)
+      {
+        ++enb;
+        LogDebug << "[ENBUCKET] bone=64 manim=" << manim << " mtime=" << mtime << " manimtime=" << manimtime
+                 << " usesCur=" << enabled_uses_current_animation << " usesDef=" << enabled_uses_default_animation
+                 << " en=" << en << " { " << enabled.debugBuckets() << " }" << std::endl;
+      }
     }
 
     if (frate <= 0.0f || flife <= 0.0f || !en)
@@ -668,6 +777,25 @@ void ParticleSystem::update(float dt)
         //rem = 0;
         for (int i = 0; i<tospawn; ++i) {
           Particle p = emitter->newParticle(this, manim, mtime, manimtime, w, l, spd, var, spr, spr2);
+
+          // TEMP [PARTDBG]: where does Noggit actually attach/spawn each Anomalus emitter? Logs the bone's
+          // world (model-local) position, the spawned particle position + emission direction, per emitter.
+          static int part_dbg_count = 0;
+          if (i == 0 && classic_effect_debug_enabled() && model && model->file_key().hasFilepath()
+              && model->file_key().filepath().find("anomalus") != std::string::npos
+              && part_dbg_count < 80)
+          {
+            ++part_dbg_count;
+            glm::vec3 const bone_pos(parent->mat[3][0], parent->mat[3][1], parent->mat[3][2]);
+            LogDebug << "[PARTDBG] tex=" << _texture_id << " type=" << emitter_type
+                     << " emitterLocalPos=(" << pos.x << "," << pos.y << "," << pos.z << ")"
+                     << " boneWorldPos=(" << bone_pos.x << "," << bone_pos.y << "," << bone_pos.z << ")"
+                     << " spawnPos=(" << p.pos.x << "," << p.pos.y << "," << p.pos.z << ")"
+                     << " dir=(" << p.dir.x << "," << p.dir.y << "," << p.dir.z << ")"
+                     << " speed=" << glm::length(p.speed)
+                     << std::endl;
+          }
+
           // sanity check:
           //if (particles.size() < MAX_PARTICLES) // No need to check this every loop iteration. Already checked above.
           particles.push_back(p);
@@ -686,10 +814,43 @@ void ParticleSystem::update(float dt)
     if (slowdown>0) {
       mspeed = expf(-1.0f * slowdown * p.life);
     }
+    else if (slowdown < 0.0f) {
+      // Negative authored drag = DECELERATION in the live 1.12 client. Verified by apitrace capture of
+      // the Anomalus feet smoke (MANAMISTBASE, drag=-0.1): the particles rise bright from the feet then
+      // visibly slow and fade to ~8% opacity at the top of their travel (measured alpha 183->20 over the
+      // last ~1.3 units of rise). WMV/Noggit's original `slowdown>0` gate dropped negative drag entirely,
+      // so the smoke never decelerated -> rose too fast and stayed at full opacity at the top. exp(drag*
+      // life) (drag<0 -> decay) reproduces the client's measured speed falloff (exp(-0.1*life) matched the
+      // deceleration: ~4.0 units risen in the first 70% of life, only ~1.3 more in the last 30%).
+      mspeed = expf(slowdown * p.life);
+    }
+    else {
+      mspeed = 1.0f;
+    }
     p.pos += p.speed * mspeed * dt;
 
     p.life += dt;
     float rlife = p.life / p.maxlife;
+
+    // Flipbook: advance the texture cell sequentially over the particle's life (data-driven from
+    // lifespanUVAnim/decayUVAnim). Overwrites the random tile picked at spawn for animated emitters
+    // only; the draw path reads p.tile unchanged. Clamped so the index can never leave [0,cells-1]
+    // (an out-of-range tile would break the whole draw loop via the size guard).
+    if (_uv_animated)
+    {
+      int const range = _uv_seq_end - _uv_seq_start + 1;
+      float const f = std::min(std::max(rlife, 0.0f), 0.99999f);
+      int frame = static_cast<int>(f * static_cast<float>(range) * static_cast<float>(_uv_repeat));
+      if (range > 0) { frame %= range; }
+      int cell = _uv_seq_start + frame;
+      if (cell < 0) { cell = 0; }
+      if (static_cast<std::size_t>(cell) >= tiles.size() && !tiles.empty())
+      {
+        cell = static_cast<int>(tiles.size()) - 1;
+      }
+      p.tile = static_cast<unsigned int>(cell);
+    }
+
     // calculate size and color based on lifetime
     p.size = lifeRamp<float>(rlife, mid, sizes[0], sizes[1], sizes[2]);
     p.color = lifeRamp<glm::vec4>(rlife, mid, colors[0], colors[1], colors[2]);
@@ -745,6 +906,12 @@ void ParticleSystem::setup(int anim, int time, int animtime)
   manim = anim;
   mtime = time;
   manimtime = animtime;
+
+  // Re-resolve the parent bone from its index every frame. A Bone* cached at construction goes stale (the
+  // model's bones vector is rebuilt/reallocated after the emitter is built), which made parent->mat read
+  // ZERO -> every particle spawned at the model origin emitting straight up. Re-pointing at the CURRENT
+  // bones array picks up the animated bone matrix so particles attach at (and follow) the real bone.
+  parent = particle_parent_bone(model, _bone_index);
 }
 
 void ParticleSystem::draw( glm::mat4x4 const& model_view
@@ -753,6 +920,13 @@ void ParticleSystem::draw( glm::mat4x4 const& model_view
                          , int instances_count
 )
 {
+  // Nothing alive: skip entirely. Avoids per-frame zero-size buffer respecifications + degenerate
+  // draw submissions for every idle emitter (needless churn for the driver's worker thread).
+  if (particles.empty())
+  {
+    return;
+  }
+
   if (!_uploaded)
   {
     upload();
@@ -761,36 +935,73 @@ void ParticleSystem::draw( glm::mat4x4 const& model_view
   // setup blend mode
   float alpha_test = -1.f;
 
-  switch (blend) 
+  // Bloom-mask alpha: every particle blend below uses glBlendFuncSeparate with the SAME RGB factors as
+  // before (so the on-screen colour is byte-for-byte unchanged) plus a fixed ALPHA rule of
+  // (GL_ZERO, GL_ONE_MINUS_SRC_ALPHA): dst_alpha' = dst_alpha * (1 - particle_coverage). The scene FBO's
+  // alpha channel is the bloom mask, so a bright/opaque particle PULLS THE MASK DOWN where it covers.
+  // Why: particles draw over the opaque pass without owning a mask, so a white-hot additive fire drawn
+  // over the lava pit (mask ~1.0 = emissive) was inheriting that emissive flag and blooming through the
+  // strong emissive path -> the Ironforge forge / firepit plumes blew out to a white screen-filling halo.
+  // Now the fire core erases the lava's emissive mask under itself (so it stops over-blooming) while the
+  // lava AROUND the flame keeps its mask and still glows. Faint edges (low coverage) barely touch it.
+  #define NOGGIT_PARTICLE_BLOOM_ALPHA GL_ZERO, GL_ONE_MINUS_SRC_ALPHA
+  switch (blend)
   {
   case 0:
-    gl.disable(GL_BLEND);
+    // Opaque: (ONE, ZERO) replaces dst RGB == the old GL_BLEND-disabled path; alpha still pulls the mask.
+    gl.enable(GL_BLEND);
+    gl.blendFuncSeparate(GL_ONE, GL_ZERO, NOGGIT_PARTICLE_BLOOM_ALPHA);
     break;
   case 1:
-    gl.disable(GL_BLEND);
+    gl.enable(GL_BLEND);
+    gl.blendFuncSeparate(GL_ONE, GL_ZERO, NOGGIT_PARTICLE_BLOOM_ALPHA);
     alpha_test = 0.5f;
     break;
   case 2:
     gl.enable(GL_BLEND);
-    gl.blendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    gl.blendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, NOGGIT_PARTICLE_BLOOM_ALPHA);
     break;
   case 3:
+    // NoAlphaAdd: pure additive, ignores src alpha. Canonical M2 blendingType 3 = ONE/ONE.
+    // (Was SRC_COLOR/ONE -- only 2 emitters in 1 file use blend 3, asset-scan verified.)
     gl.enable(GL_BLEND);
-    gl.blendFunc(GL_SRC_COLOR, GL_ONE);
+    gl.blendFuncSeparate(GL_ONE, GL_ONE, NOGGIT_PARTICLE_BLOOM_ALPHA);
     break;
   case 4:
+    // Add: additive scaled by src alpha. The dominant glow/fire mode (10k+ emitters across
+    // 2691 files all use blend 4 -- fire/flare/ember/lensflare). Asset evidence proves blend 4
+    // is additive, NOT Mod: the RE §6.10 table is off-by-one (missing NoAlphaAdd@3).
     gl.enable(GL_BLEND);
-    gl.blendFunc(GL_SRC_ALPHA, GL_ONE);
+    gl.blendFuncSeparate(GL_SRC_ALPHA, GL_ONE, NOGGIT_PARTICLE_BLOOM_ALPHA);
     break;
   case 5:
-  case 6:
+    // Mod: plain multiply. Canonical M2 blendingType 5 = DST_COLOR/ZERO (was lumped with Mod2x).
     gl.enable(GL_BLEND);
-    gl.blendFunc(GL_DST_COLOR, GL_SRC_COLOR);
+    gl.blendFuncSeparate(GL_DST_COLOR, GL_ZERO, NOGGIT_PARTICLE_BLOOM_ALPHA);
+    break;
+  case 6:
+    // Mod2x
+    gl.enable(GL_BLEND);
+    gl.blendFuncSeparate(GL_DST_COLOR, GL_SRC_COLOR, NOGGIT_PARTICLE_BLOOM_ALPHA);
     break;
   case 7:
     gl.enable(GL_BLEND);
-    gl.blendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+    gl.blendFuncSeparate(GL_ONE, GL_ONE_MINUS_SRC_ALPHA, NOGGIT_PARTICLE_BLOOM_ALPHA);
     break;
+  }
+  #undef NOGGIT_PARTICLE_BLOOM_ALPHA
+
+  // Depth-sort translucent particles back-to-front (client behaviour, RE handoff §6.10): order-dependent
+  // blends -- Alpha(2) and Mod(5/6) -- must composite farthest-first or overlapping particles stack
+  // wrong (the Timbermaw dust/fog reads far heavier than in-game without this). Additive (3/4/7) is
+  // order-independent, so skip the sort for those. Sort by camera-space depth (most-negative view z =
+  // farthest = drawn first).
+  if ((blend == 2 || blend == 5 || blend == 6) && particles.size() > 1)
+  {
+    particles.sort([&model_view] (Particle const& a, Particle const& b)
+    {
+      return (model_view * glm::vec4(a.pos, 1.0f)).z < (model_view * glm::vec4(b.pos, 1.0f)).z;
+    });
   }
 
   if (_texture_id < model->_textures.size())
@@ -887,10 +1098,15 @@ void ParticleSystem::draw( glm::mat4x4 const& model_view
     // - doesn't seem to be any different from 0 -_-
     // regular particles
 
-    if (billboard) 
+    if (billboard)
     {
-      //! \todo per-particle rotation in a non-expensive way?? :|
-      for (ParticleList::iterator it = particles.begin(); it != particles.end(); ++it) 
+      // Per-particle quad rotation: authored params.spin (radians/sec) rotates the billboard around
+      // its center over the particle's life -- positive = counterclockwise on screen (e.g. the arcane
+      // elementals' feet smoke, spin=2.0). Spline emitters keep _spin as their emission-path travel
+      // speed instead (the MC flamecircle), so no quad rotation for those.
+      bool const quad_spin = (_spin != 0.0f) && _spline_points.empty();
+
+      for (ParticleList::iterator it = particles.begin(); it != particles.end(); ++it)
       {
         if (tiles.size() - 1 < it->tile) // Alfred, 2009.08.07, error prevent
         {
@@ -903,24 +1119,35 @@ void ParticleSystem::draw( glm::mat4x4 const& model_view
           continue;
         }
 
+        glm::vec3 quad_right = vRight;
+        glm::vec3 quad_up = vUp;
+        if (quad_spin)
+        {
+          float const ang = _spin * it->life;
+          float const c = std::cos(ang);
+          float const s = std::sin(ang);
+          quad_right = vRight * c + vUp * s;
+          quad_up = vUp * c - vRight * s;
+        }
+
         texcoords.push_back(tiles[it->tile].tc[0]);
         vertices.push_back(it->pos);
-        offsets.push_back(-(vRight + vUp) * size);
+        offsets.push_back(-(quad_right + quad_up) * size);
         colors_data.push_back(it->color);
 
         texcoords.push_back(tiles[it->tile].tc[1]);
         vertices.push_back(it->pos);
-        offsets.push_back((vRight - vUp) * size);
+        offsets.push_back((quad_right - quad_up) * size);
         colors_data.push_back(it->color);
 
         texcoords.push_back(tiles[it->tile].tc[2]);
         vertices.push_back(it->pos);
-        offsets.push_back((vRight + vUp) * size);
+        offsets.push_back((quad_right + quad_up) * size);
         colors_data.push_back(it->color);
 
         texcoords.push_back(tiles[it->tile].tc[3]);
         vertices.push_back(it->pos);
-        offsets.push_back(-(vRight - vUp) * size);
+        offsets.push_back(-(quad_right - quad_up) * size);
         colors_data.push_back(it->color);
 
         add_quad_indices(indices, indice);
@@ -1065,6 +1292,10 @@ void ParticleSystem::draw( glm::mat4x4 const& model_view
   shader.uniform("alpha_test", alpha_test);
   shader.uniform("billboard", (int)billboard);
   shader.uniform("particle_blend", static_cast<int>(blend)); // for blend-aware fog in the shader
+  // Emitter flag 0x8 = particle SIZE scales with the model's scale. Trace-verified on Anomalus
+  // (creature_template.scale 5): his aura flare (flags 0x29) draws at authored size x5 in the live
+  // client, while his feet smoke (0x11) and rising stars (0x1) draw at authored size x1.
+  shader.uniform("scale_with_instance", (flags & 0x8) ? 1 : 0);
 
   OpenGL::Scoped::vao_binder const _ (_vao);
 
@@ -1167,7 +1398,7 @@ namespace
   }
 }
 
-Particle PlaneParticleEmitter::newParticle(ParticleSystem* sys, int anim, int time, int animtime, float w, float l, float spd, float var, float spr, float /*spr2*/)
+Particle PlaneParticleEmitter::newParticle(ParticleSystem* sys, int anim, int time, int animtime, float w, float l, float spd, float var, float spr, float spr2)
 {
   // Model Flags - *shrug* gotta write this down somewhere.
   // 0x1 =
@@ -1219,7 +1450,27 @@ Particle PlaneParticleEmitter::newParticle(ParticleSystem* sys, int anim, int ti
   //Spread Calculation
   auto mrot = sys->parent->mrot*CalcSpreadMatrix(spr, spr, 1.0f, 1.0f);
 
-  if (sys->flags == 1041) { // Trans Halo
+  if (!sys->_spline_points.empty()) { // Spline emitter (M2 EmitterType 3) -- e.g. the MC flamecircle ring
+    // Emit along the closed spline loop; the emission point travels around it at _spin revolutions/sec
+    // (so flamecircle's two emitters, spin 0.5 and -2, run the ring at their authored speeds/directions).
+    // Particles then rise off the ring at EmissionSpeed, giving fire/smoke that runs the circle.
+    std::size_t const n = sys->_spline_points.size();
+    float u = sys->_spin * (static_cast<float>(animtime) / 1000.0f);
+    u -= std::floor(u); // wrap to [0,1)
+    float const fseg = u * static_cast<float>(n);
+    std::size_t const i0 = static_cast<std::size_t>(fseg) % n;
+    std::size_t const i1 = (i0 + 1) % n;
+    float const t = fseg - std::floor(fseg);
+    glm::vec3 local = glm::mix(sys->_spline_points[i0], sys->_spline_points[i1], t)
+                    + glm::vec3(misc::randfloat(-l, l), 0.0f, misc::randfloat(-w, w));
+    p.pos = sys->parent->mat * glm::vec4(local, 1.0f);
+
+    glm::vec3 dir = mrot * glm::vec4(0, 1, 0, 0);
+    p.dir = safe_normalize_vec3(dir, glm::vec3(0.0f, 1.0f, 0.0f));
+    p.down = glm::vec3(0, -1.0f, 0);
+    p.speed = p.dir * spd * (1.0f + misc::randfloat(-var, var));
+  }
+  else if (sys->flags == 1041) { // Trans Halo
     p.pos = sys->parent->mat * (glm::vec4(sys->pos, 1) + glm::vec4(misc::randfloat(-l, l), 0, misc::randfloat(-w, w), 0));
 
     const float t = misc::randfloat(0.0f, 2.0f * glm::pi<float>());
@@ -1256,15 +1507,27 @@ Particle PlaneParticleEmitter::newParticle(ParticleSystem* sys, int anim, int ti
 
   }
   else {
-    p.pos = sys->pos + glm::vec3(misc::randfloat(-l, l), 0, misc::randfloat(-w, w));
-    p.pos = sys->parent->mat * glm::vec4(p.pos, 1);
+    // CLIENT-FAITHFUL plane emission (RE'd from 1.12 CParticleEmitter2 plane CreateParticle,
+    // FUN_007b8890): spawn on the authored rect -- model X in +-areaLength/2 (w), model Y in
+    // +-areaWidth/2 (l) -- and emit with a velocity TILTED from straight-up by theta in
+    // +-VerticalRange (spr) at azimuth phi in +-HorizontalRange (spr2). The old WMV spread-matrix
+    // used the vertical range for BOTH axes and ignored the horizontal range entirely.
+    glm::vec3 local = sys->pos + glm::vec3(misc::randfloat(-w, w), 0, misc::randfloat(-l, l));
+    p.pos = sys->parent->mat * glm::vec4(local, 1);
 
-    //glm::vec3 dir = mrot * glm::vec3(0,1,0);
-    glm::vec3 dir = sys->parent->mrot * glm::vec4(0, 1, 0,0);
+    float const theta = misc::randfloat(-spr, spr);    // tilt from the emitter's up axis
+    float const phi = misc::randfloat(-spr2, spr2);    // azimuth around the up axis
 
-    p.dir = safe_normalize_vec3(dir, glm::vec3(0.0f, 1.0f, 0.0f));//.normalize();
-    p.down = glm::vec3(0, -1.0f, 0); // dir * -1.0f;
-    p.speed = safe_normalize_vec3(dir, glm::vec3(0.0f, 1.0f, 0.0f)) * spd * (1.0f + misc::randfloat(-var, var));
+    // client model space is z-up: dir = (cos(phi)sin(theta), sin(phi)sin(theta), cos(theta));
+    // converted to noggit's y-up space like fixCoordSystem.
+    glm::vec3 const tilted(std::cos(phi) * std::sin(theta),
+                           std::cos(theta),
+                           -std::sin(phi) * std::sin(theta));
+    glm::vec3 dir = sys->parent->mrot * glm::vec4(tilted, 0);
+
+    p.dir = safe_normalize_vec3(dir, glm::vec3(0.0f, 1.0f, 0.0f));
+    p.down = glm::vec3(0, -1.0f, 0);
+    p.speed = p.dir * spd * (1.0f + misc::randfloat(-var, var));
   }
 
   if (!sys->billboard)  {
@@ -1298,7 +1561,16 @@ Particle SphereParticleEmitter::newParticle(ParticleSystem* sys, int anim, int t
   p.size = 1.0f;
   p.maxlife = sys->classic ? 2.4f : 1.0f;
   glm::vec3 dir(0.0f, 1.0f, 0.0f);
-  float radius = misc::randfloat(0, 1);
+  // Spawn between the inner (l = EmissionAreaWidth/2) and outer (w = EmissionAreaLength/2) radius, so
+  // particles appear ACROSS the authored emission ring/sphere -- the "max range" of the area -- instead
+  // of a fixed unit radius (the old `randfloat(0,1)` ignored EmissionArea entirely). For a shell where
+  // inner==outer (e.g. the arcane-elemental smoke ring, area 2.08 -> r 1.04) they spawn on the surface
+  // and then converge inward via the negative EmissionSpeed, matching the in-game "spawn at the edge,
+  // pull into the model" look. (Faith-Halo branch already used w/l; this fixes the general branch.)
+  float const r_inner = std::min(std::fabs(w), std::fabs(l));
+  float const r_outer = std::max(std::fabs(w), std::fabs(l));
+  float radius = (r_outer > 0.0f) ? (r_inner + (r_outer - r_inner) * misc::randfloat(0, 1))
+                                  : misc::randfloat(0, 1);
 
   // Old method
   //float t = misc::randfloat(0,2*math::constants::pi);
@@ -1353,35 +1625,38 @@ Particle SphereParticleEmitter::newParticle(ParticleSystem* sys, int anim, int t
 
   }
   else {
-    glm::vec3 bdir;
-    float temp;
+    // CLIENT-FAITHFUL sphere emission (RE'd from 1.12 CParticleEmitter2 sphere CreateParticle,
+    // FUN_007b8d70): pick elevation theta in +-VerticalRange and azimuth phi in +-HorizontalRange,
+    // spawn at (radial unit vector x radius), velocity = the SAME radial direction x EmissionSpeed
+    // (negative speed = inward -- e.g. the arcane elementals' feet smoke ring converges up the legs).
+    // Radius: for sphere emitters areal/areaw are the MIN/MAX radius -- but update() halves them for
+    // plane semantics (rect half-extents), so undo the halving here. The old WMV-derived code emitted
+    // along a spread-matrix-rotated Y axis at HALF the authored radius, which put the Anomalus smoke
+    // at his feet instead of on the authored 2.08-radius ring around him.
+    float const r_min = 2.0f * std::min(std::fabs(w), std::fabs(l));
+    float const r_max = 2.0f * std::max(std::fabs(w), std::fabs(l));
+    float const r = r_min + (r_max - r_min) * misc::randfloat(0, 1);
 
-    bdir = mrot * glm::vec4(0, 1, 0, 0) * radius;
-    temp = bdir.z;
-    bdir.z = bdir.y;
-    bdir.y = temp;
+    float const theta = misc::randfloat(-spr, spr);   // elevation from the horizontal plane
+    float const phi = misc::randfloat(-spr2, spr2);   // azimuth around the emitter axis
 
-    p.pos = sys->parent->mat * glm::vec4(sys->pos, 1) + glm::vec4(bdir, 0);
+    // radial unit direction in noggit space (up = +Y; model z-up converted like fixCoordSystem)
+    glm::vec3 const radial(std::cos(theta) * std::cos(phi),
+                           std::sin(theta),
+                           -std::cos(theta) * std::sin(phi));
 
+    p.pos = sys->parent->mat * glm::vec4(sys->pos + radial * r, 1);
 
-    //p.pos = sys->pos + bdir;
-    //p.pos = sys->parent->mat * p.pos;
-
-
-    if (!(glm::length(bdir) * glm::length(bdir)) && !(sys->flags & 0x100))
+    if (sys->flags & 0x100)
     {
-      p.speed = glm::vec3(0, 0, 0);
       dir = sys->parent->mrot * glm::vec4(0, 1, 0, 0);
     }
     else
     {
-      if (sys->flags & 0x100)
-        dir = sys->parent->mrot * glm::vec4(0, 1, 0, 0);
-      else
-        dir = glm::normalize(bdir);
-
-      p.speed = safe_normalize_vec3(dir, glm::vec3(0.0f, 1.0f, 0.0f)) * spd * (1.0f + misc::randfloat(-var, var));   // ?
+      dir = sys->parent->mrot * glm::vec4(radial, 0);
     }
+
+    p.speed = safe_normalize_vec3(dir, glm::vec3(0.0f, 1.0f, 0.0f)) * spd * (1.0f + misc::randfloat(-var, var));
   }
 
   p.dir = safe_normalize_vec3(dir, glm::vec3(0.0f, 1.0f, 0.0f));//mrot * glm::vec3(0, 1.0f,0);
@@ -1428,6 +1703,31 @@ RibbonEmitter::RibbonEmitter(Model* model_
    // create first segment
   segs.emplace_back(tpos, 0);
 
+}
+
+RibbonEmitter::RibbonEmitter(Model* model_
+                             , const BlizzardArchive::ClientFile &f
+                             , ClassicModelRibbonEmitterDef const& mta
+                             , int *globals
+                             , Noggit::NoggitRenderContext context)
+  : model (model_)
+  , color (mta.color, f, globals)
+  , opacity (mta.opacity, f, globals)
+  , above (mta.above, f, globals)
+  , below (mta.below, f, globals)
+  // Classic effect/creature trails reference a bone index; clamp to a valid bone (mirrors the
+  // particle-emitter bone guard) so a stray index can't read past the bones vector and crash.
+  , parent (&model->bones[(mta.bone >= 0 && static_cast<std::size_t>(mta.bone) < model->bones.size()) ? mta.bone : 0])
+  , pos (fixCoordSystem(mta.pos))
+  , seglen (mta.length)
+  , length (mta.res * seglen)
+  , tpos (fixCoordSystem(mta.pos))
+  , _context(context)
+{
+  _texture_ids = Model::M2Array<uint16_t>(f, mta.ofsTextures, mta.nTextures);
+  _material_ids = Model::M2Array<uint16_t>(f, mta.ofsMaterials, mta.nMaterials);
+
+  segs.emplace_back(tpos, 0);
 }
 
 RibbonEmitter::RibbonEmitter(RibbonEmitter const& other)

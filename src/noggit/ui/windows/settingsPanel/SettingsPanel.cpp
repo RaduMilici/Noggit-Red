@@ -6,6 +6,7 @@
 #include <noggit/TextureManager.h>
 #include <util/qt/overload.hpp>
 #include <noggit/ui/FramelessWindow.hpp>
+#include <noggit/MySqlSettings.hpp>
 #include <sstream>
 
 #include <QtWidgets/QDialogButtonBox>
@@ -18,6 +19,8 @@
 #include <QtWidgets/QComboBox>
 #include <QtWidgets/QSlider>
 #include <QtWidgets/QCheckBox>
+#include <QtWidgets/QGroupBox>
+#include <QtWidgets/QVBoxLayout>
 #include <QDir>
 #include <QApplication>
 
@@ -244,6 +247,20 @@ namespace Noggit
                 });
       }
 
+      // Classic MCLQ water toggle: when ON, CLASSIC (vanilla) projects also write the legacy
+      // per-MCNK MCLQ liquid chunk alongside MH2O on save. No effect on WotLK output.
+      {
+        auto* mclq_cb = new QCheckBox(tr("Save classic MCLQ water (vanilla, alongside MH2O)"), this);
+        mclq_cb->setObjectName("_save_classic_mclq_checkbox");
+        mclq_cb->setChecked(_settings->value("water/save_classic_mclq", true).toBool());
+        ui->verticalLayout_7->addWidget(mclq_cb);
+        connect(mclq_cb, &QCheckBox::toggled, [this](bool checked)
+                {
+                  _settings->setValue("water/save_classic_mclq", checked);
+                  _settings->sync();
+                });
+      }
+
       // Make the View Distance field apply LIVE: WorldRender reads view_distance every frame, so
       // changing this field moves the object/WMO render distance immediately (no Apply / reload).
       connect(ui->viewDistanceField, qOverload<double>(&QDoubleSpinBox::valueChanged), [this](double v)
@@ -277,12 +294,66 @@ namespace Noggit
           }
       );
 
+      // Split the graphics settings out of "Preferences" into a dedicated "Graphics" tab and add the
+      // persistent render-feature toggles. Done before discard_changes() so the toggle checkboxes exist.
+      build_graphics_tab();
+
       // load the values in the fields
       discard_changes();
     }
 
+    void settings::build_graphics_tab()
+    {
+      // Move the whole "Viewport" group (VSync, Anti-Aliasing, Fullscreen, View Distance, FarZ, ADT
+      // unloading, FPS limit, water opacity, object/creature render distances, WMO water dedupe,
+      // distant horizon, MCLQ water) out of the Preferences tab into a new Graphics tab. groupBox_7
+      // is reparented, not copied, so all existing widget wiring (ui->_vsync_cb, etc.) stays valid.
+      auto* graphicsPage = new QWidget();
+      auto* gLayout = new QVBoxLayout(graphicsPage);
+      gLayout->setContentsMargins(4, 4, 4, 4);
+
+      ui->groupBox_7->setParent(nullptr);
+      gLayout->addWidget(ui->groupBox_7);
+
+      // Render-feature toggles: persistent versions of the live View-menu/toolbar switches (Bloom,
+      // Fog, Doodads, etc.). MapView::setupViewMenu() reads these "render/*" keys at map load and
+      // applies them to its BoolToggleProperties, so a preference here survives restarts.
+      auto* toggles = new QGroupBox("Render features");
+      toggles->setAlignment(Qt::AlignCenter);
+      auto* form = new QFormLayout(toggles);
+
+      auto add_toggle = [&](QString const& label, QString const& key, bool def)
+      {
+        auto* cb = new QCheckBox();
+        form->addRow(new QLabel(label), cb);
+        _render_toggles.emplace_back(key, cb, def);
+      };
+      add_toggle("Doodads (M2 models)",              "render/doodads",          true);
+      add_toggle("WMO doodads",                      "render/wmo_doodads",      true);
+      add_toggle("WMOs",                             "render/wmo",              true);
+      add_toggle("Terrain",                          "render/terrain",          true);
+      add_toggle("Water",                            "render/water",            true);
+      add_toggle("Model animations",                 "render/model_animations", true);
+      add_toggle("Bloom",                            "render/bloom",            true);
+      add_toggle("Fog",                              "render/fog",              true);
+      add_toggle("Vertex color (terrain lighting)",  "render/vertex_color",     true);
+      add_toggle("Baked terrain shadows",            "render/baked_shadows",    true);
+
+      gLayout->addWidget(toggles);
+      gLayout->addStretch(1);
+
+      int const idx = ui->tabWidget->indexOf(ui->tab_7); // insert right where Preferences was
+      ui->tabWidget->insertTab(idx, graphicsPage, "Graphics");
+    }
+
     void settings::discard_changes()
     {
+      for (auto const& rt : _render_toggles)
+      {
+        std::get<1>(rt)->setChecked(
+            _settings->value(std::get<0>(rt), std::get<2>(rt)).toBool());
+      }
+
       ui->importPathField->setText(_settings->value("project/import_file", "import.txt").toString());
       ui->wmvLogPathField->setText(_settings->value("project/wmv_log_file").toString());
       ui->viewDistanceField->setValue(_settings->value("view_distance", 2000.f).toFloat());
@@ -323,11 +394,12 @@ namespace Noggit
 #ifdef USE_MYSQL_UID_STORAGE
   ui->MySQL_box->setChecked(true);
 
-      auto server_str = _settings->value("project/mysql/server", "127.0.0.1").toString();
-      auto user_str = _settings->value("project/mysql/user", "127.0.0.1").toString();
-      auto pwd_str = _settings->value("project/mysql/pwd", "127.0.0.1").toString();
-      auto db_str = _settings->value("project/mysql/db", "127.0.0.1").toString();
-      auto port_int = _settings->value("project/mysql/port", "127.0.0.1").toInt();
+      // Per-project MySQL settings (see MySqlSettings.hpp) so each project keeps its own connection.
+      auto server_str = Noggit::mysqlSetting("server", "127.0.0.1").toString();
+      auto user_str = Noggit::mysqlSetting("user", "127.0.0.1").toString();
+      auto pwd_str = Noggit::mysqlSetting("pwd", "127.0.0.1").toString();
+      auto db_str = Noggit::mysqlSetting("db", "127.0.0.1").toString();
+      auto port_int = Noggit::mysqlSetting("port", "127.0.0.1").toInt();
 
       // set some default
       if (server_str.isEmpty())
@@ -387,12 +459,14 @@ namespace Noggit
       _settings->setValue("classicUI", ui->_classic_ui->isChecked());
 
 #ifdef USE_MYSQL_UID_STORAGE
-      _settings->setValue ("project/mysql/enabled", ui->MySQL_box->isChecked());
-      _settings->setValue ("project/mysql/server", ui->_mysql_server_field->text());
-      _settings->setValue ("project/mysql/user", ui->_mysql_user_field->text());
-      _settings->setValue ("project/mysql/pwd", ui->_mysql_pwd_field->text());
-      _settings->setValue ("project/mysql/db", ui->_mysql_db_field->text());
-      _settings->setValue ("project/mysql/port", ui->_mysql_port_field->text());
+      // Save under the per-project keys (see MySqlSettings.hpp) so each project keeps its own MySQL
+      // connection instead of all projects sharing one global set.
+      _settings->setValue (Noggit::mysqlSettingKey("enabled"), ui->MySQL_box->isChecked());
+      _settings->setValue (Noggit::mysqlSettingKey("server"), ui->_mysql_server_field->text());
+      _settings->setValue (Noggit::mysqlSettingKey("user"), ui->_mysql_user_field->text());
+      _settings->setValue (Noggit::mysqlSettingKey("pwd"), ui->_mysql_pwd_field->text());
+      _settings->setValue (Noggit::mysqlSettingKey("db"), ui->_mysql_db_field->text());
+      _settings->setValue (Noggit::mysqlSettingKey("port"), ui->_mysql_port_field->text());
 #endif
 
       _settings->setValue("wireframe/type", ui->radio_wire_cursor->isChecked());
@@ -408,6 +482,11 @@ namespace Noggit
       _settings->setValue("assetBrowser/move_sensitivity", ui->assetBrowserMoveSensitivity->value());
       _settings->setValue("assetBrowser/render_asset_preview", ui->assetBrowserRenderAssetPreview->isChecked());
       _settings->setValue("fps_limit", ui->_fps_limit_slider->value());
+
+      for (auto const& rt : _render_toggles)
+      {
+        _settings->setValue(std::get<0>(rt), std::get<1>(rt)->isChecked());
+      }
 
       _settings->sync();
 

@@ -1,4 +1,5 @@
 #include <noggit/ui/windows/about/About.h>
+#include <noggit/MySqlSettings.hpp>
 #include <noggit/AsyncLoader.h>
 #include <noggit/DBC.h>
 #include <noggit/DBCFile.h>
@@ -251,7 +252,7 @@ namespace Noggit::Ui::Windows
   {
     QSettings settings;
 #ifdef USE_MYSQL_UID_STORAGE
-    bool use_mysql = settings.value("project/mysql/enabled", false).toBool();
+    bool use_mysql = Noggit::mysqlSetting("enabled", false).toBool();
 
     bool valid_conn = false;
     if (use_mysql)
@@ -369,7 +370,13 @@ namespace Noggit::Ui::Windows
               item_widget->setHidden(true);
           }
 
-            if (!wmo_maps && widget->wmo_map())
+            // The "Display WMO maps (No terrain)" toggle is meant to hide terrain-less *world* maps
+            // (clutter / test continents). Instanced content (dungeons, raids, BGs, arenas) is usually
+            // WMO-only too -- e.g. Deadmines, Blackrock Depths, Gnomeregan -- and must NOT be hidden by
+            // this toggle, otherwise selecting "Dungeon" drops every WMO dungeon and switching back to
+            // "All" loses them as well (the initial list shows them, but any filter pass would hide them).
+            // So only gate WMO *world* maps (type 0) on the checkbox.
+            if (!wmo_maps && widget->wmo_map() && widget->type() == 0)
           {
               item_widget->setHidden(true);
           }

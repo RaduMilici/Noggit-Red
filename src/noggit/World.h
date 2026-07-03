@@ -23,6 +23,7 @@
 #include <opengl/shader.fwd.hpp>
 #include <opengl/types.hpp>
 #include <noggit/rendering/LiquidTextureManager.hpp>
+#include <algorithm>
 #include <optional>
 #include <QtCore/QSettings>
 #include <map>
@@ -65,6 +66,11 @@ public:
     {
       int attachment_id = -1;
       std::optional<ModelInstance> model_instance;
+      // Transform the particle pass draws this attachment's emitters with. Set each frame in the body
+      // pass: the full animated attachment matrix when the model's emitters ride their parent (flag
+      // 0x10), else the BIND-pose placement so world-space particles (aura sparkles) don't get
+      // dragged around by the animated bone.
+      glm::mat4x4 particle_transform = glm::mat4x4(1.0f);
     };
 
     std::uint32_t guid = 0;
@@ -86,6 +92,13 @@ public:
     std::uint32_t mainhand_inventory_type = 0;
     std::uint32_t offhand_inventory_type = 0;
     std::uint32_t ranged_inventory_type = 0;
+    // Space-separated permanent aura spell ids (creature_template.auras). Their state-kit visual
+    // effect models are attached to the spawn (e.g. the arcane elementals' chest sparkle).
+    std::string auras;
+    // The client's exact ground selection-circle radius: server bounding radius (per display id,
+    // creature_display_info_addon / creature_model_info) x RAW creature_template.scale (1 when
+    // unset) -- already multiplied at load. 0 when the schema/row is missing.
+    float bounding_radius = 0.0f;
     bool model_create_failed = false;
     bool hovered = false;
     bool selected = false;
@@ -94,6 +107,29 @@ public:
     bool dirty = false;
     std::optional<ModelInstance> model_instance;
     std::vector<AttachmentModel> attachment_models;
+
+    // World radius of the ground selection circle, EXACTLY like the live client (see
+    // bounding_radius above; the scale is already applied). Falls back to the model footprint
+    // estimate when the DB has no bounding radius for this display.
+    [[nodiscard]] float selectionRingWorldRadius() const
+    {
+      // Exact client formula: scale * sqrt( sqrt(dx^2+dy^2) * 0.5 ) on the stand-animation box
+      // (ModelInstance::selectionRingRadius / Model::selection_base_radius). No per-creature data.
+      if (model_instance.has_value())
+      {
+        float const radius = model_instance->selectionRingRadius();
+        if (radius > 0.01f)
+        {
+          return std::max(0.25f, radius);
+        }
+      }
+      // Fallback for spawns whose model has not loaded yet.
+      if (bounding_radius > 0.0f)
+      {
+        return std::max(0.25f, bounding_radius);
+      }
+      return 0.5f;
+    }
 
     CreatureSpawnOverlay() = default;
     CreatureSpawnOverlay(CreatureSpawnOverlay&&) noexcept = default;
@@ -131,6 +167,7 @@ public:
   };
 
 protected:
+  bool _unloading = false; // set true at the very start of ~World; see is_unloading()
   std::vector<selection_type> _current_selection;
   // std::unordered_map<std::string, std::vector<ModelInstance*>> _models_by_filename;
   Noggit::world_model_instances_storage _model_instance_storage;
@@ -153,11 +190,20 @@ public:
   // freezes (pauses) model/particle animation in place while liquid/terrain keep churning on animtime.
   float model_animtime = 0.0f;
   float time;
+  float _models_emitter_dt = 0.0f;
 
   //! \brief Name of this map.
   std::string basename;
 
   explicit World(const std::string& name, int map_id, Noggit::NoggitRenderContext context, bool create_empty = false);
+  ~World();
+
+  // True once the World is being torn down (set first thing in ~World, before any member -- and thus any
+  // MapTile -- is destroyed). MapTile::~MapTile checks this to SKIP its per-tile instance unload: during
+  // full teardown the instance storage frees every M2/WMO instance at once, so the per-tile
+  // derefTile()/remove_models_if_needed() dance is both pointless and unsafe (it frees instances shared
+  // with other not-yet-destroyed tiles -> those tiles then deref a freed SceneObject = the map-exit crash).
+  bool is_unloading() const { return _unloading; }
 
   void LoadSavedSelectionGroups();
 
@@ -168,9 +214,14 @@ public:
   SceneObject* getObjectInstance(std::uint32_t uid);
 
   void update_models_emitters(float dt);
+  // Per-frame emitter dt captured by update_models_emitters, read by the render pass to advance each
+  // creature spawn's own per-instance particle state (see Model::swapInstanceEmitterState).
+  float models_emitter_dt() const { return _models_emitter_dt; }
 
   unsigned int getAreaID (glm::vec3 const&);
   unsigned int getWMOAreaID(glm::vec3 const&);
+  // True when pos sits below a liquid surface (used to switch the sky to the underwater LightParams set).
+  bool camera_is_underwater(glm::vec3 const& pos);
   // Top-level zone id for a position (walks AreaTable ParentAreaID up from getAreaID to the zone, e.g.
   // a sub-area in Searing Gorge resolves to Searing Gorge). Returns -1 if the tile/area isn't loaded.
   unsigned int getZoneId(glm::vec3 const&);
@@ -527,6 +578,20 @@ public:
   CreatureSpawnOverlay* findCreatureSpawn(std::uint32_t guid);
   CreatureSpawnOverlay const* findCreatureSpawn(std::uint32_t guid) const;
 
+  // Spell details for the spawned creatures' permanent auras (fetched once per spawn reload from the
+  // server's spell_template). Keyed by spell id; used for aura state-kit visuals and the creature-info
+  // UI (name/description/icon).
+  struct SpellInfo
+  {
+    std::uint32_t entry = 0;
+    std::uint32_t spell_visual = 0;
+    std::uint32_t icon_id = 0;
+    std::uint32_t school = 0;
+    std::string name;
+    std::string description;
+  };
+  std::map<std::uint32_t, SpellInfo> const& spellInfos() const { return _spell_infos; }
+
   // GameObject editing (mirrors the creature equivalents). GameObjects are loaded alongside creatures
   // by reloadCreatureSpawns(), so loading just ensures that ran.
   void setDrawGameObjectSpawns(bool state) { _draw_gameobject_spawns = state; }
@@ -566,6 +631,7 @@ protected:
   std::string _creature_spawn_status;
   std::vector<CreatureSpawnOverlay> _creature_spawns;
   std::vector<GameObjectSpawnOverlay> _gameobject_spawns;
+  std::map<std::uint32_t, SpellInfo> _spell_infos;
 
   std::array<std::pair<std::pair<int, int>, MapTile*>, 64 * 64 > _loaded_tiles_buffer;
 

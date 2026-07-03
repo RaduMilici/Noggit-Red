@@ -7,6 +7,7 @@
 #include <noggit/Brush.h> // brush
 #include <noggit/DBC.h>
 #include <noggit/Log.h>
+#include <noggit/ChunkWater.hpp>
 #include <noggit/MapChunk.h>
 #include <noggit/MapTile.h>
 #include <noggit/Misc.h>
@@ -1221,6 +1222,103 @@ namespace
     return attachments;
   }
 
+  // Aura state-kit visuals: creatures with permanent auras (creature_template.auras) get the aura's
+  // STATE kit effect models attached while the aura is active -- verified against the live client via
+  // apitrace (e.g. Anomalus's "Arcane Aura" 51098 -> SpellVisual 4659 -> state kit -> chest effect
+  // Spells\RibbonTrail.m2 = the stationary twinkling chest sparkle). Resolution chain:
+  // aura spell id -> spell_template.spellVisual1 -> SpellVisual.StateKit -> kit Head/Chest/Base
+  // effects -> SpellVisualEffectName model path, attached at the M2 Head(20)/Chest(34)/Base(19)
+  // attachment points.
+  std::string normalize_effect_model_path(std::string path)
+  {
+    std::transform(path.begin(), path.end(), path.begin(), [](unsigned char c)
+    {
+      return c == '\\' ? '/' : static_cast<char>(std::tolower(c));
+    });
+    if (path.size() > 4)
+    {
+      auto const ext = path.substr(path.size() - 4);
+      if (ext == ".mdx" || ext == ".mdl")
+      {
+        path.replace(path.size() - 4, 4, ".m2");
+      }
+    }
+    return path;
+  }
+
+  std::vector<CreatureAttachmentModelSpec> resolve_creature_aura_attachment_models(
+      std::string const& auras,
+      std::map<std::uint32_t, World::SpellInfo> const& spell_infos)
+  {
+    std::vector<CreatureAttachmentModelSpec> attachments;
+    if (auras.empty())
+    {
+      return attachments;
+    }
+
+    std::istringstream tokens(auras);
+    std::uint32_t spell_id = 0;
+    while (tokens >> spell_id)
+    {
+      auto const info_it = spell_infos.find(spell_id);
+      if (info_it == spell_infos.end() || !info_it->second.spell_visual)
+      {
+        continue;
+      }
+
+      try
+      {
+        auto visual = gSpellVisualDB.getByID(info_it->second.spell_visual);
+        auto const state_kit_id = visual.getUInt(SpellVisualDB::StateKit);
+        if (!state_kit_id)
+        {
+          continue;
+        }
+
+        auto kit = gSpellVisualKitDB.getByID(state_kit_id);
+
+        struct KitSlot { std::size_t field; int attachment_id; };
+        // M2 attachment points: Head=20, Chest=34, Base=19 (verified against Anomalus.m2's attachment
+        // table + the live-client trace position of the chest effect). NOTE: not named "slots" -- Qt
+        // defines that as a macro.
+        std::array<KitSlot, 3> const kit_slots { { { SpellVisualKitDB::HeadEffect, 20 },
+                                                   { SpellVisualKitDB::ChestEffect, 34 },
+                                                   { SpellVisualKitDB::BaseEffect, 19 } } };
+        for (auto const& kit_slot : kit_slots)
+        {
+          auto const effect_id = kit.getUInt(kit_slot.field);
+          if (!effect_id || effect_id == 0xFFFFFFFFu)
+          {
+            continue;
+          }
+
+          try
+          {
+            auto effect = gSpellVisualEffectNameDB.getByID(effect_id);
+            std::string model_path = normalize_effect_model_path(effect.getString(SpellVisualEffectNameDB::FileName));
+            if (model_path.empty())
+            {
+              continue;
+            }
+
+            CreatureAttachmentModelSpec spec;
+            spec.attachment_id = kit_slot.attachment_id;
+            spec.model_path = std::move(model_path);
+            attachments.push_back(std::move(spec));
+          }
+          catch (DBCFile::NotFound const&)
+          {
+          }
+        }
+      }
+      catch (DBCFile::NotFound const&)
+      {
+      }
+    }
+
+    return attachments;
+  }
+
   CreatureGeosetSelection resolve_creature_geoset_selection(std::uint32_t display_id)
   {
     CreatureGeosetSelection selection;
@@ -2369,6 +2467,15 @@ namespace
     }
   }
 
+  // CreatureModelData.ModelScale (M) -- the model's intrinsic scale, applied by the client on top of the
+  // object scale. This is NOT the display scale. The object scale (creature_template.scale, with the
+  // CreatureDisplayInfo fallback) is handled by the caller via resolve_creature_display_scale.
+  //
+  // Verified against the server source (tortoise-wow ObjectMgr.cpp:1436): the object scale is
+  // creature_template.scale when > 0, ELSE CreatureDisplayInfo.scale (D) -- a *fallback*, not an extra
+  // multiplier. The client then multiplies by ModelData.ModelScale (M). Final = (T>0?T:D) * M. Treating
+  // D as an always-on multiplier made Flamewaker (T=2.5,D=2) render at 5.0, dwarfing Gehennas (T=0->D=3)
+  // at 3.0 -- the in-game ratio is the reverse (Gehennas >= Flamewaker).
   float resolve_creature_model_scale(std::uint32_t display_id)
   {
     if (!display_id)
@@ -2382,11 +2489,29 @@ namespace
       auto model_id = display.getUInt(CreatureDisplayInfoDB::ModelID);
       auto model = gCreatureModelDataDB.getByID(model_id);
 
-      float display_scale = display.getFloat(CreatureDisplayInfoDB::CreatureModelScale);
       float model_scale = model.getFloat(CreatureModelDataDB::ModelScale);
-      float scale = (display_scale > 0.0f ? display_scale : 1.0f)
-                  * (model_scale > 0.0f ? model_scale : 1.0f);
-      return std::clamp(scale, ModelInstance::min_scale(), ModelInstance::max_scale());
+      return model_scale > 0.0f ? model_scale : 1.0f;
+    }
+    catch (DBCFile::NotFound const&)
+    {
+      return 1.0f;
+    }
+  }
+
+  // CreatureDisplayInfo.CreatureModelScale (D) -- the object-scale fallback used when
+  // creature_template.scale is 0 (matches server ObjectMgr.cpp:1436). 0/missing -> 1.0.
+  float resolve_creature_display_scale(std::uint32_t display_id)
+  {
+    if (!display_id)
+    {
+      return 1.0f;
+    }
+
+    try
+    {
+      auto display = gCreatureDisplayInfoDB.getByID(display_id);
+      float display_scale = display.getFloat(CreatureDisplayInfoDB::CreatureModelScale);
+      return display_scale > 0.0f ? display_scale : 1.0f;
     }
     catch (DBCFile::NotFound const&)
     {
@@ -2570,6 +2695,17 @@ World::World(const std::string& name, int map_id, Noggit::NoggitRenderContext co
   _creature_spawn_status = "Creature spawns inactive";
 }
 
+World::~World()
+{
+  // Mark teardown BEFORE any member is destroyed. The members below (mapIndex -> every MapTile, then
+  // _model_instance_storage) are destroyed in reverse-declaration order AFTER this body runs, so each
+  // MapTile::~MapTile sees is_unloading()==true and skips its per-tile derefTile()/remove_models_if_needed
+  // -- the instance storage frees all M2/WMO instances itself when it is destroyed. This prevents the
+  // map-exit crash where one tile's unload freed an instance still referenced by another tile, which then
+  // dereferenced the freed SceneObject in SceneObject::derefTile.
+  _unloading = true;
+}
+
 bool World::reloadCreatureSpawns()
 {
   append_creature_geoset_trace("reload", std::string("mapId=") + std::to_string(mapIndex._map_id));
@@ -2591,6 +2727,9 @@ bool World::reloadCreatureSpawns()
 
   LogDebug << "Creature spawn DBC stats: CreatureDisplayInfo records=" << gCreatureDisplayInfoDB.getRecordCount()
            << ", CreatureModelData records=" << gCreatureModelDataDB.getRecordCount() << std::endl;
+
+  // Per-display bounding radii (the client's exact selection-circle size source).
+  auto const bounding_radii = mysql::getCreatureBoundingRadii();
 
   _creature_spawns.reserve(rows.size());
   std::size_t resolved_models = 0;
@@ -2615,13 +2754,24 @@ bool World::reloadCreatureSpawns()
     spawn.orientation = server_to_client_orientation(row.orientation);
     spawn.original_orientation = spawn.orientation;
     spawn.animation_time_offset = static_cast<int>(((row.guid * 1103515245u) + (row.entry * 12345u)) % 3500u);
-    spawn.template_scale = row.template_scale > 0.0f ? row.template_scale : 1.0f;
+    // Object scale = creature_template.scale, falling back to CreatureDisplayInfo.scale (D) when 0
+    // (server ObjectMgr.cpp:1436). Final render = template_scale * model_scale = (T>0?T:D) * M.
+    spawn.template_scale = row.template_scale > 0.0f ? row.template_scale : resolve_creature_display_scale(row.display_id);
     spawn.mainhand_display_id = row.mainhand_display_id;
     spawn.offhand_display_id = row.offhand_display_id;
     spawn.ranged_display_id = row.ranged_display_id;
     spawn.mainhand_inventory_type = row.mainhand_inventory_type;
     spawn.offhand_inventory_type = row.offhand_inventory_type;
     spawn.ranged_inventory_type = row.ranged_inventory_type;
+    spawn.auras = row.auras;
+    if (auto const radius_it = bounding_radii.find(spawn.display_id); radius_it != bounding_radii.end())
+    {
+      // The client's ring radius = bounding_radius x the RAW template scale (1.0 when unset) --
+      // verified against live Onyxia (1.8 x 2.0 = 3.6) vs Onyxian Warder (3.0 x 1.0 = 3.0). The
+      // display-scale fallback the model render uses does NOT apply here (the warder's ring would
+      // wrongly double to 6.0).
+      spawn.bounding_radius = radius_it->second * (row.template_scale > 0.0f ? row.template_scale : 1.0f);
+    }
 
     if (spawn.display_id)
     {
@@ -2650,6 +2800,49 @@ bool World::reloadCreatureSpawns()
     }
 
     _creature_spawns.emplace_back(std::move(spawn));
+  }
+
+  // Fetch spell details for every permanent aura on the loaded spawns in ONE query. Used to resolve
+  // aura state-kit visuals (the effect models the client attaches while an aura is on -- e.g. the
+  // arcane elementals' chest sparkle = RibbonTrail.m2 from "Arcane Aura"'s state kit) and by the
+  // creature-info UI.
+  _spell_infos.clear();
+  {
+    std::set<std::uint32_t> aura_spell_ids;
+    for (auto const& spawn : _creature_spawns)
+    {
+      std::istringstream tokens(spawn.auras);
+      std::uint32_t spell_id = 0;
+      while (tokens >> spell_id)
+      {
+        if (spell_id)
+        {
+          aura_spell_ids.insert(spell_id);
+        }
+      }
+    }
+    if (!aura_spell_ids.empty())
+    {
+      std::string spell_error;
+      auto spell_rows = mysql::getSpellInfos(aura_spell_ids, &spell_error);
+      if (!spell_error.empty())
+      {
+        LogDebug << "Aura spell info load failed: " << spell_error << std::endl;
+      }
+      for (auto const& [spell_id, row] : spell_rows)
+      {
+        SpellInfo info;
+        info.entry = row.entry;
+        info.spell_visual = row.spell_visual;
+        info.icon_id = row.icon_id;
+        info.school = row.school;
+        info.name = row.name;
+        info.description = row.description;
+        _spell_infos.emplace(spell_id, std::move(info));
+      }
+      LogDebug << "Aura spell infos loaded: " << _spell_infos.size()
+               << " (requested " << aura_spell_ids.size() << ")" << std::endl;
+    }
   }
 
   _creature_spawns_loaded = true;
@@ -2688,7 +2881,9 @@ bool World::reloadCreatureSpawns()
     spawn.original_pos = spawn.pos;
     spawn.original_orientation = spawn.orientation;
     spawn.animation_time_offset = static_cast<int>(((row.guid * 1664525u) + (row.entry * 1013904223u)) % 3500u);
-    spawn.template_scale = row.template_scale > 0.0f ? row.template_scale : 1.0f;
+    // Object scale = creature_template.scale, falling back to CreatureDisplayInfo.scale (D) when 0
+    // (server ObjectMgr.cpp:1436). Final render = template_scale * model_scale = (T>0?T:D) * M.
+    spawn.template_scale = row.template_scale > 0.0f ? row.template_scale : resolve_creature_display_scale(row.display_id);
 
     if (spawn.display_id)
     {
@@ -2755,17 +2950,27 @@ bool World::ensureCreatureSpawnModel(CreatureSpawnOverlay& spawn)
     auto const overrides = applyCreatureSpawnModelAppearance(spawn, *spawn.model_instance, Noggit::NoggitRenderContext::MAP_VIEW);
 
     spawn.attachment_models.clear();
-    if (spawn.is_character_model && creature_spawn_attachments_enabled())
     {
-      auto attachment_specs = resolve_creature_attachment_models(spawn.display_id);
-      auto equipment_specs = resolve_creature_equipment_attachment_models(spawn.display_id,
-                                                                          spawn.mainhand_display_id,
-                                                                          spawn.offhand_display_id,
-                                                                          spawn.ranged_display_id,
-                                                                          spawn.offhand_inventory_type);
+      std::vector<CreatureAttachmentModelSpec> attachment_specs;
+      if (spawn.is_character_model && creature_spawn_attachments_enabled())
+      {
+        attachment_specs = resolve_creature_attachment_models(spawn.display_id);
+        auto equipment_specs = resolve_creature_equipment_attachment_models(spawn.display_id,
+                                                                            spawn.mainhand_display_id,
+                                                                            spawn.offhand_display_id,
+                                                                            spawn.ranged_display_id,
+                                                                            spawn.offhand_inventory_type);
+        attachment_specs.insert(attachment_specs.end(),
+                                std::make_move_iterator(equipment_specs.begin()),
+                                std::make_move_iterator(equipment_specs.end()));
+      }
+
+      // Aura state-kit effect models (chest sparkles etc.) apply to EVERY creature with permanent
+      // auras, not just character-skeleton models.
+      auto aura_specs = resolve_creature_aura_attachment_models(spawn.auras, _spell_infos);
       attachment_specs.insert(attachment_specs.end(),
-                              std::make_move_iterator(equipment_specs.begin()),
-                              std::make_move_iterator(equipment_specs.end()));
+                              std::make_move_iterator(aura_specs.begin()),
+                              std::make_move_iterator(aura_specs.end()));
 
       if (creature_texture_debug_enabled() && !attachment_specs.empty())
       {
@@ -2961,6 +3166,25 @@ std::vector<std::pair<std::size_t, std::string>> World::applyCreatureSpawnModelA
   for (auto const& override_entry : overrides)
   {
     model_instance.setReplaceTexture(override_entry.first, override_entry.second);
+  }
+
+  // CreatureModelAlpha (display record): the client draws the creature at this opacity. For translucent
+  // creatures (ghosts, arcane elementals like Anomalus -> alpha 200) it makes an energy-on-black body
+  // read as see-through dark energy instead of a SOLID BLACK shape -- which is what Noggit drew, because
+  // it always rendered the creature fully opaque. Stored on the instance and applied in ModelRenderPass.
+  model_instance.model_alpha = 1.0f;
+  if (spawn.display_id)
+  {
+    try
+    {
+      auto display = gCreatureDisplayInfoDB.getByID(spawn.display_id);
+      float const a = static_cast<float>(display.getUInt(CreatureDisplayInfoDB::CreatureModelAlpha)) / 255.0f;
+      if (std::isfinite(a) && a > 0.0f && a < 1.0f)
+      {
+        model_instance.model_alpha = a;
+      }
+    }
+    catch (...) {}
   }
 
   if (enable_creature_spawn_character_geosets
@@ -4117,6 +4341,10 @@ selection_result World::intersect (glm::mat4x4 const& model_view
 void World::update_models_emitters(float dt)
 {
   ZoneScoped;
+  // Remember the per-frame emitter dt so the render pass can advance each creature spawn's OWN particle
+  // state at its own animation phase (draw_map runs BEFORE tick, so it reads the previous frame's dt --
+  // negligible since dt is ~constant frame to frame).
+  _models_emitter_dt = dt;
   while (dt > 0.1f)
   {
     ModelManager::updateEmitters(0.1f);
@@ -4129,6 +4357,26 @@ unsigned int World::getAreaID (glm::vec3 const& pos)
 {
   ZoneScoped;
   return for_maybe_chunk_at (pos, [&] (MapChunk* chunk) { return chunk->getAreaID(); }).value_or(-1);
+}
+
+bool World::camera_is_underwater(glm::vec3 const& pos)
+{
+  return for_maybe_chunk_at(pos, [&](MapChunk* chunk) -> bool
+  {
+    ChunkWater* water = chunk->liquid_chunk();
+    if (!water)
+    {
+      return false;
+    }
+    auto* layers = water->getLayers();
+    if (!layers || layers->empty())
+    {
+      return false;
+    }
+    // Underwater when the camera sits below the liquid surface. getMaxHeight() is the surface for flat
+    // water (the common case); on rare sloped liquid it errs slightly toward "underwater".
+    return pos.y < water->getMaxHeight();
+  }).value_or(false);
 }
 
 unsigned int World::getZoneId(glm::vec3 const& pos)

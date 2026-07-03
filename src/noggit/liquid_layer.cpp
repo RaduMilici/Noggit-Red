@@ -8,6 +8,7 @@
 #include <ClientFile.hpp>
 
 #include <algorithm>
+#include <cmath>
 #include <string>
 
 namespace
@@ -403,25 +404,141 @@ void liquid_layer::save(sExtendableArray& adt, int base_pos, int& info_pos, int&
 void liquid_layer::changeLiquidID(int id)
 {
   _liquid_id = id;
+  // Baseline from the well-known vanilla liquid ids (magma=3, slime=4, Naxx slime=21 use the
+  // UV-bearing vertex format 1; water=1/ocean=2 use format 0). The DBC pass below refines it for
+  // custom (Turtle) liquids.
   _liquid_vertex_format = (_liquid_id == 3 || _liquid_id == 4 || _liquid_id == 21) ? 1 : 0;
 
   try
   {
     DBCFile::Record lLiquidTypeRow = gLiquidTypeDB.getByID(_liquid_id);
 
-    switch (lLiquidTypeRow.getInt(LiquidTypeDB::Type))
+    // Vanilla (1.12) LiquidType.dbc has only 4 fields: ID, Name, Type(field 2), SpellID(field 3),
+    // with Type enum 0=Magma, 2=Slime, 3=Water/Ocean. The WotLK (3.3.5) layout puts Type at field 3
+    // (enum 0=water/1=ocean/2=magma/3=slime). Reading the WotLK index on vanilla data picked up the
+    // SpellID (0 for magma/slime) -> default branch -> magma & slime were wrongly coerced to the water
+    // vertex format 0. Choose the field + enum from the DBC's actual field count.
+    if (gLiquidTypeDB.getFieldCount() <= 4)
     {
-    case 2: // magma
-    case 3: // slime
-      _liquid_vertex_format = 1;
-      break;
-    default:
-      _liquid_vertex_format = 0;
-      break;
+      int const type = lLiquidTypeRow.getInt(2); // vanilla Type
+      _liquid_vertex_format = (type == 0 /*magma*/ || type == 2 /*slime*/) ? 1 : 0;
+    }
+    else
+    {
+      switch (lLiquidTypeRow.getInt(LiquidTypeDB::Type)) // WotLK Type (field 3)
+      {
+      case 2: // magma
+      case 3: // slime
+        _liquid_vertex_format = 1;
+        break;
+      default:
+        _liquid_vertex_format = 0;
+        break;
+      }
     }
   }
   catch (...)
   {
+  }
+}
+
+int liquid_layer::mclq_liquid_type() const
+{
+  // Returns the base MCLQ category (0 water, 1 ocean, 2 magma, 3 slime) used for the MCNK header
+  // liquid flag, the per-tile nibble, and the vertex format. Derive it straight from the liquid id:
+  // neither LiquidType.dbc's Type field (vanilla encodes it differently than WotLK) nor
+  // _liquid_vertex_format are reliable here (the vanilla DBC even zeroes the magma vertex format).
+  // This mirrors the renderer's classification (LiquidTextureManager aliases) and the reader's
+  // flag->id mapping (lq_river=1, lq_ocean=2, lq_magma=3, lq_slime=4).
+  int const id = resolve_liquid_id(_liquid_id);
+
+  switch (id)
+  {
+  case 1:  return 0; // water / river
+  case 2:  return 1; // ocean
+  case 3:  return 2; // magma (lava)
+  case 4:  return 3; // slime
+  case 21: return 3; // naxxramas slime
+  default: break;
+  }
+
+  // Non-base ids: WoW liquid ids group in 4s (water, ocean, magma, slime).
+  switch ((id - 1) % 4)
+  {
+  case 1:  return 1; // ocean
+  case 2:  return 2; // magma
+  case 3:  return 3; // slime
+  default: return 0; // water
+  }
+}
+
+void liquid_layer::to_mclq(mclq& out) const
+{
+  // Exact inverse of liquid_layer(ChunkWater*, base, mclq&, liquid_id).
+  out.min_height = _minimum;
+  out.max_height = _maximum;
+
+  int const cat = mclq_liquid_type();           // 0 water, 1 ocean, 2 magma, 3 slime
+  bool const magma_format = (cat == 2 || cat == 3); // magma & slime use the s/t vertex layout
+
+  // 9x9 vertices
+  for (int z = 0; z < 9; ++z)
+  {
+    for (int x = 0; x < 9; ++x)
+    {
+      const unsigned i = z * 9 + x;
+      out.vertices[i].height = _vertices[i].y;
+
+      if (magma_format)
+      {
+        // magma/slime: tex coords stored back as 0..255
+        float const mx = std::round(_tex_coords[i].x * 255.f);
+        float const my = std::round(_tex_coords[i].y * 255.f);
+        out.vertices[i].magma.x = static_cast<std::uint16_t>(std::clamp(mx, 0.f, 65535.f));
+        out.vertices[i].magma.y = static_cast<std::uint16_t>(std::clamp(my, 0.f, 65535.f));
+      }
+      else
+      {
+        // water: depth as 0..255, the rest are zeroed
+        float const d = std::round(_depth[i] * 255.f);
+        out.vertices[i].water.depth = static_cast<std::uint8_t>(std::clamp(d, 0.f, 255.f));
+        out.vertices[i].water.flow_0_pct = 0;
+        out.vertices[i].water.flow_1_pct = 0;
+        out.vertices[i].water.filler = 0;
+      }
+    }
+  }
+
+  // Map resolved type -> vanilla MCLQ tile low-nibble liquid_type:
+  // water -> 0, ocean -> 1, slime -> 3, magma -> 6.
+  std::uint8_t type_nibble;
+  switch (mclq_liquid_type())
+  {
+  case 1:  type_nibble = 1; break; // ocean
+  case 2:  type_nibble = 6; break; // magma
+  case 3:  type_nibble = 3; break; // slime
+  default: type_nibble = 0; break; // water
+  }
+
+  // 8x8 tiles
+  for (int z = 0; z < 8; ++z)
+  {
+    for (int x = 0; x < 8; ++x)
+    {
+      const unsigned t = z * 8 + x;
+      std::uint8_t* raw = reinterpret_cast<std::uint8_t*>(&out.tiles[t]);
+
+      if (hasSubchunk(x, z))
+      {
+        // visible: liquid_type nibble set, dont_render = 0, other flags cleared
+        *raw = type_nibble;
+      }
+      else
+      {
+        // no subchunk -> 0x0F no-render sentinel (the reader skips low-nibble 0x0F)
+        *raw = 0x0F;
+      }
+    }
   }
 }
 

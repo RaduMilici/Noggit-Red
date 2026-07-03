@@ -88,6 +88,7 @@ ModelInstance& ModelInstance::operator=(ModelInstance const& other)
 
   model = other.model;
   light_color = other.light_color;
+  model_alpha = other.model_alpha;
   size_cat = other.size_cat;
   pos = other.pos;
   dir = other.dir;
@@ -113,6 +114,22 @@ ModelInstance& ModelInstance::operator=(ModelInstance const& other)
   _controlled_geoset_families = other._controlled_geoset_families;
 
   return *this;
+}
+
+float ModelInstance::selectionRingRadius() const
+{
+  if (!model.get() || !model->finishedLoading() || model->loading_failed())
+  {
+    return 0.5f * scale;
+  }
+  // EXACT client formula (reverse-engineered from wow.exe): ground selection circle radius =
+  // scale * sqrt( sqrt(dx^2 + dy^2) * 0.5 ), where dx,dy are the stand-animation bounding-box extents
+  // (Model::selection_base_radius). Byte-exact vs the live client. Falls back to the render footprint,
+  // then a fraction of the header bound, only when the stand-anim box is unavailable.
+  float r = model->selection_base_radius;
+  if (!(r > 0.01f)) { r = model->footprint_radius; }
+  if (!(r > 0.01f)) { r = model->header.bounding_box_radius * 0.35f; }
+  return r * scale;
 }
 
 void ModelInstance::setReplaceTexture(std::size_t texture_type, std::string const& filename)

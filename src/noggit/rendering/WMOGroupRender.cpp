@@ -472,6 +472,13 @@ void WMOGroupRender::initRenderBatches()
       flags |= WMORenderBatchFlags::eWMOBatch_Unfogged;
     }
 
+    if (mat.flags.sidn)
+    {
+      // Self-Illuminated Day/Night: building windows (and similar) emit their own texture colour,
+      // ramping up as the outdoor light fades. The shader adds the night-glow emissive term.
+      flags |= WMORenderBatchFlags::eWMOBatch_Sidn;
+    }
+
     std::uint32_t alpha_test;
 
     switch (mat.blend_mode)

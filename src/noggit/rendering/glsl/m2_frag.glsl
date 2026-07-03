@@ -370,5 +370,17 @@ void main()
     }
   }
 
+  // Bloom-mask encoding for the bright-pass. CRITICAL: additive passes (No_Add_Alpha=3 / Add=4) use
+  // out_color.a as the BLEND source factor (GL_SRC_ALPHA), so we must NOT overwrite it -- forcing it to
+  // 1.0 made masked low-opacity additive layers (the volumetric light-shaft's scrolling dust layer)
+  // render at full intensity. Leave additive alpha exactly as the material set it: a bright additive
+  // glow (brazier/flame) naturally accumulates a high alpha and trips the emissive bloom bypass, while a
+  // faint masked additive layer keeps its low alpha and does not. Only non-additive surfaces are capped
+  // below the reserved emissive range (lava's emissive bloom comes from the liquid shader, not here).
+  if (blend_mode != 3 && blend_mode != 4)
+  {
+    color.a = min(color.a, 0.85);
+  }
+
   out_color = color;
 }

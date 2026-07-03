@@ -35,6 +35,15 @@ public:
   void fromFile(BlizzardArchive::ClientFile& f, size_t basePos);
   void save(sExtendableArray& adt, int base_pos, int& header_pos, int& current_pos);
 
+  // Drop redundant duplicate layers (same liquid id, coverage and height) that the water tool can
+  // accumulate, so a chunk doesn't serialize e.g. three identical water blocks. Called before save.
+  void removeDuplicateLayers();
+
+  // Vanilla MCLQ serialization: one mclq block per liquid layer.
+  void to_mclq(std::vector<mclq>& out) const;
+  // MCNK header liquid flag bits (lq_river/ocean/magma/slime) required by the layers.
+  mcnk_flags mclq_header_flags() const;
+
   bool is_visible ( const float& cull_distance
                   , const math::frustum& frustum
                   , const glm::vec3& camera

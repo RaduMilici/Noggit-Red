@@ -17,7 +17,10 @@
 #include <opengl/shader.hpp>
 #include <noggit/rendering/Primitives.hpp>
 
+#include <cstdint>
 #include <memory>
+#include <unordered_map>
+#include <vector>
 
 class World;
 struct MinimapRenderSettings;
@@ -120,6 +123,7 @@ namespace Noggit::Rendering
     std::unique_ptr<OpenGL::program> _m2_instanced_program;
     std::unique_ptr<OpenGL::program> _m2_particles_program;
     std::unique_ptr<OpenGL::program> _m2_ribbons_program;
+    std::unique_ptr<OpenGL::program> _blob_shadow_program; // unit (creature) ground blob shadows
     std::unique_ptr<OpenGL::program> _m2_box_program;
     std::unique_ptr<OpenGL::program> _wmo_program;
     std::unique_ptr<OpenGL::program> _liquid_program;
@@ -149,6 +153,20 @@ namespace Noggit::Rendering
     Noggit::Rendering::Primitives::Square _square_render;
     Noggit::Rendering::Primitives::Line _line_render;
     Noggit::Rendering::Primitives::Circle _circle_render;
+
+    // Cached terrain-draped selection-disc meshes (creature spawn markers): the disc is tessellated
+    // with per-vertex ground heights so it bends with the terrain like the client's, and rebuilt
+    // only when the spawn moves or its radius changes.
+    struct ConformingDisc
+    {
+      glm::vec3 pos = glm::vec3(0.0f);
+      float radius = 0.0f;
+      std::vector<glm::vec3> vertices;
+      std::vector<glm::vec2> locals;
+      std::vector<std::uint16_t> indices;
+    };
+    std::unordered_map<std::uint32_t, ConformingDisc> _creature_disc_cache;
+    std::unordered_map<std::uint32_t, ConformingDisc> _gameobject_disc_cache;
 
     // buffers
     OpenGL::Scoped::deferred_upload_buffers<8> _buffers;

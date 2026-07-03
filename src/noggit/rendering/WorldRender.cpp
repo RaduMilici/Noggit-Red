@@ -5,6 +5,9 @@
 #include <math/frustum.hpp>
 #include <noggit/Log.h>
 #include <noggit/World.h>
+#include <noggit/TileWater.hpp>
+#include <noggit/ChunkWater.hpp>
+#include <noggit/liquid_layer.hpp>
 #include <external/PNG2BLP/Png2Blp.h>
 #include <noggit/DBC.h>
 #include <noggit/project/CurrentProject.hpp>
@@ -628,9 +631,18 @@ void WorldRender::draw (glm::mat4x4 const& model_view
     ensureBloomTargets(bloom_vp[2], bloom_vp[3]);
     gl.bindFramebuffer(GL_FRAMEBUFFER, _bloom_scene_fbo);
     gl.viewport(0, 0, _bloom_w, _bloom_h);
-    gl.clearColor(0.f, 0.f, 0.f, 1.f);
-    gl.clear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
   }
+
+  // Clear colour+depth of WHATEVER target is now bound -- the bloom scene FBO when do_bloom, else the
+  // real (Qt) framebuffer. This MUST run in both paths: the sky sphere is drawn first at far depth, so
+  // without a depth clear the non-bloom path fails the depth test against a stale depth buffer and the
+  // sky renders BLACK. CRUCIAL: glClear(GL_DEPTH) obeys the depth WRITE mask -- the previous frame ends on
+  // particle/additive passes that leave depthMask=FALSE, which turns the depth clear into a silent no-op.
+  // Force it back on first. (With bloom the composite blits the scene colour ignoring depth, which is why
+  // only the non-bloom path showed the black sky.)
+  gl.depthMask(GL_TRUE);
+  gl.clearColor(0.f, 0.f, 0.f, 1.f);
+  gl.clear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
   // setup render settings for minimap
   if (minimap_render)
@@ -1656,6 +1668,44 @@ void WorldRender::draw (glm::mat4x4 const& model_view
 
     if (!creature_spawn_instances_to_draw.empty())
     {
+      // Unit blob shadows (faithful to the client's ShadowBlob decal under units): a soft dark circle
+      // under each creature, grounding it on the terrain. Doodads don't get this (they use baked MCSH).
+      // Procedural radial blob == ShadowBlob.blp's look without a texture. Drawn first so creature meshes
+      // sit on top; depth-tested against terrain with depth-write off (terrain in front still occludes).
+      {
+        OpenGL::Scoped::use_program blob_shader {*_blob_shadow_program.get()};
+        OpenGL::Scoped::bool_setter<GL_CULL_FACE, GL_FALSE> const cull;
+        OpenGL::Scoped::depth_mask_setter<GL_FALSE> const depth_mask;
+        gl.enable(GL_BLEND);
+        gl.blendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        blob_shader.uniform("model_view_projection", mvp);
+        blob_shader.uniform("strength", 0.45f);
+        gl.bindVertexArray(_bloom_vao); // reuse an empty VAO (corners come from gl_VertexID)
+        for (auto const& draw_item : creature_spawn_instances_to_draw)
+        {
+          ModelInstance* instance = draw_item.instance;
+          if (!instance || !instance->model.get() || instance->model->loading_failed())
+          {
+            continue;
+          }
+          if (!draw_hidden_models && instance->model->is_hidden())
+          {
+            continue;
+          }
+          float foot = instance->size_cat * 0.35f; // size_cat = longest world-space AABB side (scaled)
+          if (!std::isfinite(foot) || foot <= 0.0f) { foot = 2.0f; }
+          float const radius = glm::clamp(foot, 0.6f, 14.0f);
+          glm::vec3 const p = instance->get_pos();
+          if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z))
+          {
+            continue;
+          }
+          blob_shader.uniform("center", glm::vec3(p.x, p.y + 0.1f, p.z));
+          blob_shader.uniform("radius", radius);
+          gl.drawArraysInstanced(GL_TRIANGLE_STRIP, 0, 4, 1);
+        }
+      }
+
       OpenGL::Scoped::use_program m2_shader {*_m2_program.get()};
 
       OpenGL::M2RenderState model_render_state;
@@ -1714,6 +1764,27 @@ void WorldRender::draw (glm::mat4x4 const& model_view
           );
           ++_world->_n_rendered_objects;
 
+          // Advance THIS spawn's OWN particle simulation now, while animate() (inside draw() above) has the
+          // shared bones + emitter setup at this instance's animation phase. Each spawn keeps its own live
+          // particle state (keyed by guid) so its particles stay glued to its own animated body instead of
+          // matching only the last-drawn spawn (the shared/global state still updates in tick() for
+          // doodads/preview). Gated on animations so particles freeze in place when animations are off.
+          if (draw_model_animations && draw_item.spawn)
+          {
+            if (Model* pmodel = instance->model.get())
+            {
+              pmodel->swapInstanceEmitterState(draw_item.guid);
+              float pdt = _world->models_emitter_dt();
+              while (pdt > 0.1f)
+              {
+                pmodel->updateParticleSystems(0.1f);
+                pdt -= 0.1f;
+              }
+              pmodel->updateParticleSystems(pdt);
+              pmodel->swapInstanceEmitterState(draw_item.guid);
+            }
+          }
+
           auto* parent_model = instance->model.get();
           if (draw_item.spawn && parent_model)
           {
@@ -1766,6 +1837,16 @@ void WorldRender::draw (glm::mat4x4 const& model_view
               }
 
               auto const* attachment_def = find_attachment_def(parent_model, attachment.attachment_id);
+              // Aura kit attachment fallbacks: not every creature M2 authors every point. Chest(34)
+              // falls back to ChestBloodFront(15); Head(20) to Helm(11).
+              if (!attachment_def && attachment.attachment_id == 34)
+              {
+                attachment_def = find_attachment_def(parent_model, 15);
+              }
+              if (!attachment_def && attachment.attachment_id == 20)
+              {
+                attachment_def = find_attachment_def(parent_model, 11);
+              }
               if (!attachment_def)
               {
                 if (capture_debug_enabled())
@@ -1780,6 +1861,14 @@ void WorldRender::draw (glm::mat4x4 const& model_view
               }
 
               attachment_instance.setTransformMatrix(attachment_world_matrix(*instance, parent_model, attachment_def));
+              // Particle transform: models whose emitters ride their parent (flag 0x10) use the full
+              // animated attachment matrix; world-space emitters (aura sparkles like RibbonTrail) use
+              // the BIND-pose placement (attachment pos only, no animated bone) so live particles stay
+              // put while the body animates -- matching the live client.
+              attachment.particle_transform = attachment_instance.model->particlesRideParent()
+                ? attachment_instance.transformMatrix()
+                : instance->transformMatrix()
+                  * glm::translate(glm::mat4x4(1.0f), fixCoordSystem(attachment_def->pos));
               if (draw_model_animations)
               {
                 attachment_instance.model->animcalc = false;
@@ -1807,6 +1896,27 @@ void WorldRender::draw (glm::mat4x4 const& model_view
                 , true
               );
               ++_world->_n_rendered_objects;
+
+              // Advance this attachment's OWN particle simulation (aura effect models like the
+              // arcane chest sparkle are pure particle emitters). Same per-instance scheme as the
+              // body above, keyed by (guid, attachment slot) so shared effect models (many creatures
+              // carry the same aura) each get their own sim. Runs right after draw() so the shared
+              // bones/emitter setup are at this attachment's phase.
+              if (draw_model_animations)
+              {
+                std::uint64_t const attachment_key = static_cast<std::uint64_t>(draw_item.guid)
+                  | (static_cast<std::uint64_t>(&attachment - draw_item.spawn->attachment_models.data() + 1) << 32);
+                Model* amodel = attachment_instance.model.get();
+                amodel->swapInstanceEmitterState(attachment_key);
+                float adt = _world->models_emitter_dt();
+                while (adt > 0.1f)
+                {
+                  amodel->updateParticleSystems(0.1f);
+                  adt -= 0.1f;
+                }
+                amodel->updateParticleSystems(adt);
+                amodel->swapInstanceEmitterState(attachment_key);
+              }
             }
           }
         }
@@ -1863,7 +1973,7 @@ void WorldRender::draw (glm::mat4x4 const& model_view
       std::uint32_t closest_guid = 0;
       glm::vec3 closest_pos = glm::vec3(0.0f);
 
-      struct MarkerData { glm::vec3 pos; glm::vec4 color; float radius; };
+      struct MarkerData { std::uint32_t guid; glm::vec4 color; };
       std::vector<MarkerData> markers;
       markers.reserve(512);
 
@@ -1890,26 +2000,86 @@ void WorldRender::draw (glm::mat4x4 const& model_view
         if (distance > creature_spawn_marker_distance) continue;
         ++nearby_spawns;
 
-        // Derive circle radius from the model's bounding sphere so it scales
-        // with the creature's actual size.  Fall back to a small default when
-        // the model hasn't loaded yet.
-        float model_rad = 0.5f;
-        if (spawn.model_instance.has_value())
-        {
-          auto const& mi = spawn.model_instance.value();
-          if (mi.model.get() && mi.model->finishedLoading() && !mi.model->loading_failed())
-            model_rad = mi.model->rad * mi.scale;
-        }
-        float ring_radius = std::max(0.25f, model_rad * 0.55f);
+        // Game-exact circle size: server bounding radius x creature scale (what the client renders
+        // via UNIT_FIELD_BOUNDINGRADIUS); falls back to the model footprint when the DB lacks it.
+        float const ring_radius = spawn.selectionRingWorldRadius();
 
-        glm::vec4 color = spawn.selected ? glm::vec4(0.2f, 1.0f,  0.35f, 1.0f)
+        // Terrain-draped disc mesh, cached per spawn and rebuilt only when the spawn moves or its
+        // radius changes -- so the circle bends with the ground like the client's instead of being
+        // a flat plate clipping into slopes.
+        auto& disc = _creature_disc_cache[spawn.guid];
+        if (disc.radius != ring_radius || glm::distance(disc.pos, spawn.pos) > 0.001f)
+        {
+          disc.pos = spawn.pos;
+          disc.radius = ring_radius;
+          disc.vertices.clear();
+          disc.locals.clear();
+          disc.indices.clear();
+
+          int constexpr segments = 24;
+          float constexpr ring_fractions[] = { 0.35f, 0.65f, 0.85f, 1.0f };
+          int constexpr ring_count = 4;
+
+          auto const ground_y = [&](float x, float z) -> float
+          {
+            // Probe from slightly above the spawn so slopes uphill of it still get hit.
+            glm::vec3 const hit = _world->get_ground_height(glm::vec3(x, spawn.pos.y + 3.0f, z));
+            // Guard: failed probes return (0,0,0); also ignore hits wildly off the spawn plane
+            // (overhangs / WMO roofs) and keep the disc's own plane instead.
+            if (hit == glm::vec3(0.0f) || std::abs(hit.y - spawn.pos.y) > ring_radius * 2.0f + 4.0f)
+            {
+              return spawn.pos.y;
+            }
+            return hit.y;
+          };
+
+          // centre vertex
+          disc.vertices.push_back(glm::vec3(spawn.pos.x, ground_y(spawn.pos.x, spawn.pos.z) + 0.08f, spawn.pos.z));
+          disc.locals.push_back(glm::vec2(0.0f, 0.0f));
+
+          for (int ring = 0; ring < ring_count; ++ring)
+          {
+            float const fr = ring_fractions[ring];
+            for (int seg = 0; seg < segments; ++seg)
+            {
+              float const angle = glm::two_pi<float>() * seg / float(segments);
+              float const lx = std::cos(angle) * fr;
+              float const lz = std::sin(angle) * fr;
+              float const wx = spawn.pos.x + lx * ring_radius;
+              float const wz = spawn.pos.z + lz * ring_radius;
+              disc.vertices.push_back(glm::vec3(wx, ground_y(wx, wz) + 0.08f, wz));
+              disc.locals.push_back(glm::vec2(lx, lz));
+            }
+          }
+
+          auto const ring_start = [&](int ring) { return static_cast<std::uint16_t>(1 + ring * segments); };
+          // centre fan to ring 0
+          for (int seg = 0; seg < segments; ++seg)
+          {
+            disc.indices.push_back(0);
+            disc.indices.push_back(static_cast<std::uint16_t>(ring_start(0) + seg));
+            disc.indices.push_back(static_cast<std::uint16_t>(ring_start(0) + (seg + 1) % segments));
+          }
+          // quads between consecutive rings
+          for (int ring = 0; ring + 1 < ring_count; ++ring)
+          {
+            for (int seg = 0; seg < segments; ++seg)
+            {
+              std::uint16_t const a = static_cast<std::uint16_t>(ring_start(ring) + seg);
+              std::uint16_t const b = static_cast<std::uint16_t>(ring_start(ring) + (seg + 1) % segments);
+              std::uint16_t const c = static_cast<std::uint16_t>(ring_start(ring + 1) + seg);
+              std::uint16_t const d = static_cast<std::uint16_t>(ring_start(ring + 1) + (seg + 1) % segments);
+              disc.indices.insert(disc.indices.end(), { a, c, d, a, d, b });
+            }
+          }
+        }
+
+        // Selected = the client's yellow target blob; the rest keep editor-distinct colors.
+        glm::vec4 color = spawn.selected ? glm::vec4(1.0f, 0.85f, 0.13f, 1.0f)
             : spawn.hovered  ? glm::vec4(0.2f, 0.9f,  1.0f,  1.0f)
-            : spawn.dirty    ? glm::vec4(1.0f, 0.9f,  0.15f, 1.0f)
+            : spawn.dirty    ? glm::vec4(0.2f, 1.0f,  0.35f, 1.0f)
                  : glm::vec4(1.0f, 0.55f, 0.08f, 1.0f);
-        // Sit just above the spawn's ground position so the circle hugs the
-        // terrain / object surface without clipping through it.
-        glm::vec3 ground_pos = spawn.pos + glm::vec3(0.0f, 0.05f, 0.0f);
-        markers.push_back({ground_pos, color, ring_radius});
+        markers.push_back({spawn.guid, color});
       }
 
       if (capture_debug_enabled())
@@ -1924,18 +2094,32 @@ void WorldRender::draw (glm::mat4x4 const& model_view
       gl.blendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
       gl.enable(GL_DEPTH_TEST);
 
+      // Orient the crescent texture so its bright arc faces the camera (the client's "incomplete
+      // circle" points its opening toward the viewer). Same rotation for every disc this frame.
+      auto const uv_rotation_for = [&](glm::vec3 const& pos) -> float
+      {
+        glm::vec2 const to_cam(camera_pos.x - pos.x, camera_pos.z - pos.z);
+        return std::atan2(to_cam.x, to_cam.y);
+      };
+
       // Pass 1: visible pixels (normal depth, full alpha)
       gl.depthFunc(GL_LEQUAL);
       for (auto const& m : markers)
-        _circle_render.draw(mvp, m.pos, m.color, m.radius);
+      {
+        auto const& disc = _creature_disc_cache[m.guid];
+        _circle_render.drawWorldSpace(mvp, disc.vertices, disc.locals, disc.indices, m.color,
+                                      uv_rotation_for(disc.pos));
+      }
 
       // Pass 2: occluded pixels (behind terrain, 10% alpha)
       gl.depthFunc(GL_GREATER);
       for (auto const& m : markers)
       {
+        auto const& disc = _creature_disc_cache[m.guid];
         glm::vec4 c = m.color;
         c.a *= 0.1f;
-        _circle_render.draw(mvp, m.pos, c, m.radius);
+        _circle_render.drawWorldSpace(mvp, disc.vertices, disc.locals, disc.indices, c,
+                                      uv_rotation_for(disc.pos));
       }
 
       // Restore depth function
@@ -1970,7 +2154,7 @@ void WorldRender::draw (glm::mat4x4 const& model_view
       OpenGL::Scoped::bool_setter<GL_BLEND, GL_TRUE> const enable_blend;
       OpenGL::Scoped::depth_mask_setter<GL_FALSE> const no_depth_write;
 
-      struct MarkerData { glm::vec3 pos; glm::vec4 color; float radius; };
+      struct MarkerData { std::uint32_t guid; glm::vec4 color; };
       std::vector<MarkerData> markers;
       markers.reserve(256);
 
@@ -1981,36 +2165,116 @@ void WorldRender::draw (glm::mat4x4 const& model_view
         if (glm::distance(camera_pos, spawn.pos) > creature_spawn_marker_distance)
           continue;
 
-        float model_rad = 0.5f;
+        float ring_radius = 0.5f;
         if (spawn.model_instance.has_value())
         {
-          auto const& mi = spawn.model_instance.value();
-          if (mi.model.get() && mi.model->finishedLoading() && !mi.model->loading_failed())
-            model_rad = mi.model->rad * mi.scale;
+          ring_radius = spawn.model_instance.value().selectionRingRadius();
         }
-        float const ring_radius = std::max(0.25f, model_rad * 0.55f);
+        ring_radius = std::max(0.25f, ring_radius);
+
+        // Same terrain-draped disc mesh as creature markers, cached per spawn and rebuilt only when
+        // the spawn moves or its radius changes -- so the circle bends with the ground instead of
+        // being a flat plate clipping into slopes.
+        auto& disc = _gameobject_disc_cache[spawn.guid];
+        if (disc.radius != ring_radius || glm::distance(disc.pos, spawn.pos) > 0.001f)
+        {
+          disc.pos = spawn.pos;
+          disc.radius = ring_radius;
+          disc.vertices.clear();
+          disc.locals.clear();
+          disc.indices.clear();
+
+          int constexpr segments = 24;
+          float constexpr ring_fractions[] = { 0.35f, 0.65f, 0.85f, 1.0f };
+          int constexpr ring_count = 4;
+
+          auto const ground_y = [&](float x, float z) -> float
+          {
+            glm::vec3 const hit = _world->get_ground_height(glm::vec3(x, spawn.pos.y + 3.0f, z));
+            if (hit == glm::vec3(0.0f) || std::abs(hit.y - spawn.pos.y) > ring_radius * 2.0f + 4.0f)
+            {
+              return spawn.pos.y;
+            }
+            return hit.y;
+          };
+
+          // centre vertex
+          disc.vertices.push_back(glm::vec3(spawn.pos.x, ground_y(spawn.pos.x, spawn.pos.z) + 0.08f, spawn.pos.z));
+          disc.locals.push_back(glm::vec2(0.0f, 0.0f));
+
+          for (int ring = 0; ring < ring_count; ++ring)
+          {
+            float const fr = ring_fractions[ring];
+            for (int seg = 0; seg < segments; ++seg)
+            {
+              float const angle = glm::two_pi<float>() * seg / float(segments);
+              float const lx = std::cos(angle) * fr;
+              float const lz = std::sin(angle) * fr;
+              float const wx = spawn.pos.x + lx * ring_radius;
+              float const wz = spawn.pos.z + lz * ring_radius;
+              disc.vertices.push_back(glm::vec3(wx, ground_y(wx, wz) + 0.08f, wz));
+              disc.locals.push_back(glm::vec2(lx, lz));
+            }
+          }
+
+          auto const ring_start = [&](int ring) { return static_cast<std::uint16_t>(1 + ring * segments); };
+          // centre fan to ring 0
+          for (int seg = 0; seg < segments; ++seg)
+          {
+            disc.indices.push_back(0);
+            disc.indices.push_back(static_cast<std::uint16_t>(ring_start(0) + seg));
+            disc.indices.push_back(static_cast<std::uint16_t>(ring_start(0) + (seg + 1) % segments));
+          }
+          // quads between consecutive rings
+          for (int ring = 0; ring + 1 < ring_count; ++ring)
+          {
+            for (int seg = 0; seg < segments; ++seg)
+            {
+              std::uint16_t const a = static_cast<std::uint16_t>(ring_start(ring) + seg);
+              std::uint16_t const b = static_cast<std::uint16_t>(ring_start(ring) + (seg + 1) % segments);
+              std::uint16_t const c = static_cast<std::uint16_t>(ring_start(ring + 1) + seg);
+              std::uint16_t const d = static_cast<std::uint16_t>(ring_start(ring + 1) + (seg + 1) % segments);
+              disc.indices.insert(disc.indices.end(), { a, c, d, a, d, b });
+            }
+          }
+        }
 
         // Distinct palette from creatures (which are orange/green): gameobjects use blue/purple.
         glm::vec4 const color = spawn.selected ? glm::vec4(0.35f, 1.0f, 0.45f, 1.0f)
             : spawn.hovered  ? glm::vec4(0.45f, 0.85f, 1.0f, 1.0f)
             : spawn.dirty    ? glm::vec4(1.0f,  0.9f,  0.15f, 1.0f)
                  : glm::vec4(0.55f, 0.45f, 1.0f, 1.0f);
-        markers.push_back({spawn.pos + glm::vec3(0.0f, 0.05f, 0.0f), color, ring_radius});
+        markers.push_back({spawn.guid, color});
       }
 
       gl.blendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
       gl.enable(GL_DEPTH_TEST);
 
+      // Orient the crescent texture so its bright arc faces the camera (matches creature markers).
+      auto const uv_rotation_for = [&](glm::vec3 const& pos) -> float
+      {
+        glm::vec2 const to_cam(camera_pos.x - pos.x, camera_pos.z - pos.z);
+        return std::atan2(to_cam.x, to_cam.y);
+      };
+
+      // Pass 1: visible pixels (normal depth, full alpha)
       gl.depthFunc(GL_LEQUAL);
       for (auto const& m : markers)
-        _circle_render.draw(mvp, m.pos, m.color, m.radius);
+      {
+        auto const& disc = _gameobject_disc_cache[m.guid];
+        _circle_render.drawWorldSpace(mvp, disc.vertices, disc.locals, disc.indices, m.color,
+                                      uv_rotation_for(disc.pos));
+      }
 
+      // Pass 2: occluded pixels (behind terrain, 10% alpha)
       gl.depthFunc(GL_GREATER);
       for (auto const& m : markers)
       {
+        auto const& disc = _gameobject_disc_cache[m.guid];
         glm::vec4 c = m.color;
         c.a *= 0.1f;
-        _circle_render.draw(mvp, m.pos, c, m.radius);
+        _circle_render.drawWorldSpace(mvp, disc.vertices, disc.locals, disc.indices, c,
+                                      uv_rotation_for(disc.pos));
       }
       gl.depthFunc(GL_LEQUAL);
     }
@@ -2278,7 +2542,7 @@ void WorldRender::draw (glm::mat4x4 const& model_view
 
   // model particles (drawn after water so additive glows appear on top of the water surface).
   // Drawn even when animations are off -> particles freeze in place (not advanced) instead of vanishing.
-  if (!model_with_particles.empty())
+  if (!model_with_particles.empty() || !creature_spawn_instances_to_draw.empty())
   {
     OpenGL::Scoped::bool_setter<GL_CULL_FACE, GL_FALSE> const cull;
     OpenGL::Scoped::bool_setter<GL_DEPTH_TEST, GL_TRUE> const depth_test;
@@ -2291,10 +2555,78 @@ void WorldRender::draw (glm::mat4x4 const& model_view
     OpenGL::texture::set_active_texture(0);
     particles_shader.uniform("tex", 0);
 
+    // Particles OWN the bloom mask under themselves now (alpha write ON). Each particle's blend uses
+    // glBlendFuncSeparate (see Particle.cpp) so its RGB is unchanged but its alpha MULTIPLIES the mask by
+    // (1 - coverage): a bright additive fire erases the emissive mask it would otherwise inherit from the
+    // lava pit behind it, so it stops blooming through the strong emissive path (the Ironforge forge /
+    // firepit plumes were blowing out to a white screen-filling halo). The lava around the flame keeps
+    // its mask and still glows; faint particle edges barely touch it. Particles are never themselves
+    // emissive, so erasing (never raising) the mask is the data-faithful behaviour.
+    gl.colorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    particles_shader.uniform("particle_alpha_mod", 1.0f); // batched world particles: full opacity (no creature fade)
     for (auto& it : model_with_particles)
     {
       it.first->renderer()->drawParticles(glm::transpose(model_view), particles_shader, it.second);
     }
+    // Creature spawn particles (sparkle/energy spell effects on the model). Spawns render via their own
+    // per-instance path and are NOT in model_with_particles, so their emitters were never drawn -- the
+    // arcane-elemental sparkles etc. were missing. Draw each spawn's particles with its own transform.
+    for (auto const& draw_item : creature_spawn_instances_to_draw)
+    {
+      auto* instance = draw_item.instance;
+      if (!instance || !instance->model.get() || instance->model->loading_failed())
+        continue;
+      if (!draw_hidden_models && instance->model->is_hidden())
+        continue;
+      // Draw THIS spawn's own per-instance particle state (updated at its own phase in the body pass).
+      // Only swap it in when animations are on -- otherwise fall through to the shared frozen state so
+      // particles freeze in place (matching the body, which also freezes) when animations are toggled off.
+      Model* pmodel = instance->model.get();
+      bool const use_instance_state = draw_model_animations && draw_item.spawn;
+      if (use_instance_state)
+      {
+        pmodel->swapInstanceEmitterState(draw_item.guid);
+      }
+      pmodel->renderer()->drawParticlesForInstance(
+          glm::transpose(model_view), particles_shader, instance->transformMatrix(), instance->model_alpha);
+      if (use_instance_state)
+      {
+        pmodel->swapInstanceEmitterState(draw_item.guid);
+      }
+
+      // Attachment-model particles (aura state-kit effects like the arcane chest sparkle are pure
+      // particle emitters -- without this they would never render). Each attachment's transform was
+      // set during the body pass (attachment_world_matrix), so it already rides the animated bone.
+      if (draw_item.spawn)
+      {
+        for (auto& attachment : draw_item.spawn->attachment_models)
+        {
+          if (!attachment.model_instance.has_value())
+            continue;
+          Model* amodel = attachment.model_instance->model.get();
+          if (!amodel || !amodel->finishedLoading() || amodel->loading_failed() || amodel->is_hidden())
+            continue;
+
+          std::uint64_t const attachment_key = static_cast<std::uint64_t>(draw_item.guid)
+            | (static_cast<std::uint64_t>(&attachment - draw_item.spawn->attachment_models.data() + 1) << 32);
+          if (draw_model_animations)
+          {
+            amodel->swapInstanceEmitterState(attachment_key);
+          }
+          // Full alpha: aura/spell effect models are separate from the creature, so CreatureModelAlpha
+          // (the body fade, e.g. Anomalus 0.784) does NOT apply to them in the client.
+          amodel->renderer()->drawParticlesForInstance(
+              glm::transpose(model_view), particles_shader,
+              attachment.particle_transform, 1.0f);
+          if (draw_model_animations)
+          {
+            amodel->swapInstanceEmitterState(attachment_key);
+          }
+        }
+      }
+    }
+    gl.colorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    gl.blendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA); // restore default for following passes
   }
 
 
@@ -2307,12 +2639,17 @@ void WorldRender::draw (glm::mat4x4 const& model_view
 
     ribbon_shader.uniform("model_view_projection", mvp);
 
-    gl.blendFunc(GL_SRC_ALPHA, GL_ONE);
+    // Additive RGB unchanged; alpha pulls the bloom mask down under the ribbon (same rationale as the
+    // particle pass) so additive ribbons don't bloom through an emissive surface they happen to cross.
+    gl.blendFuncSeparate(GL_SRC_ALPHA, GL_ONE, GL_ZERO, GL_ONE_MINUS_SRC_ALPHA);
 
+    gl.colorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
     for (auto& it : model_with_particles)
     {
       it.first->renderer()->drawRibbons(ribbon_shader, it.second);
     }
+    gl.colorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    gl.blendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
   }
 
   if (angled_mode || use_ref_pos)
@@ -2521,8 +2858,9 @@ void WorldRender::renderBloomAndComposite(GLuint target_fbo, int w, int h)
     gl.activeTexture(GL_TEXTURE0);
     gl.bindTexture(GL_TEXTURE_2D, _bloom_scene_color);
     p.uniform("scene", 0);
-    // High threshold so only near-white pixels (sky openings, light-shaft cores, the globe's bright
-    // top) bloom -- NOT the merely-bright sunlit terrain, which was washing the whole ground white.
+    // Emissive bloom knee (bloom_bright_frag is now emissive-ONLY -- gates emissive pixels by
+    // maxchannel > threshold*0.55). 0.50 is the value Molten Core's lava read correctly at; there is no
+    // longer a luminance path, so this no longer affects lit surfaces at all.
     p.uniform("threshold", 0.50f);
     gl.drawArraysInstanced(GL_TRIANGLES, 0, 3, 1);
   }
@@ -2560,7 +2898,7 @@ void WorldRender::renderBloomAndComposite(GLuint target_fbo, int w, int h)
     gl.activeTexture(GL_TEXTURE1);
     gl.bindTexture(GL_TEXTURE_2D, _bloom_tex[0]);
     p.uniform("bloom", 1);
-    p.uniform("intensity", 1.0f);
+    p.uniform("intensity", 0.8f); // bloom add-back strength (Molten Core value; emissive-only now)
     gl.drawArraysInstanced(GL_TRIANGLES, 0, 3, 1);
   }
 
@@ -2614,6 +2952,13 @@ void WorldRender::upload()
       ( new OpenGL::program
             { { GL_VERTEX_SHADER,   OpenGL::shader::src_from_qrc("ribbon_vs") }
                 , { GL_FRAGMENT_SHADER, OpenGL::shader::src_from_qrc("ribbon_fs") }
+            }
+      );
+
+  _blob_shadow_program.reset
+      ( new OpenGL::program
+            { { GL_VERTEX_SHADER,   OpenGL::shader::src_from_qrc("blob_shadow_vs") }
+                , { GL_FRAGMENT_SHADER, OpenGL::shader::src_from_qrc("blob_shadow_fs") }
             }
       );
 
@@ -2879,6 +3224,25 @@ void WorldRender::updateLightingUniformBlock(bool draw_fog, glm::vec3 const& cam
   }
 
   _skies->setAreaLightId(area_light_id);
+  // Underwater: switch to the underwater LightParams set (CLEAR_WATER) so the fog colour/density and
+  // ambient match the in-game submerged look (cool, dense fog); above water use CLEAR. Both colorFor
+  // and floatParamFor read the active param, so this swaps tint and fog together. If a light doesn't
+  // define the underwater param, active_sky_param falls back to defaults -- harmless.
+  // GUARDED: camera_is_underwater walks the chunk + its liquid layers, which (like getAreaID /
+  // getWMOAreaID above) can throw while a tile is mid-load/unload. The sibling calls are wrapped in a
+  // try/catch for exactly this reason; this one was not -> an uncaught exception here crashed the
+  // editor intermittently (any map, any time the camera sits over loading liquid). Default to "not
+  // underwater" on failure.
+  bool underwater = false;
+  try
+  {
+    underwater = _world->camera_is_underwater(camera_pos);
+  }
+  catch (...)
+  {
+    underwater = false;
+  }
+  _skies->setCurrentParam(underwater ? CLEAR_WATER : CLEAR);
   _skies->update_sky_colors(camera_pos, daytime);
   _outdoor_light_stats = _outdoor_lighting->getLightStats(static_cast<int>(_world->time));
 
@@ -2969,41 +3333,63 @@ void WorldRender::updateLightingUniformBlock(bool draw_fog, glm::vec3 const& cam
         return;
       }
 
-      // Dusty lightray shafts carry no authored light, so the additive beam mesh only brightens the
-      // pixels directly behind it (the floor) -- doodads/rocks under the shaft stay dark. Synthesize a
-      // soft warm point light part-way down the beam so nearby geometry actually catches the shaft's
-      // glow, via the same point-light path the terrain/WMO/M2 shaders already use.
-      if (m->file_key().hasFilepath()
-          && m->file_key().filepath().find("lightray_dusty") != std::string::npos)
-      {
-        glm::mat4x4 const transform = inst.transformMatrix();
-        // The beam mesh runs down the model's local -Y; place the light mid-lower along it.
-        glm::vec3 const world = glm::vec3(transform * glm::vec4(0.0f, -10.0f, 0.0f, 1.0f));
-        glm::vec3 const col = glm::vec3(1.0f, 0.82f, 0.5f) * 0.8f; // warm golden fill (tune intensity)
-        glm::vec3 const d = world - camera_pos;
-        collected.push_back({world, col, 22.0f, glm::dot(d, d)}); // radius 22 (tune)
-        return;
-      }
-
+      // CANON LIGHTING ONLY: do NOT synthesize warm point lights for "hot" props (lightray shafts,
+      // braziers, fires, candles, lava, etc.). Previous code fabricated a warm light from an
+      // emissive-material flag + a filename-keyword guess, which flooded prop-dense rooms (Zul'Farrak
+      // troll camps) with up to 16 fake orange lights = the orange wash. A prop with no AUTHORED M2 light
+      // does not illuminate its surroundings in the real client; only its own emissive material/particles
+      // are visible. We keep ONLY authored lights below (standalone M2 type-1, WMO MOLT, WMO-doodad M2).
       if (m->lights().empty())
       {
         return;
       }
       glm::mat4x4 const transform = inst.transformMatrix();
+      float const inst_scale = glm::length(glm::vec3(transform[0])); // world scale from the placement matrix
       for (auto& l : m->lights())
       {
+        if (l.type != 1) // 0 = directional (the model's key light), 1 = point. Only points are local glows.
+        {
+          continue;
+        }
         glm::vec3 const world = glm::vec3(transform * glm::vec4(l.pos, 1.0f));
-        glm::vec3 const col = l.diffColor.getValue(0, 0, 0) * l.diffIntensity.getValue(0, 0, 0);
+        // Sample the light's animated colour/intensity at the running clock (not frozen time 0) so
+        // campfire/torch/brazier lights flicker from their authored track instead of holding constant.
+        // _world->animtime is the global continuous clock and advances even for effect models whose
+        // per-instance animate() never runs (the same reason texanims are driven on a global clock).
+        int const lt = static_cast<int>(_world->animtime);
+        glm::vec3 const col = l.diffColor.getValue(0, lt, lt) * l.diffIntensity.getValue(0, lt, lt);
+        // Real attenuation radius (attEnd) instead of a magic number. attEnd is model-local, so scale it
+        // to world units; clamp to a sane range so degenerate/zero values still give a usable glow.
+        float const att = l.attEnd.getValue(0, 0, 0) * inst_scale;
+        float const radius = glm::clamp(att, 12.0f, 60.0f);
         glm::vec3 const d = world - camera_pos;
-        collected.push_back({world, col, 18.0f, glm::dot(d, d)});
+        collected.push_back({world, col, radius, glm::dot(d, d)});
       }
     });
 
     // Lightray shafts are usually WMO doodads (e.g. timbermaw_instance.wmo's dusty light set), which
     // the standalone-M2 loop above never sees -- collect their synthetic light here too.
     int lightray_lights = 0;
+    int wmo_molt_lights = 0;
     _world->_model_instance_storage.for_each_wmo_instance([&] (WMOInstance& wmo)
     {
+      // Authored WMO lights (MOLT) -- e.g. Ironforge's 209 forge/torch lights, dungeon braziers. These
+      // are parsed but were never fed to a renderer; wire them into the same point-light set the
+      // terrain/WMO/M2 shaders already consume, so interiors are lit by their real authored lights.
+      if (wmo.wmo.get() && wmo.wmo->finishedLoading() && !wmo.wmo->lights.empty())
+      {
+        glm::mat4x4 const wmo_transform = wmo.transformMatrix();
+        for (auto const& wl : wmo.wmo->lights)
+        {
+          glm::vec3 const world = glm::vec3(wmo_transform * glm::vec4(wl.pos, 1.0f));
+          glm::vec3 const col = glm::vec3(wl.fcolor) * std::max(wl.intensity, 0.0f);
+          float const radius = glm::clamp(wl.r, 6.0f, 60.0f); // MOLT attenuation-end radius
+          glm::vec3 const d = world - camera_pos;
+          collected.push_back({world, col, radius, glm::dot(d, d)});
+          ++wmo_molt_lights;
+        }
+      }
+
       auto* doodads = wmo.get_doodads(false);
       if (!doodads)
       {
@@ -3014,20 +3400,46 @@ void WorldRender::updateLightingUniformBlock(bool draw_fog, glm::vec3 const& cam
         for (auto& doodad : pair.second)
         {
           Model* dm = doodad.model.get();
-          if (!dm || !dm->finishedLoading() || !dm->file_key().hasFilepath()
-              || dm->file_key().filepath().find("lightray_dusty") == std::string::npos)
+          if (!dm || !dm->finishedLoading())
           {
             continue;
           }
-          glm::mat4x4 const transform = doodad.transformMatrix();
-          glm::vec3 const world = glm::vec3(transform * glm::vec4(0.0f, -10.0f, 0.0f, 1.0f));
-          glm::vec3 const col = glm::vec3(1.0f, 0.82f, 0.5f) * 0.8f;
-          glm::vec3 const d = world - camera_pos;
-          collected.push_back({world, col, 22.0f, glm::dot(d, d)});
-          ++lightray_lights;
+
+          // (No synthesized lightray/hot light here either -- canon authored lights only.)
+
+          // Real authored M2 lights on the WMO doodad (candles, lamps, braziers placed inside a WMO).
+          // These were previously dropped -- only the synthesize-when-empty path below ran -- so interior
+          // props with their own light contributed nothing. Collect them like the standalone-M2 loop,
+          // with the animated (flickering) colour sampled on the global clock.
+          if (!dm->lights().empty())
+          {
+            glm::mat4x4 const transform = doodad.transformMatrix();
+            float const inst_scale = glm::length(glm::vec3(transform[0]));
+            int const lt = static_cast<int>(_world->animtime);
+            for (auto& l : dm->lights())
+            {
+              if (l.type != 1) // point lights only
+              {
+                continue;
+              }
+              glm::vec3 const world = glm::vec3(transform * glm::vec4(l.pos, 1.0f));
+              glm::vec3 const col = l.diffColor.getValue(0, lt, lt) * l.diffIntensity.getValue(0, lt, lt);
+              float const att = l.attEnd.getValue(0, 0, 0) * inst_scale;
+              float const radius = glm::clamp(att, 12.0f, 60.0f);
+              glm::vec3 const d = world - camera_pos;
+              collected.push_back({world, col, radius, glm::dot(d, d)});
+            }
+          }
+
+          // (No synthesized "hot prop" light for WMO doodads -- canon authored lights only.)
         }
       }
     });
+
+    // (No synthesized lava-liquid point lights -- canon authored lights only. Lava still self-illuminates
+    // as an emissive SURFACE via the liquid/WMO-unlit shader path; terrain near lava is warmed by its
+    // baked MCCV vertex colours, exactly as in the client. We do not fabricate a dynamic light from it.)
+    int lava_lights = 0;
 
     {
       static bool s_lr_dbg = std::getenv("NOGGIT_LIGHT_DEBUG") != nullptr;
@@ -3036,9 +3448,23 @@ void WorldRender::updateLightingUniformBlock(bool draw_fog, glm::vec3 const& cam
       {
         ++s_lr_log;
         LogError << "LIGHTRAYLIGHTS wmoDoodadBeams=" << lightray_lights
+                 << " wmoMoltLights=" << wmo_molt_lights
+                 << " lavaLights=" << lava_lights
                  << " totalCollected=" << collected.size() << std::endl;
       }
     }
+
+    // Drop any non-finite lights BEFORE sorting: a NaN dist2 (from a bad WMO/M2 light position, radius
+    // or attenuation value) makes the comparator violate strict-weak-ordering, which is undefined
+    // behaviour in std::sort and can crash. Also guard against absurd radii.
+    collected.erase(std::remove_if(collected.begin(), collected.end(),
+                    [] (CollectedLight const& l)
+                    {
+                      return !std::isfinite(l.dist2) || !std::isfinite(l.radius) || l.radius <= 0.0f
+                          || !std::isfinite(l.pos.x) || !std::isfinite(l.pos.y) || !std::isfinite(l.pos.z)
+                          || !std::isfinite(l.color.r) || !std::isfinite(l.color.g) || !std::isfinite(l.color.b);
+                    }),
+                    collected.end());
 
     std::sort(collected.begin(), collected.end(),
               [] (CollectedLight const& a, CollectedLight const& b) { return a.dist2 < b.dist2; });

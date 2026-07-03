@@ -4,6 +4,8 @@
 
 #include <cinttypes>
 #include <cstddef>
+#include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -23,6 +25,9 @@ namespace mysql
     std::uint32_t offhand_inventory_type = 0;
     std::uint32_t ranged_inventory_type = 0;
     std::string name;
+    // Space-separated permanent aura spell ids from creature_template.auras (Turtle/mangos) or
+    // creature_template_addon.auras (AzerothCore). Empty when the schema has neither.
+    std::string auras;
     float template_scale = 1.0f;
     float position_x = 0.0f;
     float position_y = 0.0f;
@@ -75,6 +80,72 @@ namespace mysql
     std::uint32_t type = 0;
     float template_scale = 1.0f;
   };
+
+  // Details of one spell for aura visual resolution + the creature-info UI. Pulled from the server's
+  // spell_template (Turtle/vmangos); on schemas without it (AzerothCore) the map comes back empty.
+  struct SpellInfoRecord
+  {
+    std::uint32_t entry = 0;
+    std::uint32_t spell_visual = 0;
+    std::uint32_t icon_id = 0;
+    std::uint32_t school = 0;
+    std::string name;
+    std::string description;
+    // For resolving description macros ($s1/$o1/$d/$x1/$a1/... incl. cross-spell $12345s1 refs)
+    // into real numbers like the client does.
+    std::int32_t effect_base_points[3] = { 0, 0, 0 };
+    std::int32_t effect_die_sides[3] = { 0, 0, 0 };
+    std::int32_t effect_amplitude[3] = { 0, 0, 0 };
+    std::int32_t effect_chain_target[3] = { 0, 0, 0 };
+    std::int32_t effect_radius_index[3] = { 0, 0, 0 };
+    float effect_multiple_value[3] = { 0.0f, 0.0f, 0.0f };
+    std::uint32_t duration_index = 0;
+    std::uint32_t max_affected_targets = 0;
+    std::uint32_t stack_amount = 0;
+    std::uint32_t proc_charges = 0;
+    std::uint32_t proc_chance = 0;
+    std::uint32_t max_target_level = 0;
+    // Blizzard-style tooltip header (cost / range / cast time).
+    std::uint32_t mana_cost = 0;
+    std::uint32_t power_type = 0;       // 0 mana, 1 rage (stored x10), 2 focus, 3 energy
+    std::uint32_t range_index = 0;      // SpellRange.dbc
+    std::uint32_t casting_time_index = 0; // SpellCastTimes.dbc
+  };
+
+  std::map<std::uint32_t, SpellInfoRecord> getSpellInfos(std::set<std::uint32_t> const& spell_ids, std::string* error = nullptr);
+
+  // Full creature_template details for the creature-info UI (Turtle/vmangos schema; ok=false when the
+  // schema doesn't match, e.g. AzerothCore).
+  struct CreatureTemplateDetails
+  {
+    bool ok = false;
+    std::uint32_t entry = 0;
+    std::string name;
+    std::string subname;
+    std::uint32_t level_min = 0, level_max = 0;
+    std::uint32_t rank = 0;
+    std::uint32_t faction = 0;
+    std::uint32_t npc_flags = 0;
+    std::uint32_t health_min = 0, health_max = 0;
+    std::uint32_t mana_min = 0, mana_max = 0;
+    std::uint32_t gold_min = 0, gold_max = 0;
+    float dmg_min = 0.0f, dmg_max = 0.0f;
+    std::uint32_t armor = 0;
+    std::int32_t holy_res = 0, fire_res = 0, nature_res = 0, frost_res = 0, shadow_res = 0, arcane_res = 0;
+    std::uint32_t display_id = 0;
+    std::uint32_t equipment_id = 0;
+    std::uint32_t unit_class = 0;
+    std::uint32_t type = 0;
+    std::vector<std::uint32_t> spells;  // spell_id1-4 + creature_spells list entries
+    std::vector<std::uint32_t> auras;   // permanent auras
+  };
+
+  CreatureTemplateDetails getCreatureTemplateDetails(std::uint32_t entry, std::string* error = nullptr);
+
+  // Per-display bounding radius (creature_display_info_addon on Turtle, creature_model_info on
+  // vmangos/AC). This is the server's UNIT_FIELD_BOUNDINGRADIUS source -- x creature scale it is the
+  // exact radius the client uses for the ground selection circle.
+  std::map<std::uint32_t, float> getCreatureBoundingRadii(std::string* error = nullptr);
 
   bool testConnection(bool report_only_err = false);
   bool hasMaxUIDStoredDB(std::size_t mapID);

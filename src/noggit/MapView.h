@@ -45,7 +45,9 @@
 
 class World;
 class QCheckBox;
+class QComboBox;
 class QLineEdit;
+class QGroupBox;
 class QListWidget;
 class QListWidgetItem;
 class QPushButton;
@@ -67,6 +69,7 @@ namespace Noggit
   namespace Ui
   {
     class ZoneMusicPlayer;
+    class CreatureInfoPanel;
   }
 
   namespace Ui::Tools
@@ -167,7 +170,7 @@ public:
   Noggit::BoolToggleProperty _draw_model_animations = {true};
   Noggit::BoolToggleProperty _draw_hole_lines = {false};
   Noggit::BoolToggleProperty _draw_models_with_box = {false};
-  Noggit::BoolToggleProperty _draw_fog = {false};
+  Noggit::BoolToggleProperty _draw_fog = {true}; // parity default: in-game always has atmospheric fog (DBC-driven). Toggle off (F12 / Graphics tab) for far editing.
   Noggit::Ui::ZoneMusicPlayer* _zone_music_player = nullptr;
   Noggit::BoolToggleProperty _draw_hidden_models = {false};
   Noggit::BoolToggleProperty _draw_occlusion_boxes = {false};
@@ -314,6 +317,10 @@ public:
 
   [[nodiscard]]
   QWidget *getLeftSecondaryToolbar();
+
+  // Show/hide the "Quick Facts" creature-info window (creature secondary toolbar checkbox). The
+  // window is a free-floating tool window the user can move around.
+  void setCreatureInfoPanelVisible(bool visible);
 
   [[nodiscard]]
   QWidget* getActiveStampModeItem();
@@ -482,6 +489,23 @@ private:
   QCheckBox* _gameobject_zone_filter = nullptr;
   QListWidget* _creature_list_widget = nullptr;
   QLabel* _creature_browser_status = nullptr;
+  // Type/rank filter for the current-map creature browser (same controls as the model picker). Looked
+  // up per spawn by entry from _creature_template_filter_info (filled when the model picker loads
+  // creature_template).
+  QComboBox* _creature_browser_type_filter = nullptr;
+  QCheckBox* _creature_browser_elite = nullptr;
+  QCheckBox* _creature_browser_boss = nullptr;
+  QCheckBox* _creature_browser_civilian = nullptr;
+  QCheckBox* _creature_browser_trainer = nullptr;
+  struct CreatureFilterInfo
+  {
+    std::uint32_t creature_type = 0;
+    std::uint32_t rank = 0;
+    std::uint32_t type_flags = 0;
+    std::uint32_t flags_extra = 0;
+    std::uint32_t npc_flags = 0;
+  };
+  std::unordered_map<std::uint32_t, CreatureFilterInfo> _creature_template_filter_info;
   // guid -> resolved zone id cache for the "Zone only" browser filter (only valid ids cached, so
   // spawns in not-yet-loaded tiles get retried). Cleared on spawn reload.
   std::unordered_map<std::uint32_t, unsigned int> _creature_zone_cache;
@@ -490,10 +514,23 @@ private:
   QLabel* _creature_model_picker_status = nullptr;
 
   QLabel* _creature_editor_info = nullptr;
+  // "Quick Facts" dropdown (creature_template stats + spell/aura icons) toggled from the creature
+  // secondary toolbar; refreshed on spawn selection change.
+  Noggit::Ui::CreatureInfoPanel* _creature_info_panel = nullptr;
   QDoubleSpinBox* _spawn_edit_x = nullptr;
   QDoubleSpinBox* _spawn_edit_y = nullptr;
   QDoubleSpinBox* _spawn_edit_z = nullptr;
   QDoubleSpinBox* _spawn_edit_orientation = nullptr;
+
+  // "Edit/New Creature" form fields -- populated from the selected spawn so its guid/entry/display show.
+  QGroupBox* _creature_spawn_box = nullptr;
+  QLineEdit* _creature_spawn_guid_field = nullptr;
+  QLineEdit* _creature_spawn_entry_field = nullptr;
+  QLineEdit* _creature_spawn_display_field = nullptr;
+  QGroupBox* _gameobject_spawn_box = nullptr;
+  QLineEdit* _gameobject_spawn_guid_field = nullptr;
+  QLineEdit* _gameobject_spawn_entry_field = nullptr;
+  QLineEdit* _gameobject_spawn_display_field = nullptr;
 
   std::optional<std::uint32_t> _selected_creature_spawn_guid;
   std::optional<std::uint32_t> _hovered_creature_spawn_guid;
@@ -515,6 +552,10 @@ private:
   QLineEdit* _gameobject_search_field = nullptr;
   QListWidget* _gameobject_list_widget = nullptr;
   QLabel* _gameobject_browser_status = nullptr;
+  // Type filter for the current-map gameobject browser (gameobjects only have a type, no rank/elite).
+  // Looked up per spawn entry from _gameobject_template_filter_type (filled by the model picker).
+  QComboBox* _gameobject_browser_type_filter = nullptr;
+  std::unordered_map<std::uint32_t, std::uint32_t> _gameobject_template_filter_type;
 
   QLabel* _gameobject_editor_info = nullptr;
   QDoubleSpinBox* _go_spawn_edit_x = nullptr;
@@ -606,7 +647,7 @@ private:
   void selectCreatureSpawnsInArea(QRect const& rect, bool add_to_selection = true);
   void refreshCreatureEditorKnobs();
   void setHoveredCreatureSpawn(std::optional<std::uint32_t> guid);
-  std::optional<std::uint32_t> findCreatureSpawnAtCursor() const;
+  std::optional<std::uint32_t> findCreatureSpawnAtCursor(); // mesh-first pick (non-const: intersect)
   void updateCreatureSpawnHover(QPoint const& global_pos);
   bool tryStartCreatureSpawnDrag();
   void translateSelectedCreatureSpawns(glm::vec3 const& delta);
@@ -630,9 +671,10 @@ private:
   void selectGameObjectSpawnsInArea(QRect const& rect, bool add_to_selection = true);
   void refreshGameObjectEditorKnobs();
   void setHoveredGameObjectSpawn(std::optional<std::uint32_t> guid);
-  std::optional<std::uint32_t> findGameObjectSpawnAtCursor() const;
+  std::optional<std::uint32_t> findGameObjectSpawnAtCursor(); // mesh-first pick (non-const: intersect)
   void updateGameObjectSpawnHover(QPoint const& global_pos);
   bool tryStartGameObjectSpawnDrag();
+  void translateSelectedGameObjectSpawns(glm::vec3 const& delta);
   void updateSelectedGameObjectSpawnPosition(glm::vec3 const& pos);
   void showSelectedGameObjectSpawnMenu(QPoint const& global_pos);
   void discardPendingGameObjectSpawns();

@@ -526,12 +526,26 @@ void PreviewRenderer::setLightDirection(float y, float z)
 
 void PreviewRenderer::update_emitters(float dt)
 {
-  while (dt > 0.1f)
+  // Advance ONLY this preview's own models -- NOT the global ModelManager (which ticks EVERY loaded model's
+  // particles/animation). The main MapView already ticks the global set once per frame; when a tool's
+  // preview was also open it called the global update a SECOND time, so every creature in the main scene
+  // animated at ~2x speed (and got out of sync with its bones). Updating just _model_instances keeps the
+  // preview animated without touching the main scene.
+  for (auto& instance : _model_instances)
   {
-    ModelManager::updateEmitters(0.1f);
-    dt -= 0.1f;
+    if (!instance.model->finishedLoading())
+    {
+      continue;
+    }
+
+    float remaining = dt;
+    while (remaining > 0.1f)
+    {
+      instance.model->updateEmitters(0.1f);
+      remaining -= 0.1f;
+    }
+    instance.model->updateEmitters(remaining);
   }
-  ModelManager::updateEmitters(dt);
 }
 
 void PreviewRenderer::tick(float dt)

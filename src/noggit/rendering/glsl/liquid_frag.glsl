@@ -185,6 +185,7 @@ void main()
   {
     // Slime scroll at quarter speed, matching lava (divisor x4: 2880 -> 11520).
     out_color = get_tex_color(tex_coord_ + vec2(anim_uv.x*animtime / 11520.0, anim_uv.y*animtime / 11520.0), tex_array, tex_frame);
+    out_color.a = min(out_color.a, 0.85); // keep below the emissive bloom range (lava-only)
   }
   else
   {
@@ -211,7 +212,9 @@ void main()
               : mix (RiverColorLight, RiverColorDark, color_depth)
               ;
 
-    out_color = vec4(clamp(texel.rgb + lerp.rgb, 0.0, 1.0), max(lerp.a, alpha_depth) * water_alpha_mult);
+    // Cap water alpha at 0.85: the bloom bright-pass reserves alpha >0.88 for EMISSIVE surfaces (lava
+    // writes 1.0), so deep water must not stray into that range and bloom.
+    out_color = vec4(clamp(texel.rgb + lerp.rgb, 0.0, 1.0), min(max(lerp.a, alpha_depth) * water_alpha_mult, 0.85));
   }
 
   if (FogColor_FogOn.w != 0 && type != 2) // reference applies no fog to lava

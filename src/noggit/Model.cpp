@@ -145,7 +145,12 @@ namespace
     }
 
     auto const& path = model->file_key().filepath();
-    if (path.starts_with("character/") || path.starts_with("creature/"))
+    // Character (player) models are excluded -- their attachments/effects are driven separately and
+    // were never part of the classic-effect particle work. CREATURE models ARE included now: arcane
+    // elementals / ghosts / mana fiends etc. carry on-body sparkle/energy emitters (e.g. Anomalus' 8
+    // emitters) that the client shows, and creature SPAWNS draw them via ModelRender::drawParticlesForInstance.
+    // (Previously creatures were excluded too, which is why no spawn ever emitted particles.)
+    if (path.starts_with("character/"))
     {
       return false;
     }
@@ -756,6 +761,19 @@ void Model::calcClassicStaticBones(glm::mat4x4 const& model_view)
     }
 
     bone_matrices[i] = matrix;
+
+    // Particle emitters attach to bones by reading the WotLK-style Bone objects: model->bones[bone].mat
+    // (spawn position) and .mrot (emission direction). But the classic static-bone path computes matrices
+    // ONLY into bone_matrices (which the BODY shader uses) and leaves bones[].mat at its ZERO default -- so
+    // every emitter spawned its particles at the model origin (0,0,0) emitting straight up (verified via the
+    // [PARTDBG] log: boneWorldPos/spawnPos were all 0). Mirror the computed matrix into the matching Bone so
+    // emitters attach at the correct bone position/orientation. (Bind-pose = identity here, so this puts
+    // each emitter at its AUTHORED model-space position -- the arms/shoulders/feet -- instead of the origin.)
+    if (i < bones.size())
+    {
+      bones[i].mat = matrix;
+      bones[i].mrot = glm::mat4x4(glm::mat3x3(matrix));
+    }
   }
 }
 
@@ -924,6 +942,62 @@ void Model::initCommon(const BlizzardArchive::ClientFile& f)
 {
   // vertices, normals, texcoords
   _vertices = M2Array<ModelVertex>(f, header.ofsVertices, header.nVertices);
+
+  // Ground-footprint radius of the RENDER mesh, computed from the RAW M2 vertices (before the
+  // Z-up -> Y-up coord fix below), so the horizontal plane is M2 XY. The client sizes its selection
+  // circle from this (particle-free) body extent, not header.bounding_box_radius. Radius is measured
+  // from the mesh's horizontal centre (not the origin) so off-centre rigs don't skew it.
+  if (!_vertices.empty())
+  {
+    float xmin = _vertices[0].position.x, xmax = xmin;
+    float ymin = _vertices[0].position.y, ymax = ymin;
+    for (auto const& v : _vertices)
+    {
+      xmin = std::min(xmin, v.position.x); xmax = std::max(xmax, v.position.x);
+      ymin = std::min(ymin, v.position.y); ymax = std::max(ymax, v.position.y);
+    }
+    float const cx = 0.5f * (xmin + xmax);
+    float const cy = 0.5f * (ymin + ymax);
+    float r2 = 0.f;
+    for (auto const& v : _vertices)
+    {
+      float const dx = v.position.x - cx, dy = v.position.y - cy;
+      r2 = std::max(r2, dx * dx + dy * dy);
+    }
+    footprint_radius = std::sqrt(r2);
+  }
+
+  // EXACT client selection-circle base radius (see Model.h). Read the STAND animation (anim id 0)
+  // sequence's own bounding box from the raw M2 (classic layout: sequence array is 0x44-byte records,
+  // bounds_min @ +0x24, bounds_max @ +0x30), then base = sqrt( sqrt(dx^2 + dy^2) * 0.5 ). dx/dy are
+  // the M2 (Z-up) X/Y extents, read pre-fixCoordSystem, matching the client's math exactly.
+  if (_uses_classic_layout)
+  {
+    char const* const buf = f.getBuffer();
+    std::size_t const fsize = f.getSize();
+    std::uint32_t const n_anim = *reinterpret_cast<std::uint32_t const*>(buf + 0x1c);
+    std::uint32_t const ofs_anim = *reinterpret_cast<std::uint32_t const*>(buf + 0x20);
+    constexpr std::size_t kSeqStride = 0x44;
+    if (ofs_anim && n_anim && ofs_anim + static_cast<std::size_t>(n_anim) * kSeqStride <= fsize)
+    {
+      for (std::uint32_t i = 0; i < n_anim; ++i)
+      {
+        char const* const seq = buf + ofs_anim + static_cast<std::size_t>(i) * kSeqStride;
+        std::uint16_t const anim_id = *reinterpret_cast<std::uint16_t const*>(seq);
+        if (anim_id != 0) continue; // stand/idle
+        auto const* mn = reinterpret_cast<float const*>(seq + 0x24);
+        auto const* mx = reinterpret_cast<float const*>(seq + 0x30);
+        float const dx = mx[0] - mn[0];
+        float const dy = mx[1] - mn[1];
+        float const diag = std::sqrt(dx * dx + dy * dy);
+        if (diag > 0.001f)
+        {
+          selection_base_radius = std::sqrt(diag * 0.5f);
+        }
+        break;
+      }
+    }
+  }
 
   for (auto& v : _vertices)
   {
@@ -1483,7 +1557,67 @@ void Model::initCommon(const BlizzardArchive::ClientFile& f)
       }
     }
 
+    // Compact "glow/mist core" placeholder mesh (Anomalus MANAMISTBASE, Arcane Anomaly/ShadeWhite
+    // CYAN_GLOW3, ManaFiend GENERICGLOW): a high-detail sphere crammed at the model core that renders as an
+    // out-of-place bright "pill"/orb in the torso. The live 1.12 client does NOT draw it (verified via
+    // apitrace of Anomalus + Arcane Anomaly: the ~180-tri core submesh is never issued -- the client draws
+    // body + additive glows + particles instead). All geoset ids are 0 so there's no visibility flag; the
+    // reliable signal is GEOMETRIC and calibrated against both models: the core is uniquely COMPACT (max
+    // bbox extent < 20% of the whole model) AND DENSE (> 100 triangles) AND roughly 3D-spherical (min
+    // extent > 30% of max). Everything the client DOES draw is either large (body, ~75-100% of the model)
+    // or low-poly (<=40 tris) or a flat billboard glow (Purple_Glow/runes: min extent ~0), so this hits
+    // ONLY the core sphere. Skip it to match the client -- kills the pill on every arcane elemental with no
+    // filename list. (Replaces the earlier narrower particle-texture skip, which only caught Anomalus.)
+    if (_uses_classic_layout && file_key().hasFilepath()
+        && file_key().filepath().starts_with("creature/")
+        && range_fits(f, header.ofsVertices, header.nVertices, sizeof(ModelVertex)))
+    {
+      auto const* verts = reinterpret_cast<ModelVertex const*>(f.getBuffer() + header.ofsVertices);
+      glm::vec3 model_lo(1e30f), model_hi(-1e30f);
+      for (uint32_t v = 0; v < header.nVertices; ++v)
+      {
+        model_lo = glm::min(model_lo, verts[v].position);
+        model_hi = glm::max(model_hi, verts[v].position);
+      }
+      glm::vec3 const model_size = model_hi - model_lo;
+      float const model_extent = std::max({model_size.x, model_size.y, model_size.z});
+
+      for (size_t i = 0; i < view->n_submesh; ++i)
+      {
+        auto const& geo = model_geosets[i];
+        if ((geo.icount / 3) <= 100) continue; // dense only -- excludes low-poly body parts / billboards
+        if (static_cast<uint32_t>(geo.vstart) + geo.vcount > header.nVertices) continue;
+        glm::vec3 lo(1e30f), hi(-1e30f);
+        for (uint32_t v = geo.vstart; v < static_cast<uint32_t>(geo.vstart) + geo.vcount; ++v)
+        {
+          lo = glm::min(lo, verts[v].position);
+          hi = glm::max(hi, verts[v].position);
+        }
+        glm::vec3 const size = hi - lo;
+        float const maxe = std::max({size.x, size.y, size.z});
+        float const mine = std::min({size.x, size.y, size.z});
+        if (model_extent > 0.0001f && maxe > 0.0001f
+            && maxe < 0.20f * model_extent    // compact vs the whole model
+            && mine > 0.30f * maxe)           // 3D blob, not a flat billboard card
+        {
+          showGeosets[i] = false;
+        }
+      }
+    }
+
     _render_flags = M2Array<ModelRenderFlags>(f, header.ofsRenderFlags, header.nRenderFlags);
+
+    // Mark the model as a light emitter if any material is UNLIT + additive (No_Add_Alpha=3 / Add=4) --
+    // the self-illuminated glow layer of fires/braziers/lamps/lava props. Used to synthesize a warm
+    // point light for hot doodads that carry no authored M2 light (data-driven, replaces filename keywords).
+    for (std::size_t i = 0; i < _render_flags.size(); ++i)
+    {
+      if (_render_flags[i].flags.unlit && (_render_flags[i].blend == 3 || _render_flags[i].blend == 4))
+      {
+        _emits_light = true;
+        break;
+      }
+    }
 
     _renderer.initRenderPasses(view, texture_unit, model_geosets);
 
@@ -1772,8 +1906,12 @@ void Model::initAnimated(const BlizzardArchive::ClientFile& f)
 
         emitter.rows = clamp_classic_particle_int16(emitter.rows, 1, 16);
         emitter.cols = clamp_classic_particle_int16(emitter.cols, 1, 16);
+        // Keep blend clamped to 0-4: the hand-tuned dusty light-ray motes (and other classic FX) were
+        // balanced around this, and widening it to 0-7 reintroduced wrong blend (black-outlined motes).
         emitter.blend = static_cast<std::uint16_t>(std::clamp(static_cast<int>(emitter.blend), 0, 4));
-        if (emitter.EmitterType != 1 && emitter.EmitterType != 2)
+        // EmitterType 3 = SPLINE (e.g. the MC flamecircle ring): keep it so the spline emission path can
+        // run. Only force unknown types to 1 (Plane). 1=Plane, 2=Sphere, 3=Spline.
+        if (emitter.EmitterType != 1 && emitter.EmitterType != 2 && emitter.EmitterType != 3)
         {
           emitter.EmitterType = 1;
         }
@@ -1871,6 +2009,20 @@ void Model::initAnimated(const BlizzardArchive::ClientFile& f)
       _ribbons.emplace_back(this, f, rdefs[i], _global_sequences.data(), _context);
     }
   }
+  else if (_uses_classic_layout && header.nRibbonEmitters
+           && range_fits(f, header.ofsRibbonEmitters, header.nRibbonEmitters, sizeof(ClassicModelRibbonEmitterDef)))
+  {
+    // Classic 1.12 ribbon trails: mount/weapon/spell trails, phoenix tails, Kael'thas, fire sprites
+    // (217 vanilla models). The WotLK path above used the 176-byte def and was gated to !classic, so
+    // every vanilla trail was invisible. The 220-byte ClassicModelRibbonEmitterDef carries the same
+    // fields with ClassicAnimationBlock tracks. Setup (Model::animate) and draw (ModelRender) iterate
+    // _ribbons regardless of layout, so populating it here is all that's needed.
+    _ribbons.reserve(header.nRibbonEmitters);
+    auto const* rdefs = reinterpret_cast<ClassicModelRibbonEmitterDef const*>(f.getBuffer() + header.ofsRibbonEmitters);
+    for (size_t i = 0; i < header.nRibbonEmitters; ++i) {
+      _ribbons.emplace_back(this, f, rdefs[i], _global_sequences.data(), _context);
+    }
+  }
   
 
   // init lights
@@ -1907,6 +2059,71 @@ void Model::calcBones(glm::mat4x4 const& model_view
                      , int animation_time
                      )
 {
+  // Derive each billboard glow card's local texture basis (normal / up / right) from its geometry + UVs,
+  // once, so the screen-aligned billboard can align the card's authored texture-up with screen up (some
+  // cards are authored rolled 90deg in their local plane and were rendered sideways by a fixed mapping).
+  if (!_bb_bases_computed)
+  {
+    _bb_bases_computed = true;
+    for (size_t bi = 0; bi < bones.size(); ++bi)
+    {
+      if (!bones[bi].flags.billboard) continue;
+
+      // gather this card's vertices (dominant weight on this bone)
+      ModelVertex const* v0 = nullptr;
+      ModelVertex const* v1 = nullptr;
+      ModelVertex const* v2 = nullptr;
+      for (auto const& v : _vertices)
+      {
+        if (v.bones[0] != static_cast<uint8_t>(bi)) continue;
+        if (!v0) { v0 = &v; continue; }
+        // pick two more verts that give non-degenerate UV + position triangles
+        if (!v1 && (v.texcoords[0] != v0->texcoords[0])) { v1 = &v; continue; }
+        if (v1 && !v2)
+        {
+          glm::vec2 duv1 = v1->texcoords[0] - v0->texcoords[0];
+          glm::vec2 duv2 = v.texcoords[0] - v0->texcoords[0];
+          float const cross_uv = duv1.x * duv2.y - duv2.x * duv1.y;
+          if (std::abs(cross_uv) > 1e-8f) { v2 = &v; break; }
+        }
+      }
+      if (!v0 || !v1 || !v2) continue;
+
+      glm::vec3 const p0 = fixCoordSystem(v0->position);
+      glm::vec3 const p1 = fixCoordSystem(v1->position);
+      glm::vec3 const p2 = fixCoordSystem(v2->position);
+      glm::vec3 const e1 = p1 - p0;
+      glm::vec3 const e2 = p2 - p0;
+      glm::vec2 const duv1 = v1->texcoords[0] - v0->texcoords[0];
+      glm::vec2 const duv2 = v2->texcoords[0] - v0->texcoords[0];
+
+      float const det = duv1.x * duv2.y - duv2.x * duv1.y;
+      if (std::abs(det) < 1e-8f) continue;
+      float const r = 1.0f / det;
+      // tangent = local dir of increasing U; bitangent = local dir of increasing V
+      glm::vec3 const tangent   = (e1 * duv2.y - e2 * duv1.y) * r;
+      glm::vec3 const bitangent = (e2 * duv1.x - e1 * duv2.x) * r;
+
+      glm::vec3 normal = glm::cross(e1, e2);
+      if (glm::length(normal) < 1e-8f || glm::length(bitangent) < 1e-8f) continue;
+      normal = glm::normalize(normal);
+
+      // Texture V increases downward in BLPs, so screen-up follows DECREASING V = -bitangent. Orthonormalize
+      // against the card normal, then complete a right-handed frame.
+      glm::vec3 up = -bitangent;
+      up = up - normal * glm::dot(up, normal);
+      if (glm::length(up) < 1e-8f) continue;
+      up = glm::normalize(up);
+      glm::vec3 right = glm::normalize(glm::cross(up, normal));
+      // keep 'right' pointing along increasing U so the texture isn't mirrored
+      if (glm::dot(right, tangent) < 0.0f) { right = -right; }
+
+      bones[bi].bb_local_normal = normal;
+      bones[bi].bb_local_up = up;
+      bones[bi].bb_local_right = right;
+    }
+  }
+
   for (size_t i = 0; i<header.nBones; ++i)
   {
     bones[i].calc = false;
@@ -1936,6 +2153,85 @@ void Model::calcBones(glm::mat4x4 const& model_view
                << std::endl;
     }
   }
+
+}
+
+float Model::idlePoseFootprint()
+{
+  if (_idle_footprint_radius >= 0.f)
+  {
+    return _idle_footprint_radius;
+  }
+  // Default: the bind-pose footprint (correct for creatures without folding appendages).
+  _idle_footprint_radius = footprint_radius;
+
+  if (!animBones || _vertices.empty() || bones.empty())
+  {
+    return _idle_footprint_radius;
+  }
+  // Locate the stand/idle sequence (anim id 0).
+  auto const id_it = _animations_seq_per_id.find(0);
+  if (id_it == _animations_seq_per_id.end() || id_it->second.empty())
+  {
+    return _idle_footprint_radius;
+  }
+  int const seq = static_cast<int>(id_it->second.begin()->second.Index);
+
+  // Pose the skeleton at idle t=0. model_view is identity: it only affects screen-aligned billboard
+  // glow cards, which are a negligible fraction of the body footprint. This transiently overwrites the
+  // bone matrices; the next per-frame animate() recomputes them, so it is safe.
+  try
+  {
+    calcBones(glm::mat4x4(1.f), seq, 0, 0);
+  }
+  catch (...)
+  {
+    return _idle_footprint_radius;
+  }
+
+  // CPU-skin every render vertex with the posed bone matrices (same math the body shader does),
+  // then measure the horizontal (XZ, since editor space is Y-up) footprint from its centre.
+  float xmin = 1e30f, xmax = -1e30f, zmin = 1e30f, zmax = -1e30f;
+  std::vector<glm::vec2> pts;
+  pts.reserve(_vertices.size());
+  for (auto const& v : _vertices)
+  {
+    glm::vec4 p(0.f);
+    float wsum = 0.f;
+    for (int b = 0; b < 4; ++b)
+    {
+      uint8_t const w = v.weights[b];
+      if (!w) continue;
+      uint8_t const bi = v.bones[b];
+      if (bi >= bones.size()) continue;
+      p += (static_cast<float>(w) / 255.f) * (bones[bi].mat * glm::vec4(v.position, 1.f));
+      wsum += static_cast<float>(w) / 255.f;
+    }
+    glm::vec3 const pos = (wsum > 0.01f) ? glm::vec3(p) : v.position;
+    xmin = std::min(xmin, pos.x); xmax = std::max(xmax, pos.x);
+    zmin = std::min(zmin, pos.z); zmax = std::max(zmax, pos.z);
+    pts.emplace_back(pos.x, pos.z);
+  }
+  if (pts.empty())
+  {
+    return _idle_footprint_radius;
+  }
+  float const cx = 0.5f * (xmin + xmax);
+  float const cz = 0.5f * (zmin + zmax);
+  float r2 = 0.f;
+  for (auto const& pt : pts)
+  {
+    float const dx = pt.x - cx, dz = pt.y - cz;
+    r2 = std::max(r2, dx * dx + dz * dz);
+  }
+  float const r = std::sqrt(r2);
+  if (r > 0.01f)
+  {
+    _idle_footprint_radius = r;
+  }
+  LogDebug << "[SELCIRCLE] model='" << _file_key.stringRepr() << "' bindFP=" << footprint_radius
+           << " idleFP=" << _idle_footprint_radius << std::endl;
+  return _idle_footprint_radius;
 }
 
 void Model::animate(glm::mat4x4 const& model_view, int anim_id, int anim_time)
@@ -1989,6 +2285,29 @@ void Model::animate(glm::mat4x4 const& model_view, int anim_id, int anim_time)
     tmax = 1;
   }
   int t = anim_time % tmax;
+
+  // [TMAXDBG] one-time: is the anomalus stand animation long enough for its particle enabled tracks
+  // (timestamps up to ~53s) to be reached by the per-animation looped time?
+  {
+    static int tmaxdbg = 0;
+    if (tmaxdbg < 1 && _file_key.hasFilepath()
+        && _file_key.filepath().find("anomalus") != std::string::npos)
+    {
+      ++tmaxdbg;
+      LogDebug << "[TMAXDBG] anomalus anim_id=" << anim_id << " tmax=" << tmax
+               << " anim_time=" << anim_time << " t=" << t
+               << " seq_buckets=" << _animations_seq_per_id[anim_id].size() << std::endl;
+      for (auto const& id_kv : _animations_seq_per_id)
+      {
+        std::ostringstream seqs;
+        for (auto const& sub : id_kv.second)
+        {
+          seqs << "sub" << sub.first << "->seq" << sub.second.Index << "(len" << sub.second.length << "),";
+        }
+        LogDebug << "[ANIMMAP] anomalus anim_id=" << id_kv.first << " : " << seqs.str() << std::endl;
+      }
+    }
+  }
   int current_sub_anim = 0;
   int time_for_anim = t;
 
@@ -2009,7 +2328,7 @@ void Model::animate(glm::mat4x4 const& model_view, int anim_id, int anim_time)
   _anim_time = _uses_classic_layout ? time_for_anim : t;
   _global_animtime = anim_time;
 
-  if (animBones) 
+  if (animBones)
   {
     calcBones(model_view, _current_anim_seq, _anim_time, _global_animtime);
   }
@@ -2154,6 +2473,8 @@ ModelLight::ModelLight(const BlizzardArchive::ClientFile& f, const ModelLightDef
   , ambColor (mld.ambColor, f, global)
   , diffIntensity (mld.intensity, f, global)
   , ambIntensity (mld.ambIntensity, f, global)
+  , attStart (mld.attStart, f, global)
+  , attEnd (mld.attEnd, f, global)
 {}
 
 // Classic (1.12) light: same leading fields, animated tracks in the older ClassicAnimationBlock form.
@@ -2168,6 +2489,8 @@ ModelLight::ModelLight(const BlizzardArchive::ClientFile& f, const ClassicModelL
   , ambColor (mld.ambColor, f, global)
   , diffIntensity (mld.intensity, f, global)
   , ambIntensity (mld.ambIntensity, f, global)
+  , attStart (mld.attStart, f, global)
+  , attEnd (mld.attEnd, f, global)
 {}
 
 void ModelLight::setup(int time, OpenGL::light, int animtime)
@@ -2342,19 +2665,6 @@ void Bone::calcMatrix(glm::mat4x4 const& model_view
       }
     }
 
-    if (flags.billboard)
-    {
-        glm::vec3 vRight = model_view[0];
-        glm::vec3 vUp = model_view[1]; 
-    	vRight =  glm::vec3(vRight.x * -1, vRight.y * -1, vRight.z * -1);
-        m[0][2] = vRight.x;
-        m[1][2] = vRight.y;
-        m[2][2] = vRight.z;
-        m[0][1] = vUp.x;
-        m[1][1] = vUp.y;
-        m[2][1] = vUp.z;
-    }
-
     m = glm::translate(m, -pivot);
   }
 
@@ -2366,6 +2676,43 @@ void Bone::calcMatrix(glm::mat4x4 const& model_view
   else
   {
     mat = m;
+  }
+
+  // Spherical billboard: applied to the FINAL (model-space) matrix, AFTER the parent hierarchy -- so the
+  // card faces the camera no matter how the animated parent bone is oriented. The old code baked the
+  // billboard into the LOCAL matrix before the parent multiply, so a moving parent bone (e.g. Anomalus's
+  // arm) rotated the Purple_Glow glow card away from the viewer instead of keeping it camera-facing.
+  // We keep the pivot wherever the hierarchy places it (so the card still follows the arm) and only
+  // overwrite the ORIENTATION with the camera basis. Same vRight/vUp convention as before, so bones whose
+  // parent doesn't rotate render identically to the previous behaviour (mathematically equivalent when the
+  // parent rotation is identity).
+  if (flags.billboard)
+  {
+    // Screen-aligned spherical billboard on the FINAL model-space matrix -- the card stays in the camera
+    // plane (never inheriting the animated arm bone's rotation, which would swing the far-offset card
+    // around), while its pivot follows the hierarchy so it stays glued to the body. model_view is the full
+    // model->view matrix (camera view * this spawn's world transform), so the camera axes expressed in this
+    // instance's MODEL space are the ROWS of its 3x3. Card lies in the bone's local Y/Z plane (normal =
+    // local X): map local X -> view axis, local Y -> screen right, local Z -> screen up.
+    glm::vec3 const camRight = glm::normalize(glm::vec3(model_view[0][0], model_view[1][0], model_view[2][0]));
+    glm::vec3 const camUp    = glm::normalize(glm::vec3(model_view[0][1], model_view[1][1], model_view[2][1]));
+    glm::vec3 const camFwd   = glm::normalize(glm::vec3(model_view[0][2], model_view[1][2], model_view[2][2]));
+
+    glm::vec4 const world_pivot = mat * glm::vec4(pivot, 1.0f);
+
+    // Map the card's OWN texture basis to the screen: local normal -> view axis, texture-right -> screen
+    // right, texture-up -> screen up. bb = Camera * transpose(Local) since the local basis is orthonormal.
+    glm::mat3 const cam(camFwd, camRight, camUp);                                   // columns
+    glm::mat3 const local(bb_local_normal, bb_local_right, bb_local_up);            // columns
+    glm::mat3 const bb3 = cam * glm::transpose(local);
+
+    glm::mat4x4 bb(1.0f);
+    bb[0] = glm::vec4(bb3[0], 0.0f);
+    bb[1] = glm::vec4(bb3[1], 0.0f);
+    bb[2] = glm::vec4(bb3[2], 0.0f);
+    glm::vec4 const rotated_pivot = bb * glm::vec4(pivot, 1.0f);
+    bb[3] = glm::vec4(glm::vec3(world_pivot) - glm::vec3(rotated_pivot), 1.0f);
+    mat = bb;
   }
 
   // transform matrix for normal vectors ... ??
@@ -2454,6 +2801,56 @@ void Model::lightsOff(OpenGL::light lbase)
 }
 
 
+void Model::swapInstanceEmitterState(std::uint64_t instance_key)
+{
+  if (_particles.empty())
+  {
+    return;
+  }
+
+  auto& states = _instance_emitter_states[instance_key];
+  if (states.size() != _particles.size())
+  {
+    // First time this spawn is seen: default (empty, not-prewarmed) states. Swapping these in and running
+    // update() will pre-warm them to steady state, so the spawn's particles appear populated immediately.
+    states.assign(_particles.size(), ParticleSystemLiveState{});
+  }
+
+  for (std::size_t i = 0; i < _particles.size(); ++i)
+  {
+    _particles[i].swapLiveState(states[i]);
+  }
+}
+
+void Model::updateParticleSystems(float dt)
+{
+  if (!finished)
+  {
+    return;
+  }
+  for (auto& particle : _particles)
+  {
+    particle.update(dt);
+  }
+}
+
+void Model::dropInstanceEmitterState(std::uint64_t instance_key)
+{
+  _instance_emitter_states.erase(instance_key);
+}
+
+bool Model::particlesRideParent() const
+{
+  for (auto const& particle : _particles)
+  {
+    if (particle.emitterFlags() & 0x10)
+    {
+      return true;
+    }
+  }
+  return false;
+}
+
 void Model::updateEmitters(float dt)
 {
   if (finished)
@@ -2472,20 +2869,22 @@ void Model::updateEmitters(float dt)
     {
       _emitter_anim_accum_ms += dt * 1000.0f;
 
-      // Volumetric light-ray dust scrolls extremely slowly with the raw authored track (~0.04 UV/s),
-      // which reads as static in the editor even though it's technically animating; in-game the dusty
-      // texture visibly streams down the shaft. Run the scroll clock faster for these models so the
-      // dust actually flows. Scoped by path so lava falls / water / other UV anims keep real timing.
-      float tex_clock = _emitter_anim_accum_ms;
-      if (_file_key.hasFilepath()
-          && _file_key.filepath().find("volumetriclight") != std::string::npos)
-      {
-        tex_clock *= 2.0f;
-      }
-      int const animtime = static_cast<int>(tex_clock);
+      // Feed the same continuous clock as BOTH the local animation time and the global-sequence
+      // time. Classic texanims split two ways (verified by parsing the assets against Noggit's
+      // ClassicModelHeader offsets):
+      //   seq == -1  -> indexed by the track's OWN timestamps (AnimatedValue::getValue does
+      //                 time %= max_time). The lava falls (BlackRockLavaFalls01: 6 tracks, 3333ms
+      //                 loop, ~0.3 UV/s) and waterfalls (ElwynnTallWaterfall01: 2 tracks, 10000ms)
+      //                 are all seq == -1 -- they were frozen only because _anim_time stayed 0.
+      //   seq >=  0  -> indexed by the global-sequence duration (animtime % globalSequences[id]).
+      //                 The light-ray dust (Lightray_Dusty_01: 1 track, global seq 0 = 133333ms,
+      //                 0 -> -5.107 V = ~0.038 UV/s) rides this.
+      // The authored track timestamps / global-sequence durations are the real scroll speed -- no
+      // path-scoped clock scaling. (Previously: 2x for volumetriclight, which was synthetic.)
+      int const clock = static_cast<int>(_emitter_anim_accum_ms);
       for (auto& tex_anim : _texture_animations)
       {
-        tex_anim.calc(_current_anim_seq, _anim_time, animtime);
+        tex_anim.calc(_current_anim_seq, clock, clock);
       }
     }
   }

@@ -30,7 +30,8 @@ namespace Noggit::Rendering
     eWMOBatch_HasMOCV = 0x2,
     eWMOBatch_Unlit = 0x4,
     eWMOBatch_Unfogged = 0x8,
-    eWMOBatch_Collision = 0x10
+    eWMOBatch_Collision = 0x10,
+    eWMOBatch_Sidn = 0x20 // material is Self-Illuminated Day/Night (windows glow at night)
   };
 
   struct WMOCombinedDrawCall

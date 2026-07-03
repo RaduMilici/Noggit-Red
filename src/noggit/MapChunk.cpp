@@ -1415,7 +1415,8 @@ void MapChunk::save(sExtendableArray& lADTFile
                     , int& lMCIN_Position
                     , std::map<std::string, int> &lTextures
                     , std::vector<WMOInstance*> &lObjectInstances
-                    , std::vector<ModelInstance*>& lModelInstances)
+                    , std::vector<ModelInstance*>& lModelInstances
+                    , bool write_mclq)
 {
   int lID;
   int lMCNK_Size = 0x80;
@@ -1430,7 +1431,28 @@ void MapChunk::save(sExtendableArray& lADTFile
 
   header_flags.flags.do_not_fix_alpha_map = 1;
 
-  lMCNK_header->flags = header_flags.value;
+  // Vanilla MCLQ: build the per-chunk liquid blocks up front so we can stamp the MCNK
+  // header liquid flags (lq_river/ocean/magma/slime) into the flags word that is written
+  // here. The MCLQ payload itself is written later (after MCAL, where vanilla expects it).
+  std::vector<mclq> mclq_layers;
+  mcnk_flags mclq_flags;
+  mclq_flags.value = 0;
+  if (write_mclq)
+  {
+    ChunkWater* water = liquid_chunk();
+    if (water)
+    {
+      water->to_mclq(mclq_layers);
+      if (!mclq_layers.empty())
+      {
+        mclq_flags = water->mclq_header_flags();
+      }
+    }
+  }
+
+  // OR the liquid flags into the value written to the header (don't mutate the persistent
+  // header_flags member so non-classic / MH2O behaviour is unchanged).
+  lMCNK_header->flags = header_flags.value | mclq_flags.value;
   lMCNK_header->holes = holes;
   lMCNK_header->areaid = areaID;
 
@@ -1702,8 +1724,30 @@ void MapChunk::save(sExtendableArray& lADTFile
   lMCNK_Size += 8 + lMCAL_Size;
   //        }
 
-  //! Don't write anything MCLQ related anymore...
+  // MCLQ (vanilla legacy liquid). Written only for CLASSIC projects; MH2O is still written
+  // separately by TileWater. WotLK output is unchanged because write_mclq stays false.
+  if (write_mclq && !mclq_layers.empty())
+  {
+    std::size_t const N = mclq_layers.size();
+    int const lMCLQ_Size = static_cast<int>(N * sizeof(mclq)); // payload only (excludes 8-byte header)
 
+    lADTFile.Extend(8 + lMCLQ_Size);
+    SetChunkHeader(lADTFile, lCurrentPosition, 'MCLQ', lMCLQ_Size);
+
+    // ofsLiquid points at the MCLQ chunk header; sizeLiquid INCLUDES the 8-byte header
+    // (the loader gates on sizeLiquid > 8 and computes payload = sizeLiquid - 8).
+    lADTFile.GetPointer<MapChunkHeader>(lMCNK_Position + 8)->ofsLiquid = lCurrentPosition - lMCNK_Position;
+    lADTFile.GetPointer<MapChunkHeader>(lMCNK_Position + 8)->sizeLiquid = 8 + lMCLQ_Size;
+
+    char* lLiquid = lADTFile.GetPointer<char>(lCurrentPosition + 8);
+    for (std::size_t i = 0; i < N; ++i)
+    {
+      memcpy(lLiquid + i * sizeof(mclq), &mclq_layers[i], sizeof(mclq));
+    }
+
+    lCurrentPosition += 8 + lMCLQ_Size;
+    lMCNK_Size += 8 + lMCLQ_Size;
+  }
 
   // MCSE
   int lMCSE_Size = 0;

@@ -35,6 +35,20 @@ struct Particle {
 
 typedef std::list<Particle> ParticleList;
 
+// Per-instance live particle-simulation state (see ParticleSystem::swapLiveState / Model per-spawn state).
+// A shared M2 model is drawn once per creature spawn at that spawn's OWN animation phase, so a single live
+// particle list can only ever stay glued to one spawn's body. Each spawn keeps its own copy of this and
+// swaps it into the shared ParticleSystem around its per-instance update+draw. Only fields that persist
+// across frames belong here; everything else is re-derived each frame from setup()/the emitter def.
+// Standalone (not nested in ParticleSystem) so Model.h can reference it under the Model<->Particle
+// circular include without needing ParticleSystem to be a complete type there.
+struct ParticleSystemLiveState
+{
+  ParticleList particles;
+  float rem = 0.0f;
+  bool prewarmed = false;
+};
+
 class ParticleEmitter {
 public:
   explicit ParticleEmitter() {}
@@ -68,6 +82,12 @@ class ParticleSystem
   std::array<glm::vec4, 3> colors;
   std::array<float,3> sizes;
   float mid, slowdown;
+  float _spin = 0.f; // emitter spin (revolutions/sec): for a spline emitter this is how fast the
+                     // emission point travels along the spline path. From M2 particle params; 0 = none.
+  // Spline emitter path (M2 EmitterType 3, e.g. the MC flamecircle's ring). Particles are emitted along
+  // this closed loop of points; the emission position advances around it at _spin rev/sec. Empty = not a
+  // spline emitter. Points are stored in Noggit render space (fixCoordSystem applied), emitter-local.
+  std::vector<glm::vec3> _spline_points;
   glm::vec3 pos;
   uint16_t _texture_id;
   ParticleList particles;
@@ -76,6 +96,14 @@ class ParticleSystem
   int manimtime;
   int rows, cols;
   std::vector<TexCoordSet> tiles;
+  // Flipbook cell animation (classic M2 lifespanUVAnim/decayUVAnim = [startCell,endCell,repeat]).
+  // When the emitter authors a real cell range, the texture cell advances sequentially over each
+  // particle's lifetime (explosions, spell impacts, the 8x8 effect sheets) instead of freezing on a
+  // random cell. _uv_animated stays false for degenerate (0,0,1) sheets -> those keep random tiles.
+  bool _uv_animated = false;
+  int _uv_seq_start = 0;
+  int _uv_seq_end = 0;
+  int _uv_repeat = 1;
   void initTile(glm::vec2 *tc, int num);
   bool billboard;
   bool classic;
@@ -91,6 +119,11 @@ class ParticleSystem
 
   // unknown parameters omitted for now ...
   Bone *parent;
+  // The emitter's bone INDEX. `parent` is re-resolved from this each frame in setup() -- caching a Bone*
+  // at construction goes stale (the model's bones vector is rebuilt/reallocated after the emitter is
+  // created), which left parent->mat reading ZERO so every particle spawned at the model origin emitting
+  // straight up instead of following the animated bone.
+  int16_t _bone_index = 0;
   int32_t flags;
 
 public:
@@ -117,6 +150,25 @@ public:
 
   friend class PlaneParticleEmitter;
   friend class SphereParticleEmitter;
+
+  // M2 global texture index this emitter draws with. Used to detect "particle-placeholder" mesh
+  // submeshes (a mesh whose texture is also a particle texture; the client draws the particles and
+  // skips the mesh -- e.g. the Anomalus MANAMISTBASE torso mesh).
+  uint16_t textureId() const { return _texture_id; }
+
+  // Raw M2 emitter flags. Bit 0x10 = particles are simulated relative to the emitter (ride its
+  // transform); without it the client leaves spawned particles behind in world space.
+  int32_t emitterFlags() const { return flags; }
+
+  // Swap this emitter's live simulation state (particle list, spawn remainder, pre-warm guard) with an
+  // external holder. Symmetric: call once to swap a spawn's state IN, again to swap it back OUT. Used to
+  // give each creature spawn of a shared model its own particle simulation (see ParticleSystemLiveState).
+  void swapLiveState(ParticleSystemLiveState& s)
+  {
+    particles.swap(s.particles);
+    std::swap(rem, s.rem);
+    std::swap(_prewarmed, s.prewarmed);
+  }
 
   void unload();
 
@@ -173,6 +225,9 @@ class RibbonEmitter
 
 public:
   RibbonEmitter(Model*, const BlizzardArchive::ClientFile &f, ModelRibbonEmitterDef const& mta, int *globals
+                , Noggit::NoggitRenderContext context);
+  // Classic (1.12) overload: ClassicAnimationBlock-based tracks (lava-fall, weapon/spell/mount trails).
+  RibbonEmitter(Model*, const BlizzardArchive::ClientFile &f, ClassicModelRibbonEmitterDef const& mta, int *globals
                 , Noggit::NoggitRenderContext context);
 
   RibbonEmitter(RibbonEmitter const& other);

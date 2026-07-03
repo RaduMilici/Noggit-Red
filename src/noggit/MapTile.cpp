@@ -13,6 +13,7 @@
 #include <noggit/texture_set.hpp>
 #include <noggit/ui/TexturingGUI.h>
 #include <noggit/application/NoggitApplication.hpp>
+#include <noggit/project/CurrentProject.hpp>
 #include <ClientFile.hpp>
 #include <opengl/scoped.hpp>
 #include <opengl/shader.hpp>
@@ -253,6 +254,15 @@ MapTile::MapTile( int pX
 
 MapTile::~MapTile()
 {
+  // During full world teardown, skip ALL per-tile instance bookkeeping. _model_instance_storage frees
+  // every M2/WMO instance itself when the World is destroyed, so touching the (possibly already-freed,
+  // shared-across-tiles) instances here would crash -- derefTile() on a dangling SceneObject, or
+  // remove_models_if_needed() unloading an instance another not-yet-destroyed tile still points at.
+  if (_world && _world->is_unloading())
+  {
+    return;
+  }
+
   for (auto& pair : object_instances)
   {
     for (auto& instance : pair.second)
@@ -771,6 +781,19 @@ void MapTile::saveTile(World* world)
   std::vector<WMOInstance*> lObjectInstances;
   std::vector<ModelInstance*> lModelInstances;
 
+  // Drop redundant duplicate liquid layers before writing so neither MH2O nor MCLQ serializes
+  // multiple identical water blocks for a chunk.
+  for (int z = 0; z < 16; ++z)
+  {
+    for (int x = 0; x < 16; ++x)
+    {
+      if (ChunkWater* cw = Water.getChunk(x, z))
+      {
+        cw->removeDuplicateLayers();
+      }
+    }
+  }
+
   // Check which doodads and WMOs are on this ADT.
   glm::vec3 lTileExtents[2];
   lTileExtents[0] = glm::vec3(xbase, 0.0f, zbase);
@@ -1085,12 +1108,23 @@ void MapTile::saveTile(World* world)
   //MH2O
   Water.saveToFile(lADTFile, lMHDR_Position, lCurrentPosition);
 
+  // Classic projects additionally write vanilla MCLQ liquid (alongside MH2O above).
+  // WotLK stays MH2O-only. Gated behind a setting (default on for classic).
+  bool write_mclq = false;
+  {
+    auto project = Noggit::Project::CurrentProject::get();
+    bool const is_classic = project
+                          && project->projectVersion == Noggit::Project::ProjectVersion::CLASSIC;
+    write_mclq = is_classic
+              && QSettings().value("water/save_classic_mclq", true).toBool();
+  }
+
   // MCNK
   for (int y = 0; y < 16; ++y)
   {
     for (int x = 0; x < 16; ++x)
     {
-      mChunks[y][x]->save(lADTFile, lCurrentPosition, lMCIN_Position, lTextures, lObjectInstances, lModelInstances);
+      mChunks[y][x]->save(lADTFile, lCurrentPosition, lMCIN_Position, lTextures, lObjectInstances, lModelInstances, write_mclq);
     }
   }
 

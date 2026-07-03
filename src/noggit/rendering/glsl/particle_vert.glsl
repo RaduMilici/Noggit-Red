@@ -13,6 +13,7 @@ out float f_dist; // distance from camera, for fog
 
 uniform mat4 model_view_projection;
 uniform int billboard;
+uniform int scale_with_instance;
 uniform vec3 camera;
 
 void main()
@@ -23,7 +24,10 @@ void main()
   vec4 pos = transform * vec4(position, 1.0);
   if(billboard == 1)
   {
-    pos.xyz += offset;
+    // Emitter flag 0x8 = particle size scales with the model's scale (trace-verified on Anomalus,
+    // scale 5: aura flare x5, feet smoke / rising stars x1). Offsets are authored in model units.
+    float inst_scale = (scale_with_instance == 1) ? length(transform[0].xyz) : 1.0;
+    pos.xyz += offset * inst_scale;
   }
 
   f_dist = distance(camera, pos.xyz);

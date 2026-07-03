@@ -4,6 +4,7 @@
 
 #include <math/bounding_box.hpp>
 #include <noggit/Misc.h>
+#include <noggit/TextureManager.h>
 #include <opengl/scoped.hpp>
 #include <opengl/context.hpp>
 #include <opengl/types.hpp>
@@ -408,6 +409,9 @@ void Square::setup_buffers()
 
   }
 
+  Circle::Circle() = default;
+  Circle::~Circle() = default;
+
   void Circle::draw(glm::mat4x4 const& mvp
                   , glm::vec3 const& pos
                   , glm::vec4 const& color
@@ -422,10 +426,83 @@ void Square::setup_buffers()
     shader.uniform("radius", radius);
     shader.uniform("inclination", 0.f);
     shader.uniform("orientation", 0.f);
+    shader.uniform("world_space", 0);
+    shader.uniform("use_texture", 0);
     shader.uniform("color", color);
 
     OpenGL::Scoped::vao_binder const _ (_vao[0]);
     gl.drawElements(GL_TRIANGLE_STRIP, _indices_vbo, _indice_count, GL_UNSIGNED_SHORT, nullptr);
+  }
+
+  void Circle::drawWorldSpace(glm::mat4x4 const& mvp
+                             , std::vector<glm::vec3> const& world_vertices
+                             , std::vector<glm::vec2> const& local_coords
+                             , std::vector<std::uint16_t> const& indices
+                             , glm::vec4 const& color
+                             , float uv_rotation)
+  {
+    if (world_vertices.empty() || indices.empty())
+      return;
+
+    if (!_buffers_are_setup)
+      setup_buffers(); // shares the shader program
+
+    if (!_ws_buffers_are_setup)
+    {
+      _ws_vao.upload();
+      _ws_buffers.upload();
+      _ws_buffers_are_setup = true;
+    }
+
+    // Lazily load the client's selection-circle texture.
+    if (!_select_texture && !_select_texture_failed)
+    {
+      try
+      {
+        _select_texture = std::make_unique<blp_texture>(
+          BlizzardArchive::Listfile::FileKey("Textures\\UnitSelectTexture.blp"),
+          Noggit::NoggitRenderContext::MAP_VIEW);
+        _select_texture->finishLoading();
+        _select_texture->upload();
+      }
+      catch (std::exception const&)
+      {
+        _select_texture.reset();
+        _select_texture_failed = true;
+      }
+    }
+
+    bool const use_texture = _select_texture && _select_texture->is_uploaded();
+
+    gl.bufferData<GL_ARRAY_BUFFER, glm::vec3>(_ws_vertices_vbo, world_vertices, GL_STREAM_DRAW);
+    gl.bufferData<GL_ARRAY_BUFFER, glm::vec2>(_ws_locals_vbo, local_coords, GL_STREAM_DRAW);
+    gl.bufferData<GL_ELEMENT_ARRAY_BUFFER, std::uint16_t>(_ws_indices_vbo, indices, GL_STREAM_DRAW);
+
+    OpenGL::Scoped::use_program shader {*_program.get()};
+    shader.uniform("model_view_projection", mvp);
+    shader.uniform("world_space", 1);
+    shader.uniform("use_texture", use_texture ? 1 : 0);
+    shader.uniform("color", color);
+    if (use_texture)
+    {
+      gl.activeTexture(GL_TEXTURE0);
+      gl.bindTexture(GL_TEXTURE_2D_ARRAY, _select_texture->texture_array());
+      shader.uniform("tex", 0);
+      shader.uniform("tex_index", static_cast<float>(_select_texture->array_index()));
+      shader.uniform("uv_rotation", uv_rotation);
+    }
+
+    OpenGL::Scoped::vao_binder const _ (_ws_vao[0]);
+    {
+      OpenGL::Scoped::buffer_binder<GL_ARRAY_BUFFER> const vb (_ws_vertices_vbo);
+      shader.attrib("position", 3, GL_FLOAT, GL_FALSE, 0, 0);
+    }
+    {
+      OpenGL::Scoped::buffer_binder<GL_ARRAY_BUFFER> const lb (_ws_locals_vbo);
+      shader.attrib("local", 2, GL_FLOAT, GL_FALSE, 0, 0);
+    }
+    OpenGL::Scoped::buffer_binder<GL_ELEMENT_ARRAY_BUFFER> const ib (_ws_indices_vbo);
+    gl.drawElements(GL_TRIANGLES, static_cast<GLsizei>(indices.size()), GL_UNSIGNED_SHORT, nullptr);
   }
 
   void Circle::setup_buffers()
@@ -433,11 +510,12 @@ void Square::setup_buffers()
     _vao.upload();
     _buffers.upload();
 
+    // Filled disc (fan strip: rim + centre pairs) -- the fragment shader now renders the client's
+    // filled ground blob, so no inner hole.
     std::vector<glm::vec3> vertices;
     vertices.reserve((N_SEGMENTS + 1) * 2);
     std::vector<std::uint16_t> indices;
     indices.reserve((N_SEGMENTS + 1) * 2);
-    float const inner_radius = 0.14f;
 
     for (int i = 0; i <= N_SEGMENTS; ++i)
     {
@@ -445,7 +523,7 @@ void Square::setup_buffers()
       float x = std::cos(angle);
       float z = std::sin(angle);
       vertices.push_back({x, 0.f, z});
-      vertices.push_back({x * inner_radius, 0.f, z * inner_radius});
+      vertices.push_back({0.f, 0.f, 0.f});
       indices.push_back(static_cast<std::uint16_t>(i * 2));
       indices.push_back(static_cast<std::uint16_t>(i * 2 + 1));
     }

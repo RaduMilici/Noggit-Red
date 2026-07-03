@@ -198,19 +198,23 @@ void AsyncLoader::ensure_deletable (AsyncObject* object)
   ( lock
   , [&]
     {
-      auto& to_load = _to_load[(size_t)object->loading_priority()];
-      auto const& it = std::find (to_load.begin(), to_load.end(), object);
-      
-      // don't load it if it's just to delete it afterward
-      if (it != to_load.end())
+      // Search ALL priority buckets by POINTER instead of indexing via object->loading_priority().
+      // The caller (AsyncObjectMultimap::erase) drops its own lock between resolving this pointer and
+      // calling here, so under heavy concurrent load the object can be freed in that window -- and
+      // object->loading_priority() then dereferenced freed/garbage memory and crashed (null read at
+      // offset 0x10, AsyncLoader.cpp:197). Pointer comparison is safe even on a stale pointer, and the
+      // queues are small, so scanning all buckets is cheap.
+      for (auto& to_load : _to_load)
       {
-        to_load.erase(it);
-        return true;
+        auto const it = std::find (to_load.begin(), to_load.end(), object);
+        // don't load it if it's just to delete it afterward
+        if (it != to_load.end())
+        {
+          to_load.erase(it);
+          return true;
+        }
       }
-      else
-      {
-        return std::find (_currently_loading.begin(), _currently_loading.end(), object) == _currently_loading.end();
-      }
+      return std::find (_currently_loading.begin(), _currently_loading.end(), object) == _currently_loading.end();
     }
   );
 }

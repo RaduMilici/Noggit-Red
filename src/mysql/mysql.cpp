@@ -8,7 +8,9 @@
 
 #include <QtCore/QSettings>
 #include <QMessageBox>
+#include <noggit/MySqlSettings.hpp>
 
+#include <algorithm>
 #include <cstdlib>
 #include <initializer_list>
 #include <memory>
@@ -29,14 +31,14 @@ namespace
 
 	ConnectionDetails loadConnectionDetails()
 	{
-		QSettings settings;
-
+		// Per-project MySQL settings (see MySqlSettings.hpp): keyed by the active project so a 3.3.5a
+		// project and a Turtle project keep separate connections.
 		ConnectionDetails details;
-		details.host = settings.value("project/mysql/server", "127.0.0.1").toString().toStdString();
-		details.user = settings.value("project/mysql/user", "root").toString().toStdString();
-		details.password = settings.value("project/mysql/pwd", "mangos").toString().toStdString();
-		details.schema = settings.value("project/mysql/db", "tw_world").toString().toStdString();
-		details.port = settings.value("project/mysql/port", 3306).toUInt();
+		details.host = Noggit::mysqlSetting("server", "127.0.0.1").toString().toStdString();
+		details.user = Noggit::mysqlSetting("user", "root").toString().toStdString();
+		details.password = Noggit::mysqlSetting("pwd", "mangos").toString().toStdString();
+		details.schema = Noggit::mysqlSetting("db", "tw_world").toString().toStdString();
+		details.port = Noggit::mysqlSetting("port", 3306).toUInt();
 
 		return details;
 	}
@@ -261,7 +263,7 @@ namespace
 		       "LEFT JOIN item_template it3 ON it3.entry = cet.equipentry3 ";
 	}
 
-	std::string buildCreatureDisplayExpr(MYSQL* connection, bool* needs_creature_addon_join, bool* has_mount_display_col)
+	std::string buildCreatureDisplayExpr(MYSQL* connection, bool* needs_creature_addon_join, bool* has_mount_display_col, bool* needs_template_model_join = nullptr)
 	{
 		std::vector<std::string> parts;
 		std::vector<std::string> ambiguous_spawn_parts;
@@ -313,6 +315,20 @@ namespace
 		}
 
 		parts.insert(parts.end(), ambiguous_spawn_parts.begin(), ambiguous_spawn_parts.end());
+
+		// AzerothCore / TrinityCore 3.3.5a moved creature models out of creature_template into
+		// creature_template_model (CreatureDisplayID per CreatureID/Idx). Use it as the final display
+		// fallback -- on those schemas it's the ONLY source (creature_template has no inline display).
+		bool const has_template_model = tableExists(connection, "creature_template_model")
+		                             && tableHasColumn(connection, "creature_template_model", "CreatureDisplayID");
+		if (has_template_model)
+		{
+			parts.emplace_back("NULLIF(ctm.CreatureDisplayID, 0)");
+		}
+		if (needs_template_model_join)
+		{
+			*needs_template_model_join = has_template_model;
+		}
 
 		if (needs_creature_addon_join)
 		{
@@ -559,27 +575,65 @@ namespace mysql
 		}
 
 		bool needs_creature_addon_join = false;
+		bool needs_template_model_join = false;
 		bool has_mount_display_col = false;
 		bool has_template_scale_col = tableHasColumn(connection.get(), "creature_template", "scale");
+		// AzerothCore/TrinityCore 3.3.5a keep the creature's scale in creature_template_model.DisplayScale
+		// (creature_template has no scale column there).
+		bool const has_template_model_scale = tableExists(connection.get(), "creature_template_model")
+		                                   && tableHasColumn(connection.get(), "creature_template_model", "DisplayScale");
 		bool const has_equipment_schema = hasCreatureEquipmentSchema(connection.get());
-		auto display_expr = buildCreatureDisplayExpr(connection.get(), &needs_creature_addon_join, &has_mount_display_col);
+		auto display_expr = buildCreatureDisplayExpr(connection.get(), &needs_creature_addon_join, &has_mount_display_col, &needs_template_model_join);
 		auto mount_expr = has_mount_display_col
 			? "COALESCE(CASE WHEN ca.mount_display_id > 0 THEN ca.mount_display_id ELSE 0 END, 0) AS mount_display_id"
 			: "0 AS mount_display_id";
-		auto template_scale_expr = has_template_scale_col
-			? "COALESCE(NULLIF(ct.scale, 0), 1) AS template_scale"
-			: "1 AS template_scale";
+
+		// Spawn entry column: AzerothCore/TrinityCore 3.3.5a name it id1 (with id2/id3 for variants) and
+		// have no plain `id`; Turtle/mangos use `id`. Pick whichever exists.
+		std::string const creature_entry_col =
+			  tableHasColumn(connection.get(), "creature", "id")  ? "c.id"
+			: tableHasColumn(connection.get(), "creature", "id1") ? "c.id1"
+			: "c.id";
+
+		// Preserve a raw 0 (don't coerce to 1): creature_template.scale of 0 means "use the
+		// CreatureDisplayInfo scale" (server ObjectMgr.cpp:1436). On 3.3.5a there's no ct.scale, so fall
+		// back to creature_template_model.DisplayScale.
+		std::string template_scale_expr;
+		if (has_template_scale_col && has_template_model_scale)
+			template_scale_expr = "COALESCE(NULLIF(ct.scale, 0), ctm.DisplayScale, 0) AS template_scale";
+		else if (has_template_scale_col)
+			template_scale_expr = "COALESCE(ct.scale, 0) AS template_scale";
+		else if (has_template_model_scale)
+			template_scale_expr = "COALESCE(ctm.DisplayScale, 0) AS template_scale";
+		else
+			template_scale_expr = "0 AS template_scale";
+
+		// The ctm join is needed if either the display or the scale comes from creature_template_model.
+		bool const needs_ctm_join = needs_template_model_join || has_template_model_scale;
+
+		// Permanent aura spell ids (for aura state-kit visuals + the creature-info UI). Turtle/mangos
+		// keep them in creature_template.auras; AzerothCore in creature_template_addon.auras.
+		bool const has_template_auras = tableHasColumn(connection.get(), "creature_template", "auras");
+		bool const has_template_addon_auras = !has_template_auras
+		                                   && tableExists(connection.get(), "creature_template_addon")
+		                                   && tableHasColumn(connection.get(), "creature_template_addon", "auras");
+		std::string const auras_expr = has_template_auras       ? "COALESCE(ct.auras, '') AS auras"
+		                             : has_template_addon_auras ? "COALESCE(cta.auras, '') AS auras"
+		                             :                            "'' AS auras";
 
 		std::stringstream statement;
 		statement
-			<< "SELECT c.guid, c.id, c.map, c.position_x, c.position_y, c.position_z, c.orientation, ct.name, "
+			<< "SELECT c.guid, " << creature_entry_col << ", c.map, c.position_x, c.position_y, c.position_z, c.orientation, ct.name, "
 			<< template_scale_expr << ", "
 			<< display_expr << ", "
 			<< mount_expr << ", "
-			<< creatureEquipmentSelectExpr(has_equipment_schema) << " "
+			<< creatureEquipmentSelectExpr(has_equipment_schema) << ", "
+			<< auras_expr << " "
 			<< "FROM creature c "
-			<< "INNER JOIN creature_template ct ON ct.entry = c.id "
+			<< "INNER JOIN creature_template ct ON ct.entry = " << creature_entry_col << " "
+			<< (needs_ctm_join ? "LEFT JOIN creature_template_model ctm ON ctm.CreatureID = ct.entry AND ctm.Idx = 0 " : "")
 			<< (needs_creature_addon_join ? "LEFT JOIN creature_addon ca ON ca.guid = c.guid " : "")
+			<< (has_template_addon_auras ? "LEFT JOIN creature_template_addon cta ON cta.entry = ct.entry " : "")
 			<< creatureEquipmentJoinExpr(has_equipment_schema)
 			<< "WHERE c.map = " << mapID << " "
 			<< "ORDER BY ct.name, c.guid";
@@ -626,12 +680,282 @@ namespace mysql
 			record.mainhand_inventory_type = parseUnsigned(row[14]);
 			record.offhand_inventory_type = parseUnsigned(row[15]);
 			record.ranged_inventory_type = parseUnsigned(row[16]);
+			record.auras = parseString(row[17]);
 			records.push_back(record);
 		}
 
 		mysql_free_result(result);
 		return records;
   }
+
+	std::map<std::uint32_t, SpellInfoRecord> getSpellInfos(std::set<std::uint32_t> const& spell_ids, std::string* error)
+	{
+		std::map<std::uint32_t, SpellInfoRecord> infos;
+		if (spell_ids.empty())
+		{
+			return infos;
+		}
+
+		auto connection = connect(error);
+		if (!connection)
+		{
+			return infos;
+		}
+
+		// Turtle/vmangos keep custom spells in spell_template; AzerothCore has no such table (spell data
+		// lives in the client DBC there) -- return empty and let the caller degrade gracefully.
+		if (!tableExists(connection.get(), "spell_template"))
+		{
+			return infos;
+		}
+
+		std::stringstream statement;
+		statement << "SELECT entry, spellVisual1, spellIconId, school, name, description, "
+		          << "effectBasePoints1, effectBasePoints2, effectBasePoints3, "
+		          << "effectDieSides1, effectDieSides2, effectDieSides3, "
+		          << "effectAmplitude1, effectAmplitude2, effectAmplitude3, durationIndex, "
+		          << "effectChainTarget1, effectChainTarget2, effectChainTarget3, "
+		          << "effectRadiusIndex1, effectRadiusIndex2, effectRadiusIndex3, "
+		          << "effectMultipleValue1, effectMultipleValue2, effectMultipleValue3, "
+		          << "maxAffectedTargets, stackAmount, procCharges, procChance, maxTargetLevel, "
+		          << "manaCost, powerType, rangeIndex, castingTimeIndex "
+		          << "FROM spell_template WHERE entry IN (";
+		bool first = true;
+		for (auto const id : spell_ids)
+		{
+			statement << (first ? "" : ",") << id;
+			first = false;
+		}
+		statement << ")";
+
+		if (mysql_query(connection.get(), statement.str().c_str()) != 0)
+		{
+			if (error)
+			{
+				*error = mysql_error(connection.get());
+			}
+			return infos;
+		}
+
+		MYSQL_RES* result = mysql_store_result(connection.get());
+		if (!result)
+		{
+			if (error)
+			{
+				*error = mysql_error(connection.get());
+			}
+			return infos;
+		}
+
+		while (MYSQL_ROW row = mysql_fetch_row(result))
+		{
+			SpellInfoRecord info;
+			info.entry = parseUnsigned(row[0]);
+			info.spell_visual = parseUnsigned(row[1]);
+			info.icon_id = parseUnsigned(row[2]);
+			info.school = parseUnsigned(row[3]);
+			info.name = parseString(row[4]);
+			info.description = parseString(row[5]);
+			for (int i = 0; i < 3; ++i)
+			{
+				info.effect_base_points[i] = static_cast<std::int32_t>(std::strtol(row[6 + i] ? row[6 + i] : "0", nullptr, 10));
+				info.effect_die_sides[i] = static_cast<std::int32_t>(std::strtol(row[9 + i] ? row[9 + i] : "0", nullptr, 10));
+				info.effect_amplitude[i] = static_cast<std::int32_t>(std::strtol(row[12 + i] ? row[12 + i] : "0", nullptr, 10));
+				info.effect_chain_target[i] = static_cast<std::int32_t>(std::strtol(row[16 + i] ? row[16 + i] : "0", nullptr, 10));
+				info.effect_radius_index[i] = static_cast<std::int32_t>(std::strtol(row[19 + i] ? row[19 + i] : "0", nullptr, 10));
+				info.effect_multiple_value[i] = parseFloat(row[22 + i]);
+			}
+			info.duration_index = parseUnsigned(row[15]);
+			info.max_affected_targets = parseUnsigned(row[25]);
+			info.stack_amount = parseUnsigned(row[26]);
+			info.proc_charges = parseUnsigned(row[27]);
+			info.proc_chance = parseUnsigned(row[28]);
+			info.max_target_level = parseUnsigned(row[29]);
+			info.mana_cost = parseUnsigned(row[30]);
+			info.power_type = parseUnsigned(row[31]);
+			info.range_index = parseUnsigned(row[32]);
+			info.casting_time_index = parseUnsigned(row[33]);
+			infos.emplace(info.entry, info);
+		}
+
+		mysql_free_result(result);
+		return infos;
+	}
+
+	CreatureTemplateDetails getCreatureTemplateDetails(std::uint32_t entry, std::string* error)
+	{
+		CreatureTemplateDetails d;
+		d.entry = entry;
+
+		auto connection = connect(error);
+		if (!connection)
+		{
+			return d;
+		}
+
+		// Turtle/vmangos schema check (AzerothCore names these completely differently).
+		if (!tableHasColumn(connection.get(), "creature_template", "level_min"))
+		{
+			if (error)
+			{
+				*error = "creature_template schema not supported (no level_min column)";
+			}
+			return d;
+		}
+
+		bool const has_auras = tableHasColumn(connection.get(), "creature_template", "auras");
+		std::stringstream statement;
+		statement << "SELECT name, subname, level_min, level_max, `rank`, faction, npc_flags, "
+		          << "health_min, health_max, mana_min, mana_max, gold_min, gold_max, "
+		          << "dmg_min, dmg_max, armor, holy_res, fire_res, nature_res, frost_res, shadow_res, arcane_res, "
+		          << "display_id1, equipment_id, unit_class, type, "
+		          << "spell_id1, spell_id2, spell_id3, spell_id4, spell_list_id, "
+		          << (has_auras ? "COALESCE(auras, '')" : "''") << " AS auras "
+		          << "FROM creature_template WHERE entry = " << entry;
+
+		if (mysql_query(connection.get(), statement.str().c_str()) != 0)
+		{
+			if (error)
+			{
+				*error = mysql_error(connection.get());
+			}
+			return d;
+		}
+
+		MYSQL_RES* result = mysql_store_result(connection.get());
+		if (!result)
+		{
+			if (error)
+			{
+				*error = mysql_error(connection.get());
+			}
+			return d;
+		}
+
+		std::uint32_t spell_list_id = 0;
+		if (MYSQL_ROW row = mysql_fetch_row(result))
+		{
+			d.name = parseString(row[0]);
+			d.subname = parseString(row[1]);
+			d.level_min = parseUnsigned(row[2]);
+			d.level_max = parseUnsigned(row[3]);
+			d.rank = parseUnsigned(row[4]);
+			d.faction = parseUnsigned(row[5]);
+			d.npc_flags = parseUnsigned(row[6]);
+			d.health_min = parseUnsigned(row[7]);
+			d.health_max = parseUnsigned(row[8]);
+			d.mana_min = parseUnsigned(row[9]);
+			d.mana_max = parseUnsigned(row[10]);
+			d.gold_min = parseUnsigned(row[11]);
+			d.gold_max = parseUnsigned(row[12]);
+			d.dmg_min = parseFloat(row[13]);
+			d.dmg_max = parseFloat(row[14]);
+			d.armor = parseUnsigned(row[15]);
+			d.holy_res = static_cast<std::int32_t>(std::strtol(row[16] ? row[16] : "0", nullptr, 10));
+			d.fire_res = static_cast<std::int32_t>(std::strtol(row[17] ? row[17] : "0", nullptr, 10));
+			d.nature_res = static_cast<std::int32_t>(std::strtol(row[18] ? row[18] : "0", nullptr, 10));
+			d.frost_res = static_cast<std::int32_t>(std::strtol(row[19] ? row[19] : "0", nullptr, 10));
+			d.shadow_res = static_cast<std::int32_t>(std::strtol(row[20] ? row[20] : "0", nullptr, 10));
+			d.arcane_res = static_cast<std::int32_t>(std::strtol(row[21] ? row[21] : "0", nullptr, 10));
+			d.display_id = parseUnsigned(row[22]);
+			d.equipment_id = parseUnsigned(row[23]);
+			d.unit_class = parseUnsigned(row[24]);
+			d.type = parseUnsigned(row[25]);
+			for (int i = 26; i <= 29; ++i)
+			{
+				auto const spell_id = parseUnsigned(row[i]);
+				if (spell_id)
+				{
+					d.spells.push_back(spell_id);
+				}
+			}
+			spell_list_id = parseUnsigned(row[30]);
+			std::istringstream aura_tokens(parseString(row[31]));
+			std::uint32_t aura_id = 0;
+			while (aura_tokens >> aura_id)
+			{
+				if (aura_id)
+				{
+					d.auras.push_back(aura_id);
+				}
+			}
+			d.ok = true;
+		}
+		mysql_free_result(result);
+
+		// creature_spells list (Turtle): spell_list_id -> up to 8 scripted combat spells.
+		if (d.ok && spell_list_id && tableExists(connection.get(), "creature_spells"))
+		{
+			std::stringstream spells_statement;
+			spells_statement << "SELECT spellId_1, spellId_2, spellId_3, spellId_4, spellId_5, spellId_6, spellId_7, spellId_8 "
+			                 << "FROM creature_spells WHERE entry = " << spell_list_id;
+			if (mysql_query(connection.get(), spells_statement.str().c_str()) == 0)
+			{
+				if (MYSQL_RES* spells_result = mysql_store_result(connection.get()))
+				{
+					if (MYSQL_ROW row = mysql_fetch_row(spells_result))
+					{
+						for (int i = 0; i < 8; ++i)
+						{
+							auto const spell_id = parseUnsigned(row[i]);
+							if (spell_id && std::find(d.spells.begin(), d.spells.end(), spell_id) == d.spells.end())
+							{
+								d.spells.push_back(spell_id);
+							}
+						}
+					}
+					mysql_free_result(spells_result);
+				}
+			}
+		}
+
+		return d;
+	}
+
+	std::map<std::uint32_t, float> getCreatureBoundingRadii(std::string* error)
+	{
+		std::map<std::uint32_t, float> radii;
+		auto connection = connect(error);
+		if (!connection)
+		{
+			return radii;
+		}
+
+		char const* query = nullptr;
+		if (tableExists(connection.get(), "creature_display_info_addon"))
+		{
+			query = "SELECT display_id, bounding_radius FROM creature_display_info_addon";
+		}
+		else if (tableExists(connection.get(), "creature_model_info"))
+		{
+			query = "SELECT modelid, bounding_radius FROM creature_model_info";
+		}
+		else
+		{
+			return radii;
+		}
+
+		if (mysql_query(connection.get(), query) != 0)
+		{
+			if (error)
+			{
+				*error = mysql_error(connection.get());
+			}
+			return radii;
+		}
+
+		MYSQL_RES* result = mysql_store_result(connection.get());
+		if (!result)
+		{
+			return radii;
+		}
+		while (MYSQL_ROW row = mysql_fetch_row(result))
+		{
+			radii.emplace(parseUnsigned(row[0]), parseFloat(row[1]));
+		}
+		mysql_free_result(result);
+		return radii;
+	}
 
 	std::vector<GameObjectSpawnRecord> getGameObjectSpawns(std::size_t mapID, std::string* error)
 	{
@@ -809,8 +1133,11 @@ namespace mysql
 			? "COALESCE(CASE WHEN ca.mount_display_id > 0 THEN ca.mount_display_id ELSE 0 END, 0) AS mount_display_id"
 			: "0 AS mount_display_id";
 		auto template_scale_expr = has_template_scale_col
-			? "COALESCE(NULLIF(ct.scale, 0), 1) AS template_scale"
-			: "1 AS template_scale";
+			// Preserve a raw 0 (don't coerce to 1): creature_template.scale of 0 means "use the
+			// CreatureDisplayInfo scale" (server ObjectMgr.cpp:1436). The caller applies that display-scale
+			// fallback, which it can only do if it sees the real 0 rather than a coerced 1.0.
+			? "COALESCE(ct.scale, 0) AS template_scale"
+			: "0 AS template_scale";
 
 		auto escaped_search = escapeString(connection.get(), searchTerm);
 		std::stringstream statement;
@@ -917,7 +1244,8 @@ namespace mysql
 			<< "COALESCE(" << type_flags_expr << ", 0) AS type_flags, "
 			<< "COALESCE(" << flags_extra_expr << ", 0) AS flags_extra, "
 			<< display_expr << ", "
-			<< "COALESCE(NULLIF(" << scale_expr << ", 0), 1) AS template_scale "
+			// Raw 0 preserved so the caller can apply the CreatureDisplayInfo scale fallback (see getCreatureSpawns).
+			<< "COALESCE(" << scale_expr << ", 0) AS template_scale "
 			<< "FROM creature_template ct "
 			<< "ORDER BY ct.entry "
 			<< "LIMIT " << limit;
@@ -956,11 +1284,8 @@ namespace mysql
 			record.type_flags = parseUnsigned(row[6]);
 			record.flags_extra = parseUnsigned(row[7]);
 			record.display_id = parseUnsigned(row[8]);
+			// Keep a raw 0 here; the picker resolves the CreatureDisplayInfo scale fallback for scale-0 templates.
 			record.template_scale = parseFloat(row[9]);
-			if (record.template_scale <= 0.0f)
-			{
-				record.template_scale = 1.0f;
-			}
 			records.push_back(record);
 		}
 

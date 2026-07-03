@@ -451,6 +451,30 @@ struct ModelRibbonEmitterDef {
   int32_t unknown;
 };
 
+// Classic (1.12, M2 version 256) ribbon emitter. Same field order as the WotLK def, but the animated
+// tracks use the 28-byte ClassicAnimationBlock instead of the 20-byte WotLK AnimationBlock, and there
+// is NO trailing 'unknown' int32. Total = 36 (head) + 4*28 (color/opacity/above/below) + 12 (res,
+// length, angle) + 4 (s1,s2) + 2*28 (unk1,unk2) = 220 bytes (verified against phoenix/kaelthas/mounts).
+struct ClassicModelRibbonEmitterDef {
+  int32_t id;
+  int32_t bone;
+  glm::vec3 pos;
+  int32_t nTextures;
+  int32_t ofsTextures;
+  int32_t nMaterials;
+  int32_t ofsMaterials;
+  ClassicAnimationBlock color;
+  ClassicAnimationBlock opacity;
+  ClassicAnimationBlock above;
+  ClassicAnimationBlock below;
+  float res, length, Emissionangle;
+  int16_t s1, s2;
+  ClassicAnimationBlock unk1;
+  ClassicAnimationBlock unk2;
+};
+static_assert(sizeof(ClassicModelRibbonEmitterDef) == 220,
+              "Classic ribbon emitter def must be 220 bytes (verified stride); padding would misparse it");
+
 
 struct ModelEvents {
   char id[4];

@@ -12,6 +12,7 @@
   #include <mysql/mysql.h>
 #endif
 #include <noggit/map_index.hpp>
+#include <noggit/MySqlSettings.hpp>
 #include <noggit/uid_storage.hpp>
 #include <noggit/application/NoggitApplication.hpp>
 #include <ClientFile.hpp>
@@ -700,7 +701,7 @@ uint32_t MapIndex::newGUID()
 #ifdef USE_MYSQL_UID_STORAGE
   QSettings settings;
 
-  if (settings.value ("project/mysql/enabled", false).toBool())
+  if (Noggit::mysqlSetting("enabled", false).toBool())
   {
     mysql::updateUIDinDB(_map_id, highestGUID + 1); // update the highest uid in db, note that if the user don't save these uid won't be used (not really a problem tho) 
   }
@@ -1048,7 +1049,7 @@ void MapIndex::saveMaxUID()
 #ifdef USE_MYSQL_UID_STORAGE
   QSettings settings;
 
-  if (settings.value ("project/mysql/enabled", false).toBool())
+  if (Noggit::mysqlSetting("enabled", false).toBool())
   {
     if (mysql::hasMaxUIDStoredDB(_map_id))
     {
@@ -1070,7 +1071,7 @@ void MapIndex::loadMaxUID()
 #ifdef USE_MYSQL_UID_STORAGE
   QSettings settings;
 
-  if (settings.value ("project/mysql/enabled", false).toBool())
+  if (Noggit::mysqlSetting("enabled", false).toBool())
   {
     highestGUID = std::max(mysql::getGUIDFromDB(_map_id), highestGUID);
     // save to make sure the db and disk uid are synced

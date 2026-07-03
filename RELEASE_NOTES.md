@@ -24,9 +24,6 @@ content render correctly alongside 3.3.5a.
 - **Classic single-texcoord fix** — classic M2 vertices carry only one UV set; the second
   was reading garbage and stretching multi-texture passes (e.g. light-ray cones).
 - **Character equipment fix** — corrected classic character model gloves/equipment.
-- **Lava Surger "double model" fix** — the vanilla `elementalearth` model rendered an
-  extra drooping rock shell; the independent shell submeshes are now hidden (data-driven,
-  covers all elementalearth-based creatures).
 
 ### World Models (WMO)
 - **Interior lighting parity** — MOCV baked vertex lighting and MOHD ambient handled like

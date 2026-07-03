@@ -458,6 +458,142 @@ public:
     static const size_t ObjectEffectPackageID = 18;        // int
 };
 
+// ---- Spell visual DBCs (creature aura visuals) --------------------------------------------------
+// Used to resolve a creature's permanent auras (creature_template.auras) to the effect models the
+// client attaches while the aura is active: Spell -> SpellVisual -> state kit -> head/chest/base
+// effect -> SpellVisualEffectName model path. Field indices below are the vanilla(1.12) layout; the
+// first five SpellVisual fields and the kit/effect fields used here are identical in 3.3.5.
+class SpellVisualDB : public DBCFile
+{
+public:
+  SpellVisualDB() :
+    DBCFile("DBFilesClient\\SpellVisual.dbc")
+  { }
+
+  static const size_t ID = 0;
+  static const size_t PrecastKit = 1;
+  static const size_t CastKit = 2;
+  static const size_t ImpactKit = 3;
+  static const size_t StateKit = 4;
+};
+
+class SpellVisualKitDB : public DBCFile
+{
+public:
+  SpellVisualKitDB() :
+    DBCFile("DBFilesClient\\SpellVisualKit.dbc")
+  { }
+
+  static const size_t ID = 0;
+  static const size_t StartAnimID = 1;
+  static const size_t AnimID = 2;
+  static const size_t HeadEffect = 3;
+  static const size_t ChestEffect = 4;
+  static const size_t BaseEffect = 5;
+};
+
+class SpellVisualEffectNameDB : public DBCFile
+{
+public:
+  SpellVisualEffectNameDB() :
+    DBCFile("DBFilesClient\\SpellVisualEffectName.dbc")
+  { }
+
+  static const size_t ID = 0;
+  static const size_t Name = 1;
+  static const size_t FileName = 2;
+};
+
+// Spell icon paths for the creature-info UI (icon id -> Interface\Icons\... path).
+class SpellIconDB : public DBCFile
+{
+public:
+  SpellIconDB() :
+    DBCFile("DBFilesClient\\SpellIcon.dbc")
+  { }
+
+  static const size_t ID = 0;
+  static const size_t TextureFilename = 1;
+};
+
+// Spell durations for resolving the $d macro in spell descriptions (creature-info tooltips).
+class SpellDurationDB : public DBCFile
+{
+public:
+  SpellDurationDB() :
+    DBCFile("DBFilesClient\\SpellDuration.dbc")
+  { }
+
+  static const size_t ID = 0;
+  static const size_t Duration = 1; // base duration in milliseconds
+};
+
+// Spell effect radii for the $a macro (yards).
+class SpellRadiusDB : public DBCFile
+{
+public:
+  SpellRadiusDB() :
+    DBCFile("DBFilesClient\\SpellRadius.dbc")
+  { }
+
+  static const size_t ID = 0;
+  static const size_t Radius = 1; // float, yards
+};
+
+// Spell range ("30 yd range") for the Blizzard-style tooltip header.
+class SpellRangeDB : public DBCFile
+{
+public:
+  SpellRangeDB() :
+    DBCFile("DBFilesClient\\SpellRange.dbc")
+  { }
+
+  static const size_t ID = 0;
+  static const size_t MinRange = 1; // float
+  static const size_t MaxRange = 2; // float
+};
+
+// Spell cast time ("1.5 sec cast" / "Instant") for the Blizzard-style tooltip header.
+class SpellCastTimesDB : public DBCFile
+{
+public:
+  SpellCastTimesDB() :
+    DBCFile("DBFilesClient\\SpellCastTimes.dbc")
+  { }
+
+  static const size_t ID = 0;
+  static const size_t CastTime = 1; // milliseconds
+};
+
+// Faction resolution for the creature-info UI: creature_template.faction -> FactionTemplate ->
+// Faction name + Alliance/Horde reaction (from the friendly/hostile masks).
+class FactionTemplateDB : public DBCFile
+{
+public:
+  FactionTemplateDB() :
+    DBCFile("DBFilesClient\\FactionTemplate.dbc")
+  { }
+
+  static const size_t ID = 0;
+  static const size_t Faction = 1;
+  static const size_t Flags = 2;
+  static const size_t OurMask = 3;
+  static const size_t FriendlyMask = 4;
+  static const size_t HostileMask = 5;
+};
+
+class FactionDB : public DBCFile
+{
+public:
+  FactionDB() :
+    DBCFile("DBFilesClient\\Faction.dbc")
+  { }
+
+  static const size_t ID = 0;
+  static const size_t Team = 18;
+  static const size_t Name = 19; // localized
+};
+
 void OpenDBs(std::shared_ptr<BlizzardArchive::ClientData> clientData);
 
 const char * getGroundEffectDoodad(unsigned int effectID, int DoodadNum);
@@ -487,3 +623,13 @@ extern CharacterHairGeosetsDB gCharacterHairGeosetsDB;
 extern CharacterSectionsDB gCharacterSectionsDB;
 extern WMOAreaTableDB gWMOAreaTableDB;
 extern GameObjectDisplayInfoDB gGameObjectDisplayInfoDB;
+extern SpellVisualDB gSpellVisualDB;
+extern SpellVisualKitDB gSpellVisualKitDB;
+extern SpellVisualEffectNameDB gSpellVisualEffectNameDB;
+extern SpellIconDB gSpellIconDB;
+extern FactionTemplateDB gFactionTemplateDB;
+extern FactionDB gFactionDB;
+extern SpellDurationDB gSpellDurationDB;
+extern SpellRadiusDB gSpellRadiusDB;
+extern SpellRangeDB gSpellRangeDB;
+extern SpellCastTimesDB gSpellCastTimesDB;

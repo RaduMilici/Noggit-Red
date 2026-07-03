@@ -271,7 +271,12 @@ public:
   float ocean_shallow_alpha() const { return _ocean_shallow_alpha; }
   float ocean_deep_alpha() const { return _ocean_deep_alpha; }
 
-  float fog_distance_end() const { return _fog_distance / 36.f; };
+  // LightFloatBand fog-distance -> world units. The /36 was a Noggit heuristic (not from the client)
+  // calibrated so the hardcoded 18000 default == 500; against the real DBC values (median ~12000,
+  // p25~6500) it produced fog WALLS at ~180-420 units, far too close for the editor's wide view ->
+  // "too foggy". /20 pushes the wall ~1.8x out (median ~600, p25~325) while keeping the thin
+  // multiplier-0.95 fog band, so distant terrain hazes instead of slamming into a near wall.
+  float fog_distance_end() const { return _fog_distance / 20.f; };
   float fog_distance_start() const { return _fog_multiplier; };
 
   float glow() const { return _glow; };

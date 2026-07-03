@@ -32,6 +32,8 @@
       <file alias="particle_fs">../src/noggit/rendering/glsl/particle_frag.glsl</file>
       <file alias="ribbon_vs">../src/noggit/rendering/glsl/ribbon_vert.glsl</file>
       <file alias="ribbon_fs">../src/noggit/rendering/glsl/ribbon_frag.glsl</file>
+      <file alias="blob_shadow_vs">../src/noggit/rendering/glsl/blob_shadow_vert.glsl</file>
+      <file alias="blob_shadow_fs">../src/noggit/rendering/glsl/blob_shadow_frag.glsl</file>
       <file alias="terrain_vs">../src/noggit/rendering/glsl/terrain_vert.glsl</file>
       <file alias="terrain_fs">../src/noggit/rendering/glsl/terrain_frag.glsl</file>
       <file alias="wmo_vs">../src/noggit/rendering/glsl/wmo_vert.glsl</file>

@@ -140,6 +140,15 @@ namespace Noggit::Rendering
         , std::size_t instance_count
     );
 
+    // Draw this model's particles for ONE instance with the given world transform. Creature spawns
+    // render through a per-instance path (not the batched model_with_particles set), so their emitters
+    // are drawn here -- uploads the single transform to the instance buffer then reuses drawParticles.
+    void drawParticlesForInstance(glm::mat4x4 const& model_view
+        , OpenGL::Scoped::use_program& particles_shader
+        , glm::mat4x4 const& transform
+        , float model_alpha = 1.0f
+    );
+
     void drawRibbons(OpenGL::Scoped::use_program& ribbons_shader
         , std::size_t instance_count
     );

@@ -32,6 +32,10 @@ public:
 
   glm::vec3 light_color = { 1.f, 1.f, 1.f };
 
+  // Model-wide opacity from CreatureDisplayInfo.CreatureModelAlpha (0..1; 1 = fully opaque). The client
+  // draws creatures at this opacity (translucent ghosts/elementals etc.); 1.0 means no change.
+  float model_alpha = 1.0f;
+
   // used when flag 0x8 is set in wdt
   // longest side of an AABB transformed model's bounding box from the M2 header
   float size_cat;
@@ -49,6 +53,7 @@ public:
     : SceneObject(other._type, other._context)
     , model (std::move (other.model))
     , light_color (other.light_color)
+    , model_alpha (other.model_alpha)
     , size_cat (other.size_cat)
     , _need_recalc_extents(other._need_recalc_extents)
     , _forced_anim_id(other._forced_anim_id)
@@ -73,6 +78,7 @@ public:
     std::swap (pos, other.pos);
     std::swap (dir, other.dir);
     std::swap (light_color, other.light_color);
+    std::swap (model_alpha, other.model_alpha);
     std::swap (uid, other.uid);
     std::swap (scale, other.scale);
     std::swap (size_cat, other.size_cat);
@@ -113,6 +119,13 @@ public:
 
   [[nodiscard]]
   virtual bool isWMODoodad() const { return false; };
+
+  // Ground footprint radius (world units) = the model's horizontal bounding-box extent * scale. Matches
+  // the in-game selection-ring size, which follows the unit's footprint -- NOT the bounding SPHERE
+  // (model->rad), which includes the full height and over-sizes tall creatures. M2 space is Z-up, so the
+  // footprint is the X/Y extent. Used for the creature/gameobject selection circles (draw + pick).
+  [[nodiscard]]
+  float selectionRingRadius() const;
 
   [[nodiscard]]
   AsyncObject* instance_model() const override { return model.get(); };

@@ -405,7 +405,8 @@ ViewToolbar::ViewToolbar(MapView* mapView, editing_mode mode)
          * CREATURE SECONDARY TOOL
          */
 
-        SubToolBarAction* _toolbar = new SubToolBarAction();
+        SubToolBarAction* _up_toolbar = new SubToolBarAction();
+        SubToolBarAction* _down_toolbar = new SubToolBarAction();
 
         {
             IconAction* _icon = new IconAction(FontNoggitIcon{ FontNoggit::TOOL_OBJECT_EDITOR });
@@ -417,12 +418,26 @@ ViewToolbar::ViewToolbar(MapView* mapView, editing_mode mode)
                         mapView->requestRedraw();
                     });
 
-            _toolbar->ADD_ACTION(_icon);
-            _toolbar->ADD_ACTION(_patrol_paths);
-            _toolbar->SETUP_WIDGET(false);
+            _up_toolbar->ADD_ACTION(_icon);
+            _up_toolbar->ADD_ACTION(_patrol_paths);
+            _up_toolbar->SETUP_WIDGET(false);
         }
 
-        _creature_secondary_tool.push_back(_toolbar);
+        {
+            // "Quick Facts" window for the selected creature (stats + spell/aura icons), toggled
+            // like the patrol-paths checkbox; the window itself is free-floating/movable.
+            CheckBoxAction* _creature_info = new CheckBoxAction(tr("Creature info"));
+            connect(_creature_info->checkbox(), &QCheckBox::toggled, [mapView](bool checked)
+                    {
+                        mapView->setCreatureInfoPanelVisible(checked);
+                    });
+
+            _down_toolbar->ADD_ACTION(_creature_info);
+            _down_toolbar->SETUP_WIDGET(true);
+        }
+
+        _creature_secondary_tool.push_back(_up_toolbar);
+        _creature_secondary_tool.push_back(_down_toolbar);
     }
 }
 

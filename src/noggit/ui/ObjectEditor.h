@@ -113,6 +113,8 @@ namespace Noggit
       QButtonGroup* pasteModeGroup;
       QLabel* _filename;
 
+      QLabel* _selection_info = nullptr; // name / file path / UID of the selected M2 or WMO
+
       QLabel* _selection_groups_info;
 
       bool _copy_model_stats;

@@ -23,6 +23,7 @@
 #include <QFile>
 #include <QString>
 #include <QObject>
+#include <QtCore/QSettings>
 #include <QString>
 #include <thread>
 #include <chrono>
@@ -258,6 +259,11 @@ namespace Noggit::Project
 
       if(!project.has_value())
         return {};
+
+      // Record the active project so per-project settings (e.g. MySQL connection, see MySqlSettings.hpp)
+      // can be namespaced by it -- different projects (3.3.5a vs Turtle) keep their own settings.
+      QSettings().setValue("project/current_path",
+                           QString::fromStdString(project_path.generic_string()));
 
       project_reader.readPalettes(&project.value());
       project_reader.readObjectSelectionGroups(&project.value());

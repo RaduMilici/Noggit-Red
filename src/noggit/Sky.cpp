@@ -970,10 +970,20 @@ Sky* Skies::findClosestSkyByDistance(glm::vec3 pos)
 
 void Skies::setCurrentParam(int param_id)
 {
+    bool changed = false;
     for (auto& sky : skies)
     {
-        Sky* skyptr = &sky;
-        skyptr->curr_sky_param = param_id;
+        if (sky.curr_sky_param != param_id)
+        {
+            sky.curr_sky_param = param_id;
+            changed = true;
+        }
+    }
+    // update_sky_colors caches on (_last_time,_last_pos) and would otherwise skip the recompute when
+    // only the param changed (e.g. submerging while stationary). Force a refresh on an actual change.
+    if (changed)
+    {
+        _last_time = -1;
     }
 }
 
@@ -1073,18 +1083,23 @@ void Skies::update_sky_colors(glm::vec3 pos, int time)
 
   }
 
-  float fogEnd = _fog_distance / 36.f;
+  float fogEnd = _fog_distance / 20.f; // keep in sync with Sky.h fog_distance_end() (was /36, too close)
   float fogStart = _fog_multiplier * fogEnd;
   float fogRange = fogEnd - fogStart;
 
   float fogFarClip = 500.f; // Max fog farclip possible
 
+  // Fog density curve. The shader applies fogFactor = 1 - ((end-dist)/(end-start))^fog_rate, so fog_rate
+  // is the exponent on the linear fog factor: 1.0 = pure linear (the client's GL_LINEAR fog), >1 = denser
+  // (more fog at every distance). The old curve (1.5 .. 7.0) was far steeper than the client -- it put
+  // ~80-97% fog at the range midpoint, which reads as "too much fog". Pull it back toward linear: a mild
+  // 1.0 .. 1.6 (denser only for very short fog ranges) so distant terrain hazes gradually like in-game.
   if (fogRange <= fogFarClip)
   {
-    _fog_rate = ((1.0f - (fogRange / fogFarClip)) * 5.5f) + 1.5f;
+    _fog_rate = ((1.0f - (fogRange / fogFarClip)) * 0.6f) + 1.0f;
   } else
   {
-    _fog_rate = 1.5f;
+    _fog_rate = 1.0f;
   }
 
   _last_pos = pos;
@@ -1127,6 +1142,11 @@ bool Skies::draw(glm::mat4x4 const& model_view
     shader.uniform("model_view_projection", projection * model_view);
     shader.uniform("camera_pos", glm::vec3(camera_pos.x, camera_pos.y, camera_pos.z));
 
+    // The sky dome is an OPAQUE backdrop, but its fragment shader writes alpha 0 (bloom-mask opt-out). If
+    // GL_BLEND is left enabled by a prior pass (the frame's last particle/additive draws do), SRC_ALPHA=0
+    // makes the whole sky blend to fully transparent -> the cleared black shows through. Bloom hid this
+    // because its composite disables blend as the last op. Force blend off for the opaque sky dome.
+    gl.disable(GL_BLEND);
     gl.drawElements(GL_TRIANGLES, _indices_count, GL_UNSIGNED_SHORT, nullptr);
 
     return true;
@@ -1152,10 +1172,14 @@ bool Skies::draw(glm::mat4x4 const& model_view
 
     {
       OpenGL::Scoped::vao_binder const _ (_vao);
-       
+
       shader.uniform("model_view_projection", projection * model_view);
       shader.uniform("camera_pos", glm::vec3(camera_pos.x, camera_pos.y, camera_pos.z));
 
+      // Opaque sky dome, but the shader writes alpha 0 (bloom-mask opt-out). Blend left on by a prior
+      // particle pass would make SRC_ALPHA=0 blend it fully transparent -> black sky (only visible with
+      // bloom off, since bloom's composite disables blend last). Force blend off here.
+      gl.disable(GL_BLEND);
       gl.drawElements(GL_TRIANGLES, _indices_count, GL_UNSIGNED_SHORT, nullptr);
     }
   }
@@ -1312,7 +1336,11 @@ out vec4 out_color;
 
 void main()
 {
-  out_color = vec4(f_color, 1.);
+  // Alpha is the bloom mask. The sky dome is the bright background backdrop -- writing 1.0 put it in the
+  // reserved EMISSIVE bloom range (>0.88), so the whole bright sky bloomed via the lowered emissive
+  // threshold (overbearing). Write 0.0 so the sky opts OUT of bloom (like the WDL horizon backdrop); the
+  // sun/cloud highlights in the skybox M2 still bloom through their own path.
+  out_color = vec4(f_color, 0.);
 }
 )code" }
     }

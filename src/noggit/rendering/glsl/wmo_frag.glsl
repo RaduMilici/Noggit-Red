@@ -6,6 +6,7 @@
 #define eWMOBatch_HasMOCV 0x2u
 #define eWMOBatch_Unlit 0x4u
 #define eWMOBatch_Unfogged 0x8u
+#define eWMOBatch_Sidn 0x20u
 
 layout (std140) uniform lighting
 {
@@ -138,9 +139,11 @@ vec3 apply_lighting(vec3 material)
 
   if (bool(flags & eWMOBatch_Unlit))
   {
-    // Self-lit: just the baked color + the relevant ambient.
-    light_color = vertex_color
-                + (bool(flags & eWMOBatch_ExteriorLit) ? AmbientColor_FogEnd.xyz : ambient_color);
+    // Self-illuminated (F_UNLIT): render at full texture brightness, ignoring scene lighting -- e.g. the
+    // glowing lava veins in Molten Core's Blackrock WMO (material 21, bm_brspire_smalllava01, flagged
+    // unlit). Lighting these by the (near-black) cave ambient made them read as dull dark rock instead
+    // of glowing. Fullbright matches the client; the emissive bloom write in main() adds the halo.
+    light_color = vec3(1.0);
   }
   else if (bool(flags & eWMOBatch_ExteriorLit))
   {
@@ -190,7 +193,19 @@ vec3 apply_lighting(vec3 material)
 
   light_color += point_lights(f_position, normalize(f_normal));
 
-  return clamp(material.rgb * light_color, 0.0, 1.0);
+  vec3 lit = material.rgb * light_color;
+
+  // SIDN (Self-Illuminated Day/Night): windows and similar materials emit their own texture colour,
+  // ramping up as the outdoor light fades, so they glow at night and stay neutral by day. Faithful to
+  // the WMO material sidn flag (CMapObj night glow). Drive the ramp from the outdoor ambient luminance.
+  if (bool(flags & eWMOBatch_Sidn))
+  {
+    float outdoor_lum = dot(AmbientColor_FogEnd.xyz, vec3(0.2126, 0.7152, 0.0722));
+    float night = clamp(1.0 - outdoor_lum * 2.0, 0.0, 1.0);
+    lit += material.rgb * night;
+  }
+
+  return clamp(lit, 0.0, 1.0);
 }
 
 void main()
@@ -268,5 +283,11 @@ void main()
   // Write the bloom mask into alpha (read by the bloom bright-pass) AFTER the alpha-test discard so it
   // can't punch holes in cutouts. Without this, geometry tinted toward a bright fog colour (e.g.
   // distant Stormwind buildings) crosses the low bloom threshold and blooms heavily under fog.
-  out_color.a = bloom_mask;
+  //
+  // Unlit (self-illuminated) WMO materials -- glowing lava veins, runes, light fixtures -- are emissive,
+  // so write them into the reserved emissive range (>0.88) so their bright pixels bloom, exactly like
+  // lava liquid and M2 unlit-additive glows. The bright-pass's emissive branch still keeps only
+  // genuinely bright pixels (lowered threshold on max-channel), so dark parts of an unlit material don't
+  // bloom. Normal (lit) WMO surfaces stay capped to 0.85, below the emissive range.
+  out_color.a = bool(flags & eWMOBatch_Unlit) ? bloom_mask : (bloom_mask * 0.85);
 }

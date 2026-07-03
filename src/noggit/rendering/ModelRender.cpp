@@ -327,7 +327,13 @@ void ModelRender::draw(glm::mat4x4 const& model_view
   if (_model->animated && (!_model->animcalc || _model->_per_instance_animation))
   {
     auto const anim_id = instance.forcedAnimationId() >= 0 ? instance.forcedAnimationId() : 0;
-    _model->animate(model_view, anim_id, animtime);
+    // Feed the FULL model->view matrix (camera view * this instance's world transform) so billboard bones
+    // face the camera in this spawn's own frame. model_view alone is world->view; the instance's world
+    // orientation (e.g. Anomalus's 205deg heading) is applied separately in the shader via `transform`, so
+    // billboarding with only the view matrix left the Purple_Glow card rotated by the spawn's heading.
+    // calcMatrix uses model_view ONLY for the billboard basis, so this affects nothing else. This is a
+    // single-instance draw (creature spawns re-animate per draw), so per-instance billboards are correct.
+    _model->animate(model_view * instance.transformMatrix(), anim_id, animtime);
     _model->animcalc = true;
   }
 
@@ -365,6 +371,30 @@ void ModelRender::draw(glm::mat4x4 const& model_view
 
   OpenGL::Scoped::buffer_binder<GL_ELEMENT_ARRAY_BUFFER> indices_binder(_indices_buffer);
 
+  // TRANSLUCENT CREATURE (CreatureModelAlpha < 255, e.g. Anomalus 200 -> 0.784): the live client
+  // draws the body geometry TWICE (verified in the apitrace): first a DEPTH-ONLY prepass (color
+  // writes off), then the same batches again with ALPHABLENDENABLE=TRUE -- so the creature reads
+  // translucent against the BACKGROUND while the prepass depth keeps far-side/internal geometry from
+  // ghosting through. prepareDraw promotes opaque/alpha-key batches to alpha blending for such
+  // instances; here we lay the depth prepass first.
+  if (instance.model_alpha < 0.999f)
+  {
+    gl.colorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+    for (ModelRenderPass& p : _render_passes)
+    {
+      if (p.blend_mode > 1)
+      {
+        continue; // only depth-writing batches (opaque / alpha-key) participate in the prepass
+      }
+      if (p.prepareDraw(m2_shader, _model, &instance, model_render_state))
+      {
+        gl.drawElements(GL_TRIANGLES, p.index_count, GL_UNSIGNED_SHORT, reinterpret_cast<void*>(p.index_start * sizeof(GLushort)));
+        p.afterDraw();
+      }
+    }
+    gl.colorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+  }
+
   for (ModelRenderPass& p : _render_passes)
   {
     if (p.prepareDraw(m2_shader, _model, &instance, model_render_state))
@@ -377,6 +407,15 @@ void ModelRender::draw(glm::mat4x4 const& model_view
   gl.disable(GL_BLEND);
   gl.enable(GL_CULL_FACE);
   gl.depthMask(GL_TRUE);
+
+  // These three GL resets change state that prepareDraw caches in model_render_state, which is SHARED
+  // across every model in the batch. Sync the cache to what we just forced, so the next model's first
+  // pass doesn't skip re-applying a state we changed out from under it (e.g. an additive-first effect
+  // model rendering with blend left disabled). blend = 0xFFFF is an invalid sentinel that forces the
+  // next pass to re-issue both the GL blend func and the blend_mode uniform.
+  model_render_state.blend = 0xFFFF;
+  model_render_state.backface_cull = true;
+  model_render_state.z_buffered = false;
 }
 
 void ModelRender::draw(glm::mat4x4 const& model_view
@@ -542,6 +581,27 @@ void ModelRender::drawParticles(glm::mat4x4 const& model_view
   {
     p.draw(model_view, particles_shader, _transform_buffer, static_cast<int>(instance_count));
   }
+}
+
+void ModelRender::drawParticlesForInstance(glm::mat4x4 const& model_view
+    , OpenGL::Scoped::use_program& particles_shader
+    , glm::mat4x4 const& transform
+    , float model_alpha
+)
+{
+  if (_model->_particles.empty())
+  {
+    return;
+  }
+  {
+    OpenGL::Scoped::buffer_binder<GL_ARRAY_BUFFER> const transform_binder(_transform_buffer);
+    gl.bufferData(GL_ARRAY_BUFFER, sizeof(glm::mat4x4), &transform, GL_DYNAMIC_DRAW);
+  }
+  // Apply CreatureModelAlpha to the particles (same value the mesh uses). The client fades the whole
+  // model -- so the energy-elemental feet smoke that was rendering full-opacity now tracks the body.
+  particles_shader.uniform("particle_alpha_mod", model_alpha);
+  drawParticles(model_view, particles_shader, 1);
+  particles_shader.uniform("particle_alpha_mod", 1.0f); // restore for the batched (non-creature) pass
 }
 
 void ModelRender::drawRibbons( OpenGL::Scoped::use_program& ribbons_shader
@@ -1287,18 +1347,53 @@ bool ModelRenderPass::prepareDraw(OpenGL::Scoped::use_program& m2_shader, Model 
     }
   }
 
+  // How the LIVE 1.12 client renders a translucent creature (CreatureModelAlpha < 255, e.g. Anomalus
+  // 200) -- verified against the apitrace (the body geometry is submitted TWICE per frame):
+  //   * PASS A: depth-only prepass -- same body batches, COLORWRITEENABLE=0, ZWRITEENABLE=TRUE.
+  //   * PASS B: the body again with ALPHABLENDENABLE=TRUE (SRCALPHA/INVSRCALPHA) and color writes on,
+  //     alpha = CreatureModelAlpha -- translucent against the BACKGROUND, while the prepass depth
+  //     keeps far-side/internal geometry from ghosting through.
+  //   * Runes / Purple_Glow / glows: drawn ADDITIVE (SRCBLEND=SRCALPHA, DESTBLEND=ONE) with ALPHATEST
+  //     on, ZWRITEENABLE=FALSE, CULL=NONE -- glowing on top.
+  // (An earlier read of a previous capture concluded "solid body" -- that was PASS A, whose color
+  // writes are off; the blended PASS B right after it is what makes the creature see-through.)
+  // Implemented via the depth prepass in ModelRender::draw + promote_to_alpha_blend below. Creatures
+  // are also forced fullbright (spawns get no scene light; a lit material would render black).
+  float const inst_alpha = instance ? instance->model_alpha : 1.0f;
+  uint16_t effective_blend = renderflag.blend;
+  bool const translucent_display = inst_alpha < 0.999f;
+
+  // NOTE: the "glow/mist core" placeholder mesh (the out-of-place torso pill on the arcane elementals) is
+  // hidden at load time in Model.cpp via a geometric compact+dense-core-sphere test -- see showGeosets
+  // there. That replaces an earlier per-pass particle-texture skip which only caught the Anomalus.
+
+  bool const is_additive_blend = effective_blend == static_cast<uint16_t>(M2Blend::Add)
+                              || effective_blend == static_cast<uint16_t>(M2Blend::No_Add_Alpha);
+  if (!is_additive_blend)
+  {
+    mesh_color.w *= inst_alpha;
+  }
+
   // exit and return false before affecting the opengl render state
   if (mesh_color.w <= 0.0f)
   {
     return false;
   }
 
-  uint16_t effective_blend = renderflag.blend;
   bool const masked_additive = uses_masked_lightray_additive(m, *this, effective_blend);
 
-  if (model_render_state.blend != effective_blend)
+  // Translucent creatures (CreatureModelAlpha < 255): the client draws the opaque/alpha-key body
+  // batches ALPHA-BLENDED (over a depth prepass laid in ModelRender::draw) so the whole creature is
+  // see-through against the background. Promote only the GL blend state -- the blend_mode UNIFORM
+  // stays the authored value so alpha-key batches keep their alpha test in the shader.
+  bool const promote_to_alpha_blend = translucent_display
+    && (effective_blend == static_cast<uint16_t>(M2Blend::Opaque)
+        || effective_blend == static_cast<uint16_t>(M2Blend::Alpha_Key));
+  uint16_t const blend_state_key = effective_blend | (promote_to_alpha_blend ? 0x100 : 0);
+
+  if (model_render_state.blend != blend_state_key)
   {
-    switch (static_cast<M2Blend>(effective_blend))
+    switch (promote_to_alpha_blend ? M2Blend::Alpha : static_cast<M2Blend>(effective_blend))
     {
       default:
       case M2Blend::Opaque:
@@ -1328,7 +1423,7 @@ bool ModelRenderPass::prepareDraw(OpenGL::Scoped::use_program& m2_shader, Model 
     }
 
     m2_shader.uniform("blend_mode", static_cast<int>(effective_blend));
-    model_render_state.blend = effective_blend;
+    model_render_state.blend = blend_state_key;
   }
 
   if (model_render_state.masked_additive != masked_additive)
@@ -1353,18 +1448,11 @@ bool ModelRenderPass::prepareDraw(OpenGL::Scoped::use_program& m2_shader, Model 
     model_render_state.backface_cull = backface_cull;
   }
 
-  if (model_render_state.z_buffered != renderflag.flags.z_buffered)
+  bool const no_depth_write = renderflag.flags.z_buffered;
+  if (model_render_state.z_buffered != no_depth_write)
   {
-    if (renderflag.flags.z_buffered)
-    {
-      gl.depthMask(GL_FALSE);
-    }
-    else
-    {
-      gl.depthMask(GL_TRUE);
-    }
-
-    model_render_state.z_buffered = renderflag.flags.z_buffered;
+    gl.depthMask(no_depth_write ? GL_FALSE : GL_TRUE);
+    model_render_state.z_buffered = no_depth_write;
   }
 
   if (model_render_state.unfogged != renderflag.flags.unfogged)
@@ -1373,10 +1461,15 @@ bool ModelRenderPass::prepareDraw(OpenGL::Scoped::use_program& m2_shader, Model 
     model_render_state.unfogged = renderflag.flags.unfogged;
   }
 
-  if (model_render_state.unlit != renderflag.flags.unlit)
+  // A translucent creature is self-illuminated energy: render every pass FULLBRIGHT. Creature spawns don't
+  // get scene lighting, so a LIT material would render BLACK (e.g. Anomalus submesh 2 = the MANAMISTBASE
+  // aura on mat1, which is LIT unlike the UNLIT body). The body (unlit) is already fullbright; force the
+  // others to match so the whole creature reads as bright energy.
+  bool const effective_unlit = renderflag.flags.unlit || translucent_display;
+  if (model_render_state.unlit != effective_unlit)
   {
-    m2_shader.uniform("unlit", (int)renderflag.flags.unlit);
-    model_render_state.unlit = renderflag.flags.unlit;
+    m2_shader.uniform("unlit", (int)effective_unlit);
+    model_render_state.unlit = effective_unlit;
   }
 
   if (texture_count > 1)
@@ -1490,7 +1583,14 @@ bool ModelRenderPass::prepareDraw(OpenGL::Scoped::use_program& m2_shader, Model 
 
 void ModelRenderPass::afterDraw()
 {
-  gl.blendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+  // Intentionally empty. This used to reset the blend func to alpha (SRC_ALPHA, ONE_MINUS_SRC_ALPHA)
+  // after every pass -- but prepareDraw only re-issues glBlendFunc when model_render_state.blend
+  // CHANGES between passes. Resetting the func here without touching that cache desynced the two:
+  // a run of consecutive same-blend passes (e.g. Anomalus' additive glow submeshes 3/4/5) had the
+  // func silently reverted to alpha after the first pass, so every following pass -- believing it was
+  // still additive -- actually alpha-blended. For an additive texture with an opaque black background
+  // (Purple_Glow, ArcaneElementalRune) alpha blend darkens the destination toward black => the "black
+  // boxes". prepareDraw is the sole owner of the blend state; leave the GL func exactly as it set it.
 }
 
 bool ModelRenderPass::bindTexture(size_t index, Model* m, ModelInstance const* instance, OpenGL::M2RenderState& model_render_state, OpenGL::Scoped::use_program& m2_shader)

@@ -54,6 +54,16 @@ CharacterHairGeosetsDB gCharacterHairGeosetsDB;
 CharacterSectionsDB gCharacterSectionsDB;
 WMOAreaTableDB gWMOAreaTableDB;
 GameObjectDisplayInfoDB gGameObjectDisplayInfoDB;
+SpellVisualDB gSpellVisualDB;
+SpellVisualKitDB gSpellVisualKitDB;
+SpellVisualEffectNameDB gSpellVisualEffectNameDB;
+SpellIconDB gSpellIconDB;
+FactionTemplateDB gFactionTemplateDB;
+FactionDB gFactionDB;
+SpellDurationDB gSpellDurationDB;
+SpellRadiusDB gSpellRadiusDB;
+SpellRangeDB gSpellRangeDB;
+SpellCastTimesDB gSpellCastTimesDB;
 
 void OpenDBs(std::shared_ptr<BlizzardArchive::ClientData> clientData)
 {
@@ -123,6 +133,44 @@ void OpenDBs(std::shared_ptr<BlizzardArchive::ClientData> clientData)
   catch (std::exception const& e)
   {
     LogError << "Failed to open GameObjectDisplayInfo.dbc: " << e.what() << std::endl;
+  }
+  try
+  {
+    gSpellVisualDB.open(clientData);
+    gSpellVisualKitDB.open(clientData);
+    gSpellVisualEffectNameDB.open(clientData);
+  }
+  catch (std::exception const& e)
+  {
+    LogError << "Failed to open spell visual DBCs (creature aura visuals disabled): " << e.what() << std::endl;
+  }
+  try
+  {
+    gSpellIconDB.open(clientData);
+  }
+  catch (std::exception const& e)
+  {
+    LogError << "Failed to open SpellIcon.dbc: " << e.what() << std::endl;
+  }
+  try
+  {
+    gFactionTemplateDB.open(clientData);
+    gFactionDB.open(clientData);
+  }
+  catch (std::exception const& e)
+  {
+    LogError << "Failed to open Faction/FactionTemplate.dbc: " << e.what() << std::endl;
+  }
+  try
+  {
+    gSpellDurationDB.open(clientData);
+    gSpellRadiusDB.open(clientData);
+    gSpellRangeDB.open(clientData);
+    gSpellCastTimesDB.open(clientData);
+  }
+  catch (std::exception const& e)
+  {
+    LogError << "Failed to open SpellDuration/SpellRadius/SpellRange/SpellCastTimes.dbc: " << e.what() << std::endl;
   }
 }
 

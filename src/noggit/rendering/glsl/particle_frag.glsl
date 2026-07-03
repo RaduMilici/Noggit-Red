@@ -22,6 +22,11 @@ uniform int tex_index;
 uniform float alpha_test;
 uniform int particle_blend; // particle blend mode (3,4 = additive -> fade to black in fog)
 
+// Per-instance opacity = CreatureDisplayInfo.CreatureModelAlpha (0..1). The client applies this to the
+// WHOLE creature model -- mesh AND particles -- but Noggit only applied it to the mesh, so energy-
+// elemental smoke rendered at full opacity (too solid). 1.0 for everything that isn't a faded creature.
+uniform float particle_alpha_mod;
+
 void main()
 {
   vec4 t = texture(tex, vec3(f_uv, tex_index));
@@ -31,7 +36,15 @@ void main()
     discard;
   }
 
-  out_color = vec4(f_color.rgb * t.rgb, f_color.a * t.a);
+  // Fix the "black fringe": these textures store an opaque shape over a TRANSPARENT BLACK background
+  // (RGB 0, alpha 0). Bilinear filtering blends the shape with that black bg, darkening the edges, so an
+  // alpha-blended (mode 2) particle gets a dark halo / the black background appears to bleed in. Dividing
+  // the filtered RGB by its alpha undoes that darkening (equivalent to premultiplied compositing),
+  // recovering the shape's true colour at the edges. Only for alpha-blend; additive (3/4) already
+  // handles a black background correctly (black adds nothing).
+  vec3 t_rgb = (particle_blend == 2 && t.a > 0.0039) ? clamp(t.rgb / t.a, 0.0, 1.0) : t.rgb;
+
+  out_color = vec4(f_color.rgb * t_rgb, f_color.a * t.a * particle_alpha_mod);
 
   // Fog: smoke/dust particles should fade into the haze like the rest of the scene. Additive
   // particles (blend 3/4 -- fire/glow) fade to black so they dissolve; everything else fades toward

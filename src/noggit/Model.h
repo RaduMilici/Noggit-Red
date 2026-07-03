@@ -17,12 +17,15 @@
 #include <optional>
 #include <string>
 #include <vector>
+#include <cstdint>
+#include <unordered_map>
 #include <noggit/rendering/ModelRender.hpp>
 
 class Bone;
 class Model;
 class ModelInstance;
 class ParticleSystem;
+struct ParticleSystemLiveState;
 class RibbonEmitter;
 
 namespace Noggit::Rendering
@@ -64,6 +67,22 @@ public:
   bone_flags flags;
   glm::mat4x4 mat = glm::mat4x4();
   glm::mat4x4 mrot = glm::mat4x4();
+
+  // For billboard glow cards: the card's local-space basis derived from its geometry + UVs at load, so the
+  // screen-aligned billboard can align the TEXTURE's authored up/right with screen up/right (cards are
+  // authored with differing in-plane rolls, so a fixed local-axis mapping spins some sideways). normal is
+  // the card's plane normal; up follows increasing texture V-up; right completes the frame. Defaults match
+  // the old fixed mapping (local X normal / Z up / Y right) until computed.
+  glm::vec3 bb_local_normal = glm::vec3(1, 0, 0);
+  glm::vec3 bb_local_up     = glm::vec3(0, 0, 1);
+  glm::vec3 bb_local_right  = glm::vec3(0, 1, 0);
+
+  // Diagnostic: does this bone carry any animated transform track (translation/rotation)? Used to tell
+  // whether a particle emitter's ring motion is bone-driven vs. purely a particle-param effect.
+  bool hasTransformTracks()
+  {
+    return trans.uses(0) || rot.uses(0) || classic_rot.uses(0);
+  }
 
   bool calc;
   void calcMatrix(glm::mat4x4 const& model_view
@@ -129,7 +148,9 @@ struct ModelLight {
   glm::vec3 pos, tpos, dir, tdir;
   Animation::M2Value<glm::vec3> diffColor, ambColor;
   Animation::M2Value<float> diffIntensity, ambIntensity;
-  //Animation::M2Value<float> attStart,attEnd;
+  // Attenuation range (model-local units, before the doodad placement scale). attEnd is the light's
+  // radius; used to give point lights their REAL falloff distance instead of a hardcoded default.
+  Animation::M2Value<float> attStart, attEnd;
   //Animation::M2Value<bool> Enabled;
 
   ModelLight(const BlizzardArchive::ClientFile&  f, const ModelLightDef &mld, int *global);
@@ -169,6 +190,23 @@ public:
 
   void updateEmitters(float dt);
 
+  // ---- Per-instance particle simulation (creature spawns) ----------------------------------------
+  // Multiple spawns share ONE Model, but each animates at its own phase (animation_time_offset), so a
+  // single shared particle list only ever tracks one spawn's body. Each spawn (keyed by guid) gets its
+  // own live state, swapped into the shared ParticleSystem objects for the duration of its per-instance
+  // update+draw. swapInstanceEmitterState() is symmetric -- call it once to swap a spawn's state IN,
+  // again to swap it back OUT. updateParticleSystems() advances only the particle sim (no texture-anim;
+  // that stays on the shared/global clock) using the bones/setup that animate() just applied.
+  void swapInstanceEmitterState(std::uint64_t instance_key);
+  void updateParticleSystems(float dt);
+  void dropInstanceEmitterState(std::uint64_t instance_key);
+
+  // True if any particle emitter has flag 0x10 ("particles ride the emitter transform"). Used by the
+  // attachment renderer: aura effect models without it draw their particles with the BIND-pose
+  // attachment placement so existing particles don't get dragged around by the animated bone
+  // (matching the client, which simulates such particles in world space).
+  bool particlesRideParent() const;
+
   void finishLoading() override;
   void waitForChildrenLoaded() override;
 
@@ -181,6 +219,11 @@ public:
 
   [[nodiscard]]
   bool use_fake_geometry() const { return !!_fake_geometry; }
+
+  // True if the model has an UNLIT + additive material (a self-illuminated glow layer: fires, braziers,
+  // lamps, lava props). Data-driven signal for synthesizing a warm light from a doodad that carries no
+  // authored M2 light -- replaces brittle filename-keyword matching.
+  bool emitsLight() const { return _emits_light; }
 
   [[nodiscard]]
   bool animated_mesh() const { return (animGeometry || animBones); }
@@ -224,6 +267,21 @@ public:
   std::vector<uint16_t> blend_override;
 
   float rad;
+  // Particle-free ground-footprint radius of the RENDER mesh (horizontal distance from the mesh's
+  // horizontal centre to its farthest render vertex), in model space, in the BIND pose.
+  float footprint_radius = 0.f;
+
+  // EXACT client selection-circle base radius, reverse-engineered from wow.exe (FUN_00608e00 /
+  // FUN_0060aee0): the ground circle radius = OBJECT_FIELD_SCALE_X * sqrt( sqrt(dx^2 + dy^2) * 0.5 ),
+  // where dx,dy are the X/Y extents of the model's STAND animation (anim id 0) bounding box (each M2
+  // sequence stores its own bounds). Using the stand box -- not the global header box -- is what
+  // excludes attack/particle extents. Verified byte-exact vs apitrace (ManaFiend 1.834, Anomalus
+  // 1.144, Drake 3.346). 0 = unavailable (fall back to footprint_radius). See noggit-selection-circle.
+  float selection_base_radius = 0.f;
+
+  // (unused, kept for reference) idle-pose footprint experiment -- superseded by selection_base_radius.
+  float _idle_footprint_radius = -1.f;
+  float idlePoseFootprint();
   float trans;
   bool animcalc;
 
@@ -251,9 +309,11 @@ private:
 
   bool _per_instance_animation;
   bool _uses_classic_layout = false;
+  bool _emits_light = false; // has an unlit+additive (emissive glow) material -- see emitsLight()
   uint32_t _embedded_view_offset = 0;
   bool _logged_layout_summary = false;
   bool _logged_animation_branch = false;
+  bool _bb_bases_computed = false;
   bool _logged_classic_character_geosets = false;
   std::uint32_t _logged_missing_special_texture_mask = 0;
   std::vector<ClassicStaticBone> _classic_static_bones;
@@ -290,6 +350,10 @@ private:
   std::vector<ModelRenderFlags> _render_flags;
   std::vector<ParticleSystem> _particles;
   std::vector<RibbonEmitter> _ribbons;
+
+  // Per-spawn live particle state (see swapInstanceEmitterState). Keyed by creature spawn guid; each
+  // entry holds one ParticleSystemLiveState per _particles emitter. Default states pre-warm on first update.
+  std::unordered_map<std::uint64_t, std::vector<ParticleSystemLiveState>> _instance_emitter_states;
 
   std::vector<int> _global_sequences;
   std::vector<TextureAnim> _texture_animations;

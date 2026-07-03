@@ -109,6 +109,7 @@ namespace OpenGL
     bool unfogged = false;
     bool unlit = false;
     bool masked_additive = false;
+    int discard_invisible = 0; // promoted creature pass: discard texels that add nothing (no depth write)
     bool allow_lightray_model = true;
     std::array<GLuint, 2> tex_arrays;
     std::array<GLuint, 2> tex_indices;
