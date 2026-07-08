@@ -96,7 +96,18 @@ MapIndex::MapIndex (const std::string &pBasename, int map_id, World* world,
   theFile.read(&mphd, sizeof(MPHD));
 
   mHasAGlobalWMO = mphd.flags & FLAG_GLOBAL_OBJECT;
-  mBigAlpha = mphd.flags & FLAG_BIG_ALPHA;
+  // The 1.12 client never reads MPHD flags -- "big alpha" (uncompressed 8-bit alphamaps)
+  // only exists from WotLK on, where the client checks flag 0x4. Some Turtle custom maps
+  // (e.g. Karazahn40, flags=0xE) carry garbage MPHD flags while their MCAL data is regular
+  // 2048-byte 4-bit; trusting the bit makes the alpha reader consume 4096 bytes per layer,
+  // which misreads texture blends on every chunk and runs past the file buffer on the last
+  // chunk of a tile (access violation -> whole tile fails to load).
+  mBigAlpha = (mphd.flags & FLAG_BIG_ALPHA)
+           && Noggit::Project::CurrentProject::get()->projectVersion != Noggit::Project::ProjectVersion::CLASSIC;
+  if ((mphd.flags & FLAG_BIG_ALPHA) && !mBigAlpha)
+  {
+    LogDebug << "WDT \"" << basename << "\" sets MPHD big-alpha flag on a classic project; ignoring it (1.12 client behavior)." << std::endl;
+  }
   _sort_models_by_size_class = mphd.flags & FLAG_DOODADS_SORT;
 
   if (!(mphd.flags & FLAG_SHADING))
@@ -281,9 +292,14 @@ void MapIndex::enterTile(const TileIndex& tile)
   int cx = static_cast<int>(tile.x);
   int cz = static_cast<int>(tile.z);
 
-  for (int pz = std::max(cz - 1, 0); pz < std::min(cz + 2, 64); ++pz)
+  // Prefetch the (2r+1)x(2r+1) grid of tiles around the camera. User-configurable (Settings -> "ADT
+  // loading radius"), default 1 = 3x3 to match the reference build. A larger radius streams content in
+  // earlier (smoother as you move) but keeps more tiles resident -> more terrain/objects/WMOs to draw
+  // every frame -> lower fps. Read live so the slider takes effect on the next tile crossing.
+  int const radius = std::max(0, QSettings().value("loading_radius", 1).toInt());
+  for (int pz = std::max(cz - radius, 0); pz <= std::min(cz + radius, 63); ++pz)
   {
-    for (int px = std::max(cx - 1, 0); px < std::min(cx + 2, 64); ++px)
+    for (int px = std::max(cx - radius, 0); px <= std::min(cx + radius, 63); ++px)
     {
       loadTile(TileIndex(static_cast<std::size_t>(px), static_cast<std::size_t>(pz)));
     }

@@ -10,6 +10,20 @@
 #include <cstdlib>
 #include <list>
 
+#if defined(_WIN32)
+#include <cstdio>
+#include <cstring>
+#include <stdexcept>
+#include <eh.h>
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
+
 namespace
 {
   bool async_loader_trace_enabled()
@@ -54,6 +68,46 @@ void AsyncLoader::wait_until_idle()
 
 void AsyncLoader::process()
 {
+#if defined(_WIN32)
+  // Translate SEH exceptions (access violations etc.) into std::runtime_error on this
+  // worker thread so the catch blocks below can log the exception code, faulting
+  // module+offset and accessed address instead of an anonymous "unknown exception".
+  // Requires /EHa (set globally in CMakeLists). The module+offset is resolvable to a
+  // source line with llvm-symbolizer against the .pdb.
+  _set_se_translator([](unsigned int code, EXCEPTION_POINTERS* ep)
+  {
+    char buf[192];
+    void* code_addr = (ep && ep->ExceptionRecord) ? ep->ExceptionRecord->ExceptionAddress : nullptr;
+    unsigned long long target = 0;
+    int op = -1;
+    if (ep && ep->ExceptionRecord && code == EXCEPTION_ACCESS_VIOLATION
+        && ep->ExceptionRecord->NumberParameters >= 2)
+    {
+      op = static_cast<int>(ep->ExceptionRecord->ExceptionInformation[0]);
+      target = static_cast<unsigned long long>(ep->ExceptionRecord->ExceptionInformation[1]);
+    }
+    char mod_name[96] = "?";
+    unsigned long long mod_ofs = 0;
+    HMODULE mod = nullptr;
+    if (code_addr
+        && GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                              static_cast<LPCSTR>(code_addr), &mod)
+        && mod)
+    {
+      char full[MAX_PATH];
+      if (GetModuleFileNameA(mod, full, sizeof(full)))
+      {
+        char const* slash = std::strrchr(full, '\\');
+        std::snprintf(mod_name, sizeof(mod_name), "%s", slash ? slash + 1 : full);
+      }
+      mod_ofs = reinterpret_cast<unsigned long long>(code_addr) - reinterpret_cast<unsigned long long>(mod);
+    }
+    std::snprintf(buf, sizeof(buf), "SEH exception 0x%08X at %s+0x%llX (%s of address 0x%llX)",
+                  code, mod_name, mod_ofs, op == 0 ? "read" : op == 1 ? "write" : op == 8 ? "exec" : "op?", target);
+    throw std::runtime_error(buf);
+  });
+#endif
+
   AsyncObject* object = nullptr;
 
   QSettings settings;

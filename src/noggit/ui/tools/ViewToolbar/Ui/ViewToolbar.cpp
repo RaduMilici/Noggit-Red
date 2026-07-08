@@ -103,6 +103,7 @@ ViewToolbar::ViewToolbar(MapView *mapView, ViewToolbar *tb)
     add_tool_icon(mapView, &mapView->_draw_terrain, tr("Terrain"), FontNoggit::VISIBILITY_TERRAIN, tb);
     add_tool_icon(mapView, &mapView->_draw_water, tr("Water"), FontNoggit::VISIBILITY_WATER, tb);
     add_tool_icon(mapView, &mapView->_draw_bloom, tr("Bloom"), FontNoggit::VISIBILITY_LIGHT, tb);
+    add_tool_icon(mapView, &mapView->_draw_ground_clutter, tr("Ground Clutter"), FontNoggit::VISIBILITY_GROUNDEFFECTS, tb);
 
     addSeparator();
 

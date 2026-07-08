@@ -13,6 +13,7 @@ struct ENTRY_MODF;
 namespace Noggit::Rendering
 {
   class LiquidTextureManager;
+  class WorldRender;
 }
 
 class WMOInstance : public SceneObject
@@ -105,6 +106,7 @@ public:
             , display_mode display
             , bool no_cull = false
             , bool draw_exterior = true
+            , Noggit::Rendering::WorldRender* world_renderer = nullptr // per-room (MOLR) light scoping
             );
 
   void intersect (math::ray const&, selection_result*, bool do_exterior = true);

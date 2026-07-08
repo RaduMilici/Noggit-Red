@@ -148,6 +148,20 @@ GLboolean OpenGL::context::isEnabled (GLenum target)
 #endif
   return _current_context->functions()->glIsEnabled (target);
 }
+void OpenGL::context::finish()
+{
+#ifndef NOGGIT_DO_NOT_CHECK_FOR_OPENGL_ERRORS
+  verify_context_and_check_for_gl_errors const _ (_current_context, NOGGIT_CURRENT_FUNCTION);
+#endif
+  return _current_context->functions()->glFinish();
+}
+void OpenGL::context::flush()
+{
+#ifndef NOGGIT_DO_NOT_CHECK_FOR_OPENGL_ERRORS
+  verify_context_and_check_for_gl_errors const _ (_current_context, NOGGIT_CURRENT_FUNCTION);
+#endif
+  return _current_context->functions()->glFlush();
+}
 void OpenGL::context::viewport (GLint x, GLint y, GLsizei width, GLsizei height)
 {
 #ifndef NOGGIT_DO_NOT_CHECK_FOR_OPENGL_ERRORS

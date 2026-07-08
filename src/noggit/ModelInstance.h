@@ -36,6 +36,25 @@ public:
   // draws creatures at this opacity (translucent ghosts/elementals etc.); 1.0 means no change.
   float model_alpha = 1.0f;
 
+  // Model-wide color multiplier from aura char-proc tints (Ghost Visual's light-blue shift).
+  // (1,1,1) = no change. Applied to every render pass's mesh color alongside model_alpha.
+  glm::vec3 model_tint = glm::vec3(1.0f);
+
+  // Camera-relative render anchor (jitter fix). When set, the vertex shader uses `_render_origin` as
+  // the ~17000 world anchor and `_render_transform_rel` as the vertex transform RELATIVE to it (small
+  // translation). Attachments (helmet/weapon following an animated parent bone) set this from a
+  // DOUBLE-precision computation so the animated offset isn't quantized to the coarse float grid at
+  // world scale. The plain transformMatrix() stays world-space (particles, picking) untouched.
+  glm::vec3 _render_origin = glm::vec3(0.0f);
+  glm::mat4x4 _render_transform_rel = glm::mat4x4(1.0f);
+  bool _has_render_anchor = false;
+  void setRenderAnchor(glm::vec3 const& origin, glm::mat4x4 const& rel)
+  {
+    _render_origin = origin;
+    _render_transform_rel = rel;
+    _has_render_anchor = true;
+  }
+
   // used when flag 0x8 is set in wdt
   // longest side of an AABB transformed model's bounding box from the M2 header
   float size_cat;
@@ -54,9 +73,11 @@ public:
     , model (std::move (other.model))
     , light_color (other.light_color)
     , model_alpha (other.model_alpha)
+    , model_tint (other.model_tint)
     , size_cat (other.size_cat)
     , _need_recalc_extents(other._need_recalc_extents)
     , _forced_anim_id(other._forced_anim_id)
+    , _close_hands(other._close_hands)
     , _replace_textures(std::move(other._replace_textures))
     , _show_geosets(std::move(other._show_geosets))
     , _visible_geoset_ids(std::move(other._visible_geoset_ids))
@@ -79,11 +100,13 @@ public:
     std::swap (dir, other.dir);
     std::swap (light_color, other.light_color);
     std::swap (model_alpha, other.model_alpha);
+    std::swap (model_tint, other.model_tint);
     std::swap (uid, other.uid);
     std::swap (scale, other.scale);
     std::swap (size_cat, other.size_cat);
     std::swap (_need_recalc_extents, other._need_recalc_extents);
     std::swap (_forced_anim_id, other._forced_anim_id);
+    std::swap (_close_hands, other._close_hands);
     std::swap (_replace_textures, other._replace_textures);
     std::swap (_show_geosets, other._show_geosets);
     std::swap (_visible_geoset_ids, other._visible_geoset_ids);
@@ -167,11 +190,17 @@ public:
   void setForcedAnimationId(int anim_id) { _forced_anim_id = anim_id; }
   [[nodiscard]] int forcedAnimationId() const { return _forced_anim_id; }
 
+  // Weapon grip: when true, the model overlays the HandsClosed pose onto the finger bones only (fist
+  // closes around a held weapon) while the body keeps its normal idle. See Model::applyHandGripOverlay.
+  void setCloseHands(bool v) { _close_hands = v; }
+  [[nodiscard]] bool closeHands() const { return _close_hands; }
+
 protected:
   bool _need_recalc_extents = true;
   bool _need_gpu_transform_update = true;
   std::uint32_t _gpu_transform_uid;
   int _forced_anim_id = -1;
+  bool _close_hands = false;
   std::map<std::size_t, scoped_blp_texture_reference> _replace_textures;
   std::vector<bool> _show_geosets;
   std::vector<std::uint16_t> _visible_geoset_ids;

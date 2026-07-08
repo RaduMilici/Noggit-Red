@@ -4,6 +4,7 @@
 #include <noggit/application/NoggitApplication.hpp>
 #include <ClientFile.hpp>
 
+#include <QtCore/QSettings>
 #include <QtCore/QString>
 #include <QtGui/QPixmap>
 
@@ -20,6 +21,39 @@ constexpr unsigned N_ARRAY_TEX = 1;
 namespace
 {
   constexpr char const* fallback_texture_filename = "tileset/generic/black.blp";
+
+  // Anisotropic filtering (checklist 20.5): the client exposes this as a CVar; noggit had none, so
+  // oblique/distant tilesets and model textures were blurrier than in-game. EXT_texture_filter_
+  // anisotropic is core-adjacent and universally supported; constants defined locally since the
+  // GL headers in use predate them. Level from QSettings render/anisotropic_filtering (default 16),
+  // clamped to the hardware max; <= 1 disables. Cached once (samplers are created early and often).
+  constexpr GLenum GL_TEXTURE_MAX_ANISOTROPY_LOCAL = 0x84FE;
+  constexpr GLenum GL_MAX_TEXTURE_MAX_ANISOTROPY_LOCAL = 0x84FF;
+
+  float anisotropy_level()
+  {
+    static float const level = []
+    {
+      float requested = QSettings().value("render/anisotropic_filtering", 16.0f).toFloat();
+      GLfloat hw_max = 1.0f;
+      gl.getFloatv(GL_MAX_TEXTURE_MAX_ANISOTROPY_LOCAL, &hw_max);
+      if (!(hw_max >= 1.0f)) // extension absent or query failed
+      {
+        hw_max = 1.0f;
+      }
+      return std::clamp(requested, 1.0f, hw_max);
+    }();
+    return level;
+  }
+
+  void apply_anisotropy(GLenum target)
+  {
+    float const level = anisotropy_level();
+    if (level > 1.0f)
+    {
+      gl.texParameterf(target, GL_TEXTURE_MAX_ANISOTROPY_LOCAL, level);
+    }
+  }
 
   bool is_null_texture_reference(std::string filename)
   {
@@ -172,6 +206,7 @@ TexArrayParams& TextureManager::get_tex_array(int width, int height, int mip_lev
     gl.texParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAX_LEVEL, mip_level - 1);
     gl.texParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MIN_FILTER, mip_level > 1 ? GL_LINEAR_MIPMAP_LINEAR : GL_LINEAR);
     gl.texParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    apply_anisotropy(GL_TEXTURE_2D_ARRAY);
   }
   else
   {
@@ -215,6 +250,7 @@ TexArrayParams& TextureManager::get_tex_array(GLint compression, int width, int 
     gl.texParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAX_LEVEL, mip_level - 1);
     gl.texParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MIN_FILTER, mip_level > 1 ? GL_LINEAR_MIPMAP_LINEAR : GL_LINEAR);
     gl.texParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    apply_anisotropy(GL_TEXTURE_2D_ARRAY);
   }
   else
   {

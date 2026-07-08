@@ -27,6 +27,7 @@ namespace Noggit::Ui
     Q_OBJECT
   public:
     explicit ZoneMusicPlayer(QWidget* parent = nullptr);
+    ~ZoneMusicPlayer() override;
 
     // Enable/disable playback. When disabled, stops everything (the list still reflects the zone).
     void set_enabled(bool enabled);
@@ -45,6 +46,7 @@ namespace Noggit::Ui
     void schedule_next();         // wait the silence interval, then play_random()
     void tick_fade();             // step the crossfade (live deck up, other deck down)
     void stop_playback();
+    void shutdown_audio();        // release the media backend fully (stop + clear media) for a clean exit
 
     // Two decks so a new track can fade IN while the previous one fades OUT at the same time (a real
     // crossfade with overlap), instead of going silent between tracks. _active_deck is the live one.

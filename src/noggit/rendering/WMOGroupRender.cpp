@@ -429,6 +429,13 @@ void WMOGroupRender::initRenderBatches()
 
   _render_batches.resize(_wmo_group->_batches.size());
 
+  int interior_batches_start = 0;
+  if (_wmo_group->header.transparency_batches_count > 0)
+  {
+    interior_batches_start =
+      _wmo_group->_batches[_wmo_group->header.transparency_batches_count - 1].vertex_end + 1;
+  }
+
   std::size_t batch_counter = 0;
   for (auto& batch : _wmo_group->_batches)
   {
@@ -439,18 +446,29 @@ void WMOGroupRender::initRenderBatches()
 
     std::uint32_t flags = 0;
 
-    // Match reference noggit3: exterior-lit is driven purely by the group's exterior /
-    // exterior_lit flags. The extra use_outdoor_lights gate suppressed it for groups
-    // flagged indoor+vertex-color that still have exterior-facing batches; the MOCV fixup
-    // zeroes vertex color on those exterior batches, so without ExteriorLit they were lit
-    // only by 0.20*ambient -> burnt (fully on 3.3.5a Stormwind, partially in vanilla).
-    if (_wmo_group->header.flags.exterior_lit || _wmo_group->header.flags.exterior)
+    bool const group_exterior_lit =
+      _wmo_group->header.flags.exterior_lit || _wmo_group->header.flags.exterior;
+    bool const has_mocv =
+      _wmo_group->header.flags.has_vertex_color || _wmo_group->header.flags.use_mocv2_for_texture_blending;
+
+    bool const batch_is_exterior = static_cast<int>(batch.vertex_start) < interior_batches_start;
+
+    // Route ExteriorLit PER BATCH within an exterior-lit group. NOTE: the genuine exterior batches (the
+    // opening-facing reveal/jamb faces) are deliberately NOT sun-lit here -- they face down/sideways with
+    // no direct sun (nDotL=0), so the exterior branch would render them near-black. They are interior
+    // batches lit by their baked warm MOCV instead (Goldshire doorway reveal is authored 255,168,85, which
+    // the un-halved fixup now renders bright). Only fully-exterior no-MOCV groups get the whole-group flag.
+    if (group_exterior_lit && (!has_mocv || batch_is_exterior))
     {
       flags |= WMORenderBatchFlags::eWMOBatch_ExteriorLit;
     }
-    if (_wmo_group->header.flags.has_vertex_color || _wmo_group->header.flags.use_mocv2_for_texture_blending)
+    if (has_mocv)
     {
       flags |= WMORenderBatchFlags::eWMOBatch_HasMOCV;
+    }
+    if (_wmo_group->_has_portal_openness)
+    {
+      flags |= WMORenderBatchFlags::eWMOBatch_PortalSpill;
     }
 
     if (batch.texture >= _wmo_group->wmo->materials.size())

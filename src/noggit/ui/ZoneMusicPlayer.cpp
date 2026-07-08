@@ -16,6 +16,7 @@
 #include <QtCore/QTemporaryFile>
 #include <QtCore/QUrl>
 #include <QtCore/QSettings>
+#include <QtCore/QCoreApplication>
 
 #include <sstream>
 #include <algorithm>
@@ -92,6 +93,35 @@ namespace Noggit::Ui
       _master_volume = saved_volume;
       _volume_slider->setValue(saved_volume);
       _enable_check->setChecked(settings.value("zone_music/enabled", false).toBool());
+    }
+
+    // Tear the audio backend down BEFORE the app exits. Qt5's Windows QMediaPlayer runs a DirectShow
+    // filter-graph thread; if a deck is still Playing at process teardown that thread can keep the
+    // process alive (and audio looping) in the background = "Noggit stays open playing music after
+    // close". aboutToQuit fires while the event loop is still running, so the stop + media release
+    // actually get processed. (Destructor does the same as a fallback for a plain widget teardown.)
+    connect(qApp, &QCoreApplication::aboutToQuit, this, [this]() { shutdown_audio(); });
+  }
+
+  ZoneMusicPlayer::~ZoneMusicPlayer()
+  {
+    shutdown_audio();
+  }
+
+  void ZoneMusicPlayer::shutdown_audio()
+  {
+    _enabled = false;
+    if (_silence_timer) { _silence_timer->stop(); }
+    if (_fade_timer) { _fade_timer->stop(); }
+    for (int i = 0; i < DECK_COUNT; ++i)
+    {
+      if (_decks[i])
+      {
+        _decks[i]->stop();
+        // Releasing the media unhooks the DirectShow graph and the temp-file handle, which lets the
+        // backend thread finish -- a bare stop() alone can leave it running on exit.
+        _decks[i]->setMedia(QMediaContent());
+      }
     }
   }
 

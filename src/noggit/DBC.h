@@ -154,12 +154,12 @@ public:
     DBCFile("DBFilesClient\\GroundEffectTexture.dbc")
   { }
 
-  /// Fields
-  static const size_t ID = 0;        // uint
-  static const size_t Doodads = 1;    // uint[4]
-  static const size_t Weights = 5;    // uint[4]
-  static const size_t Amount = 9;      // uint
-  static const size_t TerrainType = 10;  // uint
+  /// Fields (1.12 layout, VERIFIED: 7 columns, NO separate weight array -- repeated doodad ids in
+  /// the 4 slots are the weighting. Amount/density at field 5, sound/terrain-type at 6.)
+  static const size_t ID = 0;         // uint
+  static const size_t Doodads = 1;    // uint[4] (0 / 0xFFFFFFFF = empty slot)
+  static const size_t Amount = 5;     // uint (density; how many to scatter per subcell)
+  static const size_t TerrainType = 6; // uint
 };
 
 class GroundEffectDoodadDB : public DBCFile
@@ -169,10 +169,11 @@ public:
     DBCFile("DBFilesClient\\GroundEffectDoodad.dbc")
   { }
 
-  /// Fields
-  static const size_t ID = 0;        // uint
-  static const size_t Filename = 1;    // string
-  static const size_t Flags = 2;   // uint
+  /// Fields (1.12 layout, VERIFIED: field 1 is a sequential index, the FILENAME string is field 2.
+  /// Reading field 1 as the string gave truncated garbage -> grass never loaded.)
+  static const size_t ID = 0;         // uint
+  static const size_t Filename = 2;   // string  (world\nodxt\detail\*.mdl)
+  static const size_t Flags = 1;      // uint
 };
 
 class LiquidTypeDB : public DBCFile
@@ -490,6 +491,16 @@ public:
   static const size_t HeadEffect = 3;
   static const size_t ChestEffect = 4;
   static const size_t BaseEffect = 5;
+  // Char procs: model-wide effects applied while the kit's aura is active. Layout verified
+  // empirically across kit 989 (Ghost Visual: proc 1 = tint, param ARGB 0x4B0CB9FD + proc 14 =
+  // transparency, param 0.5f), kit 312 (Stealth: proc 14 = 0.3f) and kit 3450 (proc 14 = 0.5f):
+  // the proc TYPE ids sit at fields 15..18 and their params (raw u32 -- reinterpret as float or
+  // ARGB depending on type) at fields 19..22. 0xFFFFFFFF/0 = unused slot.
+  static const size_t CharProc0 = 15;
+  static const size_t CharParam0 = 19;
+  static const size_t CharProcCount = 4;
+  static const size_t CharProcTransparency = 14;
+  static const size_t CharProcTint = 1;
 };
 
 class SpellVisualEffectNameDB : public DBCFile

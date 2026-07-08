@@ -160,6 +160,13 @@ public:
   // transform); without it the client leaves spawned particles behind in world space.
   int32_t emitterFlags() const { return flags; }
 
+  // Flag 0x10: the client stores these particles in EMITTER-LOCAL space (CParticle2 +0x00 is
+  // emitter-local, RE handoff 6.4) so live particles RIDE the animated bone -- e.g. the instance
+  // portal's swirl ring rotating with its spinning bone like a wheel. Spawn keeps positions local
+  // and draw() transforms by the bone's CURRENT matrix. Without the flag, spawn bakes the bone
+  // matrix and particles stay where they were emitted (trailing behind an animated bone).
+  bool ridesParent() const { return (flags & 0x10) != 0 && parent != nullptr; }
+
   // Swap this emitter's live simulation state (particle list, spawn remainder, pre-warm guard) with an
   // external holder. Symmetric: call once to swap a spawn's state IN, again to swap it back OUT. Used to
   // give each creature spawn of a shared model its own particle simulation (see ParticleSystemLiveState).

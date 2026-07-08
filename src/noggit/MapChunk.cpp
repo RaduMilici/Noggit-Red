@@ -2,9 +2,12 @@
 #include <math/frustum.hpp>
 #include <noggit/Brush.h>
 #include <noggit/TileWater.hpp>
+#include <noggit/ChunkWater.hpp>
+#include <noggit/liquid_layer.hpp>
 #include <noggit/Log.h>
 #include <noggit/MapChunk.h>
 #include <noggit/MapHeaders.h>
+#include <noggit/DBC.h>
 #include <noggit/Misc.h>
 #include <noggit/World.h>
 #include <noggit/Alphamap.hpp>
@@ -16,6 +19,7 @@
 #include <opengl/scoped.hpp>
 #include <external/tracy/Tracy.hpp>
 #include <glm/glm.hpp>
+#include <glm/gtc/matrix_transform.hpp>
 #include <ClientFile.hpp>
 
 #include <algorithm>
@@ -2052,5 +2056,207 @@ void MapChunk::registerChunkUpdate(unsigned flags)
 {
   _chunk_update_flags |= flags;
   mt->registerChunkUpdate(flags);
+}
+
+std::vector<MapChunk::DetailDoodad> const& MapChunk::detailDoodads()
+{
+  if (!_detail_doodads_computed)
+  {
+    computeDetailDoodads();
+    _detail_doodads_computed = true;
+  }
+  return _detail_doodads;
+}
+
+// Ground clutter (checklist 14.1). Faithful to the client's ground-effect scheme: the MCNK header's
+// 8x8 doodad STENCIL (which subcells are barren) + 2-bit-per-subcell doodad MAPPING (which of the 4
+// texture layers' GroundEffectTexture applies) drive a weighted pick among that texture's up-to-4
+// GroundEffectDoodad models, scattered `Amount` times per subcell. Model SELECTION + density are
+// data-faithful; the scatter uses a deterministic per-chunk RNG (exact xy positions aren't visually
+// load-bearing) and interpolates height from the chunk's own world-space vertices (robust, no plane
+// fit). Positions/rotations are baked into transforms here once and cached.
+void MapChunk::computeDetailDoodads()
+{
+  _detail_doodads.clear();
+
+  if (!texture_set || gGroundEffectTextureDB.getRecordCount() == 0)
+  {
+    return;
+  }
+  if (holes == 0xFFFF) // fully holed -> no ground
+  {
+    return;
+  }
+
+  std::uint16_t const* mapping = texture_set->getDoodadMappingBase();
+  std::uint8_t const* stencil = texture_set->getDoodadStencilBase();
+
+  // Liquid coverage for the underwater test below (the client places no ground effects on submerged
+  // terrain). One ChunkWater per MCNK; each liquid layer carries an 8x8 subchunk coverage mask.
+  ChunkWater* const water_chunk = mt ? mt->Water.getChunk(px, py) : nullptr;
+
+  // Deterministic per-chunk RNG (LCG). Seeded by the chunk's global grid index so a chunk always
+  // scatters the same clutter across reloads/frames.
+  std::uint32_t rng = static_cast<std::uint32_t>((mt->index.z * 16 + py) * 4096 + (mt->index.x * 16 + px)) * 2654435761u + 1u;
+  auto next01 = [&rng]() -> float
+  {
+    rng = rng * 1664525u + 1013904223u;
+    return static_cast<float>((rng >> 8) & 0xFFFFFF) / static_cast<float>(0x1000000);
+  };
+
+  // Bilinear world-space position (incl. height) inside subcell (sx,sy) at local (u,v) in [0,1].
+  // mVertices are already world-space; the 9x9 outer grid is rows of 17 (9 outer + 8 inner).
+  auto cell_pos = [this](int sx, int sy, float u, float v) -> glm::vec3
+  {
+    glm::vec3 const tl = mVertices[sy * 17 + sx];
+    glm::vec3 const tr = mVertices[sy * 17 + sx + 1];
+    glm::vec3 const bl = mVertices[(sy + 1) * 17 + sx];
+    glm::vec3 const br = mVertices[(sy + 1) * 17 + sx + 1];
+    glm::vec3 const top = glm::mix(tl, tr, u);
+    glm::vec3 const bot = glm::mix(bl, br, u);
+    return glm::mix(top, bot, v);
+  };
+
+  for (int sy = 0; sy < 8; ++sy)
+  {
+    for (int sx = 0; sx < 8; ++sx)
+    {
+      // Stencil bit set on this subcell -> no clutter here (barren patch).
+      if ((stencil[sy] >> sx) & 1u)
+      {
+        continue;
+      }
+
+      // Hole covering this subcell -> no ground to stand on. Low-res holes are a 4x4 mask.
+      unsigned const hole_bit = 1u << ((sy / 2) * 4 + (sx / 2));
+      if (static_cast<unsigned>(holes) & hole_bit)
+      {
+        continue;
+      }
+
+      // Underwater: the client never scatters ground effects on submerged terrain. Skip any subcell
+      // covered by a liquid layer (fixes "grass growing in the water").
+      if (water_chunk)
+      {
+        bool submerged = false;
+        for (auto const& layer : *water_chunk->getLayers())
+        {
+          if (layer.hasSubchunk(sx, sy))
+          {
+            submerged = true;
+            break;
+          }
+        }
+        if (submerged)
+        {
+          continue;
+        }
+      }
+
+      // Slope: no ground clutter on steep terrain (mountainsides). Approximate the subcell's face
+      // normal from its 4 world-space corners and skip when it tilts too far from horizontal (the
+      // up-component of the unit normal below the cutoff = "grass on the mountains" fix). The client's
+      // ground-effect cutoff is ~0.4 (a ~66deg slope); 0.5 (~60deg) here is a touch stricter so obvious
+      // mountainside grass is gone while rolling hills keep theirs. Tunable if it reads off.
+      {
+        glm::vec3 const tl = mVertices[sy * 17 + sx];
+        glm::vec3 const tr = mVertices[sy * 17 + sx + 1];
+        glm::vec3 const bl = mVertices[(sy + 1) * 17 + sx];
+        glm::vec3 const face_n = glm::cross(tr - tl, bl - tl);
+        float const len = glm::length(face_n);
+        if (len > 1e-5f && (std::abs(face_n.y) / len) < 0.5f)
+        {
+          continue;
+        }
+      }
+
+      // 2-bit layer index for this subcell -> which of the chunk's up-to-4 texture layers.
+      unsigned const layer = (mapping[sy] >> (2 * sx)) & 3u;
+      if (layer >= texture_set->num())
+      {
+        continue;
+      }
+      unsigned const effect_id = texture_set->getEffectForLayer(layer);
+      if (!effect_id)
+      {
+        continue;
+      }
+
+      // Doodad table: the 4 doodad slots (repeated ids = higher chance -- there is no separate weight
+      // column in 1.12). Pick uniformly among the non-empty slots.
+      std::array<unsigned, 4> table{};
+      unsigned filled = 0;
+      unsigned amount = 8;
+      try
+      {
+        DBCFile::Record tex_rec = gGroundEffectTextureDB.getByID(effect_id);
+        for (int i = 0; i < 4; ++i)
+        {
+          unsigned const doodad_id = tex_rec.getUInt(GroundEffectTextureDB::Doodads + i);
+          if (doodad_id && doodad_id != 0xFFFFFFFFu)
+          {
+            table[filled++] = doodad_id;
+          }
+        }
+        unsigned const a = tex_rec.getUInt(GroundEffectTextureDB::Amount);
+        amount = a ? std::min(a, 16u) : 8u;
+      }
+      catch (...)
+      {
+        continue;
+      }
+      if (filled == 0)
+      {
+        continue;
+      }
+
+      for (unsigned d = 0; d < amount; ++d)
+      {
+        unsigned const doodad_id = table[static_cast<std::size_t>(next01() * filled) % filled];
+        if (!doodad_id)
+        {
+          continue;
+        }
+
+        std::string filename;
+        try
+        {
+          filename = gGroundEffectDoodadDB.getByID(doodad_id).getString(GroundEffectDoodadDB::Filename);
+        }
+        catch (...)
+        {
+          continue;
+        }
+        if (filename.empty())
+        {
+          continue;
+        }
+
+        // Normalize path: client stores "foo.mdx" under world\nodxt\detail\.
+        std::string path = "world/nodxt/detail/" + filename;
+        std::replace(path.begin(), path.end(), '\\', '/');
+        std::transform(path.begin(), path.end(), path.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        auto const ext = path.size() >= 4 ? path.substr(path.size() - 4) : std::string();
+        if (ext == ".mdx" || ext == ".mdl")
+        {
+          path.replace(path.size() - 4, 4, ".m2");
+        }
+
+        float const u = next01();
+        float const v = next01();
+        glm::vec3 const world_pos = cell_pos(sx, sy, u, v);
+
+        float const yaw = next01() * glm::two_pi<float>();
+        float const scale = 0.9f + next01() * 0.35f; // subtle size variation
+
+        glm::mat4x4 transform(1.0f);
+        transform = glm::translate(transform, world_pos);
+        transform = glm::rotate(transform, yaw, glm::vec3(0.0f, 1.0f, 0.0f));
+        transform = glm::scale(transform, glm::vec3(scale));
+
+        _detail_doodads.push_back({std::move(path), transform});
+      }
+    }
+  }
 }
 

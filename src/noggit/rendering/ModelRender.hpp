@@ -119,6 +119,11 @@ namespace Noggit::Rendering
         , int animtime
         , display_mode display
         , bool no_cull = false
+        , bool bloom_mask_only = false // re-stamp only the emissive bloom mask (alpha channel); no colour
+        // Interior light for this object: rgb = the MOCV floor colour sampled under it, a = 1 when
+        // indoors; (0,0,0,0) = outdoor (default). The shader splits the colour into ambient/diffuse per
+        // the client's unit interior lighting (RE_notes/15) instead of the outdoor sun.
+        , glm::vec4 const& interior_light = glm::vec4(0.f)
     );
 
     void draw (glm::mat4x4 const& model_view
@@ -133,11 +138,31 @@ namespace Noggit::Rendering
         , std::unordered_map<Model*, std::size_t>& model_boxes_to_draw
         , display_mode display
         , bool no_cull = false
+        // Representative instance supplying the per-instance resolves the instanced draw can't do per-copy
+        // (replaceable creature skin texture, geoset selection). All instances in ONE call must share it --
+        // callers group creatures by (model, display) so each batch is a single skin. nullptr for doodads.
+        , ModelInstance const* representative = nullptr
+        // Per-instance interior light (parallel to `instances`): rgb = sampled MOCV floor colour,
+        // a = 1 indoors. Empty = all outdoor. The draw partitions instances by this value into sub-draws.
+        , std::vector<glm::vec4> const& instance_interior = {}
     );
 
     void drawParticles(glm::mat4x4 const& model_view
         , OpenGL::Scoped::use_program& particles_shader
         , std::size_t instance_count
+    );
+
+    // Draw particles/ribbons for a FILTERED set of instance transforms (uploads them to the
+    // instance buffer first). Used for the client-faithful particle draw range: the batched world
+    // pass culls doodad instances beyond the range instead of stamping every placement's identical
+    // cloud (IF Great Forge: stacked LavaSteam columns multiplied additively into a white core).
+    void drawParticlesFiltered(glm::mat4x4 const& model_view
+        , OpenGL::Scoped::use_program& particles_shader
+        , std::vector<glm::mat4x4> const& transforms
+    );
+
+    void drawRibbonsFiltered(OpenGL::Scoped::use_program& ribbons_shader
+        , std::vector<glm::mat4x4> const& transforms
     );
 
     // Draw this model's particles for ONE instance with the given world transform. Creature spawns

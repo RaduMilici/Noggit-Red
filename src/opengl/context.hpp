@@ -59,6 +59,9 @@ namespace OpenGL
     NOGGIT_FORCEINLINE void disable (GLenum);
     NOGGIT_FORCEINLINE GLboolean isEnabled (GLenum);
 
+    NOGGIT_FORCEINLINE void finish();
+    NOGGIT_FORCEINLINE void flush();
+
     NOGGIT_FORCEINLINE void viewport (GLint x, GLint y, GLsizei width, GLsizei height);
 
     NOGGIT_FORCEINLINE void depthFunc (GLenum);

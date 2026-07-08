@@ -107,6 +107,19 @@ namespace
     return enabled;
   }
 
+  // Cross-fade between poses on animation/sub-animation transitions (matches the 1.12 client's ~150ms
+  // smoothstep blend). ON by default; set NOGGIT_NO_ANIM_BLEND=1 to fall back to hard sequence switches.
+  bool anim_transition_blend_enabled()
+  {
+    static bool const enabled = []()
+    {
+      char const* value = std::getenv("NOGGIT_NO_ANIM_BLEND");
+      return !(value && *value && std::strcmp(value, "0") != 0);
+    }();
+
+    return enabled;
+  }
+
   bool is_classic_effect_shell_model_path(std::string const& path)
   {
     return path.starts_with("world/generic/passivedoodads/particleemitters/")
@@ -604,8 +617,10 @@ void Model::finishLoading()
     ModelHeader translated_header;
     copy_classic_header(classic_header, translated_header);
 
+    // v257 is a rare vanilla-era variant with the same classic layout (the Turtle tree ships a
+    // handful); gating at 256 made those fall through to the WotLK parse and misload.
     if (std::memcmp(translated_header.id, "MD20", 4) == 0
-        && m2_version(translated_header.version) <= 256
+        && m2_version(translated_header.version) <= 257
         && range_fits(f, classic_header.ofsViews, classic_header.nViews, sizeof(ClassicModelView))
         && m2_classic_ranges_fit(f, classic_header))
     {
@@ -1098,7 +1113,19 @@ void Model::initCommon(const BlizzardArchive::ClientFile& f)
   }
 
   // init colors
-  if (!_uses_classic_layout && header.nColors)
+  // Classic (1.12) layout carries the same two tracks in the older 28-byte animation-block form;
+  // it was previously skipped entirely, which killed the color/alpha pulse on ~10% of vanilla
+  // models (portals, glow doodads, colored creature FX). Mirrors the transparency load below.
+  if (_uses_classic_layout && header.nColors)
+  {
+    _colors.reserve(header.nColors);
+    ClassicModelColorDef const* colorDefs = reinterpret_cast<ClassicModelColorDef const*>(f.getBuffer() + header.ofsColors);
+    for (size_t i = 0; i < header.nColors; ++i)
+    {
+      _colors.emplace_back (f, colorDefs[i], _global_sequences.data());
+    }
+  }
+  else if (header.nColors)
   {
     _colors.reserve(header.nColors);
     ModelColorDef const* colorDefs = reinterpret_cast<ModelColorDef const*>(f.getBuffer() + header.ofsColors);
@@ -1557,17 +1584,24 @@ void Model::initCommon(const BlizzardArchive::ClientFile& f)
       }
     }
 
-    // Compact "glow/mist core" placeholder mesh (Anomalus MANAMISTBASE, Arcane Anomaly/ShadeWhite
-    // CYAN_GLOW3, ManaFiend GENERICGLOW): a high-detail sphere crammed at the model core that renders as an
-    // out-of-place bright "pill"/orb in the torso. The live 1.12 client does NOT draw it (verified via
-    // apitrace of Anomalus + Arcane Anomaly: the ~180-tri core submesh is never issued -- the client draws
-    // body + additive glows + particles instead). All geoset ids are 0 so there's no visibility flag; the
-    // reliable signal is GEOMETRIC and calibrated against both models: the core is uniquely COMPACT (max
-    // bbox extent < 20% of the whole model) AND DENSE (> 100 triangles) AND roughly 3D-spherical (min
-    // extent > 30% of max). Everything the client DOES draw is either large (body, ~75-100% of the model)
-    // or low-poly (<=40 tris) or a flat billboard glow (Purple_Glow/runes: min extent ~0), so this hits
-    // ONLY the core sphere. Skip it to match the client -- kills the pill on every arcane elemental with no
-    // filename list. (Replaces the earlier narrower particle-texture skip, which only caught Anomalus.)
+    // Compact "glow/mist core" placeholder mesh (Anomalus MANAMISTBASE): a high-detail sphere crammed
+    // exactly at the model CENTROID that renders as an out-of-place opaque "pill"/orb in the torso. The
+    // live 1.12 client does NOT draw it (apitrace of Anomalus: the ~180-tri core submesh is never issued
+    // -- the client draws body + additive glows + particles instead). All geoset ids are 0 so there's no
+    // visibility flag; the signal is GEOMETRIC.
+    //
+    // 2026-07-03 REGRESSION FIX: the previous version tested only COMPACT (<20% model extent) + DENSE
+    // (>100 tris) + 3D-BLOB (min>30% max). That signature ALSO matches legitimate body parts -- a
+    // creature-tree scan found it silently hiding a submesh on 91 models (Medivh's hood, Ragnaros/Illidan
+    // body segments, a 2030-tri gryphon-mount body, ...). The reported bug was creature 61958 "Echo of
+    // Medivh" losing its hood (hood submesh: 107 tris, compact, roundish -> false positive). The missing
+    // discriminator is POSITION: the Anomalus pill sits essentially ON the model centroid
+    // (|centroid - modelCenter| = 1.6% of model extent), while every false positive is off-centre --
+    // Medivh's hood is up at the head (43.7%). Requiring near-coincidence with the model centre keeps the
+    // pill hidden and reveals the ~85 body parts that were wrongly culled. NOTE: this is an ADDED
+    // restriction, so it can only ever REVEAL geometry -- it cannot newly hide anything that renders today.
+    // A handful of genuinely centre-coincident blobs on other models (FrostLord, gryphon mounts, Ragnaros
+    // sub0) stay hidden as before and are unverified -- flagged in the report as follow-up.
     if (_uses_classic_layout && file_key().hasFilepath()
         && file_key().filepath().starts_with("creature/")
         && range_fits(f, header.ofsVertices, header.nVertices, sizeof(ModelVertex)))
@@ -1581,6 +1615,7 @@ void Model::initCommon(const BlizzardArchive::ClientFile& f)
       }
       glm::vec3 const model_size = model_hi - model_lo;
       float const model_extent = std::max({model_size.x, model_size.y, model_size.z});
+      glm::vec3 const model_center = (model_lo + model_hi) * 0.5f;
 
       for (size_t i = 0; i < view->n_submesh; ++i)
       {
@@ -1588,17 +1623,22 @@ void Model::initCommon(const BlizzardArchive::ClientFile& f)
         if ((geo.icount / 3) <= 100) continue; // dense only -- excludes low-poly body parts / billboards
         if (static_cast<uint32_t>(geo.vstart) + geo.vcount > header.nVertices) continue;
         glm::vec3 lo(1e30f), hi(-1e30f);
+        glm::dvec3 centroid_acc(0.0);
         for (uint32_t v = geo.vstart; v < static_cast<uint32_t>(geo.vstart) + geo.vcount; ++v)
         {
           lo = glm::min(lo, verts[v].position);
           hi = glm::max(hi, verts[v].position);
+          centroid_acc += glm::dvec3(verts[v].position);
         }
+        glm::vec3 const centroid = geo.vcount ? glm::vec3(centroid_acc / double(geo.vcount)) : lo;
         glm::vec3 const size = hi - lo;
         float const maxe = std::max({size.x, size.y, size.z});
         float const mine = std::min({size.x, size.y, size.z});
+        float const dist_to_center = glm::length(centroid - model_center);
         if (model_extent > 0.0001f && maxe > 0.0001f
-            && maxe < 0.20f * model_extent    // compact vs the whole model
-            && mine > 0.30f * maxe)           // 3D blob, not a flat billboard card
+            && maxe < 0.20f * model_extent            // compact vs the whole model
+            && mine > 0.30f * maxe                    // 3D blob, not a flat billboard card
+            && dist_to_center < 0.05f * model_extent) // sits ON the model centroid (a "core", not a body part)
         {
           showGeosets[i] = false;
         }
@@ -1689,7 +1729,30 @@ void Model::initAnimated(const BlizzardArchive::ClientFile& f)
         anim.Index = static_cast<int16_t>(animation_index);
 
         _animation_length[anim.animID] += anim.length;
-        _animations_seq_per_id[anim.animID][anim.subAnimID] = anim;
+        // Classic data can repeat (animID, subAnimID) across sequences -- e.g. ShadeWhite/ManaFiend
+        // (the arcane elementals) carry THREE Stand sequences that are all sub 0. Keying by
+        // subAnimID alone silently dropped all but the last, while _animation_length still summed
+        // every one: the variation walk in animate() then ran past its single kept sequence and
+        // sampled beyond its keys -- a ~2.7s whole-body freeze at the end of every Stand cycle
+        // (masked before the sampler wrapped tracks; exposed by the client-canon hold). Give
+        // colliding sub ids the next free slot so every sequence stays playable.
+        {
+          auto& bucket = _animations_seq_per_id[anim.animID];
+          uint16_t sub_key = anim.subAnimID;
+          while (bucket.count(sub_key))
+          {
+            ++sub_key;
+          }
+          bucket[sub_key] = anim;
+        }
+
+        // Capture the authored scheduling fields (dropped by ModelAnimation) so the idle scheduler can
+        // reproduce the client's weighted, replay-count-driven variation timing. File/variation order is
+        // preserved (matches the client's variationNext chain walk).
+        _anim_variations[static_cast<uint16_t>(anim.animID)].push_back(
+          AnimVariation{ anim.Index, anim.length, classic_anim.frequency,
+                         classic_anim.minimumRepetitions, classic_anim.maximumRepetitions,
+                         classic_anim.blendTime });
       }
     }
     else
@@ -1729,6 +1792,10 @@ void Model::initAnimated(const BlizzardArchive::ClientFile& f)
       }
     };
 
+    // KeyBoneID per bone, captured to build the weapon-grip finger-overlay set below.
+    std::vector<int32_t> key_bone_ids;
+    key_bone_ids.reserve(header.nBones);
+
     if (_uses_classic_layout)
     {
       ClassicModelBoneDef const* mb = reinterpret_cast<ClassicModelBoneDef const*>(f.getBuffer() + header.ofsBones);
@@ -1738,6 +1805,7 @@ void Model::initAnimated(const BlizzardArchive::ClientFile& f)
         sanitize_sequence_id(bone.translation);
         sanitize_sequence_id(bone.rotation);
         sanitize_sequence_id(bone.scaling);
+        key_bone_ids.push_back(mb[i].KeyBoneID);
         bones.emplace_back(f, bone, _global_sequences.data());
       }
     }
@@ -1750,6 +1818,7 @@ void Model::initAnimated(const BlizzardArchive::ClientFile& f)
         sanitize_sequence_id(bone.translation);
         sanitize_sequence_id(bone.rotation);
         sanitize_sequence_id(bone.scaling);
+        key_bone_ids.push_back(mb[i].KeyBoneID);
         bones.emplace_back(f, bone, _global_sequences.data(), animation_files);
       }
     }
@@ -1802,8 +1871,34 @@ void Model::initAnimated(const BlizzardArchive::ClientFile& f)
       }
     }
 
+    // Weapon-grip finger-overlay set: the finger bones (KeyBoneID 8..17 = Index/Middle/Pinky/Ring/Thumb,
+    // right then left) plus their descendant segments. Built in bone-index (parents-first) order so the
+    // overlay pass can rely on each bone's parent already being posed. We select by KEY BONE ID -- NOT by
+    // "which bones HandsClosed animates" -- because HandsClosed also keys the arms/shoulders (as a static
+    // single-frame pose); including those would freeze the upper body. Fingers only.
+    _hand_overlay_bones.clear();
+    if (bones.size() == key_bone_ids.size())
+    {
+      std::vector<uint8_t> in_set(bones.size(), 0);
+      for (size_t i = 0; i < bones.size(); ++i)
+      {
+        int32_t const kb = key_bone_ids[i];
+        bool finger = (kb >= 8 && kb <= 17);
+        int const parent = bones[i].parent;
+        if (!finger && parent >= 0 && static_cast<size_t>(parent) < in_set.size() && in_set[parent])
+        {
+          finger = true; // descendant of a finger bone (a finger segment)
+        }
+        if (finger)
+        {
+          in_set[i] = 1;
+          _hand_overlay_bones.push_back(static_cast<uint16_t>(i));
+        }
+      }
+    }
+
     bone_matrices.resize(bones.size());
-  }  
+  }
 
   if (animTextures) 
   {
@@ -2067,7 +2162,12 @@ void Model::calcBones(glm::mat4x4 const& model_view
     _bb_bases_computed = true;
     for (size_t bi = 0; bi < bones.size(); ++bi)
     {
-      if (!bones[bi].flags.billboard) continue;
+      // Spherical (0x8) AND cylindrical (lock x/y/z) billboards both need the card's texture basis: the
+      // cylindrical lock axis is the card's derived UP (the flame's vertical edge), so derive it for those too.
+      if (!(bones[bi].flags.billboard
+            || bones[bi].flags.cylindrical_billboard_lock_x
+            || bones[bi].flags.cylindrical_billboard_lock_y
+            || bones[bi].flags.cylindrical_billboard_lock_z)) continue;
 
       // gather this card's vertices (dominant weight on this bone)
       ModelVertex const* v0 = nullptr;
@@ -2154,6 +2254,40 @@ void Model::calcBones(glm::mat4x4 const& model_view
     }
   }
 
+  // Weapon-grip: after the normal body pass, curl the fingers closed from the HandsClosed pose. Only the
+  // finger-subtree bones are touched, each anchored to its already-posed (breathing) parent, so the body
+  // animation is preserved. Enabled per-draw for creatures holding an in-hand weapon.
+  if (_hand_overlay_active)
+  {
+    applyHandGripOverlay(time, animation_time);
+  }
+}
+
+void Model::applyHandGripOverlay(int time, int animtime)
+{
+  if (_hand_overlay_bones.empty())
+  {
+    return;
+  }
+
+  // Resolve the HandsClosed (animID 15) sequence index for this model. Absent -> nothing to overlay
+  // (e.g. a weapon-holding creature model that has no HandsClosed pose; it just keeps open hands).
+  auto const it = _animations_seq_per_id.find(15);
+  if (it == _animations_seq_per_id.end() || it->second.empty())
+  {
+    return;
+  }
+  int const seq = it->second.begin()->second.Index;
+
+  // Re-pose each finger-subtree bone from that sequence. _hand_overlay_bones is parents-first, and finger
+  // parents (the hand) are NOT in the set, so every bone here reads an already-final parent matrix.
+  for (uint16_t const bi : _hand_overlay_bones)
+  {
+    if (bi < bones.size())
+    {
+      bones[bi].overrideLocalFromSeq(bones.data(), seq, time, animtime);
+    }
+  }
 }
 
 float Model::idlePoseFootprint()
@@ -2234,6 +2368,105 @@ float Model::idlePoseFootprint()
   return _idle_footprint_radius;
 }
 
+bool Model::advanceIdleSchedule(int anim_id, long long anim_time,
+                                int& out_seq, int& out_time,
+                                bool& out_do_blend, int& out_blend_seq_from, int& out_blend_time_from,
+                                float& out_blend_w)
+{
+  auto const vit = _anim_variations.find(static_cast<uint16_t>(anim_id));
+  if (vit == _anim_variations.end() || vit->second.empty())
+  {
+    return false;
+  }
+  std::vector<AnimVariation> const& vars = vit->second;
+
+  IdleSchedule& st = _idle_schedules[_active_idle_key];
+
+  // (Re)initialise on first use or when the played animation id changes. Seed a per-instance PRNG from
+  // the instance key so different spawns follow different variation timelines (no synchronized leaning).
+  if (!st.init || st.anim_id != anim_id)
+  {
+    std::uint64_t z = _active_idle_key * 0x9E3779B97F4A7C15ull + 0x123456789abcdefull;
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+    z = (z ^ (z >> 27));
+    st.rng = static_cast<uint32_t>(z ^ (z >> 32)) | 1u; // non-zero for xorshift
+    st.init = true;
+    st.anim_id = anim_id;
+    st.cur_seq = -1;
+    st.prev_seq = -1;
+    st.prev_len = 1;
+    st.cur_len = 1;
+    st.cur_blend = 0;
+    st.play_start = anim_time;
+    st.play_end = anim_time; // force an immediate roll below
+  }
+
+  auto next_rand = [&st]() -> uint32_t
+  {
+    uint32_t x = st.rng;
+    x ^= x << 13; x ^= x >> 17; x ^= x << 5; // xorshift32
+    st.rng = x;
+    return x;
+  };
+
+  uint32_t freq_sum = 0;
+  for (auto const& v : vars) { freq_sum += v.frequency; }
+
+  auto roll_variation = [&]() -> AnimVariation const&
+  {
+    if (vars.size() == 1 || freq_sum == 0)
+    {
+      return vars[next_rand() % vars.size()];
+    }
+    uint32_t roll = next_rand() % freq_sum;            // roulette over the frequency chain (client-exact)
+    for (auto const& v : vars)
+    {
+      if (roll < v.frequency) { return v; }
+      roll -= v.frequency;
+    }
+    return vars.back();
+  };
+
+  // Advance the schedule to cover anim_time. Usually 0-1 iterations; more only after the instance was
+  // off-screen for a while and its clock jumped. Guard against pathological zero-length data.
+  int guard = 0;
+  while (anim_time >= st.play_end && guard++ < 4096)
+  {
+    AnimVariation const& v = roll_variation();
+    uint32_t replay = v.replay_min;
+    if (v.replay_max > v.replay_min)                    // replayCount in [replayMin, replayMax-1] (client)
+    {
+      replay = v.replay_min + (next_rand() % (v.replay_max - v.replay_min));
+    }
+    if (replay < 1) { replay = 1; }
+    long long const dur = static_cast<long long>(std::max<uint32_t>(1, v.length)) * replay;
+
+    st.prev_seq = st.cur_seq;
+    st.prev_len = st.cur_len;
+    st.cur_seq = v.seq_index;
+    st.cur_len = static_cast<int>(std::max<uint32_t>(1, v.length));
+    st.cur_blend = static_cast<int>(v.blend_time);
+    st.play_start = st.play_end;
+    st.play_end = st.play_start + dur;
+  }
+
+  out_seq = st.cur_seq;
+  long long within = anim_time - st.play_start;
+  if (within < 0) { within = 0; }
+  out_time = static_cast<int>(within % std::max(1, st.cur_len));
+
+  out_do_blend = false;
+  if (st.prev_seq >= 0 && st.cur_blend > 0 && within < st.cur_blend)
+  {
+    out_blend_seq_from = st.prev_seq;
+    out_blend_time_from = std::max(0, st.prev_len - 1); // previous variation sampled at its end
+    float const x = static_cast<float>(within) / static_cast<float>(st.cur_blend);
+    out_blend_w = x * x * (3.0f - 2.0f * x);            // smoothstep, matches the client
+    out_do_blend = true;
+  }
+  return true;
+}
+
 void Model::animate(glm::mat4x4 const& model_view, int anim_id, int anim_time)
 {
   if (!_logged_animation_branch && classic_m2_debug_enabled())
@@ -2310,27 +2543,73 @@ void Model::animate(glm::mat4x4 const& model_view, int anim_id, int anim_time)
   }
   int current_sub_anim = 0;
   int time_for_anim = t;
+  bool do_blend = false;
+  int blend_seq_from = 0;
+  int blend_time_from = 0;
+  float blend_w = 1.0f; // weight of the TO (current) pose
 
-  for (auto const& sub_animation : _animations_seq_per_id[anim_id])
+  auto const& subs = _animations_seq_per_id[anim_id];
+
+  // IDLE-VARIATION SCHEDULER (client-accurate; see Model::advanceIdleSchedule). Replaces the old fixed
+  // sequential concatenation of sub-variations. The client rolls a frequency-weighted variation, plays it
+  // for length*replayCount, then re-rolls -- so a unit stands mostly neutral and occasionally shifts into
+  // a longer-held pose (e.g. HumanMale Stand sub1 "lean", replay 2-7 => held ~5-19s), cross-fading over the
+  // authored blendTime (500ms for Stand). Per-instance state keeps spawns desynced.
+  int sched_seq = 0;
+  int sched_time = 0;
+  if (_uses_classic_layout && animBones && anim_transition_blend_enabled()
+      && advanceIdleSchedule(anim_id, static_cast<long long>(anim_time),
+                             sched_seq, sched_time, do_blend, blend_seq_from, blend_time_from, blend_w))
   {
-    if (static_cast<int>(sub_animation.second.length) > time_for_anim)
+    _current_anim_seq = sched_seq;
+    _anim_time = sched_time;
+  }
+  else
+  {
+    // Legacy path (non-classic model, blending disabled, or no variation data): sub-variations
+    // concatenated on one timeline.
+    for (auto const& sub_animation : subs)
     {
-      current_sub_anim = sub_animation.first;
-      break;
+      if (static_cast<int>(sub_animation.second.length) > time_for_anim)
+      {
+        current_sub_anim = sub_animation.first;
+        break;
+      }
+      time_for_anim -= sub_animation.second.length;
     }
-
-    time_for_anim -= sub_animation.second.length;
+    ModelAnimation const& a = _animations_seq_per_id[anim_id][current_sub_anim];
+    _current_anim_seq = a.Index;
+    _anim_time = _uses_classic_layout ? time_for_anim : t;
   }
 
-  ModelAnimation const& a = _animations_seq_per_id[anim_id][current_sub_anim];
-
-  _current_anim_seq = a.Index;//_animations_seq_lookup[anim_id][current_sub_anim];
-  _anim_time = _uses_classic_layout ? time_for_anim : t;
   _global_animtime = anim_time;
 
   if (animBones)
   {
-    calcBones(model_view, _current_anim_seq, _anim_time, _global_animtime);
+    if (do_blend)
+    {
+      // FROM pose (previous sequence at its end) -> snapshot -> TO pose (current) -> lerp in place.
+      calcBones(model_view, blend_seq_from, blend_time_from, _global_animtime);
+      if (_blend_scratch.size() != bones.size())
+      {
+        _blend_scratch.resize(bones.size());
+      }
+      for (std::size_t i = 0; i < bones.size(); ++i)
+      {
+        _blend_scratch[i] = bones[i].mat;
+      }
+      calcBones(model_view, _current_anim_seq, _anim_time, _global_animtime);
+      float const w_to = blend_w;
+      float const w_from = 1.0f - blend_w;
+      for (std::size_t i = 0; i < bones.size(); ++i)
+      {
+        bones[i].mat = _blend_scratch[i] * w_from + bones[i].mat * w_to;
+      }
+    }
+    else
+    {
+      calcBones(model_view, _current_anim_seq, _anim_time, _global_animtime);
+    }
   }
 
   if (animGeometry || animBones)
@@ -2414,9 +2693,13 @@ void Model::animate(glm::mat4x4 const& model_view, int anim_id, int anim_time)
 
   for (auto& particle : _particles)
   {
-    // random time distribution for teh win ..?
-    int pt = (t + static_cast<int>(tmax*particle.tofs)) % tmax;
-    particle.setup(_current_anim_seq, pt, _global_animtime);
+    // Sample emitter tracks at the model's real animation time -- NO random phase offset. The old
+    // WMV `tmax*tofs` shift desynchronized burst-pattern emitters: Ironforge's ForgeLava steam
+    // authors its emission rate as bellows-synced BURSTS (rate keys 0..20..0 over the 6667ms anim);
+    // the client fires every stacked emitter in sync (puff / gap / puff), but random phases spread
+    // the bursts across time so their additive quads overlapped CONTINUOUSLY into a blown-out
+    // white core at the plume center.
+    particle.setup(_current_anim_seq, t, _global_animtime);
   }
 
   for (std::size_t i = 0; i < _ribbons.size(); ++i)
@@ -2435,21 +2718,41 @@ void Model::animate(glm::mat4x4 const& model_view, int anim_id, int anim_time)
 void TextureAnim::calc(int anim, int time, int animtime)
 {
     mat = glm::mat4x4(1);
-  if (trans.uses(anim)) 
+  if (trans.uses(anim))
   {
       mat = glm::translate(mat, trans.getValue(anim, time, animtime));
   }
-  if (rot.uses(anim)) 
+
+  // Rotation and scaling pivot about the tile CENTER (0.5, 0.5) -- the client convention. Without
+  // the pivot they orbit/stretch from the UV corner, so rotating portal swirls slid around the
+  // origin instead of spinning in place. Pure translation scrolls (lava falls, waterfalls) never
+  // enter these branches and are byte-identical to before.
+  bool const has_rot = _uses_classic_rotation ? classic_rot.uses(anim) : rot.uses(anim);
+  bool const has_scale = scale.uses(anim);
+  if (has_rot || has_scale)
   {
-      mat *= glm::toMat4(rot.getValue(anim, time, animtime));
-  }
-  if (scale.uses(anim)) 
-  {
-      mat = glm::scale(mat, scale.getValue(anim, time, animtime));
+      mat = glm::translate(mat, glm::vec3(0.5f, 0.5f, 0.0f));
+      if (has_rot)
+      {
+          glm::quat const q = _uses_classic_rotation ? classic_rot.getValue(anim, time, animtime)
+                                                     : rot.getValue(anim, time, animtime);
+          mat *= glm::toMat4(q);
+      }
+      if (has_scale)
+      {
+          mat = glm::scale(mat, scale.getValue(anim, time, animtime));
+      }
+      mat = glm::translate(mat, glm::vec3(-0.5f, -0.5f, 0.0f));
   }
 }
 
 ModelColor::ModelColor(const BlizzardArchive::ClientFile& f, const ModelColorDef &mcd, int *global)
+  : color (mcd.color, f, global)
+  , opacity(mcd.opacity, f, global)
+{}
+
+// Classic (1.12) color: same tracks in the older ClassicAnimationBlock form.
+ModelColor::ModelColor(const BlizzardArchive::ClientFile& f, const ClassicModelColorDef &mcd, int *global)
   : color (mcd.color, f, global)
   , opacity(mcd.opacity, f, global)
 {}
@@ -2526,14 +2829,21 @@ void ModelLight::setup(int time, OpenGL::light, int animtime)
 TextureAnim::TextureAnim (const BlizzardArchive::ClientFile& f, const ModelTexAnimDef &mta, int *global)
   : trans (mta.trans, f, global)
   , rot (mta.rot, f, global)
+  , classic_rot ()
   , scale (mta.scale, f, global)
+  , _uses_classic_rotation (false)
   , mat (glm::mat4x4())
 {}
 
 TextureAnim::TextureAnim (const BlizzardArchive::ClientFile& f, const ClassicModelTexAnimDef &mta, int *global)
   : trans (mta.trans, f, global)
-  , rot (mta.rot, f, global)
+  , rot ()
+  // Vanilla rotation keys are float quaternions (like classic bones), NOT WotLK packed int16 --
+  // reading them through the packed converter produced garbage tumbling rotations. UV-space
+  // rotation needs NO fixCoordSystemQuat (that conversion is for model space).
+  , classic_rot (mta.rot, f, global)
   , scale (mta.scale, f, global)
+  , _uses_classic_rotation (true)
   , mat (glm::mat4x4())
 {}
 
@@ -2706,13 +3016,59 @@ void Bone::calcMatrix(glm::mat4x4 const& model_view
     glm::mat3 const local(bb_local_normal, bb_local_right, bb_local_up);            // columns
     glm::mat3 const bb3 = cam * glm::transpose(local);
 
+    // PRESERVE the animated bone SCALE: `mat` (about to be replaced) carries the hierarchy's scale --
+    // e.g. the candle glow cards pulse via a bone scale track on a global sequence, which the pure
+    // rotation basis was silently discarding (glow stopped breathing). Per-axis scale = column lengths;
+    // reapplied pivot-centred so the card grows/shrinks in place.
+    glm::vec3 const bone_scale(glm::length(glm::vec3(mat[0])),
+                               glm::length(glm::vec3(mat[1])),
+                               glm::length(glm::vec3(mat[2])));
+
     glm::mat4x4 bb(1.0f);
-    bb[0] = glm::vec4(bb3[0], 0.0f);
-    bb[1] = glm::vec4(bb3[1], 0.0f);
-    bb[2] = glm::vec4(bb3[2], 0.0f);
+    bb[0] = glm::vec4(bb3[0] * bone_scale.x, 0.0f);
+    bb[1] = glm::vec4(bb3[1] * bone_scale.y, 0.0f);
+    bb[2] = glm::vec4(bb3[2] * bone_scale.z, 0.0f);
     glm::vec4 const rotated_pivot = bb * glm::vec4(pivot, 1.0f);
     bb[3] = glm::vec4(glm::vec3(world_pivot) - glm::vec3(rotated_pivot), 1.0f);
     mat = bb;
+  }
+  else if (flags.cylindrical_billboard_lock_x
+        || flags.cylindrical_billboard_lock_y
+        || flags.cylindrical_billboard_lock_z)
+  {
+    // Cylindrical billboard: keep the LOCKED axis fixed and rotate the card around it so its normal faces
+    // the camera as much as possible. 1.12 torches/candles/lampposts/sconces are all lock-Z: the flame card
+    // stays UPRIGHT (up axis kept) and only spins horizontally toward the viewer -- so it no longer tips
+    // toward the camera at steep pitch the way a spherical billboard would. The locked axis is the card's
+    // own up (the flame's vertical edge, derived above), transformed by the hierarchy, so a tilted placement
+    // tilts its flame with it. (Only lock-Z exists in the data; X/Y fall through this same up-lock.)
+    glm::vec3 const U = glm::normalize(glm::mat3(mat) * bb_local_up); // locked axis in model space
+    glm::vec4 const world_pivot = mat * glm::vec4(pivot, 1.0f);
+    glm::vec3 const camFwd = glm::normalize(glm::vec3(model_view[0][2], model_view[1][2], model_view[2][2]));
+
+    glm::vec3 N = camFwd - U * glm::dot(camFwd, U); // project camera-forward onto the plane perp to U
+    float const nlen = glm::length(N);
+    if (nlen > 1e-4f) // degenerate when the camera looks straight along the lock axis -> keep the hierarchy pose
+    {
+      N /= nlen;
+      glm::vec3 const R = glm::normalize(glm::cross(U, N));
+      glm::mat3 const target(N, R, U);                                   // columns: normal, right, up
+      glm::mat3 const local(bb_local_normal, bb_local_right, bb_local_up);
+      glm::mat3 const bb3 = target * glm::transpose(local);
+
+      // Preserve the animated bone scale (candle-flame pulse) -- same as the spherical path above.
+      glm::vec3 const bone_scale(glm::length(glm::vec3(mat[0])),
+                                 glm::length(glm::vec3(mat[1])),
+                                 glm::length(glm::vec3(mat[2])));
+
+      glm::mat4x4 bb(1.0f);
+      bb[0] = glm::vec4(bb3[0] * bone_scale.x, 0.0f);
+      bb[1] = glm::vec4(bb3[1] * bone_scale.y, 0.0f);
+      bb[2] = glm::vec4(bb3[2] * bone_scale.z, 0.0f);
+      glm::vec4 const rotated_pivot = bb * glm::vec4(pivot, 1.0f);
+      bb[3] = glm::vec4(glm::vec3(world_pivot) - glm::vec3(rotated_pivot), 1.0f);
+      mat = bb;
+    }
   }
 
   // transform matrix for normal vectors ... ??
@@ -2733,6 +3089,49 @@ void Bone::calcMatrix(glm::mat4x4 const& model_view
   }
 
   calc = true;
+}
+
+void Bone::overrideLocalFromSeq(Bone* allbones, int seq, int time, int animtime)
+{
+  // Rebuild this bone's LOCAL transform from `seq` (HandsClosed), identical to calcMatrix's local block,
+  // then compose against the parent's ALREADY-final matrix. No recursion, no calc flag: the parent (the
+  // Stand-posed hand) is untouched, so only this finger bone moves.
+  glm::mat4x4 m = glm::mat4x4(1);
+  if ( flags.transformed
+    || flags.billboard
+    || flags.cylindrical_billboard_lock_x
+    || flags.cylindrical_billboard_lock_y
+    || flags.cylindrical_billboard_lock_z
+     )
+  {
+    m = glm::translate(m, pivot);
+
+    if (trans.uses(seq))
+    {
+      m = glm::translate(m, trans.getValue(seq, time, animtime));
+    }
+
+    bool const has_rotation = _uses_classic_rotation ? classic_rot.uses(seq) : rot.uses(seq);
+    if (has_rotation)
+    {
+      glm::quat q = _uses_classic_rotation ? classic_rot.getValue(seq, time, animtime)
+                                           : rot.getValue(seq, time, animtime);
+      glm::vec3 rot_euler = glm::eulerAngles(q);
+      glm::vec3 test_rot_vec = glm::vec3(rot_euler[2],
+        -(rot_euler[1] + glm::radians(180.f)),
+        -(rot_euler[0] + glm::radians(180.f)));
+      m = m * glm::eulerAngleXYZ(test_rot_vec.x, test_rot_vec.y, test_rot_vec.z);
+    }
+
+    if (scale.uses(seq))
+    {
+      m = glm::scale(m, scale.getValue(seq, time, animtime));
+    }
+
+    m = glm::translate(m, -pivot);
+  }
+
+  mat = (parent >= 0) ? allbones[parent].mat * m : m;
 }
 
 

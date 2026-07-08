@@ -26,6 +26,7 @@ layout (std140) uniform matrices
 {
   mat4 model_view;
   mat4 projection;
+  vec4 camera_pos;
 };
 
 uniform mat4 transform;
@@ -61,7 +62,11 @@ void main()
   else
   {
     vec4 pos = transform * position;
-    vec4 view_space_pos = model_view * pos;
+    // Camera-relative (see terrain_vert.glsl): subtract camera before the rotation so world-scale
+    // coords never cancel in float -> no PS1 jitter of WMO geometry against the models/terrain.
+    mat4 view_rot = model_view;
+    view_rot[3].xyz = vec3(0.0);
+    vec4 view_space_pos = view_rot * vec4(pos.xyz - camera_pos.xyz, 1.0);
     gl_Position = projection * view_space_pos;
 
     f_position = pos.xyz;

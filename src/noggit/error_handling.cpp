@@ -3,6 +3,9 @@
 
 #include <atomic>
 #include <csignal>
+#include <cstdint>
+#include <cstdlib>
+#include <exception>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -197,12 +200,66 @@ namespace Noggit
 
   }
 
+  namespace
+  {
+    // std::terminate is reached by an unhandled C++ exception, an exception escaping a noexcept function
+    // or a destructor during unwind, or a rethrow with no active exception. On MSVC it goes straight to
+    // __fastfail, which bypasses the vectored/SEH handlers above -- so those crashes leave NO callstack
+    // in the log (the classic "died with a clean log" symptom). Log the active exception + a stack here.
+    [[noreturn]] void on_terminate()
+    {
+      LogError << "\n=== std::terminate() -- unhandled C++ exception / noexcept violation (thread "
+#ifdef _WIN32
+               << GetCurrentThreadId()
+#endif
+               << ") ===" << std::endl;
+      if (auto const ex = std::current_exception())
+      {
+        try { std::rethrow_exception(ex); }
+        catch (std::exception const& e) { LogError << "  active exception: " << e.what() << std::endl; }
+        catch (...) { LogError << "  active exception: <non-std type>" << std::endl; }
+      }
+      else
+      {
+        LogError << "  (no active exception -- likely a bad rethrow or a direct std::terminate call)" << std::endl;
+      }
+      printStacktrace();
+      std::cerr << "=== end terminate ===" << std::endl;
+      std::cerr.flush();
+      std::abort();
+    }
+
+#ifdef _WIN32
+    // The CRT invalid-parameter handler (bad iterator, sprintf with a null, etc.) and a pure-virtual
+    // call BOTH __fastfail silently by default. Route them through the stack logger too.
+    void on_invalid_parameter(wchar_t const*, wchar_t const*, wchar_t const*, unsigned int, uintptr_t)
+    {
+      LogError << "\n=== CRT invalid parameter (thread " << GetCurrentThreadId() << ") ===" << std::endl;
+      printStacktrace();
+      std::cerr.flush();
+      std::abort();
+    }
+
+    void on_purecall()
+    {
+      LogError << "\n=== pure virtual function call (thread " << GetCurrentThreadId() << ") ===" << std::endl;
+      printStacktrace();
+      std::cerr.flush();
+      std::abort();
+    }
+#endif
+  }
+
   void RegisterErrorHandlers()
   {
 #ifdef _WIN32
     AddVectoredExceptionHandler(1 /*call first*/, vectored_exception_handler);
     SetUnhandledExceptionFilter(windows_exception_handler);
+    _set_invalid_parameter_handler(on_invalid_parameter);
+    _set_purecall_handler(on_purecall);
 #endif
+
+    std::set_terminate(on_terminate);
 
     signal (SIGABRT, leave);
     signal (SIGFPE, leave);

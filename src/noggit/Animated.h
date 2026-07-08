@@ -205,14 +205,21 @@ namespace Animation
           return dataVector[pos];
         }
 
-        TimestampType max_time = timestampVector.back();
-        if (max_time > 0)
+        // The client's track seeker (wow.exe FUN_00713d50, RE_notes/ghidra/out/decomp_m2seek.c) never
+        // wraps a track by its own last timestamp: it seeks strictly inside the current animation's
+        // key range and HOLDS the boundary key before the first / after the last key -- only the
+        // sequence clock the caller supplies loops. The old per-track `time %= max_time` here made
+        // every track re-loop on its OWN period, so bones whose tracks end before the animation does
+        // wrapped early and out of sync with each other: continuous squirming/jitter and feet sliding
+        // on animated creatures whenever a track's end != the animation's length. (Before the first
+        // key the old code also interpolated with a NEGATIVE fraction = extrapolation spikes.)
+        if (time <= timestampVector[0])
         {
-          time %= max_time;
+          return dataVector[0];
         }
-        else
+        if (time >= timestampVector[usable_count - 1])
         {
-          time = TimestampType();
+          return dataVector[usable_count - 1];
         }
 
         size_t pos = 0;

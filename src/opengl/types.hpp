@@ -24,6 +24,10 @@ namespace OpenGL
   {
   	glm::mat4x4 model_view;
     glm::mat4x4 projection;
+    // World-space camera position (xyz; w unused). Used by terrain/WMO vertex shaders to render
+    // camera-relative -- subtract this (Sterbenz-exact for near geometry) before the rotation so the
+    // float pipeline never cancels world-scale (~17000 on a real map) coordinates = no PS1 jitter.
+    glm::vec4 camera_pos;
   };
 
   // Emitter point lights (campfires, braziers, ...) carried to the terrain/WMO/M2 shaders.
@@ -109,6 +113,8 @@ namespace OpenGL
     bool unfogged = false;
     bool unlit = false;
     bool masked_additive = false;
+    int creature_bloom = -1; // -1 = unset; 1 = opaque energy creature (mask direct); 3 = alpha-only mask pass
+    bool bloom_mask_pass = false; // drawing the alpha-only bloom-mask re-draw of a translucent creature
     int discard_invisible = 0; // promoted creature pass: discard texels that add nothing (no depth write)
     bool allow_lightray_model = true;
     std::array<GLuint, 2> tex_arrays;

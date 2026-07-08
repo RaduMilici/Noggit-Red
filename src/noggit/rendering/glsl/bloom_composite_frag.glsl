@@ -14,5 +14,9 @@ void main()
 {
   vec3 c = texture(scene, uv).rgb;
   vec3 b = texture(bloom, uv).rgb;
-  out_color = vec4(c + b * intensity, 1.0);
+  // MEASURED composite (wow_cap_upstairs.trace, RE_notes/16): oC0 = scene + weight * blur^2 with
+  // weight = the zone glow (0.647 in the inn frame, carried in the quad vertex alpha). blur is
+  // SQUARED -- dark blur contributes ~nothing, bright areas glow warm -- preserving contrast
+  // instead of washing the frame.
+  out_color = vec4(c + b * b * intensity, 1.0);
 }

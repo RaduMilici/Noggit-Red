@@ -2,6 +2,8 @@
 
 #include <noggit/world_tile_update_queue.hpp>
 
+#include <algorithm>
+
 #include <noggit/Log.h>
 #include <noggit/ModelInstance.h>
 #include <noggit/WMOInstance.h>
@@ -31,9 +33,20 @@ namespace Noggit
       auto& extents(instance->getExtents());
       TileIndex start(extents[0]), end(extents[1]);
 
-      for (size_t z = start.z; z <= end.z; ++z)
+      // Defensive span clamp. A model with a bad/garbage bounding box (inf/-inf or min>max header boxes,
+      // common in fuckported/custom models) yields extents spanning the whole 64x64 map, so this double
+      // loop would call update_model_tile (-> loadTile) for THOUSANDS of tiles -> multi-GB blowup and a
+      // wedged update thread (main thread then thrashes rendering the ballooning world = "freeze"). No
+      // real instance spans more than a couple tiles; cap it at a generous 8x8 so a bad box can never
+      // load the map. (Root cause also fixed in ModelInstance::recalcExtents.)
+      size_t const z0 = std::min(start.z, end.z);
+      size_t const x0 = std::min(start.x, end.x);
+      size_t const z1 = std::min<size_t>(std::max(start.z, end.z), z0 + 8);
+      size_t const x1 = std::min<size_t>(std::max(start.x, end.x), x0 + 8);
+
+      for (size_t z = z0; z <= z1; ++z)
       {
-        for (size_t x = start.x; x <= end.x; ++x)
+        for (size_t x = x0; x <= x1; ++x)
         {
           world->mapIndex.update_model_tile(TileIndex(x, z), update_type, instance);
         }

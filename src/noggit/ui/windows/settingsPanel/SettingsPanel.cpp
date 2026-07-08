@@ -174,16 +174,19 @@ namespace Noggit
                 });
       }
 
-      // Object render distance (live): how far ADT objects + WMOs render. Same setting as the
-      // "View Distance" field above (view_distance); WorldRender reads it every frame. A slider is
-      // just easier to drag than the spinbox. Capped at farZ (2048) since the far plane clips beyond.
+      // Object render distance (live): how far ADT objects + WMOs + models render. This is INDEPENDENT
+      // of the "View Distance" field (view_distance) above -- view_distance drives terrain, horizon and
+      // FOG, while this slider only caps objects. Keeping them separate means dragging this never moves
+      // the fog wall. WorldRender reads object_render_distance every frame and clamps it to the view
+      // distance. Capped at farZ (2048) since the far plane clips beyond.
       {
         auto* od_label = new QLabel(this);
         auto* od_slider = new QSlider(Qt::Horizontal, this);
         od_slider->setObjectName("_object_render_distance_slider");
         od_slider->setMinimum(200);
         od_slider->setMaximum(2048);
-        int const init_od = static_cast<int>(_settings->value("view_distance", 2000.f).toFloat());
+        int const init_od = static_cast<int>(
+          _settings->value("object_render_distance", _settings->value("view_distance", 2000.f).toFloat()).toFloat());
         od_slider->setValue(std::clamp(init_od, 200, 2048));
         od_label->setText(tr("Object render distance: %1").arg(od_slider->value()));
         ui->verticalLayout_7->addWidget(od_label);
@@ -191,8 +194,51 @@ namespace Noggit
         connect(od_slider, &QSlider::valueChanged, [this, od_label](int v)
                 {
                   od_label->setText(tr("Object render distance: %1").arg(v));
-                  _settings->setValue("view_distance", static_cast<float>(v));
-                  if (ui->viewDistanceField) ui->viewDistanceField->setValue(v); // keep the field in sync
+                  _settings->setValue("object_render_distance", static_cast<float>(v));
+                  _settings->sync();
+                });
+      }
+
+      // ADT loading radius (live, applies next time you cross a tile): the NxN grid of tiles kept loaded
+      // around the camera. radius 1 = 3x3 (matches reference noggit), 2 = 5x5, etc. Fewer tiles = fewer
+      // objects/WMOs to draw = higher fps, but content streams in a bit later as you move. See enterTile.
+      {
+        auto* lr_label = new QLabel(this);
+        auto* lr_slider = new QSlider(Qt::Horizontal, this);
+        lr_slider->setObjectName("_adt_loading_radius_slider");
+        lr_slider->setMinimum(0);
+        lr_slider->setMaximum(8);
+        int const init_lr = _settings->value("loading_radius", 1).toInt();
+        lr_slider->setValue(std::clamp(init_lr, 0, 8));
+        lr_label->setText(tr("ADT loading radius: %1 (%2x%2 grid)").arg(lr_slider->value()).arg(2 * lr_slider->value() + 1));
+        ui->verticalLayout_7->addWidget(lr_label);
+        ui->verticalLayout_7->addWidget(lr_slider);
+        connect(lr_slider, &QSlider::valueChanged, [this, lr_label](int v)
+                {
+                  lr_label->setText(tr("ADT loading radius: %1 (%2x%2 grid)").arg(v).arg(2 * v + 1));
+                  _settings->setValue("loading_radius", v);
+                  _settings->sync();
+                });
+      }
+
+      // Async loader thread count (applies on RESTART -- the loader pool is created once at startup).
+      // 3 matches reference noggit. More threads stream faster but steal CPU from the render thread while
+      // loading; fewer = smoother frame time during streaming.
+      {
+        auto* th_label = new QLabel(this);
+        auto* th_slider = new QSlider(Qt::Horizontal, this);
+        th_slider->setObjectName("_async_thread_count_slider");
+        th_slider->setMinimum(1);
+        th_slider->setMaximum(16);
+        int const init_th = _settings->value("async_thread_count", 3).toInt();
+        th_slider->setValue(std::clamp(init_th, 1, 16));
+        th_label->setText(tr("Loader threads (restart to apply): %1").arg(th_slider->value()));
+        ui->verticalLayout_7->addWidget(th_label);
+        ui->verticalLayout_7->addWidget(th_slider);
+        connect(th_slider, &QSlider::valueChanged, [this, th_label](int v)
+                {
+                  th_label->setText(tr("Loader threads (restart to apply): %1").arg(v));
+                  _settings->setValue("async_thread_count", v);
                   _settings->sync();
                 });
       }
@@ -204,7 +250,7 @@ namespace Noggit
         cd_slider->setObjectName("_creature_draw_distance_slider");
         cd_slider->setMinimum(50);
         cd_slider->setMaximum(2000);
-        int const init_cd = _settings->value("creature/draw_distance", 120.0f).toFloat();
+        int const init_cd = _settings->value("creature/draw_distance", 500.0f).toFloat();
         cd_slider->setValue(std::clamp(init_cd, 50, 2000));
         cd_label->setText(tr("Creature draw distance: %1").arg(cd_slider->value()));
         ui->verticalLayout_7->addWidget(cd_label);
@@ -213,6 +259,48 @@ namespace Noggit
                 {
                   cd_label->setText(tr("Creature draw distance: %1").arg(v));
                   _settings->setValue("creature/draw_distance", static_cast<float>(v));
+                  _settings->sync();
+                });
+      }
+
+      // Ground clutter density (live): fraction of the client's scattered detail doodads (grass/
+      // flowers/pebbles) to render, 0-100% -- the equivalent of the in-game density slider. The
+      // on/off is the toolbar/View-menu "Ground clutter" toggle; this only sets how much.
+      {
+        auto* gc_label = new QLabel(this);
+        auto* gc_slider = new QSlider(Qt::Horizontal, this);
+        gc_slider->setObjectName("_ground_clutter_density_slider");
+        gc_slider->setMinimum(0);
+        gc_slider->setMaximum(100);
+        int const init_gc = static_cast<int>(_settings->value("render/ground_clutter_density", 100.0f).toFloat());
+        gc_slider->setValue(std::clamp(init_gc, 0, 100));
+        gc_label->setText(tr("Ground clutter density: %1%").arg(gc_slider->value()));
+        ui->verticalLayout_7->addWidget(gc_label);
+        ui->verticalLayout_7->addWidget(gc_slider);
+        connect(gc_slider, &QSlider::valueChanged, [this, gc_label](int v)
+                {
+                  gc_label->setText(tr("Ground clutter density: %1%").arg(v));
+                  _settings->setValue("render/ground_clutter_density", static_cast<float>(v));
+                  _settings->sync();
+                });
+      }
+
+      // Ground clutter draw distance (live): how far from the camera detail doodads render.
+      {
+        auto* gcd_label = new QLabel(this);
+        auto* gcd_slider = new QSlider(Qt::Horizontal, this);
+        gcd_slider->setObjectName("_ground_clutter_distance_slider");
+        gcd_slider->setMinimum(20);
+        gcd_slider->setMaximum(500);
+        int const init_gcd = static_cast<int>(_settings->value("render/ground_clutter_distance", 120.0f).toFloat());
+        gcd_slider->setValue(std::clamp(init_gcd, 20, 500));
+        gcd_label->setText(tr("Ground clutter distance: %1").arg(gcd_slider->value()));
+        ui->verticalLayout_7->addWidget(gcd_label);
+        ui->verticalLayout_7->addWidget(gcd_slider);
+        connect(gcd_slider, &QSlider::valueChanged, [this, gcd_label](int v)
+                {
+                  gcd_label->setText(tr("Ground clutter distance: %1").arg(v));
+                  _settings->setValue("render/ground_clutter_distance", static_cast<float>(v));
                   _settings->sync();
                 });
       }
@@ -228,6 +316,21 @@ namespace Noggit
         connect(wmo_stencil_cb, &QCheckBox::toggled, [this](bool checked)
                 {
                   _settings->setValue("water/wmo_stencil", checked);
+                  _settings->sync();
+                });
+      }
+
+      // WMO portal culling (live): ON = when inside a building/dungeon, only the rooms reachable through
+      // visible doorways from your room are drawn (big fps win in cities like Ironforge). It's conservative
+      // -- it never hides on-screen geometry -- but if anything ever pops out that shouldn't, turn it off.
+      {
+        auto* portal_cb = new QCheckBox(tr("WMO portal culling (hide unseen interior rooms)"), this);
+        portal_cb->setObjectName("_wmo_portal_culling_checkbox");
+        portal_cb->setChecked(_settings->value("render/wmo_portal_culling", true).toBool());
+        ui->verticalLayout_7->addWidget(portal_cb);
+        connect(portal_cb, &QCheckBox::toggled, [this](bool checked)
+                {
+                  _settings->setValue("render/wmo_portal_culling", checked);
                   _settings->sync();
                 });
       }
@@ -262,7 +365,8 @@ namespace Noggit
       }
 
       // Make the View Distance field apply LIVE: WorldRender reads view_distance every frame, so
-      // changing this field moves the object/WMO render distance immediately (no Apply / reload).
+      // changing this field moves the terrain/horizon and FOG distance immediately (no Apply / reload).
+      // Objects have their own "Object render distance" slider (object_render_distance).
       connect(ui->viewDistanceField, qOverload<double>(&QDoubleSpinBox::valueChanged), [this](double v)
               {
                 _settings->setValue("view_distance", static_cast<float>(v));

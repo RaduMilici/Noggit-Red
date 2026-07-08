@@ -13,6 +13,7 @@
 #include <noggit/rendering/WMORender.hpp>
 #include <noggit/rendering/Primitives.hpp>
 #include <ClientFile.hpp>
+#include <external/glm/gtc/type_precision.hpp> // glm::u8vec3 (_ground_colors)
 #include <optional>
 
 #include <map>
@@ -195,6 +196,10 @@ public:
   [[nodiscard]]
   std::vector<uint16_t> doodad_ref() const { return _doodad_ref; }
 
+  // MOLR: indices into the root WMO's MOLT light list that illuminate this group (per-room lighting).
+  [[nodiscard]]
+  std::vector<int16_t> const& light_refs() const { return _light_refs; }
+
   glm::vec3 BoundingBoxMin;
   glm::vec3 BoundingBoxMax;
   glm::vec3 VertexBoxMin;
@@ -221,13 +226,42 @@ public:
   [[nodiscard]]
   std::uint32_t wmo_area_table_group_id() const { return header.id; }
 
+  // Range into the root WMO's _portal_refs list = this group's portals (for portal-visibility culling).
+  [[nodiscard]]
+  std::uint16_t portal_start() const { return header.portal_start; }
+  [[nodiscard]]
+  std::uint16_t portal_count() const { return header.portal_count; }
+
   [[nodiscard]]
   Noggit::Rendering::WMOGroupRender* renderer() { return &_renderer; };
   ::glm::vec3 center;
 
+  // Root-side MOGI flags for this group, read at ROOT load (available for every group before any group
+  // FILE loads). Needed by AttenTransVerts: a portal brightens only when its TARGET group has
+  // MOGI.flags & 0x48 (exterior / exterior-lit).
+  std::uint32_t mogi_flags = 0;
+
+  // Client CWorldEntity::SampleGroundColor (RE_notes/15, wow.exe 0x69E4C0/0x6B9A50): straight-down ray in
+  // WMO-LOCAL space from local_pos.y+1.0 to local_pos.y-12.0 against this group's triangles; on hit,
+  // barycentric-interpolates the retained MOCV rgb of the face into *out (0..1). Returns false when this
+  // group keeps no ground colours (non-indoor / no MOCV) or no floor is under the point. This colour is
+  // the ENTIRE base light of a unit standing indoors (MOHD ambient and the sun play no part).
+  bool sample_ground_color(glm::vec3 const& local_pos, glm::vec3* out) const;
+
 private:
   void load_mocv(BlizzardArchive::ClientFile& f, uint32_t size);
+  // The 1.12 client's ONLY load-time MOCV mutation (byte-matched 100% on 64,317 traced verts across 3
+  // WMOs, RE_notes/19): brighten TRANSPARENCY-BATCH vertices toward white by proximity to portals that
+  // lead to exterior groups (op = 1 - 0.15*d, accumulated, capped 1), written ONLY when the new alpha
+  // byte exceeds the stored one. Everything else ships to the GPU verbatim -- the wowdev
+  // "FixColorVertexAlpha" (ambient subtract / halve / alpha fold) does NOT exist in 1.12.
+  void atten_trans_verts(std::vector<std::uint32_t>& colors); // parked (reverted; see WMO.cpp note)
   void fix_vertex_color_alpha();
+  void compute_portal_openness();
+  // Client-faithful (SMOGroup flag `do_not_attenuate_vertices_based_on_distance_to_portal`): brighten
+  // interior vertices toward the outdoor light by their proximity to this group's portals, so the light
+  // spills smoothly through a doorway/window instead of a hard interior/exterior seam. Stored per-vertex
+  // as an "openness" factor in the vertex-colour alpha (1 at a portal, fading to 0 inward).
 
   WMO *wmo;
   wmo_group_header header;
@@ -235,10 +269,16 @@ private:
   int32_t num;
   int32_t fog;
   std::vector<uint16_t> _doodad_ref;
+  std::vector<int16_t> _light_refs; // MOLR
   std::unique_ptr<wmo_liquid> lq;
 
   std::vector <wmo_triangle_material_info> _material_infos;
   std::vector<wmo_batch> _batches;
+
+  // (Legacy, always false now: the portal-spill experiment is superseded by the byte-matched 1.12
+  // AttenTransVerts + tex*MOCV*(1+4a) pipeline, RE_notes/19.)
+  // this (indoor) group. The renderer flags such batches so the shader applies the outdoor-light spill.
+  bool _has_portal_openness = false;
 
   std::vector<::glm::vec3> _vertices;
   std::vector<::glm::vec3> _normals;
@@ -246,6 +286,9 @@ private:
   std::vector<glm::vec2> _texcoords_2;
   std::vector<glm::vec4> _vertex_colors;
   std::vector<uint16_t> _indices;
+  // Compact MOCV rgb copy (post atten_trans_verts), INDOOR groups only: the renderer clears
+  // _vertex_colors on GPU upload, but sample_ground_color() needs the baked floor colours on the CPU.
+  std::vector<glm::u8vec3> _ground_colors;
 
   std::optional<std::vector<wmo_bsp_node>> _bsp_tree_nodes;
   std::optional<std::vector<uint16_t>> _bsp_indices;
@@ -274,6 +317,17 @@ struct WMOPV {
 
 struct WMOPR {
   int16_t portal, group, dir, reserved;
+};
+
+// One MOPT entry: the polygon of a portal is _portal_vertices[base_vertex .. base_vertex+vertex_count).
+// (For CULLING the plane is recomputed from the transformed polygon; but the 1.12 AttenTransVerts pass
+// (RE_notes/19) needs the AUTHORED plane, stored here in noggit's swapped coord convention -- the swap
+// is orthogonal so dot(normal_swapped, v_swapped) + dist is invariant.)
+struct wmo_portal_info {
+  uint16_t base_vertex;
+  uint16_t vertex_count;
+  glm::vec3 plane_normal = glm::vec3(0.f);
+  float plane_dist = 0.f;
 };
 
 struct WMODoodadSet {
@@ -337,6 +391,14 @@ public:
   std::vector<std::string> models;
   std::vector<wmo_doodad_instance> modelis;
   std::vector<glm::vec3> model_nearest_light_vector;
+
+  // Portal graph for interior visibility culling (MOPV/MOPT/MOPR). _portal_vertices = all portal polygon
+  // corners (WMO local space); _portal_info[p] = which slice of _portal_vertices is portal p's polygon;
+  // _portal_refs = the links (each group's portals are _portal_refs[group.portal_start .. +portal_count),
+  // giving the neighbour group index + which side of the portal that group sits on).
+  std::vector<glm::vec3> _portal_vertices;
+  std::vector<wmo_portal_info> _portal_info;
+  std::vector<WMOPR> _portal_refs;
 
   std::vector<WMOLight> lights;
   glm::vec4 ambient_light_color;

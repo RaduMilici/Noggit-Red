@@ -168,7 +168,7 @@ void PreviewRenderer::draw()
   glm::mat4x4 const mvp(proj * mv);
   math::frustum const frustum (glm::transpose(mvp));
 
-  updateMVPUniformBlock(mv, proj);
+  updateMVPUniformBlock(mv, proj, _camera.position);
 
   if (_lighting_needs_update)
     updateLightingUniformBlock();
@@ -767,10 +767,14 @@ void Noggit::Ui::Tools::PreviewRenderer::updateLightingUniformBlock()
   _lighting_needs_update = false;
 }
 
-void Noggit::Ui::Tools::PreviewRenderer::updateMVPUniformBlock(const glm::mat4x4& model_view, const glm::mat4x4& projection)
+void Noggit::Ui::Tools::PreviewRenderer::updateMVPUniformBlock(const glm::mat4x4& model_view, const glm::mat4x4& projection, const glm::vec3& camera_pos)
 {
   _mvp_ubo_data.model_view = model_view;
   _mvp_ubo_data.projection = projection;
+  // The M2/WMO/terrain vertex shaders render CAMERA-RELATIVE (they zero the view translation and subtract
+  // camera_pos): without a real camera_pos the camera's translation is ignored, so moving the preview
+  // camera did nothing and it appeared glued to the model centre. Feed the actual camera position.
+  _mvp_ubo_data.camera_pos = glm::vec4(camera_pos, 1.0f);
 
   gl.bindBuffer(GL_UNIFORM_BUFFER, _mvp_ubo);
   gl.bufferSubData(GL_UNIFORM_BUFFER, 0, sizeof(OpenGL::MVPUniformBlock), &_mvp_ubo_data);

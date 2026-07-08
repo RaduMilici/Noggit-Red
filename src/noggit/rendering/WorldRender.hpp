@@ -16,17 +16,32 @@
 
 #include <opengl/shader.hpp>
 #include <noggit/rendering/Primitives.hpp>
+#include <noggit/ModelInstance.h>
+#include <noggit/InteriorVolume.hpp>
 
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
 class World;
+class WMO;
 struct MinimapRenderSettings;
 
 namespace Noggit::Rendering
 {
+  // Per-frame acceleration structure for the legacy-creature-doodad overlap test. Maps a creature model
+  // path to the spawn overlays that use it, so should_suppress_legacy_creature_instance() is an O(1)
+  // lookup + tiny bucket scan instead of walking ALL ~35k creature spawns per creature instance per frame.
+  struct LegacyOverlayInfo
+  {
+    glm::vec3 pos = glm::vec3(0.0f);
+    float overlay_radius = 1.0f;
+    std::uint32_t guid = 0;
+    std::string overlay_model;
+  };
+
   class WorldRender : public BaseRender
   {
   public:
@@ -74,6 +89,7 @@ namespace Noggit::Rendering
         , bool minimap_render = false
         , bool draw_wmo_exterior = true
         , bool draw_bloom = false
+        , bool draw_ground_clutter = true
     );
 
     bool saveMinimap (TileIndex const& tile_idx
@@ -88,6 +104,14 @@ namespace Noggit::Rendering
 
     [[nodiscard]] std::unique_ptr<Skies>& skies() { return _skies; };
 
+    // Per-room (MOLR) point-light scoping: the client lights each interior WMO group ONLY by the
+    // MOLT lights its MOLR chunk references. Called by WMORender between group draws to swap the
+    // point-light region of the lighting UBO to the group's authored set; restore returns to the
+    // frame's global nearest-16 pool (kept in _lighting_ubo_data) before non-WMO passes.
+    void setWmoGroupPointLights(WMO const* wmo, std::vector<int16_t> const& light_refs,
+                                glm::mat4x4 const& transform, glm::vec3 const& camera_pos);
+    void restoreGlobalPointLights();
+
   private:
 
     void drawMinimap ( MapTile *tile
@@ -97,7 +121,7 @@ namespace Noggit::Rendering
         , MinimapRenderSettings* settings
     );
 
-    void updateMVPUniformBlock(const glm::mat4x4& model_view, const glm::mat4x4& projection);
+    void updateMVPUniformBlock(const glm::mat4x4& model_view, const glm::mat4x4& projection, glm::vec3 const& camera_pos);
     void updateLightingUniformBlock(bool draw_fog, glm::vec3 const& camera_pos);
     void updateLightingUniformBlockMinimap(MinimapRenderSettings* settings);
 
@@ -110,11 +134,20 @@ namespace Noggit::Rendering
     // Bloom post-process: (re)create the offscreen targets for the given viewport size, and run the
     // bright-pass -> blur -> composite once the scene has been rendered into the scene target.
     void ensureBloomTargets(int w, int h);
-    void renderBloomAndComposite(GLuint target_fbo, int w, int h);
+    void renderBloomAndComposite(GLuint target_fbo, int w, int h, glm::vec3 const& camera_pos);
 
     World* _world;
-    float _cull_distance;
+    float _cull_distance;         // how far OBJECTS/WMOs/models render (Object Render Distance slider), clamped to terrain
+    float _terrain_cull_distance; // how far TERRAIN/horizon/sky render = view distance (+ fog clamp); drives fog too
     float _view_distance;
+
+    // Ground clutter (checklist 14.1): persistent model refs for detail doodads, keyed by path, so
+    // the handful of shared grass/pebble M2s stay resident while the camera moves.
+    std::unordered_map<std::string, scoped_model_reference> _detail_doodad_models;
+
+    // Rebuilt at the start of each draw() from the world's creature spawns; keyed by spawn model_path.
+    std::unordered_map<std::string, std::vector<LegacyOverlayInfo>> _legacy_suppress_index;
+    void rebuildLegacySuppressIndex();
 
     // shaders
     std::unique_ptr<OpenGL::program> _mcnk_program;;
@@ -168,6 +201,16 @@ namespace Noggit::Rendering
     std::unordered_map<std::uint32_t, ConformingDisc> _creature_disc_cache;
     std::unordered_map<std::uint32_t, ConformingDisc> _gameobject_disc_cache;
 
+    // Per-object interior lighting: cache of quantized-world-position -> interior light (rgb = WMO room
+    // ambient, a = 1 when the position is inside an indoor group; (0,0,0,0) = outdoor). Objects in the
+    // same room share a cell, and the value is spatial, so a coarse ~1yd grid key is exact enough. Cleared
+    // periodically (_interior_light_epoch) so WMOs that stream in late get picked up.
+    std::unordered_map<std::int64_t, glm::vec4> _interior_light_cache;
+    // Indoor-group AABBs, rebuilt only every _interior_light_epoch tick (the gather is EXPENSIVE); object
+    // interior tests are then cheap AABB checks against this list.
+    std::vector<InteriorVolume> _interior_volumes;
+    unsigned _interior_light_epoch = 0;
+
     // buffers
     OpenGL::Scoped::deferred_upload_buffers<8> _buffers;
     GLuint const& _mvp_ubo = _buffers[0];
@@ -182,6 +225,7 @@ namespace Noggit::Rendering
     // uniform blocks
     OpenGL::MVPUniformBlock _mvp_ubo_data;
     OpenGL::LightingUniformBlock _lighting_ubo_data;
+    bool _point_lights_scoped = false; // true while the UBO carries a WMO group's MOLR set
     OpenGL::TerrainParamsUniformBlock _terrain_params_ubo_data;
 
 

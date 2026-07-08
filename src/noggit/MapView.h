@@ -164,6 +164,7 @@ public:
   Noggit::BoolToggleProperty _draw_wmo = {true};
   Noggit::BoolToggleProperty _draw_water = {true};
   Noggit::BoolToggleProperty _draw_bloom = {true};
+  Noggit::BoolToggleProperty _draw_ground_clutter = {true};
   Noggit::BoolToggleProperty _draw_wmo_doodads = {true};
   Noggit::BoolToggleProperty _draw_wmo_exterior = { true };
   Noggit::BoolToggleProperty _draw_models = {true};

@@ -43,6 +43,7 @@
 #include <QDir>
 #include <QIcon>
 #include <QThread>
+#include <QtCore/QSettings>
 #include <noggit/ui/windows/noggitWindow/components/BuildMapListComponent.hpp>
 #include <noggit/application/Utils.hpp>
 
@@ -870,7 +871,23 @@ namespace Noggit::Ui::Windows
     } else
     {
       event->accept();
+      // No map open (project menu) -> nothing to save, so exit the process for real. Closing the
+      // window alone was leaving the app running in the background on some systems.
+      forceQuit();
     }
+  }
+
+  void NoggitWindow::forceQuit()
+  {
+    // Flush user settings (volume, window state, etc.) to disk while we still can. QSettings normally
+    // syncs on destruction, which the hard exit below skips.
+    QSettings().sync();
+
+    // Terminate immediately. This kills the render-loop timer, the AsyncLoader worker threads, and the
+    // QMediaPlayer DirectShow/WMF audio thread all at once -- none of them can keep the process alive or
+    // keep growing memory once the process is gone. std::_Exit runs no destructors (so no GL-context or
+    // async-loader teardown can hang), and we already persisted what matters above.
+    std::_Exit(0);
   }
 
   void NoggitWindow::handleEventMapListContextMenuPinMap(int mapId, std::string MapName)
@@ -913,9 +930,11 @@ namespace Noggit::Ui::Windows
         map_loaded = false;
         break;
       case QMessageBox::DestructiveRole:
-        Noggit::Ui::Tools::ViewportManager::ViewportManager::unloadAll();
-        setCentralWidget(_null_widget = new QWidget(this));
+        // User chose Exit (unsaved changes already warned as lost). Don't rely on the Qt/GL teardown to
+        // unwind cleanly -- it has been leaving the process alive in the background, leaking memory and
+        // still playing zone music. Just terminate the process.
         event->accept();
+        forceQuit();
         break;
       default:
         event->ignore();

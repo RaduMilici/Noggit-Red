@@ -252,6 +252,13 @@ struct ModelColorDef {
   AnimationBlock opacity;
 };
 
+// Classic (1.12) color defs: same two tracks in the older 28-byte ClassicAnimationBlock form
+// (mirrors ClassicModelTransDef below).
+struct ClassicModelColorDef {
+  ClassicAnimationBlock color;
+  ClassicAnimationBlock opacity;
+};
+
 // block H - transp defs
 struct ModelTransDef {
   AnimationBlock trans;

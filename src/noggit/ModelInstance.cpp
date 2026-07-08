@@ -3,6 +3,8 @@
 #include <glm/gtx/quaternion.hpp>
 #include <math/bounding_box.hpp>
 #include <math/frustum.hpp>
+
+#include <cmath>
 #include <glm/glm.hpp>
 #include <noggit/Log.h>
 #include <noggit/Misc.h> // checkinside
@@ -102,6 +104,7 @@ ModelInstance& ModelInstance::operator=(ModelInstance const& other)
   _need_gpu_transform_update = other._need_gpu_transform_update;
   _gpu_transform_uid = other._gpu_transform_uid;
   _forced_anim_id = other._forced_anim_id;
+  _close_hands = other._close_hands;
 
   _replace_textures.clear();
   for (auto const& pair : other._replace_textures)
@@ -314,6 +317,23 @@ void ModelInstance::recalcExtents()
 
   extents[0] = bounding_of_rotated_points.min;
   extents[1] = bounding_of_rotated_points.max;
+
+  // Guard the "fuckported model" case the TODO above calls out: a header collision/bounding box of
+  // {inf,-inf} (or any min>max / non-finite value, common in custom/Turtle models) yields garbage
+  // world extents. Downstream, world_tile_update_queue::apply() derives a TileIndex range from these
+  // extents and loads EVERY tile in it -- a whole-map range means thousands of tiles get loaded ->
+  // gigabytes of RAM and a frozen client. Collapse a bad box to a point at pos (same as loading_failed).
+  bool const bad_extents =
+       !std::isfinite(extents[0].x) || !std::isfinite(extents[0].y) || !std::isfinite(extents[0].z)
+    || !std::isfinite(extents[1].x) || !std::isfinite(extents[1].y) || !std::isfinite(extents[1].z)
+    || extents[0].x > extents[1].x || extents[0].y > extents[1].y || extents[0].z > extents[1].z;
+  if (bad_extents)
+  {
+    extents[0] = extents[1] = pos;
+    size_cat = 0.f;
+    _need_recalc_extents = false;
+    return;
+  }
 
   size_cat = glm::distance(bounding_of_rotated_points.max, bounding_of_rotated_points.min);
 

@@ -305,6 +305,8 @@ void ModelRender::draw(glm::mat4x4 const& model_view
     , int animtime
     , display_mode display
     , bool no_cull
+    , bool bloom_mask_only
+    , glm::vec4 const& interior_light
 )
 {
   if (!_model->finishedLoading() || _model->loading_failed())
@@ -326,7 +328,20 @@ void ModelRender::draw(glm::mat4x4 const& model_view
 
   if (_model->animated && (!_model->animcalc || _model->_per_instance_animation))
   {
-    auto const anim_id = instance.forcedAnimationId() >= 0 ? instance.forcedAnimationId() : 0;
+    int anim_id = instance.forcedAnimationId() >= 0 ? instance.forcedAnimationId() : 0;
+    // A forced animation may not exist on this model. Fall back to Stand(0) so animate() never indexes a
+    // missing sequence.
+    if (anim_id != 0 && !_model->hasAnimationId(anim_id))
+    {
+      anim_id = 0;
+    }
+    // Weapon grip: this instance holds an in-hand weapon -> after the body pass, overlay the HandsClosed
+    // pose onto the finger bones only (see Model::applyHandGripOverlay). Set on the shared model just
+    // before this instance's animate() -- creatures re-animate per draw, so it applies to this spawn only.
+    _model->_hand_overlay_active = instance.closeHands();
+    // Identify which spawn is animating so the idle-variation scheduler keeps a per-instance timeline
+    // (each spawn leans on its own schedule instead of all in unison). uid is the spawn guid for creatures.
+    _model->_active_idle_key = static_cast<std::uint64_t>(instance.uid);
     // Feed the FULL model->view matrix (camera view * this instance's world transform) so billboard bones
     // face the camera in this spawn's own frame. model_view alone is world->view; the instance's world
     // orientation (e.g. Anomalus's 205deg heading) is applied separately in the shader via `transform`, so
@@ -344,7 +359,28 @@ void ModelRender::draw(glm::mat4x4 const& model_view
     return;
   }
 
-  m2_shader.uniform("transform", instance.transformMatrix());
+  // Camera-relative anchor: split the world transform into a ~17000 origin + a small relative transform
+  // so the shader keeps everything small (jitter fix). Attachments supply a double-computed anchor;
+  // everything else derives it from its (static) world position here.
+  {
+    glm::mat4x4 tr;
+    glm::vec3 origin;
+    if (instance._has_render_anchor)
+    {
+      origin = instance._render_origin;
+      tr = instance._render_transform_rel;
+    }
+    else
+    {
+      tr = instance.transformMatrix();
+      origin = glm::vec3(tr[3]);
+      tr[3] = glm::vec4(0.0f, 0.0f, 0.0f, 1.0f);
+    }
+    m2_shader.uniform("transform", tr);
+    m2_shader.uniform("model_origin", origin);
+    // Always set so no stale interior value leaks from a previous indoor draw. (0,0,0,0) = outdoor.
+    m2_shader.uniform("instance_interior", interior_light);
+  }
 
   if (_model->animBones)
   {
@@ -370,6 +406,38 @@ void ModelRender::draw(glm::mat4x4 const& model_view
   }
 
   OpenGL::Scoped::buffer_binder<GL_ELEMENT_ARRAY_BUFFER> indices_binder(_indices_buffer);
+
+  // BLOOM-MASK-ONLY re-stamp (called after the particle pass, which erases the emissive mask under
+  // every particle -- so a smoke cloud from another creature was killing this creature's bloom). Draw
+  // the depth-writing body batches into the ALPHA CHANNEL only, over the depth this creature already
+  // laid, stamping the brightness-driven emissive mask (shader creature_bloom == 3) so the bloom
+  // survives whatever drew in front. No colour, no blend, no depth writes.
+  if (bloom_mask_only)
+  {
+    gl.colorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_TRUE);
+    gl.disable(GL_BLEND);
+    gl.depthMask(GL_FALSE);
+    model_render_state.bloom_mask_pass = true;
+    model_render_state.creature_bloom = -1;
+    for (ModelRenderPass& p : _render_passes)
+    {
+      if (p.blend_mode > 1)
+      {
+        continue;
+      }
+      if (p.prepareDraw(m2_shader, _model, &instance, model_render_state))
+      {
+        gl.disable(GL_BLEND);
+        gl.drawElements(GL_TRIANGLES, p.index_count, GL_UNSIGNED_SHORT, reinterpret_cast<void*>(p.index_start * sizeof(GLushort)));
+        p.afterDraw();
+      }
+    }
+    model_render_state.bloom_mask_pass = false;
+    model_render_state.creature_bloom = -1;
+    model_render_state.blend = 0xFFFF;
+    gl.colorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    return;
+  }
 
   // TRANSLUCENT CREATURE (CreatureModelAlpha < 255, e.g. Anomalus 200 -> 0.784): the live client
   // draws the body geometry TWICE (verified in the apitrace): first a DEPTH-ONLY prepass (color
@@ -404,6 +472,38 @@ void ModelRender::draw(glm::mat4x4 const& model_view
     }
   }
 
+  // Translucent energy creature (Anomalus): the alpha-blended body above lands the FBO's bloom mask
+  // at ~alpha^2 -- far below the emissive range -- so its bright texels never bloomed, while the client's
+  // screen-luminance FFXGlow blooms them. Re-draw the depth-writing batches into the ALPHA CHANNEL ONLY
+  // (color writes off, blending off, depth already laid by the prepass): the shader (creature_bloom == 3)
+  // stamps a brightness-driven emissive mask for hot texels and discards the rest. The body's blended
+  // COLOR -- and its see-through translucency -- is untouched.
+  if (instance.model_alpha < 0.999f && is_classic_creature_or_character_model(_model))
+  {
+    gl.colorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_TRUE);
+    gl.disable(GL_BLEND);
+    gl.depthMask(GL_FALSE);
+    model_render_state.bloom_mask_pass = true;
+    model_render_state.creature_bloom = -1; // force the uniform to re-evaluate as mode 3
+    for (ModelRenderPass& p : _render_passes)
+    {
+      if (p.blend_mode > 1)
+      {
+        continue; // body batches only (opaque / alpha-key), same set as the depth prepass
+      }
+      if (p.prepareDraw(m2_shader, _model, &instance, model_render_state))
+      {
+        gl.disable(GL_BLEND); // prepareDraw may have re-enabled blending for the promoted pass
+        gl.drawElements(GL_TRIANGLES, p.index_count, GL_UNSIGNED_SHORT, reinterpret_cast<void*>(p.index_start * sizeof(GLushort)));
+        p.afterDraw();
+      }
+    }
+    model_render_state.bloom_mask_pass = false;
+    model_render_state.creature_bloom = -1; // next model re-evaluates its own mode
+    model_render_state.blend = 0xFFFF;      // blend state was forced off; make the next pass re-set it
+    gl.colorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+  }
+
   gl.disable(GL_BLEND);
   gl.enable(GL_CULL_FACE);
   gl.depthMask(GL_TRUE);
@@ -430,6 +530,8 @@ void ModelRender::draw(glm::mat4x4 const& model_view
     , std::unordered_map<Model*, std::size_t>& model_boxes_to_draw
     , display_mode display
     , bool no_cull
+    , ModelInstance const* representative
+    , std::vector<glm::vec4> const& instance_interior
 )
 {
   ZoneScopedN(NOGGIT_CURRENT_FUNCTION);
@@ -527,14 +629,29 @@ void ModelRender::draw(glm::mat4x4 const& model_view
                << std::endl;
     }
 
+    // Partition the instances by interior-light value into contiguous groups so each group can be drawn
+    // with a single `instance_interior` uniform (the shader lights indoor objects by room ambient, no
+    // outdoor sun). Common case: all-exterior -> one group with interior (0,0,0,0) == the old single draw.
+    // Mixed models (some spawns inside a building) get one extra draw per distinct room ambient.
+    struct InteriorGroup { glm::vec4 interior; std::vector<glm::mat4x4> transforms; };
+    std::vector<InteriorGroup> interior_groups;
+    for (std::size_t i = 0; i < instances.size(); ++i)
     {
-      OpenGL::Scoped::buffer_binder<GL_ARRAY_BUFFER> const transform_binder (_transform_buffer);
-      gl.bufferData(GL_ARRAY_BUFFER, instances.size() * sizeof(::glm::mat4x4), instances.data(), GL_DYNAMIC_DRAW);
-      //m2_shader.attrib("transform", 0, 1);
+      glm::vec4 const inter = (i < instance_interior.size()) ? instance_interior[i] : glm::vec4(0.f);
+      InteriorGroup* grp = nullptr;
+      for (auto& cand : interior_groups)
+      {
+        if (cand.interior == inter) { grp = &cand; break; }
+      }
+      if (!grp) { interior_groups.push_back({inter, {}}); grp = &interior_groups.back(); }
+      grp->transforms.push_back(instances[i]);
     }
 
     if (skip_mesh_passes)
     {
+      // Nothing to rasterize, but the transform buffer still feeds particle/ribbon draws below.
+      OpenGL::Scoped::buffer_binder<GL_ARRAY_BUFFER> const transform_binder (_transform_buffer);
+      gl.bufferData(GL_ARRAY_BUFFER, instances.size() * sizeof(::glm::mat4x4), instances.data(), GL_DYNAMIC_DRAW);
       return;
     }
 
@@ -553,12 +670,61 @@ void ModelRender::draw(glm::mat4x4 const& model_view
 
     OpenGL::Scoped::buffer_binder<GL_ELEMENT_ARRAY_BUFFER> indices_binder(_indices_buffer);
 
-    for (ModelRenderPass& p : _render_passes)
+    static bool const s_inst_dbg = std::getenv("NOGGIT_INSTANCE_DEBUG") != nullptr;
+    int passes_drawn = 0;
+    int passes_total = 0;
+
+    for (auto const& group : interior_groups)
     {
-      if (p.prepareDraw(m2_shader, _model, nullptr, model_render_state))
+      if (group.transforms.empty())
       {
-        gl.drawElementsInstanced(GL_TRIANGLES, p.index_count, GL_UNSIGNED_SHORT, reinterpret_cast<void*>(p.index_start * sizeof(GLushort)), static_cast<GLsizei>(instances.size()));
-        p.afterDraw();
+        continue;
+      }
+
+      {
+        // Upload only this group's transforms so index 0 is the group start (no glDraw*BaseInstance in
+        // GL 3.3), then set the room light this whole group shares.
+        OpenGL::Scoped::buffer_binder<GL_ARRAY_BUFFER> const transform_binder (_transform_buffer);
+        gl.bufferData(GL_ARRAY_BUFFER, group.transforms.size() * sizeof(::glm::mat4x4), group.transforms.data(), GL_DYNAMIC_DRAW);
+      }
+      m2_shader.uniform("instance_interior", group.interior);
+
+      for (ModelRenderPass& p : _render_passes)
+      {
+        ++passes_total;
+        // Pass the representative instance so replaceable creature skins + geoset selection resolve (the
+        // per-instance state the instanced draw otherwise loses -> invisible creatures). nullptr = doodads.
+        if (p.prepareDraw(m2_shader, _model, representative, model_render_state))
+        {
+          ++passes_drawn;
+          gl.drawElementsInstanced(GL_TRIANGLES, p.index_count, GL_UNSIGNED_SHORT, reinterpret_cast<void*>(p.index_start * sizeof(GLushort)), static_cast<GLsizei>(group.transforms.size()));
+          p.afterDraw();
+        }
+      }
+    }
+
+    // Leave the FULL instance set in the transform buffer for the particle/ribbon draws that follow
+    // (they instance-count off it). Interior partitioning only affects the mesh passes above.
+    {
+      OpenGL::Scoped::buffer_binder<GL_ARRAY_BUFFER> const transform_binder (_transform_buffer);
+      gl.bufferData(GL_ARRAY_BUFFER, instances.size() * sizeof(::glm::mat4x4), instances.data(), GL_DYNAMIC_DRAW);
+    }
+
+    if (s_inst_dbg && _model->file_key().hasFilepath())
+    {
+      static std::set<std::string> logged;
+      auto const& fp = _model->file_key().filepath();
+      if (fp.find("creature") != std::string::npos && logged.insert(fp).second)
+      {
+        float bone0 = _model->bone_matrices.empty() ? -999.f : _model->bone_matrices[0][0][0];
+        LogError << "INSTDBG model='" << fp << "' instances=" << instances.size()
+                 << " passesDrawn=" << passes_drawn << "/" << passes_total
+                 << " animated=" << _model->animated << " animBones=" << _model->animBones
+                 << " animcalc=" << _model->animcalc
+                 << " boneMatrices=" << _model->bone_matrices.size()
+                 << " bone0.m00=" << bone0
+                 << " firstXform.t=(" << instances[0][3][0] << "," << instances[0][3][1] << "," << instances[0][3][2] << ")"
+                 << std::endl;
       }
     }
 
@@ -583,13 +749,48 @@ void ModelRender::drawParticles(glm::mat4x4 const& model_view
   }
 }
 
+void ModelRender::drawParticlesFiltered(glm::mat4x4 const& model_view
+    , OpenGL::Scoped::use_program& particles_shader
+    , std::vector<glm::mat4x4> const& transforms
+)
+{
+  if (_model->_particles.empty() || transforms.empty() || !_uploaded)
+  {
+    return; // !_uploaded: GL buffers don't exist until the mesh path uploads (see drawParticlesForInstance)
+  }
+  {
+    OpenGL::Scoped::buffer_binder<GL_ARRAY_BUFFER> const transform_binder(_transform_buffer);
+    gl.bufferData(GL_ARRAY_BUFFER, transforms.size() * sizeof(glm::mat4x4), transforms.data(), GL_DYNAMIC_DRAW);
+  }
+  drawParticles(model_view, particles_shader, transforms.size());
+}
+
+void ModelRender::drawRibbonsFiltered(OpenGL::Scoped::use_program& ribbons_shader
+    , std::vector<glm::mat4x4> const& transforms
+)
+{
+  if (_model->_ribbons.empty() || transforms.empty() || !_uploaded)
+  {
+    return; // !_uploaded: see drawParticlesForInstance
+  }
+  {
+    OpenGL::Scoped::buffer_binder<GL_ARRAY_BUFFER> const transform_binder(_transform_buffer);
+    gl.bufferData(GL_ARRAY_BUFFER, transforms.size() * sizeof(glm::mat4x4), transforms.data(), GL_DYNAMIC_DRAW);
+  }
+  drawRibbons(ribbons_shader, transforms.size());
+}
+
 void ModelRender::drawParticlesForInstance(glm::mat4x4 const& model_view
     , OpenGL::Scoped::use_program& particles_shader
     , glm::mat4x4 const& transform
     , float model_alpha
 )
 {
-  if (_model->_particles.empty())
+  // _uploaded guard: the mesh draw frustum-culls BEFORE upload(), so a freshly-streamed model whose
+  // every copy was culled so far has NO GL buffers yet -- binding/bufferData on the never-generated
+  // _transform_buffer name here fed the NVIDIA driver garbage and it AV'd on a later flush. Skip until
+  // the mesh path has uploaded (first visible frame).
+  if (_model->_particles.empty() || !_uploaded)
   {
     return;
   }
@@ -1315,17 +1516,45 @@ bool ModelRenderPass::prepareDraw(OpenGL::Scoped::use_program& m2_shader, Model 
   }
 
   // emissive colors
-  if (color_index != -1 && static_cast<size_t>(color_index) < m->_colors.size() && m->_colors[color_index].color.uses(0))
+  // Sample BOTH tracks preferring the current animation with an anim-0 fallback (same convention
+  // as the transparency block below). Previously RGB was hardcoded to anim 0 while opacity used the
+  // current sequence -- asymmetric, and models whose color track is keyed on the playing animation
+  // (portal pulses) never advanced.
+  if (color_index != -1 && static_cast<size_t>(color_index) < m->_colors.size())
   {
-    ::glm::vec3 c (m->_colors[color_index].color.getValue (0, m->_anim_time, m->_global_animtime));
-    if (m->_colors[color_index].opacity.uses (m->_current_anim_seq))
+    auto& color_track (m->_colors[color_index].color);
+    auto& opacity_track (m->_colors[color_index].opacity);
+
+    bool has_color = true;
+    ::glm::vec3 c (1.0f, 1.0f, 1.0f);
+    if (color_track.uses (m->_current_anim_seq))
     {
-      mesh_color.w = m->_colors[color_index].opacity.getValue (m->_current_anim_seq, m->_anim_time, m->_global_animtime);
+      c = color_track.getValue (m->_current_anim_seq, m->_anim_time, m->_global_animtime);
+    }
+    else if (color_track.uses (0))
+    {
+      c = color_track.getValue (0, m->_anim_time, m->_global_animtime);
+    }
+    else
+    {
+      has_color = false;
     }
 
-    mesh_color.x = c.x; mesh_color.y = c.y; mesh_color.z = c.z;
+    if (has_color)
+    {
+      if (opacity_track.uses (m->_current_anim_seq))
+      {
+        mesh_color.w = opacity_track.getValue (m->_current_anim_seq, m->_anim_time, m->_global_animtime);
+      }
+      else if (opacity_track.uses (0))
+      {
+        mesh_color.w = opacity_track.getValue (0, m->_anim_time, m->_global_animtime);
+      }
 
-    emissive_color = glm::vec4(c.x,c.y,c.z, mesh_color.w);
+      mesh_color.x = c.x; mesh_color.y = c.y; mesh_color.z = c.z;
+
+      emissive_color = glm::vec4(c.x,c.y,c.z, mesh_color.w);
+    }
   }
 
   // opacity
@@ -1345,6 +1574,15 @@ bool ModelRenderPass::prepareDraw(OpenGL::Scoped::use_program& m2_shader, Model 
         mesh_color.w = mesh_color.w * transparency.getValue(0, m->_anim_time, m->_global_animtime);
       }
     }
+  }
+
+  // TRACE-VERIFIED (RE_notes/20): a pass whose animated opacity evaluates to ~0 is NOT drawn by the
+  // client (alphatest >= 1/255 kills it). E.g. Anomalus's MANAMISTBASE shell is DEATH-ONLY
+  // (ModelColor alpha = 0 in every idle anim) -- drawing it at idle painted a dim lit layer over his
+  // bright body. Skip such passes outright.
+  if (mesh_color.w < (1.0f / 255.0f))
+  {
+    return false;
   }
 
   // How the LIVE 1.12 client renders a translucent creature (CreatureModelAlpha < 255, e.g. Anomalus
@@ -1369,9 +1607,20 @@ bool ModelRenderPass::prepareDraw(OpenGL::Scoped::use_program& m2_shader, Model 
 
   bool const is_additive_blend = effective_blend == static_cast<uint16_t>(M2Blend::Add)
                               || effective_blend == static_cast<uint16_t>(M2Blend::No_Add_Alpha);
-  if (!is_additive_blend)
+  // TRACE-VERIFIED (RE_notes/20, Anomalus draw block): CreatureModelAlpha multiplies the ALPHA of
+  // EVERY pass -- the body's blend alpha AND the additive layers' tex.a x 0.784 (SRCALPHA/ONE, so it
+  // scales their added light). It NEVER multiplies RGB. The old !is_additive gate left additive
+  // layers unscaled.
+  mesh_color.w *= inst_alpha;
+  (void)is_additive_blend;
+
+  // Aura char-proc tint (Ghost Visual's light-blue shift): whole-model color multiplier, applied
+  // to every pass including additive glows -- the client's ghost effect shifts the entire body.
+  if (instance)
   {
-    mesh_color.w *= inst_alpha;
+    mesh_color.x *= instance->model_tint.x;
+    mesh_color.y *= instance->model_tint.y;
+    mesh_color.z *= instance->model_tint.z;
   }
 
   // exit and return false before affecting the opengl render state
@@ -1410,7 +1659,11 @@ bool ModelRenderPass::prepareDraw(OpenGL::Scoped::use_program& m2_shader, Model 
         break;
       case M2Blend::Add:
         gl.enable(GL_BLEND);
-        gl.blendFunc(GL_SRC_ALPHA, GL_ONE);
+        // Premultiplied additive: m2_frag folds the material alpha into RGB for Add passes (visually
+        // identical to SRC_ALPHA/ONE) so the alpha channel can carry the EMITTED-brightness bloom
+        // mask instead of coverage alpha -- coverage alpha marked whole glow-card quads emissive and
+        // bloomed the bright sky behind them into hard white boxes (see m2_frag bloom-mask block).
+        gl.blendFunc(GL_ONE, GL_ONE);
         break;
       case M2Blend::Mod:
         gl.enable(GL_BLEND);
@@ -1470,6 +1723,31 @@ bool ModelRenderPass::prepareDraw(OpenGL::Scoped::use_program& m2_shader, Model 
   {
     m2_shader.uniform("unlit", (int)effective_unlit);
     model_render_state.unlit = effective_unlit;
+  }
+
+  // Emissive bloom for bright energy creatures (Anomalus, arcane elementals, ghosts): the live client's
+  // FFXGlow blooms bright SCREEN pixels regardless of material flags. Noggit's bloom is emissive-mask
+  // (alpha) driven, so an opaque bright body never blooms. Scope a luminance->mask contribution to
+  // creature/character M2s only (not WMO/terrain, which is what caused the Ironforge wash).
+  // Mode 1 = opaque ENERGY creature pass: hot texels feed the mask directly (alpha channel is free).
+  //          Gated on the pass being UNLIT (self-illuminated) -- that's what makes a body "energy"
+  //          (elemental/ghost bodies are unlit; ordinary skin/cloth is lit). Without the gate, any
+  //          brightly-LIT surface crossed the luma knee and bloomed (glowing white blouses on NPCs);
+  //          the client never blooms lit bodies -- its FFXGlow has no per-pixel gate at all.
+  // Mode 3 = the alpha-only mask re-draw of a TRANSLUCENT creature (see ModelRender::draw): the body
+  //          pass itself (mode 0) keeps its authored blend alpha so the body stays see-through.
+  // Mode 2 = the body pass of a translucent creature: alpha is the BLEND FACTOR there, so the
+  //          shader must not clobber it with the fog bloom-mask write (that overwrite made
+  //          translucent creatures render opaque on any fogged map).
+  int const creature_bloom = model_render_state.bloom_mask_pass
+    ? 3
+    : (is_classic_creature_or_character_model(m)
+        ? (translucent_display ? 2 : (effective_unlit ? 1 : 0))
+        : 0);
+  if (model_render_state.creature_bloom != creature_bloom)
+  {
+    m2_shader.uniform("creature_bloom", creature_bloom);
+    model_render_state.creature_bloom = creature_bloom;
   }
 
   if (texture_count > 1)

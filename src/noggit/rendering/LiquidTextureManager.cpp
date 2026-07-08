@@ -5,6 +5,9 @@
 #include "noggit/DBC.h"
 #include "noggit/application/NoggitApplication.hpp"
 
+#include <QtCore/QSettings>
+
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <unordered_set>
@@ -238,6 +241,18 @@ void LiquidTextureManager::upload()
     gl.texParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAX_LEVEL, mip_level - 1);
     gl.texParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
     gl.texParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    // Anisotropic filtering (checklist 20.5): water/lava are seen at grazing angles more than any
+    // other surface, so they benefit the most. Same QSettings level as TextureManager.
+    {
+      GLfloat hw_max = 1.0f;
+      gl.getFloatv(0x84FF /*GL_MAX_TEXTURE_MAX_ANISOTROPY_EXT*/, &hw_max);
+      float const requested = QSettings().value("render/anisotropic_filtering", 16.0f).toFloat();
+      float const level = std::clamp(requested, 1.0f, hw_max >= 1.0f ? hw_max : 1.0f);
+      if (level > 1.0f)
+      {
+        gl.texParameterf(GL_TEXTURE_2D_ARRAY, 0x84FE /*GL_TEXTURE_MAX_ANISOTROPY_EXT*/, level);
+      }
+    }
 
     _texture_frames_map[liquid_type_id] = std::make_tuple(array, anim, type, n_frames);
     if (liquid_debug_enabled())

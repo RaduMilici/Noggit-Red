@@ -229,6 +229,13 @@ vec4 texture_blend()
   vec4 t3 = get_tex_color(vary_t3_uv, instances[instanceID].ChunkTextureSamplers.w, abs(instances[instanceID].ChunkTextureArrayIDs.w));
   t3.a = mix(t3.a, 0.f, int(instances[instanceID].ChunkTextureArrayIDs.w < 0));
 
+  // MCLY 0x80 overbright (bit 1 of ChunkTexDoAnim, RE_notes/21 A1): the layer renders ~2x brighter
+  // (client MOD2X) -- authored on lava-crack layers (MC / Searing Gorge / custom zones) to glow.
+  t0.rgb *= 1.0 + float((instances[instanceID].ChunkTexDoAnim.x >> 1) & 1);
+  t1.rgb *= 1.0 + float((instances[instanceID].ChunkTexDoAnim.y >> 1) & 1);
+  t2.rgb *= 1.0 + float((instances[instanceID].ChunkTexDoAnim.z >> 1) & 1);
+  t3.rgb *= 1.0 + float((instances[instanceID].ChunkTexDoAnim.w >> 1) & 1);
+
   return vec4 (t0 * (1.0 - (a0 + a1 + a2)) + t1 * a0 + t2 * a1 + t3 * a2);
 }
 

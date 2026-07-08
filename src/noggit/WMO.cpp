@@ -12,6 +12,9 @@
 #include <opengl/scoped.hpp>
 
 #include <algorithm>
+#include <cstdlib>
+#include <cstring>
+#include <limits>
 #include <iomanip>
 #include <iostream>
 #include <map>
@@ -199,17 +202,13 @@ void WMO::finishLoading ()
 
   assert (fourcc == 'MOPV');
 
-  f.seekRelative (size);
-
-  /*
-  std::vector<glm::vec3> portal_vertices;
-
-  for (size_t i (0); i < size / 12; ++i) {
+  // Portal polygon corners. Same X/Z-up -> Y-up swap the rest of the WMO geometry uses.
+  _portal_vertices.reserve(size / 12);
+  for (size_t i (0); i < size / 12; ++i)
+  {
     f.read (ff, 12);
-    portal_vertices.push_back(glm::vec3(ff[0], ff[2], -ff[1]));
+    _portal_vertices.push_back(glm::vec3(ff[0], ff[2], -ff[1]));
   }
-
-   */
 
   // - MOPT ----------------------------------------------
 
@@ -218,7 +217,21 @@ void WMO::finishLoading ()
 
   assert (fourcc == 'MOPT');
 
-  f.seekRelative (size);
+  // Each MOPT is uint16 base_index, uint16 count, then a 16-byte C4Plane. The plane is STORED (in the
+  // swapped coord convention, an orthogonal transform, so distances are invariant) -- AttenTransVerts
+  // (RE_notes/19) needs the authored plane for its on-plane test. Culling still recomputes its own.
+  _portal_info.reserve(size / 0x14);
+  for (size_t i (0); i < size / 0x14; ++i)
+  {
+    wmo_portal_info info;
+    f.read (&info.base_vertex, 2);
+    f.read (&info.vertex_count, 2);
+    float plane[4];
+    f.read (plane, 16);
+    info.plane_normal = glm::vec3(plane[0], plane[2], -plane[1]); // same swap as MOPV/MOVT
+    info.plane_dist = plane[3];
+    _portal_info.push_back(info);
+  }
 
   // - MOPR ----------------------------------------------
 
@@ -227,7 +240,11 @@ void WMO::finishLoading ()
 
   assert(fourcc == 'MOPR');
 
-  f.seekRelative (size);
+  _portal_refs.resize(size / sizeof(WMOPR));
+  if (size)
+  {
+    f.read (_portal_refs.data(), size);
+  }
 
   // - MOVV ----------------------------------------------
 
@@ -295,8 +312,23 @@ void WMO::finishLoading ()
 
   assert (fourcc == 'MODD');
 
-  modelis.reserve(size / 0x28);
-  for (size_t i (0); i < size / 0x28; ++i)
+  // Guard a corrupt MODD chunk size. `size / 0x28` is the doodad count; a broken/custom (fuckported) WMO
+  // -- e.g. Turtle's world/wmo/playerhousing/human/humanlevelonetest.wmo -- can carry a bogus MODD size of
+  // over a gigabyte, which made this create TENS OF MILLIONS of wmo_doodad_instance (34.5M observed, ~7GB,
+  // froze the client at load). Doodad refs (MODR) are uint16, so nothing past index 65535 is ever
+  // referenceable -- clamp there. reserve() must use the clamped count too or it alone allocates GBs.
+  std::size_t const modd_end = f.getPos () + size;
+  std::size_t doodad_count = size / 0x28;
+  constexpr std::size_t MAX_WMO_MODD_DOODADS = 65536;
+  if (doodad_count > MAX_WMO_MODD_DOODADS)
+  {
+    LogError << "WMO \"" << _file_key.stringRepr() << "\" MODD claims " << doodad_count << " doodads "
+             << "(corrupt chunk); clamping to " << MAX_WMO_MODD_DOODADS << " to avoid OOM/freeze." << std::endl;
+    doodad_count = MAX_WMO_MODD_DOODADS;
+  }
+
+  modelis.reserve(doodad_count);
+  for (size_t i (0); i < doodad_count; ++i)
   {
     struct
     {
@@ -316,6 +348,8 @@ void WMO::finishLoading ()
 
     f.seek (after_entry);
   }
+
+  f.seek (modd_end); // keep chunk alignment even if the doodad count was clamped
 
   // - MFOG ----------------------------------------------
 
@@ -400,24 +434,64 @@ std::map<uint32_t, std::vector<wmo_doodad_instance>> WMO::doodads_per_group(uint
 {
   std::map<uint32_t, std::vector<wmo_doodad_instance>> doodads;
 
+  // Doodad set 0 is the GLOBAL/default set and is ALWAYS rendered; a non-zero instance set is drawn IN
+  // ADDITION to it (the client unions set 0 + the selected set). Previously only the selected set's range
+  // was collected, so every interior that uses a non-zero doodad set lost all of its global props
+  // (chandeliers, furniture, etc.). An out-of-range set now falls back to the global set instead of empty.
+  auto const in_set = [&](uint16_t ref, uint16_t set_index) -> bool
+  {
+    if (set_index >= doodadsets.size())
+    {
+      return false;
+    }
+    auto const& dset = doodadsets[set_index];
+    uint32_t const start = dset.start, end = start + dset.size;
+    return ref >= start && ref < end;
+  };
+
   if (doodadset >= doodadsets.size())
   {
-    LogError << "Invalid doodadset for instance of wmo " << _file_key.stringRepr() << std::endl;
-    return doodads;
+    LogError << "Invalid doodadset " << doodadset << " for instance of wmo " << _file_key.stringRepr()
+             << " -- rendering the global set 0 only" << std::endl;
   }
 
-  auto const& dset = doodadsets[doodadset];
-  uint32_t start = dset.start, end = start + dset.size;
+  // Hard cap on the number of doodad instances one WMO can spawn. A broken/custom (fuckported) WMO with a
+  // corrupt MODR/MODD or an oversized group/modelis count can otherwise reference the same modelis entries
+  // millions of times: observed 34.5 MILLION wmo_doodad_instances (~7GB, ~200B each) from a single custom
+  // playerhousing WMO, which froze the client and blew out RAM as they were created/destroyed on the main
+  // thread. Real WMOs have at most a few thousand doodads, so 200k is astronomically safe.
+  constexpr std::size_t MAX_WMO_DOODADS = 200000;
+  std::size_t total = 0;
+  bool capped = false;
 
-  for (int i = 0; i < groups.size(); ++i)
+  for (int i = 0; i < groups.size() && !capped; ++i)
   {
     for (uint16_t ref : groups[i].doodad_ref())
     {
-      if (ref >= start && ref < end)
+      if (ref >= modelis.size())
       {
+        continue;
+      }
+      bool const in_global = in_set(ref, 0);
+      bool const in_selected = (doodadset != 0) && in_set(ref, doodadset);
+      if (in_global || in_selected)
+      {
+        if (total >= MAX_WMO_DOODADS)
+        {
+          capped = true;
+          break;
+        }
         doodads[i].push_back(modelis[ref]);
+        ++total;
       }
     }
+  }
+
+  if (capped)
+  {
+    LogError << "WMO \"" << _file_key.stringRepr() << "\" resolved an absurd doodad count (>"
+             << MAX_WMO_DOODADS << "); capping to avoid OOM/freeze. The WMO's MODR/MODD data is likely "
+             << "corrupt (groups=" << groups.size() << ", modelis=" << modelis.size() << ")." << std::endl;
   }
 
   return doodads;
@@ -479,8 +553,9 @@ WMOGroup::WMOGroup(WMO *_wmo, BlizzardArchive::ClientFile* f, int _num, char con
   , _renderer(this)
 {
   // extract group info from f
-  std::uint32_t flags; // not used, the flags are in the group header
+  std::uint32_t flags;
   f->read(&flags, 4);
+  mogi_flags = flags; // root-side MOGI flags -- AttenTransVerts tests TARGET groups' 0x48 bits
   float ff[3];
   f->read(ff, 12);
   VertexBoxMax = glm::vec3(ff[0], ff[1], ff[2]);
@@ -497,7 +572,8 @@ WMOGroup::WMOGroup(WMO *_wmo, BlizzardArchive::ClientFile* f, int _num, char con
 }
 
 WMOGroup::WMOGroup(WMOGroup const& other)
-  : BoundingBoxMin(other.BoundingBoxMin)
+  : mogi_flags(other.mogi_flags)
+  , BoundingBoxMin(other.BoundingBoxMin)
   , BoundingBoxMax(other.BoundingBoxMax)
   , VertexBoxMin(other.VertexBoxMin)
   , VertexBoxMax(other.VertexBoxMax)
@@ -510,6 +586,7 @@ WMOGroup::WMOGroup(WMOGroup const& other)
   , num(other.num)
   , fog(other.fog)
   , _doodad_ref(other._doodad_ref)
+  , _light_refs(other._light_refs)
   , _batches(other._batches)
   , _vertices(other._vertices)
   , _normals(other._normals)
@@ -684,7 +761,8 @@ void WMOGroup::load()
   _batches.resize (size / sizeof (wmo_batch));
   f.read (_batches.data (), size);
 
-  _renderer.initRenderBatches();
+  // NOTE: initRenderBatches() is deferred to the END of load() so it runs after MOCV is parsed
+  // (MOCV comes after MOBA in the file).
 
   // - MOLR ----------------------------------------------
   if (header.flags.has_light)
@@ -699,7 +777,11 @@ void WMOGroup::load()
     }
     else
     {
-      f.seekRelative (size);
+      // Per-group light references: indices into the root MOLT list naming which lights illuminate
+      // THIS group (the client's per-room lighting). Used by WorldRender to scope the point-light
+      // UBO per interior group instead of the global nearest-16 pool.
+      _light_refs.resize (size / sizeof (int16_t));
+      f.read (_light_refs.data (), _light_refs.size () * sizeof (int16_t));
     }
 
   }
@@ -716,8 +798,20 @@ void WMOGroup::load()
     }
     else
     {
-      _doodad_ref.resize (size / sizeof (int16_t));
-      f.read (_doodad_ref.data (), size);
+      // Guard a corrupt MODR chunk size: a huge count would allocate gigabytes and feed the doodad
+      // explosion in WMO::doodads_per_group. A group realistically has at most a few thousand refs.
+      std::uint32_t count = size / sizeof (int16_t);
+      constexpr std::uint32_t MAX_DOODAD_REFS = 1000000u;
+      std::size_t const chunk_end = f.getPos () + size;
+      if (count > MAX_DOODAD_REFS)
+      {
+        LogError << "WMO group MODR ref count " << count << " is absurd; clamping to " << MAX_DOODAD_REFS
+                 << " (corrupt chunk)." << std::endl;
+        count = MAX_DOODAD_REFS;
+      }
+      _doodad_ref.resize (count);
+      f.read (_doodad_ref.data (), count * sizeof (int16_t));
+      f.seek (chunk_end); // keep chunk alignment even if we clamped a corrupt count
     }
 
   }
@@ -987,14 +1081,100 @@ void WMOGroup::load()
   {
     use_outdoor_lights = true;
   }
+
+  // Retain a compact copy of the baked MOCV rgb for TRUE indoor groups (client proxy rule:
+  // flags & (exterior|exterior_lit) == 0): interior ground-colour sampling for units
+  // (sample_ground_color / RE_notes/15) needs it on the CPU after the renderer clears
+  // _vertex_colors on upload.
+  if (header.flags.indoor && !header.flags.exterior && !header.flags.exterior_lit
+      && header.flags.has_vertex_color && _vertex_colors.size() >= _vertices.size())
+  {
+    _ground_colors.resize(_vertices.size());
+    for (std::size_t i = 0; i < _vertices.size(); ++i)
+    {
+      _ground_colors[i] = glm::u8vec3(static_cast<std::uint8_t>(glm::clamp(_vertex_colors[i].x, 0.f, 1.f) * 255.f)
+                                    , static_cast<std::uint8_t>(glm::clamp(_vertex_colors[i].y, 0.f, 1.f) * 255.f)
+                                    , static_cast<std::uint8_t>(glm::clamp(_vertex_colors[i].z, 0.f, 1.f) * 255.f));
+    }
+  }
+
+  // Deferred from just after the MOBA read: build render batches now that MOCV has been parsed.
+  _renderer.initRenderBatches();
+}
+
+bool WMOGroup::sample_ground_color(glm::vec3 const& local_pos, glm::vec3* out) const
+{
+  // Client CWorldEntity::SampleGroundColor (wow.exe 0x69E4C0 -> 0x6B9A50, RE_notes/15): ray from
+  // entity+1.0 down 12.0 units, barycentric-interpolate the hit face's MOCV. Group verts are stored in
+  // noggit convention (y = up), so "down" is -y here; a WMO instance's rotation is assumed yaw-only
+  // (true for buildings), which preserves the vertical.
+  if (_ground_colors.empty() || _vertices.empty() || _indices.size() < 3)
+  {
+    return false;
+  }
+
+  float const top = local_pos.y + 1.0f;
+  float const bottom = local_pos.y - 12.0f;
+  float best_y = bottom;
+  bool found = false;
+
+  for (std::size_t i = 0; i + 2 < _indices.size(); i += 3)
+  {
+    std::uint16_t const ia = _indices[i], ib = _indices[i + 1], ic = _indices[i + 2];
+    if (ia >= _vertices.size() || ib >= _vertices.size() || ic >= _vertices.size())
+    {
+      continue;
+    }
+    glm::vec3 const& a = _vertices[ia];
+    glm::vec3 const& b = _vertices[ib];
+    glm::vec3 const& c = _vertices[ic];
+
+    // Horizontal (xz) barycentric test -- the client projects the hit onto the face's dominant plane,
+    // which for a floor face is the horizontal one.
+    float const den = (b.z - c.z) * (a.x - c.x) + (c.x - b.x) * (a.z - c.z);
+    if (std::abs(den) < 1e-6f)
+    {
+      continue; // vertical face (wall): no horizontal footprint to stand on
+    }
+    float const l0 = ((b.z - c.z) * (local_pos.x - c.x) + (c.x - b.x) * (local_pos.z - c.z)) / den;
+    float const l1 = ((c.z - a.z) * (local_pos.x - c.x) + (a.x - c.x) * (local_pos.z - c.z)) / den;
+    float const l2 = 1.f - l0 - l1;
+    if (l0 < -0.001f || l1 < -0.001f || l2 < -0.001f)
+    {
+      continue;
+    }
+
+    float const y = l0 * a.y + l1 * b.y + l2 * c.y;
+    if (y > top || y <= best_y)
+    {
+      continue; // above the entity's feet, below the 12-unit reach, or below a closer floor already found
+    }
+
+    // The client clamps the fixed-point barycentrics to [0,256]; mirror with a [0,1] clamp.
+    float const w0 = glm::clamp(l0, 0.f, 1.f), w1 = glm::clamp(l1, 0.f, 1.f), w2 = glm::clamp(l2, 0.f, 1.f);
+    glm::vec3 const ca = glm::vec3(_ground_colors[ia]) / 255.f;
+    glm::vec3 const cb = glm::vec3(_ground_colors[ib]) / 255.f;
+    glm::vec3 const cc = glm::vec3(_ground_colors[ic]) / 255.f;
+    *out = ca * w0 + cb * w1 + cc * w2;
+    best_y = y;
+    found = true;
+  }
+
+  return found;
 }
 
 void WMOGroup::load_mocv(BlizzardArchive::ClientFile& f, uint32_t size)
 {
-  uint32_t const* colors = reinterpret_cast<uint32_t const*> (f.getPointer());
-  _vertex_colors.resize(size / sizeof(uint32_t));
+  std::uint32_t const count = size / sizeof(std::uint32_t);
+  std::vector<std::uint32_t> colors(count);
+  std::memcpy(colors.data(), f.getPointer(), count * sizeof(std::uint32_t));
 
-  for (size_t i(0); i < size / sizeof(uint32_t); ++i)
+  // REVERTED (user, 2026-07-07): the byte-matched raw-MOCV pipeline (atten_trans_verts +
+  // tex*MOCV*(1+4a), RE_notes/19) rendered WORSE on our content despite matching the client's vertex
+  // bytes -- the rest of our pipeline evidently compensates around the legacy fix. Back to the
+  // approved formula; atten_trans_verts stays parked below for a future retry.
+  _vertex_colors.resize(count);
+  for (std::size_t i(0); i < count; ++i)
   {
     _vertex_colors[i] = colorFromInt(colors[i]);
   }
@@ -1017,6 +1197,8 @@ void WMOGroup::load_mocv(BlizzardArchive::ClientFile& f, uint32_t size)
   {
     fix_vertex_color_alpha();
   }
+
+  compute_portal_openness();
 
   // there's no read so this is required
   f.seekRelative(size);
@@ -1046,10 +1228,6 @@ void WMOGroup::fix_vertex_color_alpha()
 
   // A near-white MOHD ambient (e.g. the Timbermaw instance, authored (1,1,1)) is effectively a
   // "no extra ambient" sentinel: the baked MOCV already carries the full interior lighting.
-  // Subtracting white here would clamp every interior vertex to black, and the shader's ambient
-  // re-add would then flood the whole interior to full brightness (the washed-out "too bright"
-  // look). Detect that and preserve the baked MOCV untouched instead -- the shader applies a
-  // matching tiny floor rather than white. WMOs with a real authored ambient are unaffected.
   bool const neutral_ambient = wmo_ambient_color.x > 0.95f
                             && wmo_ambient_color.y > 0.95f
                             && wmo_ambient_color.z > 0.95f;
@@ -1064,11 +1242,8 @@ void WMOGroup::fix_vertex_color_alpha()
 
     constexpr float normalized_alpha_scale = 255.f / 64.f;
 
-    // I removed the color = color/2 because it's just multiplied by 2 in the shader afterward in blizzard's code
     if (neutral_ambient)
     {
-      // Preserve the artist-baked MOCV as the interior lighting (only the exterior-batch alpha
-      // attenuation is kept) -- no ambient subtraction, no halving.
       if (i >= interior_batchs_start)
       {
         r = r + (r * a * normalized_alpha_scale);
@@ -1084,9 +1259,10 @@ void WMOGroup::fix_vertex_color_alpha()
     }
     else if (i >= interior_batchs_start)
     {
-      r = (r + (r * a * normalized_alpha_scale) - wmo_ambient_color.x) * 0.5f;
-      g = (g + (g * a * normalized_alpha_scale) - wmo_ambient_color.y) * 0.5f;
-      b = (b + (b * a * normalized_alpha_scale) - wmo_ambient_color.z) * 0.5f;
+      // un-halved (client-MOCV-data justified; the user-approved state)
+      r = r + (r * a * normalized_alpha_scale) - wmo_ambient_color.x;
+      g = g + (g * a * normalized_alpha_scale) - wmo_ambient_color.y;
+      b = b + (b * a * normalized_alpha_scale) - wmo_ambient_color.z;
     }
     else
     {
@@ -1094,9 +1270,9 @@ void WMOGroup::fix_vertex_color_alpha()
       g -= wmo_ambient_color.y;
       b -= wmo_ambient_color.z;
 
-      r = (r * (1.f - a)) * 0.5f;
-      g = (g * (1.f - a)) * 0.5f;
-      b = (b * (1.f - a)) * 0.5f;
+      r = r * (1.f - a);
+      g = g * (1.f - a);
+      b = b * (1.f - a);
     }
 
     color.x = std::min(1.f, std::max(0.f, r));
@@ -1106,6 +1282,192 @@ void WMOGroup::fix_vertex_color_alpha()
                    // it can be overriden by the 2nd mocv chunk
   }
 }
+
+void WMOGroup::compute_portal_openness()
+{
+  // Portal-proximity "openness" baked into the vertex-colour alpha (1 at a portal fading to 0 inward):
+  // the shader lerps the interior light toward the outdoor light by it, smoothing doorways.
+  if (!header.flags.indoor
+      || header.flags.use_mocv2_for_texture_blending
+      || wmo->flags.do_not_attenuate_vertices_based_on_distance_to_portal
+      || header.portal_count == 0
+      || _vertices.empty()
+      || _vertex_colors.size() < _vertices.size())
+  {
+    return;
+  }
+
+  std::vector<glm::vec3> portal_points;
+  for (std::uint16_t p = 0; p < header.portal_count; ++p)
+  {
+    std::size_t const ref_idx = static_cast<std::size_t>(header.portal_start) + p;
+    if (ref_idx >= wmo->_portal_refs.size()) { continue; }
+    auto const& ref = wmo->_portal_refs[ref_idx];
+    if (ref.portal < 0 || static_cast<std::size_t>(ref.portal) >= wmo->_portal_info.size()) { continue; }
+    auto const& info = wmo->_portal_info[static_cast<std::size_t>(ref.portal)];
+    for (std::uint16_t v = 0; v < info.vertex_count; ++v)
+    {
+      std::size_t const vi = static_cast<std::size_t>(info.base_vertex) + v;
+      if (vi < wmo->_portal_vertices.size())
+      {
+        portal_points.push_back(wmo->_portal_vertices[vi]);
+      }
+    }
+  }
+  if (portal_points.empty())
+  {
+    return;
+  }
+
+  constexpr float FADE = 7.0f;
+  for (std::size_t i = 0; i < _vertices.size(); ++i)
+  {
+    float mind = std::numeric_limits<float>::max();
+    for (auto const& pp : portal_points)
+    {
+      mind = std::min(mind, glm::distance(_vertices[i], pp));
+    }
+    _vertex_colors[i].w = std::clamp(1.0f - mind / FADE, 0.0f, 1.0f);
+  }
+  _has_portal_openness = true;
+}
+
+namespace
+{
+  int major_axis(glm::vec3 const& n)
+  {
+    float const ax = std::abs(n.x), ay = std::abs(n.y), az = std::abs(n.z);
+    return (ax >= ay && ax >= az) ? 0 : (ay >= az ? 1 : 2);
+  }
+
+  // Even-odd crossing test on the two coordinates left after dropping the plane's major axis.
+  bool point_in_poly_2d(glm::vec3 const& v, glm::vec3 const* poly, std::size_t n, int drop_axis)
+  {
+    int const a0 = (drop_axis == 0) ? 1 : 0;
+    int const a1 = (drop_axis == 2) ? 1 : 2;
+    bool inside = false;
+    for (std::size_t i = 0, j = n - 1; i < n; j = i++)
+    {
+      float const xi = poly[i][a0], yi = poly[i][a1];
+      float const xj = poly[j][a0], yj = poly[j][a1];
+      if (((yi > v[a1]) != (yj > v[a1]))
+          && (v[a0] < (xj - xi) * (v[a1] - yi) / (yj - yi) + xi))
+      {
+        inside = !inside;
+      }
+    }
+    return inside;
+  }
+
+  // Min 3D point-to-SEGMENT distance over the polygon's edges (from the UNPROJECTED vertex).
+  float dist_to_polygon_edges_3d(glm::vec3 const& v, glm::vec3 const* poly, std::size_t n)
+  {
+    float best = std::numeric_limits<float>::max();
+    for (std::size_t i = 0, j = n - 1; i < n; j = i++)
+    {
+      glm::vec3 const& a = poly[j];
+      glm::vec3 const& b = poly[i];
+      glm::vec3 const ab = b - a;
+      float const len2 = glm::dot(ab, ab);
+      float const t = len2 > 0.f ? std::clamp(glm::dot(v - a, ab) / len2, 0.f, 1.f) : 0.f;
+      best = std::min(best, glm::length(v - (a + ab * t)));
+    }
+    return best;
+  }
+}
+
+void WMOGroup::atten_trans_verts(std::vector<std::uint32_t>& colors)
+{
+  // 1.12 CMapObj::AttenTransVerts, ported verbatim from the byte-matched spec (RE_notes/19 section 3).
+  // Touches ONLY transparency-batch vertices: brighten toward white by proximity to portals whose
+  // TARGET group is exterior (MOGI flags & 0x48), op = 1 - 0.15*d accumulated over portals, capped at
+  // 1; a vertex ON a portal to another INTERIOR group is zeroed. Written ONLY when the new alpha byte
+  // strictly exceeds the stored one (authored MOCV usually already bakes this -- left bit-identical).
+  if (header.transparency_batches_count == 0
+      || header.transparency_batches_count > _batches.size())
+  {
+    return;
+  }
+  std::size_t const n_trans = std::min<std::size_t>(
+      static_cast<std::size_t>(_batches[header.transparency_batches_count - 1].vertex_end) + 1,
+      std::min(colors.size(), _vertices.size()));
+
+  for (std::size_t vi = 0; vi < n_trans; ++vi)
+  {
+    glm::vec3 const& v = _vertices[vi];
+    float accum = 0.0f;
+
+    for (std::size_t r = header.portal_start;
+         r < static_cast<std::size_t>(header.portal_start) + header.portal_count
+         && r < wmo->_portal_refs.size(); ++r)                       // MOPR order matters
+    {
+      auto const& ref = wmo->_portal_refs[r];
+      if (ref.portal < 0 || static_cast<std::size_t>(ref.portal) >= wmo->_portal_info.size())
+      {
+        continue;
+      }
+      auto const& portal = wmo->_portal_info[static_cast<std::size_t>(ref.portal)];
+      if (portal.vertex_count == 0
+          || static_cast<std::size_t>(portal.base_vertex) + portal.vertex_count > wmo->_portal_vertices.size())
+      {
+        continue;
+      }
+      glm::vec3 const* poly = wmo->_portal_vertices.data() + portal.base_vertex;
+
+      float const d = glm::dot(portal.plane_normal, v) + portal.plane_dist;
+
+      float d_use;
+      // On-plane epsilon: bracketed to (0, 0.39) by the byte-match; 0.01 recommended (note sec 7).
+      if (std::abs(d) <= 0.01f
+          && point_in_poly_2d(v, poly, portal.vertex_count, major_axis(portal.plane_normal)))
+      {
+        d_use = static_cast<float>(ref.dir) * d;   // vertex lies ON the portal: ~0
+      }
+      else
+      {
+        d_use = dist_to_polygon_edges_3d(v, poly, portal.vertex_count);
+      }
+
+      bool const target_exterior = ref.group >= 0
+        && static_cast<std::size_t>(ref.group) < wmo->groups.size()
+        && (wmo->groups[static_cast<std::size_t>(ref.group)].mogi_flags & 0x48);
+
+      if (target_exterior)
+      {
+        float const v25 = (d_use >= 0.0f) ? d_use * 0.15f : 0.0f;   // 0.15 exactly (constraint-pinned)
+        if (1.0f - v25 > 0.001f)
+        {
+          accum += 1.0f - v25;                     // multiple exterior portals ACCUMULATE
+        }
+      }
+      else if (d_use > -1.0f && d_use < 1.0f)
+      {
+        accum = 0.0f;                              // ON a portal to an interior group: kill, stop
+        break;
+      }
+    }
+
+    float const op = (accum > 0.001f) ? std::min(accum, 1.0f) : 0.0f;
+    std::uint8_t const na = static_cast<std::uint8_t>(op * 255.0f);  // truncation, not rounding
+
+    std::uint32_t const c = colors[vi];
+    std::uint8_t const ca = static_cast<std::uint8_t>((c >> 24) & 0xFF);
+    if (na > ca)  // BYTE compare vs stored alpha; skip the whole vertex unless strictly higher
+    {
+      std::uint8_t const cr = static_cast<std::uint8_t>((c >> 16) & 0xFF);
+      std::uint8_t const cg = static_cast<std::uint8_t>((c >> 8) & 0xFF);
+      std::uint8_t const cb = static_cast<std::uint8_t>(c & 0xFF);
+      std::uint8_t const nr = static_cast<std::uint8_t>(cr + (255.0f - cr) * op);
+      std::uint8_t const ng = static_cast<std::uint8_t>(cg + (255.0f - cg) * op);
+      std::uint8_t const nb = static_cast<std::uint8_t>(cb + (255.0f - cb) * op);
+      colors[vi] = (static_cast<std::uint32_t>(na) << 24)
+                 | (static_cast<std::uint32_t>(nr) << 16)
+                 | (static_cast<std::uint32_t>(ng) << 8)
+                 |  static_cast<std::uint32_t>(nb);
+    }
+  }
+}
+
 
 bool WMOGroup::is_visible( glm::mat4x4 const& transform
                          , math::frustum const& frustum

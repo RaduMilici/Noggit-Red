@@ -7,6 +7,7 @@
 #define eWMOBatch_Unlit 0x4u
 #define eWMOBatch_Unfogged 0x8u
 #define eWMOBatch_Sidn 0x20u
+#define eWMOBatch_PortalSpill 0x40u
 
 layout (std140) uniform lighting
 {
@@ -46,6 +47,9 @@ uniform vec3 ambient_color;
 // 1 when this WMO has exterior groups (an "open" WMO, e.g. a cave mouth). Lets outdoor zone light
 // bleed into its interior groups; 0 for fully enclosed dungeons (keep their dark authored interior).
 uniform int wmo_open;
+// Debug: 1 = output the raw fixed-up MOCV vertex colour (magenta where a batch has NO MOCV flag), so we
+// can see whether the black doorway-reveal faces actually carry the warm baked colour or lose it.
+uniform int debug_mocv;
 
 in vec3 f_position;
 in vec3 f_normal;
@@ -157,38 +161,31 @@ vec3 apply_lighting(vec3 material)
   }
   else
   {
-    // Interior geometry: lit purely by the WMO's own ambient + the baked MOCV. Matches the client
-    // (and reference noggit3) -- NO outdoor-ambient floor / sun diffuse / sky-ground hemispheric
-    // mix, all of which previously flooded out the baked shadows and made interiors washed-out.
+    // Interior geometry: the WMO's own MOHD ambient + the baked MOCV -- the client / reference noggit3
+    // formula `ambient_color + vertex_color`. (The removed wmo_open spill, interior_sun and time-of-day
+    // MOCV multiply were the real hand-tuned hacks that washed out / crushed Ironforge -- gone for good.)
     //
-    // A near-white MOHD ambient is a "no extra ambient" sentinel (e.g. Timbermaw instance = (1,1,1)):
-    // the baked MOCV already is the interior light, so adding literal white would flood the scene.
-    // Treat near-white as a tiny floor; otherwise honour the artist-authored ambient (e.g.
-    // md_timbermawhold's dim purple) as the dev-designed interior fill light.
+    // ONE required guard, NOT a look-tune: some WMOs (e.g. the Timbermaw instance) author a near-white
+    // (~1,1,1) MOHD ambient as a sentinel meaning "the baked MOCV already carries the full interior
+    // light -- add nothing extra". fix_vertex_color_alpha() detects that same near-white case and PRESERVES
+    // the baked MOCV (it does NOT subtract the ambient the way it does for a normal WMO). So the shader
+    // must match: for near-white ambient, add ~0 (a tiny floor so unlit vertices aren't pure black), not
+    // literal white -- otherwise (1,1,1)+MOCV floods every baked shadow flat (bland Timbermaw). Normal
+    // WMOs (Ironforge et al.) have a real dark authored ambient and take the plain path unchanged.
+    // (Byte-matched client formula tex*MOCV*(1+4a) was tried and REVERTED -- looked worse on our
+    // content; see WMO.cpp load_mocv note. Approved formula below.)
     vec3 interior_ambient = all(greaterThan(ambient_color, vec3(0.95))) ? vec3(0.04) : ambient_color;
-    // Open WMOs (cave mouths): approximate outdoor light spilling in by lifting the interior ambient
-    // floor toward the outdoor zone ambient. max() keeps already-bright baked MOCV intact and only
-    // fills the shadowed areas, so it warms/brightens the cave without flattening it. Enclosed
-    // dungeons (wmo_open == 0) are untouched and stay dark/moody.
-    vec3 interior_sun = vec3(0.0);
-    if (wmo_open != 0)
+    light_color = interior_ambient + vertex_color;
+
+    if (bool(flags & eWMOBatch_PortalSpill))
     {
-      interior_ambient = max(interior_ambient, AmbientColor_FogEnd.xyz * 0.6);
-      // Open cave: the outdoor sun spills in, so add its (time-varying) diffuse on lit-facing surfaces.
+      float openness = clamp(f_vertex_color.a, 0.0, 1.0);
       float nDotL = clamp(dot(normalize(f_normal),
                               -normalize(vec3(-LightDir_FogRate.x, LightDir_FogRate.z, -LightDir_FogRate.y))),
                           0.0, 1.0);
-      interior_sun = DiffuseColor_FogStart.xyz * nDotL * 0.5;
+      vec3 outdoor = clamp(DiffuseColor_FogStart.xyz * nDotL, 0.0, 1.0) + AmbientColor_FogEnd.xyz;
+      light_color = mix(light_color, outdoor, openness);
     }
-    light_color = interior_ambient + interior_sun + vertex_color;
-
-    // Make the interior track TIME OF DAY. The wmo_open heuristic misses open caves like
-    // timbermaw_instance (0 exterior groups), so do this for ALL interiors: scale the baked interior
-    // light by the outdoor ambient brightness so the WMO darkens at night / brightens by day, and add
-    // a small time-varying tint so it warms at dusk -- matching the doodads sitting in the same cave.
-    float outdoor_lum = dot(AmbientColor_FogEnd.xyz, vec3(0.2126, 0.7152, 0.0722));
-    light_color *= clamp(outdoor_lum * 2.2, 0.3, 1.15);
-    light_color += AmbientColor_FogEnd.xyz * 0.15;
   }
 
   light_color += point_lights(f_position, normalize(f_normal));
@@ -210,6 +207,18 @@ vec3 apply_lighting(vec3 material)
 
 void main()
 {
+  if (debug_mocv == 1)
+  {
+    vec3 vc = bool(flags & eWMOBatch_HasMOCV) ? f_vertex_color.rgb : vec3(1.0, 0.0, 1.0);
+    out_color = vec4(vc, 1.0);
+    return;
+  }
+  if (debug_mocv == 2) // show the portal-openness factor (white=at portal, black=deep/no spill)
+  {
+    float o = bool(flags & eWMOBatch_PortalSpill) ? clamp(f_vertex_color.a, 0.0, 1.0) : 0.0;
+    out_color = vec4(vec3(o), 1.0);
+    return;
+  }
 
   float dist_from_camera = distance(camera, f_position);
   bool fog = FogColor_FogOn.w != 0 && !bool(flags & eWMOBatch_Unfogged);

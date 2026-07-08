@@ -446,40 +446,11 @@ ParticleSystem::ParticleSystem(Model* model_
     }
   }
 
-  // GENERAL tiny-particle visibility floor (replaces the old per-model "volumetriclight" size x10 hack).
-  // Some emitters author sub-pixel particle sizes (the volumetric-light dust sparkles are ~0.014 units)
-  // that simply vanish in the editor. Scale such emitters up to a minimum readable size, and -- for
-  // ADDITIVE blends, where the rendered brightness scales ~size^2 -- scale the alpha DOWN by f^2 so the
-  // brightness stays data-faithful (a small visible faint speck, not a bright blob). This is data-derived
-  // (the factor comes from the authored size), works for every tiny-particle effect, and needs no
-  // per-model tuning.
-  {
-    float const peak_size = std::max({ sizes[0], sizes[1], sizes[2] });
-    float const MIN_VISIBLE_SIZE = 0.06f; // min readable world size; gentler than 0.10 so fire embers
-                                          // (peak ~0.03-0.05) aren't over-enlarged into the bright core.
-    if (peak_size > 0.0f && peak_size < MIN_VISIBLE_SIZE)
-    {
-      float const f = MIN_VISIBLE_SIZE / peak_size;
-      for (float& s : sizes)
-      {
-        s *= f;
-      }
-      // ADDITIVE blends (NoAlphaAdd 3 / Add 4 / InvAlphaAdd 7): rendered brightness scales with the
-      // particle AREA (~size^2), so enlarging a small additive speck without compensating makes it
-      // BRIGHTER. That blew out dense additive fire -- the Forgebonfire / firepit ember emitters
-      // (peak ~0.03-0.05) were floored ~2x and so ~4x too bright, stacking into the white core. Scale the
-      // alpha down by 1/f^2 so the integrated brightness stays data-faithful: a faint speck made visible,
-      // not a bright blob. (Alpha-blend dust keeps full alpha -- its brightness isn't area-additive.)
-      if (blend == 3 || blend == 4 || blend == 7)
-      {
-        float const inv_area = 1.0f / (f * f);
-        for (auto& c : colors)
-        {
-          c.a *= inv_area;
-        }
-      }
-    }
-  }
+  // REMOVED (trace-verified, RE_notes/18): the old "tiny-particle visibility floor" scaled any
+  // sub-0.06-unit particle UP and its alpha DOWN -- but the client renders authored sizes verbatim:
+  // the inn candle flames are 0.02-0.05 unit quads (5-20 px on screen) drawn at FULL authored alpha,
+  // stacking additively into small bright yellow licks. The floor made ours bigger AND dimmer -- the
+  // opposite. Authored data passes through untouched now.
 
   // Large-area, alpha-blended ambient dust/fog (e.g. the Timbermaw furbolg dust: emission area ~8-12u,
   // ~270 motes) fills a big volume with many overlapping semi-transparent particles. In the editor's
@@ -1063,7 +1034,7 @@ void ParticleSystem::draw( glm::mat4x4 const& model_view
 
   std::uint16_t indice = 0;
 
-  if (billboard) 
+  if (billboard)
   {
     vRight = glm::normalize(glm::vec3(model_view[0]));
     vUp = glm::normalize(glm::vec3(model_view[1]));
@@ -1072,6 +1043,18 @@ void ParticleSystem::draw( glm::mat4x4 const& model_view
     //vUp = glm::vec3(model_view[0][1], model_view[1][1], model_view[2][1]); // Spherical billboarding
     //vUp = glm::vec3(0,1,0); // Cylindrical billboarding
   }
+
+  // Flag 0x10 (ride parent): particles are stored BONE-LOCAL (client CParticle2 convention, RE
+  // handoff 6.4) -- transform by the bone's CURRENT matrix here so live particles follow the
+  // animated bone every frame (the instance portal's swirl rotates with its spinning bone like a
+  // wheel instead of freezing where each puff spawned).
+  bool const riding = ridesParent();
+  glm::mat4x4 const ride_mat = riding ? parent->mat : glm::mat4x4(1.0f);
+  glm::mat3 const ride_rot = glm::mat3(ride_mat);
+  auto const ride_pos = [&](glm::vec3 const& v) -> glm::vec3
+  {
+    return riding ? glm::vec3(ride_mat * glm::vec4(v, 1.0f)) : v;
+  };
 
   auto add_quad_indices([] (std::vector<std::uint16_t>& indices, std::uint16_t& start)
   {
@@ -1130,23 +1113,25 @@ void ParticleSystem::draw( glm::mat4x4 const& model_view
           quad_up = vUp * c - vRight * s;
         }
 
+        glm::vec3 const ppos = ride_pos(it->pos);
+
         texcoords.push_back(tiles[it->tile].tc[0]);
-        vertices.push_back(it->pos);
+        vertices.push_back(ppos);
         offsets.push_back(-(quad_right + quad_up) * size);
         colors_data.push_back(it->color);
 
         texcoords.push_back(tiles[it->tile].tc[1]);
-        vertices.push_back(it->pos);
+        vertices.push_back(ppos);
         offsets.push_back((quad_right - quad_up) * size);
         colors_data.push_back(it->color);
 
         texcoords.push_back(tiles[it->tile].tc[2]);
-        vertices.push_back(it->pos);
+        vertices.push_back(ppos);
         offsets.push_back((quad_right + quad_up) * size);
         colors_data.push_back(it->color);
 
         texcoords.push_back(tiles[it->tile].tc[3]);
-        vertices.push_back(it->pos);
+        vertices.push_back(ppos);
         offsets.push_back(-(quad_right - quad_up) * size);
         colors_data.push_back(it->color);
 
@@ -1168,20 +1153,22 @@ void ParticleSystem::draw( glm::mat4x4 const& model_view
           continue;
         }
 
+        glm::vec3 const ppos = ride_pos(it->pos);
+
         texcoords.push_back(tiles[it->tile].tc[0]);
-        vertices.push_back(it->pos + it->corners[0] * size);
+        vertices.push_back(ppos + ride_rot * it->corners[0] * size);
         colors_data.push_back(it->color);
 
         texcoords.push_back(tiles[it->tile].tc[1]);
-        vertices.push_back(it->pos + it->corners[1] * size);
+        vertices.push_back(ppos + ride_rot * it->corners[1] * size);
         colors_data.push_back(it->color);
 
         texcoords.push_back(tiles[it->tile].tc[2]);
-        vertices.push_back(it->pos + it->corners[2] * size);
+        vertices.push_back(ppos + ride_rot * it->corners[2] * size);
         colors_data.push_back(it->color);
 
         texcoords.push_back(tiles[it->tile].tc[3]);
-        vertices.push_back(it->pos + it->corners[3] * size);
+        vertices.push_back(ppos + ride_rot * it->corners[3] * size);
         colors_data.push_back(it->color);
 
         add_quad_indices(indices, indice);
@@ -1213,20 +1200,23 @@ void ParticleSystem::draw( glm::mat4x4 const& model_view
         continue;
       }
 
+      glm::vec3 const ppos = ride_pos(it->pos);
+      glm::vec3 const porigin = ride_pos(it->origin);
+
       texcoords.push_back(tiles[it->tile].tc[0]);
-      vertices.push_back(it->pos + bv0 * size);
+      vertices.push_back(ppos + bv0 * size);
       colors_data.push_back(it->color);
 
       texcoords.push_back(tiles[it->tile].tc[1]);
-      vertices.push_back(it->pos + bv1 * size);
+      vertices.push_back(ppos + bv1 * size);
       colors_data.push_back(it->color);
 
       texcoords.push_back(tiles[it->tile].tc[2]);
-      vertices.push_back(it->origin + bv1 * size);
+      vertices.push_back(porigin + bv1 * size);
       colors_data.push_back(it->color);
 
       texcoords.push_back(tiles[it->tile].tc[3]);
-      vertices.push_back(it->origin + bv0 * size);
+      vertices.push_back(porigin + bv0 * size);
       colors_data.push_back(it->color);
 
       add_quad_indices(indices, indice);
@@ -1268,8 +1258,25 @@ void ParticleSystem::draw( glm::mat4x4 const& model_view
     }
 
     ++debug_draw_log_count;
+    std::string bound_tex = "<none>";
+    int bound_layer = -1;
+    if (_texture_id < model->_textures.size() && model->_textures[_texture_id].get())
+    {
+      bound_tex = model->_textures[_texture_id]->file_key().stringRepr();
+      bound_layer = model->_textures[_texture_id]->array_index();
+    }
+    std::string tile0 = "<none>";
+    if (!tiles.empty())
+    {
+      std::ostringstream t0;
+      t0 << "{(" << tiles[0].tc[0].x << "," << tiles[0].tc[0].y << ")(" << tiles[0].tc[1].x << "," << tiles[0].tc[1].y
+         << ")(" << tiles[0].tc[2].x << "," << tiles[0].tc[2].y << ")(" << tiles[0].tc[3].x << "," << tiles[0].tc[3].y << ")}";
+      tile0 = t0.str();
+    }
     LogDebug << "Classic effect particle draw model='" << model->file_key().stringRepr()
              << "' source=classic"
+             << " boundTex='" << bound_tex << "' layer=" << bound_layer
+             << " tile0=" << tile0
              << " instances=" << instances_count
              << " live=" << particles.size()
              << " vertices=" << vertices.size()
@@ -1448,7 +1455,10 @@ Particle PlaneParticleEmitter::newParticle(ParticleSystem* sys, int anim, int ti
   p.maxlife = sys->classic ? 2.4f : 1.0f;
 
   //Spread Calculation
-  auto mrot = sys->parent->mrot*CalcSpreadMatrix(spr, spr, 1.0f, 1.0f);
+  // Ride-parent (flag 0x10) systems spawn in BONE-LOCAL space: draw() applies the bone's current
+  // matrix, so the spawn-time bone rotation must NOT be baked into directions/corners either.
+  auto mrot = (sys->ridesParent() ? glm::mat4x4(1.0f) : glm::mat4x4(sys->parent->mrot))
+            * CalcSpreadMatrix(spr, spr, 1.0f, 1.0f);
 
   if (!sys->_spline_points.empty()) { // Spline emitter (M2 EmitterType 3) -- e.g. the MC flamecircle ring
     // Emit along the closed spline loop; the emission point travels around it at _spin revolutions/sec
@@ -1463,7 +1473,8 @@ Particle PlaneParticleEmitter::newParticle(ParticleSystem* sys, int anim, int ti
     float const t = fseg - std::floor(fseg);
     glm::vec3 local = glm::mix(sys->_spline_points[i0], sys->_spline_points[i1], t)
                     + glm::vec3(misc::randfloat(-l, l), 0.0f, misc::randfloat(-w, w));
-    p.pos = sys->parent->mat * glm::vec4(local, 1.0f);
+    // Flag 0x10 (ride parent): spawn LOCAL, draw() applies the bone's current matrix.
+    p.pos = sys->ridesParent() ? local : glm::vec3(sys->parent->mat * glm::vec4(local, 1.0f));
 
     glm::vec3 dir = mrot * glm::vec4(0, 1, 0, 0);
     p.dir = safe_normalize_vec3(dir, glm::vec3(0.0f, 1.0f, 0.0f));
@@ -1486,7 +1497,9 @@ Particle PlaneParticleEmitter::newParticle(ParticleSystem* sys, int anim, int ti
     p.speed = safe_normalize_vec3(dir, glm::vec3(0.0f, 1.0f, 0.0f)) * spd * misc::randfloat(0, var);
   }
   else if (sys->flags == 25 && sys->parent->parent<1) { // Weapon Flame
-    p.pos = sys->parent->pivot + (sys->pos + glm::vec3(misc::randfloat(-l, l), misc::randfloat(-l, l), misc::randfloat(-w, w)));
+    // flags 25 contains bit 0x10 (ride parent) -> spawn local so draw()'s bone transform applies once.
+    p.pos = (sys->ridesParent() ? glm::vec3(0.0f) : sys->parent->pivot)
+          + (sys->pos + glm::vec3(misc::randfloat(-l, l), misc::randfloat(-l, l), misc::randfloat(-w, w)));
     glm::vec3 dir = mrot * glm::vec4(0.0f, 1.0f, 0.0f,0.0f);
     p.dir = safe_normalize_vec3(dir, glm::vec3(0.0f, 1.0f, 0.0f));
     //glm::vec3 dir = sys->model->bones[sys->parent->parent].mrot * sys->parent->mrot * glm::vec3(0.0f, 1.0f, 0.0f);
@@ -1494,14 +1507,19 @@ Particle PlaneParticleEmitter::newParticle(ParticleSystem* sys, int anim, int ti
 
   }
   else if (sys->flags == 25 && sys->parent->parent > 0) { // Weapon with built-in Flame (Avenger lightsaber!)
-    p.pos = sys->parent->mat * (glm::vec4(sys->pos, 1) + glm::vec4(misc::randfloat(-l, l), misc::randfloat(-l, l), misc::randfloat(-w, w), 0));
+    // flags 25 contains bit 0x10 (ride parent) -> spawn local so draw()'s bone transform applies once.
+    p.pos = sys->ridesParent()
+          ? sys->pos + glm::vec3(misc::randfloat(-l, l), misc::randfloat(-l, l), misc::randfloat(-w, w))
+          : glm::vec3(sys->parent->mat * (glm::vec4(sys->pos, 1) + glm::vec4(misc::randfloat(-l, l), misc::randfloat(-l, l), misc::randfloat(-w, w), 0)));
     glm::vec3 dir = glm::vec4(sys->parent->mat[1][0], sys->parent->mat[1][1], sys->parent->mat [1][2],0.0f) + glm::vec4(0.0f, 1.0f, 0.0f,0.0f);
     p.dir = safe_normalize_vec3(dir, glm::vec3(0.0f, 1.0f, 0.0f));
     p.speed = p.dir * spd * misc::randfloat(0, var * 2);
 
   }
   else if (sys->flags == 17 && sys->parent->parent<1) { // Weapon Glow
-    p.pos = sys->parent->pivot + (sys->pos + glm::vec3(misc::randfloat(-l, l), misc::randfloat(-l, l), misc::randfloat(-w, w)));
+    // flags 17 contains bit 0x10 (ride parent) -> spawn local so draw()'s bone transform applies once.
+    p.pos = (sys->ridesParent() ? glm::vec3(0.0f) : sys->parent->pivot)
+          + (sys->pos + glm::vec3(misc::randfloat(-l, l), misc::randfloat(-l, l), misc::randfloat(-w, w)));
     glm::vec3 dir = mrot * glm::vec4(0, 1, 0,0);
     p.dir = safe_normalize_vec3(dir, glm::vec3(0.0f, 1.0f, 0.0f));
 
@@ -1513,7 +1531,9 @@ Particle PlaneParticleEmitter::newParticle(ParticleSystem* sys, int anim, int ti
     // +-VerticalRange (spr) at azimuth phi in +-HorizontalRange (spr2). The old WMV spread-matrix
     // used the vertical range for BOTH axes and ignored the horizontal range entirely.
     glm::vec3 local = sys->pos + glm::vec3(misc::randfloat(-w, w), 0, misc::randfloat(-l, l));
-    p.pos = sys->parent->mat * glm::vec4(local, 1);
+    // Flag 0x10 (ride parent): spawn LOCAL, draw() applies the bone's current matrix (see sphere).
+    bool const rides = sys->ridesParent();
+    p.pos = rides ? local : glm::vec3(sys->parent->mat * glm::vec4(local, 1));
 
     float const theta = misc::randfloat(-spr, spr);    // tilt from the emitter's up axis
     float const phi = misc::randfloat(-spr2, spr2);    // azimuth around the up axis
@@ -1523,7 +1543,7 @@ Particle PlaneParticleEmitter::newParticle(ParticleSystem* sys, int anim, int ti
     glm::vec3 const tilted(std::cos(phi) * std::sin(theta),
                            std::cos(theta),
                            -std::sin(phi) * std::sin(theta));
-    glm::vec3 dir = sys->parent->mrot * glm::vec4(tilted, 0);
+    glm::vec3 dir = rides ? tilted : glm::vec3(sys->parent->mrot * glm::vec4(tilted, 0));
 
     p.dir = safe_normalize_vec3(dir, glm::vec3(0.0f, 1.0f, 0.0f));
     p.down = glm::vec3(0, -1.0f, 0);
@@ -1610,21 +1630,13 @@ Particle SphereParticleEmitter::newParticle(ParticleSystem* sys, int anim, int t
   rotate(0,0, &bdir.z, &bdir.x, phi);
   */
 
-  if (sys->flags == 57 || sys->flags == 313) { // Faith Halo
-    glm::vec3 bdir(w*glm::cos(t._)*1.6f, 0.0f, l*glm::sin(t._)*1.6f);
-
-    p.pos = sys->pos + bdir;
-    p.pos = sys->parent->mat * glm::vec4(p.pos, 1);
-
-    if (glm::length(bdir) * glm::length(bdir) == 0)
-      p.speed = glm::vec3(0, 0, 0);
-    else {
-      dir = sys->parent->mrot * glm::vec4((glm::normalize(bdir)),0);//mrot * glm::vec3(0, 1.0f,0);
-      p.speed = safe_normalize_vec3(dir, glm::vec3(0.0f, 1.0f, 0.0f)) * spd * (1.0f + misc::randfloat(-var, var));   // ?
-    }
-
-  }
-  else {
+  // NOTE: WMV carried a "Faith Halo" override here for emitters whose whole flags word equaled
+  // 57 or 313 (ring at 1.6x radius in the local XZ plane, radial speed). The REAL 1.12 client has
+  // exactly ONE sphere CreateParticle (FUN_007b8d70, RE'd + trace-verified below) with no such
+  // flags dispatch -- and the override is what made instance portals (flags=57) tumble like a
+  // flipping coin instead of spinning in the portal plane. Removed 2026-07-03; all sphere
+  // emitters now take the client-faithful path. (Full canon flag-bit semantics = checklist 12.14.)
+  {
     // CLIENT-FAITHFUL sphere emission (RE'd from 1.12 CParticleEmitter2 sphere CreateParticle,
     // FUN_007b8d70): pick elevation theta in +-VerticalRange and azimuth phi in +-HorizontalRange,
     // spawn at (radial unit vector x radius), velocity = the SAME radial direction x EmissionSpeed
@@ -1640,20 +1652,33 @@ Particle SphereParticleEmitter::newParticle(ParticleSystem* sys, int anim, int t
     float const theta = misc::randfloat(-spr, spr);   // elevation from the horizontal plane
     float const phi = misc::randfloat(-spr2, spr2);   // azimuth around the emitter axis
 
-    // radial unit direction in noggit space (up = +Y; model z-up converted like fixCoordSystem)
-    glm::vec3 const radial(std::cos(theta) * std::cos(phi),
+    // radial unit direction in noggit space (up = +Y; model z-up converted like fixCoordSystem).
+    // AZIMUTH PHASE (2026-07-03, empirically derived from InstancePortal): azimuth 0 points along
+    // model +Y, not +X. With HorizontalRange=0 + VerticalRange=pi the ring then lies in the model
+    // YZ plane -- the portal's octagon plane, whose normal (X) is the spinning bone's axis -- so
+    // the swirl rotates like a WHEEL in its own plane. With the old +X phase the ring lay in the
+    // XZ meridian and the bone spin tumbled it like a flipping coin. Full-azimuth emitters
+    // (HorizontalRange ~ pi, e.g. the arcane elementals' smoke ring) are statistically identical
+    // under any phase, so this only affects constrained-azimuth emitters.
+    // wow-space radial = (-cos(theta)*sin(phi), cos(theta)*cos(phi), sin(theta)) -> noggit y-up:
+    glm::vec3 const radial(-std::cos(theta) * std::sin(phi),
                            std::sin(theta),
-                           -std::cos(theta) * std::sin(phi));
+                           -std::cos(theta) * std::cos(phi));
 
-    p.pos = sys->parent->mat * glm::vec4(sys->pos + radial * r, 1);
+    // Flag 0x10 (ride parent): keep spawn LOCAL to the bone -- draw() applies the bone's current
+    // matrix each frame so live particles rotate with it (portal swirl wheel). Otherwise bake the
+    // bone matrix at spawn (client leaves non-riding particles behind).
+    bool const rides = sys->ridesParent();
+    glm::vec3 const local_pos = sys->pos + radial * r;
+    p.pos = rides ? local_pos : glm::vec3(sys->parent->mat * glm::vec4(local_pos, 1));
 
     if (sys->flags & 0x100)
     {
-      dir = sys->parent->mrot * glm::vec4(0, 1, 0, 0);
+      dir = rides ? glm::vec3(0, 1, 0) : glm::vec3(sys->parent->mrot * glm::vec4(0, 1, 0, 0));
     }
     else
     {
-      dir = sys->parent->mrot * glm::vec4(radial, 0);
+      dir = rides ? radial : glm::vec3(sys->parent->mrot * glm::vec4(radial, 0));
     }
 
     p.speed = safe_normalize_vec3(dir, glm::vec3(0.0f, 1.0f, 0.0f)) * spd * (1.0f + misc::randfloat(-var, var));

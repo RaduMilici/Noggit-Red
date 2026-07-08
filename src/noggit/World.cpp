@@ -884,6 +884,16 @@ namespace
       return value <= 50;
     };
 
+    // The geoset columns move between builds: 1.12's CharacterFacialHairStyles has NINE fields --
+    // race, sex, variation, then SIX geoset slots of which the first three are unused 0xCCCCCCCC
+    // fill and the real beard/moustache/sideburn values sit in fields 6/7/8. WotLK's has EIGHT
+    // fields with the real values at 3/4/5 (the DBC.h constants). Reading 3/4/5 on vanilla data
+    // returned the 0xCC fill, tripped the sanity guard below, and facial-feature geoset control
+    // silently never applied -- e.g. undead males stacked ALL jaw/cheek feature variants at once
+    // (the "broken mouth" on Suffering Victim, display 1027).
+    std::size_t const field_count = gCharacterFacialHairStylesDB.getFieldCount();
+    std::size_t const geoset_field_base = field_count >= 9 ? 6 : CharacterFacialHairStylesDB::BeardGeoset;
+
     for (auto it = gCharacterFacialHairStylesDB.begin(); it != gCharacterFacialHairStylesDB.end(); ++it)
     {
       if (it->getUInt(CharacterFacialHairStylesDB::RaceID) != race_id
@@ -893,9 +903,9 @@ namespace
         continue;
       }
 
-      auto const beard = it->getUInt(CharacterFacialHairStylesDB::BeardGeoset);
-      auto const moustache = it->getUInt(CharacterFacialHairStylesDB::MoustacheGeoset);
-      auto const sideburn = it->getUInt(CharacterFacialHairStylesDB::SideburnGeoset);
+      auto const beard = it->getUInt(geoset_field_base + 0);
+      auto const moustache = it->getUInt(geoset_field_base + 1);
+      auto const sideburn = it->getUInt(geoset_field_base + 2);
 
       // Guard against malformed/unsupported classic DBC layouts producing
       // garbage selectors that would hide the whole head family.
@@ -1177,16 +1187,26 @@ namespace
 
     try
     {
-      auto display = gCreatureDisplayInfoDB.getByID(display_id);
-      auto extra_display_id = display.getUInt(CreatureDisplayInfoDB::ExtendedDisplayInfoID);
-      if (!extra_display_id)
+      // Race/sex only matter for the racial filename-suffix variants some item models ship
+      // (helms mostly). Non-character creatures (demons, beasts) have NO CreatureDisplayInfoExtra
+      // -- bailing out when it is absent was why Kruul (59991) never got his equipped axe.
+      // Fall back to 0/0: weapon/shield models resolve without a racial suffix.
+      std::uint32_t race_id = 0;
+      std::uint32_t sex_id = 0;
+      try
       {
-        return attachments;
+        auto display = gCreatureDisplayInfoDB.getByID(display_id);
+        auto const extra_display_id = display.getUInt(CreatureDisplayInfoDB::ExtendedDisplayInfoID);
+        if (extra_display_id)
+        {
+          auto display_extra = gCreatureDisplayInfoExtraDB.getByID(extra_display_id);
+          race_id = display_extra.getUInt(CreatureDisplayInfoExtraDB::DisplayRaceID);
+          sex_id = display_extra.getUInt(CreatureDisplayInfoExtraDB::DisplaySexID);
+        }
       }
-
-      auto display_extra = gCreatureDisplayInfoExtraDB.getByID(extra_display_id);
-      auto const race_id = display_extra.getUInt(CreatureDisplayInfoExtraDB::DisplayRaceID);
-      auto const sex_id = display_extra.getUInt(CreatureDisplayInfoExtraDB::DisplaySexID);
+      catch (DBCFile::NotFound const&)
+      {
+      }
 
       append_item_attachment_specs(attachments,
                                    mainhand_display_id,
@@ -1319,6 +1339,94 @@ namespace
     return attachments;
   }
 
+  struct CreatureAuraModelEffects
+  {
+    float alpha = 1.0f;
+    glm::vec3 tint = glm::vec3(1.0f);
+    bool any = false;
+  };
+
+  // Model-wide "char proc" effects of permanent auras (Ghost Visual, Stealth...): the aura's
+  // state kit can carry a transparency proc (type 14, param = alpha as float) and a tint proc
+  // (type 1, param = ARGB color, alpha byte = blend strength). The live client draws the whole
+  // creature with these applied -- e.g. Echo of Medivh (aura 9617 -> kit 989) is ~50% translucent
+  // with a light-blue shift, on top of the attached Ghost_state mist. Field layout: see
+  // SpellVisualKitDB::CharProc0 in DBC.h (verified against ghost/stealth kits).
+  CreatureAuraModelEffects resolve_creature_aura_model_effects(
+      std::string const& auras,
+      std::map<std::uint32_t, World::SpellInfo> const& spell_infos)
+  {
+    CreatureAuraModelEffects effects;
+    if (auras.empty())
+    {
+      return effects;
+    }
+
+    std::istringstream tokens(auras);
+    std::uint32_t spell_id = 0;
+    while (tokens >> spell_id)
+    {
+      auto const info_it = spell_infos.find(spell_id);
+      if (info_it == spell_infos.end() || !info_it->second.spell_visual)
+      {
+        continue;
+      }
+
+      try
+      {
+        auto visual = gSpellVisualDB.getByID(info_it->second.spell_visual);
+        auto const state_kit_id = visual.getUInt(SpellVisualDB::StateKit);
+        if (!state_kit_id)
+        {
+          continue;
+        }
+
+        auto kit = gSpellVisualKitDB.getByID(state_kit_id);
+        for (std::size_t slot = 0; slot < SpellVisualKitDB::CharProcCount; ++slot)
+        {
+          auto const proc = kit.getUInt(SpellVisualKitDB::CharProc0 + slot);
+          if (!proc || proc == 0xFFFFFFFFu)
+          {
+            continue;
+          }
+          auto const param = kit.getUInt(SpellVisualKitDB::CharParam0 + slot);
+
+          if (proc == SpellVisualKitDB::CharProcTransparency)
+          {
+            float a;
+            std::memcpy(&a, &param, sizeof(a));
+            if (std::isfinite(a) && a > 0.01f && a < 1.0f)
+            {
+              effects.alpha *= a;
+              effects.any = true;
+            }
+          }
+          else if (proc == SpellVisualKitDB::CharProcTint)
+          {
+            // Tint color blended in at the ARGB alpha byte's strength (ghost kit: light blue at
+            // 75/255 = 29%) -- the fully authored interpretation. (A full-multiply variant was
+            // tried and reads far too blue once real translucency shows; the strength byte is
+            // there for a reason.)
+            float const strength = static_cast<float>((param >> 24) & 0xFF) / 255.0f;
+            glm::vec3 const color(static_cast<float>((param >> 16) & 0xFF) / 255.0f,
+                                  static_cast<float>((param >> 8) & 0xFF) / 255.0f,
+                                  static_cast<float>(param & 0xFF) / 255.0f);
+            if (strength > 0.0f)
+            {
+              effects.tint *= glm::mix(glm::vec3(1.0f), color, strength);
+              effects.any = true;
+            }
+          }
+        }
+      }
+      catch (DBCFile::NotFound const&)
+      {
+      }
+    }
+
+    return effects;
+  }
+
   CreatureGeosetSelection resolve_creature_geoset_selection(std::uint32_t display_id)
   {
     CreatureGeosetSelection selection;
@@ -1370,9 +1478,16 @@ namespace
 
       if (auto facial_hair_geosets = resolve_classic_facial_hair_geosets(race_id, sex_id, facial_hair_id))
       {
-        assign_geoset_selection_if_nonzero(selection, CharacterGeosetFamily::Geoset100, facial_hair_geosets->beard, true);
-        assign_geoset_selection_if_nonzero(selection, CharacterGeosetFamily::Geoset200, facial_hair_geosets->moustache, true);
-        assign_geoset_selection_if_nonzero(selection, CharacterGeosetFamily::Geoset300, facial_hair_geosets->sideburn, true);
+        // Column->group mapping verified against ScourgeMale + the vanilla DBC: column 2 selects
+        // the 300 family and column 3 the 200 family, and the values are ABSOLUTE variant numbers
+        // (relative=false -- undead male cols {2,3,4} must map onto the model's exact {102,103,104}
+        // set; +1 would select the nonexistent 105). Assign UNCONDITIONALLY: the client always
+        // controls these families -- value 0 selects geoset X00 which models rarely have, i.e.
+        // "none". Leaving a family uncontrolled instead draws ALL its variants stacked (the undead
+        // "broken mouth": every jaw/cheek feature variant rendered at once).
+        assign_geoset_selection(selection, CharacterGeosetFamily::Geoset100, facial_hair_geosets->beard, false);
+        assign_geoset_selection(selection, CharacterGeosetFamily::Geoset300, facial_hair_geosets->moustache, false);
+        assign_geoset_selection(selection, CharacterGeosetFamily::Geoset200, facial_hair_geosets->sideburn, false);
         debug << " facialHairApplied=["
               << facial_hair_geosets->beard << ","
               << facial_hair_geosets->moustache << ","
@@ -2940,6 +3055,9 @@ bool World::ensureCreatureSpawnModel(CreatureSpawnOverlay& spawn)
   {
     BlizzardArchive::Listfile::FileKey const file_key(spawn.model_path);
     spawn.model_instance.emplace(file_key, _context);
+    // Stable, unique per-spawn id (the creature guid) -- used as the idle-variation scheduler key so each
+    // spawn keeps its own animation timeline (creature model_instances otherwise leave uid uninitialised).
+    spawn.model_instance->uid = static_cast<unsigned int>(spawn.guid);
     spawn.model_instance->pos = spawn.pos;
     spawn.model_instance->dir = glm::vec3(0.0f, spawn.orientation, 0.0f);
     spawn.model_instance->scale = std::clamp(spawn.template_scale * spawn.model_scale,
@@ -2952,9 +3070,18 @@ bool World::ensureCreatureSpawnModel(CreatureSpawnOverlay& spawn)
     spawn.attachment_models.clear();
     {
       std::vector<CreatureAttachmentModelSpec> attachment_specs;
-      if (spawn.is_character_model && creature_spawn_attachments_enabled())
+      if (creature_spawn_attachments_enabled())
       {
-        attachment_specs = resolve_creature_attachment_models(spawn.display_id);
+        // CDIExtra-driven helm/shoulder attachments only exist for character-skeleton NPCs.
+        if (spawn.is_character_model)
+        {
+          attachment_specs = resolve_creature_attachment_models(spawn.display_id);
+        }
+
+        // Equipment weapons (creature_equip_template -> item displays) attach to ANY creature whose
+        // skeleton has hand attachment points, not just character models -- e.g. Kruul (59991), a
+        // demon model wielding Shar'tateth (Karazan_2h_demon_axe). Models without the attachment
+        // point skip harmlessly at draw time (find_attachment_def returns nothing).
         auto equipment_specs = resolve_creature_equipment_attachment_models(spawn.display_id,
                                                                             spawn.mainhand_display_id,
                                                                             spawn.offhand_display_id,
@@ -3134,6 +3261,7 @@ bool World::ensureGameObjectSpawnModel(GameObjectSpawnOverlay& spawn)
   {
     BlizzardArchive::Listfile::FileKey const file_key(spawn.model_path);
     spawn.model_instance.emplace(file_key, _context);
+    spawn.model_instance->uid = static_cast<unsigned int>(spawn.guid); // idle-scheduler key (see above)
     spawn.model_instance->pos = spawn.pos;
     spawn.model_instance->dir = glm::vec3(0.0f, spawn.orientation, 0.0f);
     spawn.model_instance->scale = std::clamp(spawn.template_scale,
@@ -3187,6 +3315,19 @@ std::vector<std::pair<std::size_t, std::string>> World::applyCreatureSpawnModelA
     catch (...) {}
   }
 
+  // Aura char-proc model effects (Ghost Visual / Stealth): whole-body transparency + tint from the
+  // aura's state kit, multiplied on top of CreatureModelAlpha. The translucent depth-prepass path
+  // (model_alpha < 1) handles the rendering.
+  model_instance.model_tint = glm::vec3(1.0f);
+  {
+    auto const aura_effects = resolve_creature_aura_model_effects(spawn.auras, _spell_infos);
+    if (aura_effects.any)
+    {
+      model_instance.model_alpha = std::clamp(model_instance.model_alpha * aura_effects.alpha, 0.05f, 1.0f);
+      model_instance.model_tint = aura_effects.tint;
+    }
+  }
+
   if (enable_creature_spawn_character_geosets
       && creature_spawn_geosets_enabled()
       && spawn.is_character_model)
@@ -3197,6 +3338,17 @@ std::vector<std::pair<std::size_t, std::string>> World::applyCreatureSpawnModelA
       model_instance.setGeosetSelections(geoset_selection.visible_ids,
                                          geoset_selection.controlled_families);
     }
+  }
+
+  // Hand grip on a held weapon. A creature with an in-hand weapon must close its fist around the grip;
+  // the default Stand (animID 0) leaves the hand open, so a drawn weapon floats in an open palm. The
+  // client keeps the BODY on its normal breathing idle and overlays the HandsClosed (animID 15) pose
+  // onto the FINGER bones only (HandsClosed is a single-frame pose that also keys the arms/shoulders,
+  // so it must NOT be played as a whole idle -- that freezes the body). We flag the instance; the model
+  // applies the finger-only overlay in calcBones (see Model::applyHandGripOverlay).
+  if (spawn.mainhand_display_id != 0)
+  {
+    model_instance.setCloseHands(true);
   }
 
   return overrides;
@@ -4688,6 +4840,75 @@ unsigned int World::getWMOZoneMusic(glm::vec3 const& pos)
   });
 
   return music;
+}
+
+bool World::camera_is_inside_wmo(glm::vec3 const& pos)
+{
+  auto contains = [](std::pair<glm::vec3, glm::vec3> const& extents, glm::vec3 const& point)
+  {
+    return point.x >= extents.first.x && point.x <= extents.second.x
+        && point.y >= extents.first.y && point.y <= extents.second.y
+        && point.z >= extents.first.z && point.z <= extents.second.z;
+  };
+
+  bool inside = false;
+  _model_instance_storage.for_each_wmo_instance([&](WMOInstance& wmo_instance)
+  {
+    if (inside || !wmo_instance.finishedLoading() || wmo_instance.wmo->loading_failed())
+    {
+      return;
+    }
+
+    auto const& wmo_extents = wmo_instance.getExtents();
+    if (!contains({wmo_extents[0], wmo_extents[1]}, pos))
+    {
+      return; // not even in the loose outer AABB
+    }
+
+    // The outer AABB is loose (covers nearby terrain for big city WMOs). Only "inside" if pos falls in
+    // one of the group AABBs -- the same test the ZoneMusic resolver uses to pick the building you stand in.
+    for (auto const& group_extents : wmo_instance.getGroupExtents())
+    {
+      if (contains(group_extents.second, pos))
+      {
+        inside = true;
+        return;
+      }
+    }
+  }, [&]() { return inside; });
+
+  return inside;
+}
+
+void World::collect_interior_volumes(std::vector<InteriorVolume>& out)
+{
+  out.clear();
+  _model_instance_storage.for_each_wmo_instance([&](WMOInstance& wmo_instance)
+  {
+    if (!wmo_instance.finishedLoading() || wmo_instance.wmo->loading_failed())
+    {
+      return;
+    }
+
+    // getGroupExtents() forces a full per-WMO extents recalc -- fine here because this whole gather runs
+    // at most a few dozen WMOs and is throttled by the caller (never per object).
+    glm::mat4 const inv_transform = glm::inverse(wmo_instance.transformMatrix());
+    for (auto const& [group_index, group_extents] : wmo_instance.getGroupExtents())
+    {
+      if (group_index < 0 || group_index >= static_cast<int>(wmo_instance.wmo->groups.size()))
+      {
+        continue;
+      }
+      auto const& group = wmo_instance.wmo->groups[group_index];
+      // Client proxy rule (RE_notes/15, 0x695960): a TRUE interior group has neither exterior nor
+      // exterior_lit set. Only such groups carry retained ground colours for unit lighting.
+      if (group.is_indoor() && !group.is_exterior_lit() && !group.is_exterior())
+      {
+        out.push_back({group_extents.first, group_extents.second, inv_transform,
+                       wmo_instance.wmo, group_index});
+      }
+    }
+  });
 }
 
 int World::getZoneMusic(glm::vec3 const& pos)

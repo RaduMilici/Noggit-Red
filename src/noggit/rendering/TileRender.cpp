@@ -203,12 +203,15 @@ void TileRender::draw (OpenGL::Scoped::use_program& mcnk_shader
           unsigned layer_flags = chunk->texture_set->flag(k);
           auto flag_view = reinterpret_cast<MCLYFlags*>(&layer_flags);
 
-          _chunk_instance_data[i].ChunkTexDoAnim[k] = flag_view->animation_enabled;
+          // bit 0 = UV animation enabled; bit 1 = MCLY 0x80 overbright ("way brighter, used for lava
+          // to make it glow" -- vanilla MCLY bit, audit RE_notes/21 A1). The frag shader applies x2.
+          _chunk_instance_data[i].ChunkTexDoAnim[k] = (flag_view->animation_enabled ? 1 : 0)
+                                                    | (flag_view->overbright ? 2 : 0);
           _chunk_instance_data[i].ChunkTexAnimSpeed[k] = flag_view->animation_speed;
           _chunk_instance_data[i].ChunkTexAnimDir[k] = flag_view->animation_rotation;
         }
-
-        _chunk_instance_data[i].ChunkTexDoAnim[1] = chunk->header_flags.flags.impass;
+        // (Removed a stray `ChunkTexDoAnim[1] = impass` that stomped layer 1's anim flag -- the impass
+        // overlay reads ChunkHoles_DrawImpass_TexLayerCount_CantPaint[1], set above.)
       }
 
       if (flags & ChunkUpdateFlags::AREA_ID)

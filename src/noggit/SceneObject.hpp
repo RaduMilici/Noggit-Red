@@ -50,13 +50,15 @@ public:
 
   void normalizeDirection();
 
+  // Return by const-ref: the model-collection loops call this for every doodad every frame; returning a
+  // 64-byte copy at thousands of call sites was pure churn. No caller mutates the result (verified).
   [[nodiscard]]
-  glm::mat4x4 transformMatrix() const { return _transform_mat; };
+  glm::mat4x4 const& transformMatrix() const { return _transform_mat; };
 
   void setTransformMatrix(glm::mat4x4 const& matrix);
 
   [[nodiscard]]
-  glm::mat4x4 transformMatrixInverted() const { return _transform_mat_inverted; };
+  glm::mat4x4 const& transformMatrixInverted() const { return _transform_mat_inverted; };
 
   [[nodiscard]]
   SceneObjectTypes which() const { return _type; };

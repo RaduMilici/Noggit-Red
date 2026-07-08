@@ -33,6 +33,7 @@ layout (std140) uniform matrices
 {
   mat4 model_view;
   mat4 projection;
+  vec4 camera_pos;
 };
 
 layout (std140) uniform liquid_layers_params
@@ -108,12 +109,9 @@ void main()
   shadow_chunk_index = params.shadow_chunk_index;
   shadow_uv = vec2(position.x / CHUNKSIZE, position.y / CHUNKSIZE);
 
-  if(use_transform == 1)
-  {
-    gl_Position = projection * model_view * transform * final_pos;
-  }
-  else
-  {
-    gl_Position = projection * model_view * final_pos;
-  }
+  // Camera-relative (see terrain_vert.glsl) so water surfaces don't jitter against the terrain/models.
+  mat4 view_rot = model_view;
+  view_rot[3].xyz = vec3(0.0);
+  vec4 world_pos = (use_transform == 1) ? (transform * final_pos) : final_pos;
+  gl_Position = projection * view_rot * vec4(world_pos.xyz - camera_pos.xyz, 1.0);
 }

@@ -9,23 +9,36 @@ in uvec4 bones_weight;
 in uvec4 bones_indices;
 
 #ifdef instanced
-  in mat4 transform;
+  in mat4 transform;              // model->world
 #else
   uniform mat4 transform;
 #endif
 
+// Interior light for this draw: rgb = WMO room ambient, a = 1 when the object is indoors. A uniform in
+// BOTH variants -- the instanced path partitions its instances by interior value into per-value sub-draws
+// so one uniform covers each sub-batch (avoids a per-instance attribute + shared-VAO location fragility).
+uniform vec4 instance_interior;
+
 uniform samplerBuffer bone_matrices;
+
+// World anchor for camera-relative rendering. `transform` carries the vertex position RELATIVE to this
+// anchor (small), so the large ~17000 world coordinate lives only in model_origin and never gets baked
+// into an animated float matrix (which would quantize the motion = dithering attachments). 0 for the
+// instanced path, where transform already holds each instance's full world position.
+uniform vec3 model_origin;
 
 out vec2 uv1;
 out vec2 uv2;
 out float camera_dist;
 out vec3 norm;
 out vec3 m2_world_pos;
+flat out vec4 v_interior;        // rgb = interior room ambient, a = 1 when the object is indoors
 
 layout (std140) uniform matrices
 {
   mat4 model_view;
   mat4 projection;
+  vec4 camera_pos;
 };
 
 uniform int tex_unit_lookup_1;
@@ -109,12 +122,26 @@ void main()
   }
 
   mat4 modelMatrix = transform * boneTransformMat;
-  mat4 cameraMatrix = model_view * modelMatrix;
   mat3 normMatrix = mat3(modelMatrix);
-  mat3 cameraNormMatrix = mat3(cameraMatrix);
 
-  vec4 vertex = cameraMatrix * pos;
-  m2_world_pos = (modelMatrix * pos).xyz;
+  // PS1-style vertex jitter fix -- CAMERA-RELATIVE, keeping the ANIMATED part at small magnitude.
+  // Two precision traps at world scale (~17000 on a real map):
+  //   1) multiplying model_view*worldpos in float cancels catastrophically (camera slide);
+  //   2) building worldpos = transform*bone*pos at ~17000 QUANTIZES the small per-vertex animation to
+  //      the ~0.002 float grid there -> the animation dithers.
+  // Fix both: never form the full ~17000 world position for the clip path. Transform the animated
+  // LOCAL vertex by the model's rotation/scale ONLY (small), and add the model-origin-minus-camera
+  // offset (Sterbenz-exact, small). Everything the clip position touches stays small = precise. Then
+  // apply the rotation-only view (its translation is irrelevant).
+  mat4 view_rot = model_view;
+  view_rot[3].xyz = vec3(0.0);
+  mat3 cameraNormMatrix = mat3(view_rot) * normMatrix;
+
+  vec3 local_pos = (boneTransformMat * pos).xyz;                                  // animated, model-local (small)
+  vec3 anchor_rel = mat3(transform) * local_pos + transform[3].xyz;               // vertex relative to model_origin (small)
+  vec3 world_rel = anchor_rel + (model_origin - camera_pos.xyz);                  // + Sterbenz-exact origin-minus-camera
+  vec4 vertex = view_rot * vec4(world_rel, 1.0);
+  m2_world_pos = anchor_rel + model_origin;                                       // full world (for point lights)
 
   // important to normalize because of the scaling !!
   norm = normalize(normMatrix * normal);
@@ -124,5 +151,6 @@ void main()
   uv2 = get_texture_uv(tex_unit_lookup_2, vertex.xyz, camera_norm, tex_matrix_2);
 
   camera_dist = -vertex.z;
+  v_interior = instance_interior;
   gl_Position = projection * vertex;
 }

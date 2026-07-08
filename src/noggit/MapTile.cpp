@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cctype>
+#include <cstdio>
 #include <cstring>
 #include <list>
 #include <map>
@@ -310,6 +311,12 @@ void MapTile::finishLoading()
     error_on_loading();
   };
 
+  // Track the load stage so the exception handler below can report exactly where a tile
+  // load blows up (this is how the Karazahn40 MPHD big-alpha AV was pinpointed).
+  char load_stage[128] = "open";
+  try
+  {
+
   BlizzardArchive::ClientFile theFile(_file_key, Noggit::Application::NoggitApplication::instance()->clientData());
 
   Log << "Opening tile " << index.x << ", " << index.z << " (\"" << _file_key.stringRepr() << "\") from " << (theFile.isExternal() ? "disk" : "MPQ") << "." << std::endl;
@@ -330,6 +337,7 @@ void MapTile::finishLoading()
 
   uint32_t version;
 
+  std::snprintf(load_stage, sizeof(load_stage), "MVER/MHDR");
   theFile.read(&fourcc, 4);
   theFile.seekRelative(4);
   theFile.read(&version, 4);
@@ -366,6 +374,7 @@ void MapTile::finishLoading()
 
   // - MCIN ----------------------------------------------
 
+  std::snprintf(load_stage, sizeof(load_stage), "MCIN..MODF tables");
   if (!readADTChunkHeader(theFile, Header.mcin + 0x14, 'MCIN', "MCIN", &size))
   {
     LogError << "ADT \"" << _file_key.stringRepr() << "\" is missing a readable MCIN. Aborting tile load." << std::endl;
@@ -487,6 +496,7 @@ void MapTile::finishLoading()
   //! \todo  Parse all chunks in the new style!
 
   // - MH2O ----------------------------------------------
+  std::snprintf(load_stage, sizeof(load_stage), "MH2O/MFBO");
   if (Header.mh2o != 0) {
     int ofsW = Header.mh2o + 0x14 + 0x8;
     if (auto mh2o_size = readOptionalADTChunkHeader(theFile, Header.mh2o, 'MH2O', "MH2O"))
@@ -585,6 +595,7 @@ void MapTile::finishLoading()
         continue;
       }
 
+      std::snprintf(load_stage, sizeof(load_stage), "wmo-instance uid=%u '%s'", object.uniqueID, filename.c_str());
       add_model(_world->add_wmo_instance(WMOInstance(filename, &object, _context), _tile_is_being_reloaded));
     }
 
@@ -605,6 +616,7 @@ void MapTile::finishLoading()
         continue;
       }
 
+      std::snprintf(load_stage, sizeof(load_stage), "m2-instance uid=%u '%s'", model.uniqueID, filename.c_str());
       add_model(_world->add_model_instance(ModelInstance(filename, &model, _context), _tile_is_being_reloaded));
     }
 
@@ -615,6 +627,7 @@ void MapTile::finishLoading()
 
   for (int nextChunk = 0; nextChunk < 256; ++nextChunk)
   {
+    std::snprintf(load_stage, sizeof(load_stage), "MCNK %d (ofs=0x%X)", nextChunk, lMCNKOffsets[nextChunk]);
     theFile.seek(lMCNKOffsets[nextChunk]);
 
     unsigned x = nextChunk / 16;
@@ -634,6 +647,22 @@ void MapTile::finishLoading()
   finished = true;
   _tile_is_being_reloaded = false;
   _state_changed.notify_all();
+
+  }
+  catch (std::exception const& e)
+  {
+    // Report exactly where this tile load blew up, then let the AsyncLoader handle the
+    // failure as before.
+    LogError << "MapTile " << index.x << "," << index.z << " (\"" << _file_key.stringRepr()
+             << "\") load exception at stage: " << load_stage << " -- " << e.what() << std::endl;
+    throw;
+  }
+  catch (...)
+  {
+    LogError << "MapTile " << index.x << "," << index.z << " (\"" << _file_key.stringRepr()
+             << "\") load exception at stage: " << load_stage << std::endl;
+    throw;
+  }
 }
 
 bool MapTile::isTile(int pX, int pZ)

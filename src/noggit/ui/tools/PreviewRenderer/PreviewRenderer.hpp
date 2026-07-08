@@ -87,7 +87,7 @@ class PreviewRenderer : public Noggit::Ui::Tools::ViewportManager::Viewport
 
     void updateLightingUniformBlock();
 
-    void updateMVPUniformBlock(const glm::mat4x4& model_view, const glm::mat4x4& projection);
+    void updateMVPUniformBlock(const glm::mat4x4& model_view, const glm::mat4x4& projection, const glm::vec3& camera_pos);
 
   private:
     int _width;

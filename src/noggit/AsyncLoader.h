@@ -4,6 +4,9 @@
 
 #include <noggit/AsyncObject.h>
 
+#include <QtCore/QSettings>
+
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <condition_variable>
@@ -16,7 +19,11 @@ class AsyncLoader
 public:
   static AsyncLoader& instance()
   {
-    static AsyncLoader async_loader(2);
+    // Worker thread count is user-configurable (Settings -> "Loader threads"), default 3 to match the
+    // reference build. More threads stream faster but contend with the main/render thread's CPU while
+    // loading; fewer keeps frame time smoother. Created once; a change needs a restart.
+    int const threads = std::max(1, QSettings().value("async_thread_count", 3).toInt());
+    static AsyncLoader async_loader(threads);
     return async_loader;
   }
 

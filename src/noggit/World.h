@@ -6,6 +6,7 @@
 #include <math/trig.hpp>
 #include <noggit/rendering/CursorRender.hpp>
 #include <noggit/Misc.h>
+#include <noggit/InteriorVolume.hpp>
 #include <noggit/Model.h> // ModelManager
 #include <noggit/ModelInstance.h>
 #include <noggit/Selection.h>
@@ -229,6 +230,14 @@ public:
   // AreaTable parent chain. 0 = no music authored.
   unsigned int getWMOZoneMusic(glm::vec3 const&);
   int getZoneMusic(glm::vec3 const&);
+  // True if pos falls inside a loaded WMO's group AABB (i.e. the camera is standing inside a building/
+  // dungeon interior, not merely inside its loose outer AABB). Used to drop the client's outdoor
+  // FFXGlow floor when indoors (see renderBloomAndComposite).
+  bool camera_is_inside_wmo(glm::vec3 const& pos);
+  // Gather every loaded indoor group's world AABB + room ambient (see InteriorVolume) once. Calls the
+  // EXPENSIVE getGroupExtents per WMO -- callers MUST throttle this, never per-object-per-frame -- so
+  // object interior tests become cheap AABB checks. Lights indoor objects by the room, not the sun.
+  void collect_interior_volumes(std::vector<InteriorVolume>& out);
   // If the camera is inside a WMO group that has authored interior fog (MFOG), fills color/start/end
   // and returns true. Used to apply that fog to the whole scene (terrain, doodads, light shafts).
   bool getInteriorFog(glm::vec3 const& pos, glm::vec3& out_color, float& out_start, float& out_end);

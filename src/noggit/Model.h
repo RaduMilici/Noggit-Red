@@ -93,6 +93,13 @@ public:
                  , int time
                  , int animtime
                  );
+
+  // Weapon-grip finger overlay: recompute THIS bone's matrix from a DIFFERENT sequence (HandsClosed),
+  // using the parent's ALREADY-computed matrix -- no recursion, no calc-flag reset. Called only on the
+  // finger-subtree bones after the normal (Stand) pass, so the fingers curl relative to the still-
+  // Stand-posed (breathing) hand while the rest of the skeleton is untouched. Mirrors calcMatrix's
+  // local-transform build exactly (same euler remap).
+  void overrideLocalFromSeq(Bone* allbones, int seq, int time, int animtime);
   Bone ( const BlizzardArchive::ClientFile& f,
          const ModelBoneDef &b,
          int *global,
@@ -110,7 +117,13 @@ public:
 class TextureAnim {
   Animation::M2Value<glm::vec3> trans;
   Animation::M2Value<glm::quat, packed_quaternion> rot;
+  // Classic (1.12) rotation tracks store FLOAT quaternions; packed int16 quats are WotLK-era.
+  // Same split Bone already has (rot vs classic_rot) -- without it, classic texanim rotations
+  // misparsed float data as packed quats and portal swirls tumbled ("coin flip") instead of
+  // spinning in the texture plane.
+  Animation::M2Value<glm::quat> classic_rot;
   Animation::M2Value<glm::vec3> scale;
+  bool _uses_classic_rotation = false;
 
 public:
   glm::mat4x4 mat;
@@ -125,6 +138,7 @@ struct ModelColor {
   Animation::M2Value<float, int16_t> opacity;
 
   ModelColor(const BlizzardArchive::ClientFile& f, const ModelColorDef &mcd, int *global);
+  ModelColor(const BlizzardArchive::ClientFile& f, const ClassicModelColorDef &mcd, int *global);
 };
 
 struct ModelTransparency {
@@ -239,7 +253,13 @@ public:
 
   [[nodiscard]] bool usesClassicLayout() const { return _uses_classic_layout; }
   [[nodiscard]] bool supportsTrackAnimations() const { return !_uses_classic_layout && !_animations_seq_per_id.empty(); }
-  [[nodiscard]] bool hasAnimationId(int anim_id) const;
+  // True if this model actually has the given animation id (with sequences). Used to fall back to
+  // Stand (0) when a forced weapon-idle (Ready1H/Ready2H) is requested on a model that lacks it.
+  [[nodiscard]] bool hasAnimationId(int anim_id) const
+  {
+    auto const it = _animations_seq_per_id.find(static_cast<uint16_t>(anim_id));
+    return it != _animations_seq_per_id.end() && !it->second.empty();
+  }
 
   // ===============================
   // Toggles
@@ -346,6 +366,60 @@ private:
   //      <anim_id, <sub_anim_id, animation>
   std::map<uint16_t, std::map<uint16_t, ModelAnimation>> _animations_seq_per_id;
   std::map<int16_t, uint32_t> _animation_length;
+
+  // Weapon-grip hand overlay. When _hand_overlay_active (set per-draw from ModelInstance::closeHands),
+  // calcBones runs the normal body pass then re-poses ONLY the finger-subtree bones from the HandsClosed
+  // sequence so a held weapon gets a closed fist while the body keeps its idle. _hand_overlay_bones is
+  // built once at load = finger bones (KeyBoneID 8..17) + their descendants, in parents-first order.
+  // The HandsClosed sequence index is resolved from _animations_seq_per_id[15] at apply time.
+  bool _hand_overlay_active = false;
+  std::vector<uint16_t> _hand_overlay_bones;
+  void applyHandGripOverlay(int time, int animtime);
+
+  // Scratch pose (final bone matrices of the blend-FROM sequence) used by animate()'s cross-fade on
+  // animation transitions. Transient per-draw, like the bone pose itself.
+  std::vector<glm::mat4x4> _blend_scratch;
+
+  // Idle-variation scheduling (client-accurate). Per animID, the playable variations with the authored
+  // M2Sequence fields the 1.12 client uses to schedule them: a frequency-weighted roulette picks a
+  // variation, it plays for length*replayCount (replay in [replayMin,replayMax]), then re-rolls; each
+  // transition cross-fades over blendTime. Parsed from ClassicModelAnimation at load.
+  struct AnimVariation
+  {
+    int      seq_index;   // sequence index (== ModelAnimation.Index), what the bone tracks are keyed by
+    uint32_t length;      // duration ms
+    uint16_t frequency;   // roulette weight (variations of one animID sum to ~0x7FFF)
+    uint32_t replay_min;
+    uint32_t replay_max;
+    uint32_t blend_time;  // ms
+  };
+  std::map<uint16_t, std::vector<AnimVariation>> _anim_variations;
+
+  // Per-instance idle schedule state (keyed by ModelInstance uid). Persists across draws so each spawn
+  // follows its OWN randomized variation timeline (they don't lean in unison). Advanced incrementally in
+  // animate() from the per-instance anim_time clock.
+  struct IdleSchedule
+  {
+    bool     init = false;
+    int      anim_id = -1;
+    uint32_t rng = 0;
+    int      cur_seq = -1;
+    int      cur_len = 1;
+    int      cur_blend = 0;
+    long long play_start = 0;
+    long long play_end = 0;
+    int      prev_seq = -1;
+    int      prev_len = 1;
+  };
+  std::unordered_map<std::uint64_t, IdleSchedule> _idle_schedules;
+  std::uint64_t _active_idle_key = 0;
+  // Advances the active instance's idle schedule to anim_time and fills the current/blend selection.
+  // Returns false if this animID has no variation data (caller uses the legacy path). do_blend/out params
+  // mirror animate()'s cross-fade inputs.
+  bool advanceIdleSchedule(int anim_id, long long anim_time,
+                           int& out_seq, int& out_time,
+                           bool& out_do_blend, int& out_blend_seq_from, int& out_blend_time_from,
+                           float& out_blend_w);
 
   std::vector<ModelRenderFlags> _render_flags;
   std::vector<ParticleSystem> _particles;

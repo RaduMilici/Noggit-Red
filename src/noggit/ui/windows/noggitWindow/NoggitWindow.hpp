@@ -40,6 +40,13 @@ namespace Noggit::Ui::Windows
           std::shared_ptr<Noggit::Project::NoggitProject> project);
 
       void promptExit(QCloseEvent* event);
+
+      // Persist settings, silence audio, then terminate the process outright. Used on the user-confirmed
+      // exit paths. The normal Qt/OpenGL/AsyncLoader teardown has repeatedly failed to actually exit on
+      // Windows -- the event loop kept running so memory grew and zone music kept playing in the
+      // background after the window "closed". A hard exit once the user has committed to quitting is the
+      // one thing that can't get stuck. (Return-to-menu does NOT go through here -- only real exit does.)
+      [[noreturn]] void forceQuit();
       void promptUidFixFailure();
       void jumpToMapPosition(int map_id,
                              glm::vec3 pos,

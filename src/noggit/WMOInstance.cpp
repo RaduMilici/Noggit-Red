@@ -67,6 +67,7 @@ void WMOInstance::draw ( OpenGL::Scoped::use_program& wmo_shader
                        , display_mode display
                        , bool no_cull
                        , bool draw_exterior
+                       , Noggit::Rendering::WorldRender* world_renderer
                        )
 {
   if (!wmo->finishedLoading() || wmo->loading_failed())
@@ -124,6 +125,7 @@ void WMOInstance::draw ( OpenGL::Scoped::use_program& wmo_shader
               , world_has_skies
               , display
               , !draw_exterior
+              , world_renderer
               );
   }
 

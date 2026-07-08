@@ -94,9 +94,25 @@ namespace Noggit
       {
         std::scoped_lock lock(_mutex);
 
-        if (--_counts.at(pair) == 0)
+        // Tolerate an already-released / missing key instead of _counts.at() throwing
+        // "invalid unordered_map<K,T> key" -> uncaught -> std::terminate. That fired on return-to-menu
+        // while ~World tore down _creature_spawns: a ModelInstance's scoped texture reference could be
+        // released after its count entry was already erased (a double-release), aborting the whole
+        // teardown (and cascading into "deleteBuffers without active GL context" once the exception
+        // unwound past ~MapView's context scope). If the entry is already gone there is nothing to do.
+        auto const count_it = _counts.find(pair);
+        if (count_it == _counts.end())
         {
-          obj = static_cast<AsyncObject*>(&(_elements.at(pair)));
+          return;
+        }
+
+        if (--count_it->second == 0)
+        {
+          auto const elem_it = _elements.find(pair);
+          if (elem_it != _elements.end())
+          {
+            obj = static_cast<AsyncObject*>(&(elem_it->second));
+          }
         }
       }
 

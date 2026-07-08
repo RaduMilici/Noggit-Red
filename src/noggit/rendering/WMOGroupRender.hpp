@@ -31,7 +31,8 @@ namespace Noggit::Rendering
     eWMOBatch_Unlit = 0x4,
     eWMOBatch_Unfogged = 0x8,
     eWMOBatch_Collision = 0x10,
-    eWMOBatch_Sidn = 0x20 // material is Self-Illuminated Day/Night (windows glow at night)
+    eWMOBatch_Sidn = 0x20, // material is Self-Illuminated Day/Night (windows glow at night)
+    eWMOBatch_PortalSpill = 0x40 // vertex-colour alpha carries the portal-openness spill factor
   };
 
   struct WMOCombinedDrawCall

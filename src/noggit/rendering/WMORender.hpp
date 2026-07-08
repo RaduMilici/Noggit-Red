@@ -17,6 +17,7 @@ class WMO;
 namespace Noggit::Rendering
 {
   class LiquidTextureManager;
+  class WorldRender;
 
   class WMORender : public BaseRender
   {
@@ -42,6 +43,7 @@ namespace Noggit::Rendering
         , bool world_has_skies
         , display_mode display
         , bool interior_only
+        , WorldRender* world_renderer = nullptr // per-room (MOLR) light scoping
     );
 
     bool drawSkybox(glm::mat4x4 const& model_view

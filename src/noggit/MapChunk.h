@@ -17,6 +17,8 @@
 #include <map>
 #include <memory>
 #include <array>
+#include <string>
+#include <vector>
 #include <QImage>
 
 namespace BlizzardArchive
@@ -67,6 +69,25 @@ public:
            , bool init_empty = false, int chunk_idx = 0, bool load_textures = true);
 
   auto getHoleMask(void) const -> unsigned { return static_cast<unsigned>(holes); }
+
+  // Ground clutter (detail doodads): grass/flowers/pebbles the client scatters on terrain from the
+  // GroundEffectTexture/Doodad DBCs. Computed lazily on first render, cached here as (model path,
+  // world transform) pairs. WorldRender resolves + instanced-draws them near the camera. See
+  // MapChunk::computeDetailDoodads (checklist 14.1).
+  struct DetailDoodad
+  {
+    std::string model_path;
+    glm::mat4x4 transform;
+    // Resolved once by the clutter draw (WorldRender) and cached here so the per-frame collection skips
+    // the std::string hash-map lookup for every doodad. Safe: _detail_doodad_models is never cleared, and
+    // this doodad is destroyed together with its chunk. mutable so it can be filled through a const ref.
+    mutable Model* cached_model = nullptr;
+  };
+  std::vector<DetailDoodad> const& detailDoodads();
+  bool _detail_doodads_computed = false;
+  std::vector<DetailDoodad> _detail_doodads;
+  void computeDetailDoodads();
+
   MapTile *mt;
   glm::vec3 vmin, vmax, vcenter;
   int px, py;

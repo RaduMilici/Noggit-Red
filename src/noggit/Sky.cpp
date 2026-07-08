@@ -183,6 +183,13 @@ namespace
 
     if (light_params.field_count > glow_field)
       param->set_glow(light_params.number(row, glow_field));
+    // VANILLA data fix (trace-measured, wow_cap_kara / wow_cap_upstairs): 1.12 stores glow as
+    // LightFloatBand band 3, NOT LightParams field 3 (which Turtle zeroes everywhere). Param 386
+    // band 3 = 0.70; spatially blended by the sky weights this yields the client's measured
+    // composite weights (inn 0.647, Karazhan 0.600). Without this every zone fell to the 0.329
+    // floor and interiors like Kara lost their bloom (Anomalus's bright parts).
+    if (classic_light_params && !param->floatParams[3].empty())
+      param->set_glow(param->floatParams[3].front().value);
     if (light_params.field_count > river_shallow_field)
       param->set_river_shallow_alpha(light_params.number(row, river_shallow_field));
     if (light_params.field_count > river_deep_field)
@@ -432,6 +439,10 @@ SkyParam::SkyParam(int paramId, Noggit::NoggitRenderContext context)
 
         _highlight_sky = light_param.getInt(LightParamsDB::highlightSky);
         _glow = light_param.getFloat(glow_field);
+        // VANILLA: glow = LightFloatBand band 3 (LightParams field 3 is zeroed in 1.12 data) --
+        // see the matching fix in the raw-DBC path above.
+        if (classic_light_params && !floatParams[3].empty())
+          _glow = floatParams[3].front().value;
         _river_shallow_alpha = light_param.getFloat(river_shallow_field);
         _river_deep_alpha = light_param.getFloat(river_deep_field);
         _ocean_shallow_alpha = light_param.getFloat(ocean_shallow_field);
@@ -1083,24 +1094,12 @@ void Skies::update_sky_colors(glm::vec3 pos, int time)
 
   }
 
-  float fogEnd = _fog_distance / 20.f; // keep in sync with Sky.h fog_distance_end() (was /36, too close)
-  float fogStart = _fog_multiplier * fogEnd;
-  float fogRange = fogEnd - fogStart;
-
-  float fogFarClip = 500.f; // Max fog farclip possible
-
-  // Fog density curve. The shader applies fogFactor = 1 - ((end-dist)/(end-start))^fog_rate, so fog_rate
-  // is the exponent on the linear fog factor: 1.0 = pure linear (the client's GL_LINEAR fog), >1 = denser
-  // (more fog at every distance). The old curve (1.5 .. 7.0) was far steeper than the client -- it put
-  // ~80-97% fog at the range midpoint, which reads as "too much fog". Pull it back toward linear: a mild
-  // 1.0 .. 1.6 (denser only for very short fog ranges) so distant terrain hazes gradually like in-game.
-  if (fogRange <= fogFarClip)
-  {
-    _fog_rate = ((1.0f - (fogRange / fogFarClip)) * 0.6f) + 1.0f;
-  } else
-  {
-    _fog_rate = 1.0f;
-  }
+  // The 1.12 client uses pure LINEAR vertex fog (D3DFOG_LINEAR), verified via apitrace on Elwynn. The
+  // shader applies fogFactor = 1 - ((end-dist)/(end-start))^fog_rate, so fog_rate = 1.0 is the client's
+  // straight linear ramp between fog start and end. (Was a 1.0-1.6 exponent tuned by eye, which read as
+  // too-dense fog vs. the client.) fog_start/end distances are computed render-side (see WorldRender:
+  // fog_end = min(fog_distance_end, view_distance); fog_start stays the DBC fraction of fog_end).
+  _fog_rate = 1.0f;
 
   _last_pos = pos;
   _last_time = time;

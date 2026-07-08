@@ -31,5 +31,7 @@ void main()
   }
 
   f_dist = distance(camera, pos.xyz);
-  gl_Position = model_view_projection * pos;
+  // Camera-relative: model_view_projection is projection*view_rot (rotation only), so subtract the
+  // camera before it -- keeps particles locked to the (also camera-relative) models/terrain, no jitter.
+  gl_Position = model_view_projection * vec4(pos.xyz - camera, 1.0);
 }

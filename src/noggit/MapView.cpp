@@ -3904,6 +3904,7 @@ void MapView::setupViewMenu()
   _draw_water.set            (_settings->value("render/water",            true ).toBool());
   _draw_model_animations.set (_settings->value("render/model_animations", true ).toBool());
   _draw_bloom.set            (_settings->value("render/bloom",            true ).toBool());
+  _draw_ground_clutter.set   (_settings->value("render/ground_clutter",   true ).toBool());
   _draw_fog.set              (_settings->value("render/fog",              true ).toBool());
   _draw_vertex_color.set     (_settings->value("render/vertex_color",     true ).toBool());
   _draw_baked_shadows.set    (_settings->value("render/baked_shadows",    true ).toBool());
@@ -3927,6 +3928,7 @@ void MapView::setupViewMenu()
   ADD_TOGGLE (view_menu, "Water",       Qt::Key_F4, _draw_water);
   ADD_TOGGLE (view_menu, "Bloom",       Qt::Key_F5, _draw_bloom);
   ADD_TOGGLE (view_menu, "WMOs",        Qt::Key_F6, _draw_wmo);
+  ADD_TOGGLE (view_menu, "Ground clutter", Qt::SHIFT | Qt::Key_G, _draw_ground_clutter);
 
   ADD_TOGGLE_POST (view_menu, "Lines", Qt::Key_F7, _draw_lines,
                    [=]
@@ -7611,6 +7613,13 @@ MapView::~MapView()
   AsyncLoader::instance().wait_until_idle();
 
   OpenGL::context::scoped_setter const _ (::gl, context());
+  // Force the GPU fully idle BEFORE deleting any GL resource below (and in ~World via _world.reset()).
+  // Returning to menu / switching maps crashed inside the NVIDIA GL driver (nvoglv64.dll, __fastfail):
+  // the last rendered frame's draws were still in flight referencing textures/buffers that teardown then
+  // deleted, so the driver touched freed objects. glFinish blocks until all queued GL commands complete,
+  // so nothing the deletes free is still in use. (The per-call glGetError sync used to hide this; this is
+  // the explicit, sync-setting-independent fix.)
+  gl.finish();
   delete _texBrush;
   delete _viewport_overlay_ui;
 
@@ -8855,6 +8864,7 @@ void MapView::draw_map()
                ,false
                , _draw_wmo_exterior.get()
                , _draw_bloom.get()
+               , _draw_ground_clutter.get()
                );
 
   // reset after each world::draw call
