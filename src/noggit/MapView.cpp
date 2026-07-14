@@ -35,6 +35,7 @@
 #include <noggit/ui/MinimapCreator.hpp>
 #include <noggit/project/CurrentProject.hpp>
 #include <opengl/scoped.hpp>
+#include <noggit/mcp/McpServer.hpp>
 #include <noggit/ui/tools/ViewToolbar/Ui/ViewToolbar.hpp>
 #include <noggit/ui/tools/AssetBrowser/Ui/AssetBrowser.hpp>
 #include <noggit/ui/tools/AssetBrowser/ModelView.hpp>
@@ -1087,6 +1088,10 @@ void MapView::setupScriptingUi()
 {
   scriptingTool = new Noggit::Scripting::scripting_tool(this, this, _settings);
   _tool_panel_dock->registerTool("Scripting", scriptingTool);
+
+  // Phase 0 MCP endpoint: start the in-process AI-control server now that the scripting engine
+  // (its execution backend) exists. Owned by MapView, so it lives and dies with the open map.
+  _mcp_server = std::make_unique<Noggit::Mcp::McpServer>(this);
 }
 
 void MapView::setupObjectEditorUi()

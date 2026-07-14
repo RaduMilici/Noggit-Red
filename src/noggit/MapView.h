@@ -118,9 +118,14 @@ enum class save_mode
   all
 };
 
+namespace Noggit { namespace Mcp { class McpServer; } }
+
 class MapView : public Noggit::Ui::Tools::ViewportManager::Viewport
 {
   Q_OBJECT
+  // Phase 0 MCP endpoint drives the editor programmatically; it needs the scripting engine,
+  // the GL context and the camera-framing helper, so grant it friend access.
+  friend class Noggit::Mcp::McpServer;
 public:
   bool _mod_alt_down = false;
   bool _mod_ctrl_down = false;
@@ -473,6 +478,7 @@ private:
   Noggit::Ui::Tools::LightEditor* lightEditor;
   Noggit::Ui::Tools::ChunkManipulator::ChunkManipulatorPanel* _chunk_manipulator;
   Noggit::Scripting::scripting_tool* scriptingTool;
+  std::unique_ptr<Noggit::Mcp::McpServer> _mcp_server;
 
   OpenGL::texture* const _texBrush;
 
