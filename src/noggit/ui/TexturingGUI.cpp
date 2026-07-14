@@ -172,7 +172,10 @@ namespace Noggit
                   specular_filter->setFilterRegExp (on ? "true" : "");
                 }
               );
-      only_specular->setChecked (true);
+      // Default OFF: 1.12 / vanilla (Turtle) tilesets have no "_s.blp" specular variants, so leaving
+      // this filter ON hid EVERY texture -> the browser grid looked empty and you could never pick a
+      // texture to paint with / add to the quick palette. The checkbox still lets you opt back in.
+      only_specular->setChecked (false);
 
 
 
