@@ -14,6 +14,7 @@
 #include <limits>
 #include <thread>
 #include <chrono>
+#include <cstdlib>
 
 #include <QSettings>
 #include <QColor>
@@ -22,6 +23,35 @@
 
 
 using namespace Noggit::Ui::Tools;
+
+namespace
+{
+  // The offscreen preview MUST render with the main map-view GL context current. VAOs (and FBOs) are
+  // NOT shared across GL contexts (OpenGL spec) -- not even with AA_ShareOpenGLContexts -- so drawing
+  // the preview models in a separate offscreen context references VAOs created in the main context and
+  // __fastfails the NVIDIA driver (0xC0000409 in nvoglv64). Rendering in the context that OWNS the
+  // VAOs removes that crash class outright. Borrow the live map-view viewport's context to do it.
+  Noggit::Ui::Tools::ViewportManager::Viewport* main_viewport()
+  {
+    for (auto* vp : Noggit::Ui::Tools::ViewportManager::ViewportManager::_viewports)
+    {
+      if (vp && vp->getRenderContext() == Noggit::MAP_VIEW)
+        return vp;
+    }
+    return nullptr;
+  }
+
+  // Offscreen thumbnail rendering is DISABLED by default. The preview model/WMO draw __fastfails the
+  // NVIDIA driver (0xC0000409 in nvoglv64), surfacing at the next GL flush (readback). Dump-confirmed
+  // it's a DRIVER bug: it crashes even with the main map-view context current, it is NOT a C++
+  // exception (uncatchable), and it cannot be fixed from app code -- only avoided by not drawing.
+  // Set NOGGIT_ENABLE_PREVIEW_THUMBS=1 to re-enable the render (for debugging / a future driver fix).
+  bool offscreen_previews_enabled()
+  {
+    static bool const on = std::getenv("NOGGIT_ENABLE_PREVIEW_THUMBS") != nullptr;
+    return on;
+  }
+}
 
 
 PreviewRenderer::PreviewRenderer(int width, int height, Noggit::NoggitRenderContext context, QWidget* parent)
@@ -35,25 +65,13 @@ PreviewRenderer::PreviewRenderer(int width, int height, Noggit::NoggitRenderCont
   _context = context;
   _cache = {};
 
-  OpenGL::context::save_current_context const context_save (::gl);
-  // Share GL objects with the global (main-window) context so models uploaded there are valid to
-  // draw here -- otherwise the offscreen draw __fastfails the NVIDIA driver (see AA_ShareOpenGLContexts
-  // in main). AA_ShareOpenGLContexts already routes create() through the global share context, but
-  // set it explicitly too for clarity/robustness.
-  if (QOpenGLContext::globalShareContext())
-  {
-    _offscreen_context.setShareContext(QOpenGLContext::globalShareContext());
-  }
-  _offscreen_context.create();
-
+  // No private offscreen GL context: preview thumbnails are rendered into an FBO with the MAIN
+  // map-view context current (see renderToPixmap). VAOs aren't shared across contexts, so a second
+  // context's draws use invalid VAOs and __fastfail the NVIDIA driver; rendering in the VAO-owning
+  // context eliminates that. Just configure the FBO format and default lighting here (no GL needed).
   _fmt.setSamples(1);
   _fmt.setInternalTextureFormat(GL_RGBA8);
   _fmt.setAttachment(QOpenGLFramebufferObject::Depth);
-
-  _offscreen_surface.create();
-  _offscreen_context.makeCurrent(&_offscreen_surface);
-
-  OpenGL::context::scoped_setter const context_set (::gl, &_offscreen_context);
 
   _light_dir = glm::vec3(0.0f, 1.0f, 0.0f);
   _diffuse_light = {1.0f, 0.532352924f, 0.0f};
@@ -115,10 +133,15 @@ void PreviewRenderer::setModel(std::string const &filename)
 
 void PreviewRenderer::setModelOffscreen(std::string const& filename)
 {
-  OpenGL::context::save_current_context const context_save (::gl);
-  _offscreen_context.makeCurrent(&_offscreen_surface);
-  OpenGL::context::scoped_setter const context_set (::gl, &_offscreen_context);
-
+  // Offscreen thumbnails are disabled (see offscreen_previews_enabled / renderToPixmap): don't even
+  // load the model for a preview that won't be drawn. renderToPixmap returns a blank thumbnail.
+  if (!offscreen_previews_enabled())
+  {
+    _filename = filename;
+    return;
+  }
+  // setModel does no GL (it creates model instances + blocks on async load + computes extents); the
+  // actual GL upload/draw happens in renderToPixmap under the main map-view context.
   setModel(filename);
 }
 
@@ -478,24 +501,30 @@ QPixmap* PreviewRenderer::renderToPixmap()
   if(it != _cache.end())
     return &it->second;
 
-  // The whole GL section is wrapped: noggit's GL-error-check throws (from verify_context AND its
-  // destructor) on any GL error, and the preview offscreen context legitimately hits errors
-  // (e.g. bindBuffer GL_INVALID_OPERATION when a Model's GL buffers live in the main context, not
-  // this one). Unhandled, that throw escaped the Qt showEvent handler -> std::terminate ->
-  // 0xC0000409 (the asset-browser crash). Catch everything here and fall back to a blank preview.
+  // Offscreen thumbnails are DISABLED: the preview model/WMO draw __fastfails the NVIDIA driver
+  // (0xC0000409 in nvoglv64), surfacing at the next GL flush (this readback). Dump-confirmed it is a
+  // DRIVER bug -- it crashes even with the main map-view context current, is uncatchable (a driver
+  // __fastfail, not a C++ exception), and can only be avoided, not fixed, from app code. Return a
+  // blank thumbnail rather than issuing the crashing draw. The onscreen 3D ModelViewer uses a
+  // different path and is unaffected. Set NOGGIT_ENABLE_PREVIEW_THUMBS=1 to re-enable (debug only).
+  if (!offscreen_previews_enabled())
+    return &(_cache[curEntry] = QPixmap());
+
+  // (Only reached when previews are explicitly re-enabled.) Render into an FBO with the MAIN
+  // map-view context current -- mirrors WorldRender::saveMinimap. try/catch stays because noggit's
+  // gl-error-check (verify_context) can throw; a driver __fastfail, however, it cannot catch.
+  auto* main = main_viewport();
+  if (!main || !main->context() || !main->context()->isValid())
+  {
+    LogError << "PreviewRenderer: no map-view GL context available for '" << _filename
+             << "' -- skipping preview." << std::endl;
+    return &(_cache[curEntry] = QPixmap());
+  }
+
   try
   {
-    OpenGL::context::save_current_context const context_save (::gl);
-
-    if (!_offscreen_context.makeCurrent(&_offscreen_surface)
-        || QOpenGLContext::currentContext() != &_offscreen_context)
-    {
-      LogError << "PreviewRenderer: could not make the offscreen GL context current for '"
-               << _filename << "' -- skipping preview." << std::endl;
-      return &(_cache[curEntry] = QPixmap());
-    }
-
-    OpenGL::context::scoped_setter const context_set (::gl, &_offscreen_context);
+    main->makeCurrent();
+    OpenGL::context::scoped_setter const context_set (::gl, main->context());
 
     QOpenGLFramebufferObject pixel_buffer(_width, _height, _fmt);
     pixel_buffer.bind();
@@ -505,64 +534,23 @@ QPixmap* PreviewRenderer::renderToPixmap()
     gl.depthMask(GL_TRUE);
     gl.clear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
-    // FLUSHED STEP-LOG for the NVIDIA offscreen __fastfail hunt: gl.finish() forces each GL step to
-    // complete synchronously, so the LAST line written to log.txt before the process dies names the
-    // exact failing call. (Env NOGGIT_PREVIEW_TRACE=1 to enable; off by default -- it's slow.)
-    static bool const s_preview_trace = std::getenv("NOGGIT_PREVIEW_TRACE") != nullptr;
-    _preview_trace = s_preview_trace;
-    if (s_preview_trace) { LogError << "PREVIEW '" << _filename << "' pre-draw" << std::endl; gl.finish(); }
-
+    // draw() blocks per instance on wait_until_loaded()/waitForChildrenLoaded() (those are plain
+    // condition-variable waits -- they do NOT pump the Qt event loop), so geometry and textures are
+    // loaded by the time it returns. No async-loader wait/redraw dance and no context re-assert.
     tick(1.0f);
     draw();
 
-    if (s_preview_trace) { LogError << "PREVIEW '" << _filename << "' post-draw" << std::endl; gl.finish(); }
-
-    auto& async_loader = AsyncLoader::instance();
-
-    if (async_loader.is_loading())
-    {
-      // wait for the loader to finish
-      do
-      {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-      } while (async_loader.is_loading());
-
-      // redraw
-      gl.clear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-      draw();
-    }
-
-    // Clearing alpha from image
+    // Clear alpha from the image (opaque thumbnail).
     gl.colorMask(false, false, false, true);
     gl.clearColor(0.0f, 0.0f, 0.0f, 1.0f);
-    glClear(GL_COLOR_BUFFER_BIT);
+    gl.clear(GL_COLOR_BUFFER_BIT);
     gl.colorMask(true, true, true, true);
 
-    // The draws all complete, but the readback (glReadPixels via toImage) __fastfails the NVIDIA
-    // driver. Prime suspect: the offscreen context was lost during draw()'s async-loader wait
-    // (wait_until_loaded pumps and can make the main window context current again), so the readback
-    // runs against a context/FBO that is no longer valid. Re-assert both before reading.
-    bool const ctx_ok = (QOpenGLContext::currentContext() == &_offscreen_context)
-                     || _offscreen_context.makeCurrent(&_offscreen_surface);
-    bool fbo_ok = false;
-    if (ctx_ok)
-    {
-      pixel_buffer.bind();
-      gl.finish();
-      fbo_ok = pixel_buffer.isValid();
-    }
-    if (!ctx_ok || !fbo_ok)
-    {
-      LogError << "PreviewRenderer: offscreen context/FBO not ready at readback for '"
-               << _filename << "' (ctxOk=" << ctx_ok << " fboValid=" << fbo_ok
-               << ") -- skipping preview (no crash)." << std::endl;
-      return &(_cache[curEntry] = QPixmap());
-    }
-    if (_preview_trace) { LogError << "PREVIEW '" << _filename << "' pre-readback (toImage)" << std::endl; gl.finish(); }
     QPixmap result{};
-    result = std::move(QPixmap::fromImage(pixel_buffer.toImage()));
-    if (_preview_trace) { LogError << "PREVIEW '" << _filename << "' post-readback" << std::endl; }
+    if (pixel_buffer.isValid())
+      result = QPixmap::fromImage(pixel_buffer.toImage());
     pixel_buffer.release();
+    main->doneCurrent();
 
     if (result.isNull())
     {
@@ -577,12 +565,14 @@ QPixmap* PreviewRenderer::renderToPixmap()
   {
     LogError << "PreviewRenderer: preview render failed for '" << _filename
              << "' (" << ex.what() << ") -- skipping preview (no crash)." << std::endl;
+    try { main->doneCurrent(); } catch (...) {}
     return &(_cache[curEntry] = QPixmap());
   }
   catch (...)
   {
     LogError << "PreviewRenderer: preview render failed for '" << _filename
              << "' (unknown) -- skipping preview (no crash)." << std::endl;
+    try { main->doneCurrent(); } catch (...) {}
     return &(_cache[curEntry] = QPixmap());
   }
 }
@@ -807,15 +797,18 @@ void PreviewRenderer::unloadOpenglData()
 {
   if (_offscreen_mode)
   {
-    // Context gone (teardown): nothing to unload -- the GL resources die with it. Guarding avoids
-    // scoped_setter dereferencing a null/invalid context (context.cpp:21 versionFunctions -> AV).
-    if (!_offscreen_context.isValid())
-      return;
-    OpenGL::context::save_current_context const context_save (::gl);
-    _offscreen_context.makeCurrent(&_offscreen_surface);
-    OpenGL::context::scoped_setter const context_set (::gl, &_offscreen_context);
+    // Offscreen previews now render (and upload) in the MAIN map-view context, so unload our GL data
+    // there. If that context is gone (teardown / map-view destroyed) the GL resources die with it --
+    // skip; the deferred_upload_* dtors are already teardown-guarded. ViewportManager also calls this
+    // when the map-view loses its context, which resets _uploaded so we re-upload cleanly next time.
+    auto* main = main_viewport();
+    if (!main || !main->context() || !main->context()->isValid())
+      return;  // context gone: GL resources die with it; unload() w/o a context could throw
+    main->makeCurrent();
+    OpenGL::context::scoped_setter const context_set (::gl, main->context());
 
     unload();
+    main->doneCurrent();
     return;
   }
 

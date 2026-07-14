@@ -95,9 +95,9 @@ class PreviewRenderer : public Noggit::Ui::Tools::ViewportManager::Viewport
 
     std::map<std::tuple<std::string, int, int>, QPixmap> _cache;
 
-    QOpenGLContext _offscreen_context;
+    // NOTE: no private offscreen QOpenGLContext any more. Preview thumbnails render into an FBO with
+    // the MAIN map-view context current (renderToPixmap) so VAOs are valid -- see the .cpp header.
     QOpenGLFramebufferObjectFormat _fmt;
-    QOffscreenSurface _offscreen_surface;
 
     glm::vec3 _background_color;
     glm::vec3 _diffuse_light;

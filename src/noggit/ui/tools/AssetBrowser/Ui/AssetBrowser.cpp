@@ -330,13 +330,8 @@ void AssetBrowserWidget::showEvent(QShowEvent* event)
 {
   QMainWindow::showEvent(event);
 
-  // Warm the preview context on first open, NOT in the constructor: doing the offscreen GL burst
-  // (context creation + shader compiles + model upload + readback) during MapView construction
-  // intermittently fail-fasts the NVIDIA driver (0xC0000409 in nvoglv64) on map load.
-  if (!_preview_context_warmed)
-  {
-    _preview_context_warmed = true;
-    _preview_renderer->setModelOffscreen("world/wmo/azeroth/buildings/human_farm/farm.wmo");
-    _preview_renderer->renderToPixmap();
-  }
+  // The farm.wmo "warm-up" offscreen render was removed: it was the immediate crash trigger on
+  // asset-browser open. The preview model/WMO draw __fastfails the NVIDIA driver (0xC0000409 in
+  // nvoglv64) -- a driver bug that can't be caught or fixed from app code -- so offscreen thumbnails
+  // are disabled (see PreviewRenderer::renderToPixmap). The list + onscreen 3D preview still work.
 }
