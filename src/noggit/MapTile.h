@@ -160,6 +160,21 @@ public:
   [[nodiscard]]
   tsl::robin_map<AsyncObject*, std::vector<SceneObject*>> const& getObjectInstances() const { return object_instances; };
 
+  // Per-chunk object buckets (client MCRF semantics, checklist D1): render-only acceleration.
+  // Each of the 16x16 chunk cells lists the instances whose AABB overlaps it, plus the union AABB
+  // of those instances (can exceed the cell: objects overhang). On a partially-visible tile the
+  // renderer frustum-tests the ~33yd buckets and only per-instance-tests survivors, instead of
+  // testing every instance on the tile. Rebuilt lazily on the render thread whenever the tile's
+  // object set changes (add/remove/move all re-register through add_model/remove_model).
+  struct ObjectBucket
+  {
+    std::vector<std::pair<AsyncObject*, SceneObject*>> instances;
+    glm::vec3 aabb_min = glm::vec3(0.0f);
+    glm::vec3 aabb_max = glm::vec3(0.0f);
+  };
+
+  std::array<ObjectBucket, 256> const& getObjectBuckets();
+
   float camDist() { return _cam_dist; }
   void calcCamDist(glm::vec3 const& camera);
   void markExtentsDirty() { _extents_dirty = true; }
@@ -201,6 +216,10 @@ private:
   
   std::vector<uint32_t> uids;
   tsl::robin_map<AsyncObject*, std::vector<SceneObject*>> object_instances; // only includes M2 and WMO. perhaps a medium common ancestor then?
+
+  std::array<ObjectBucket, 256> _object_buckets;
+  bool _object_buckets_dirty = true;
+  void rebuildObjectBuckets();
 
   std::unique_ptr<MapChunk> mChunks[16][16];
   std::array<float, 145 * 256 * 4> _chunk_heightmap_buffer;

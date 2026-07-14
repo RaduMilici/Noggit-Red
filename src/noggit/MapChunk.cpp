@@ -26,6 +26,7 @@
 #include <iostream>
 #include <map>
 #include <QImage>
+#include <QtCore/QSettings>
 #include <limits>
 
 MapChunk::MapChunk(MapTile* maintile, BlizzardArchive::ClientFile* f, bool bigAlpha,tile_mode mode
@@ -2091,6 +2092,14 @@ void MapChunk::computeDetailDoodads()
   std::uint16_t const* mapping = texture_set->getDoodadMappingBase();
   std::uint8_t const* stencil = texture_set->getDoodadStencilBase();
 
+  // CLIENT frillDensity (wow.exe: CVar 1..256 -> DAT_00c7b494 = the number of scrambled SUBCELL
+  // VISITS per chunk in FUN_006bfc10, each visit placing the row's full density into one of the
+  // 64 subcells). Effective doodads per subcell = density * frillDensity / 64. The user's client
+  // runs 256 (the max) = 4x the DBC density -- that's the "thick like fur" fullness.
+  QSettings clutter_settings;
+  float const frill = std::clamp(clutter_settings.value("render/ground_clutter_frill_density", 256.0f).toFloat(), 1.0f, 256.0f);
+  float const frill_scale = frill / 64.0f;
+
   // Liquid coverage for the underwater test below (the client places no ground effects on submerged
   // terrain). One ChunkWater per MCNK; each liquid layer carries an 8x8 subchunk coverage mask.
   ChunkWater* const water_chunk = mt ? mt->Water.getChunk(px, py) : nullptr;
@@ -2182,9 +2191,10 @@ void MapChunk::computeDetailDoodads()
         continue;
       }
 
-      // Doodad table: the 4 doodad slots (repeated ids = higher chance -- there is no separate weight
-      // column in 1.12). Pick uniformly among the non-empty slots.
-      std::array<unsigned, 4> table{};
+      // Doodad table: the RAW 4 slots (client keeps empties in place -- the round-robin below
+      // indexes the raw array so an empty slot simply places nothing, which is how the client
+      // weights species and leaves gaps).
+      std::array<unsigned, 4> slot_ids{ 0, 0, 0, 0 };
       unsigned filled = 0;
       unsigned amount = 8;
       try
@@ -2195,11 +2205,15 @@ void MapChunk::computeDetailDoodads()
           unsigned const doodad_id = tex_rec.getUInt(GroundEffectTextureDB::Doodads + i);
           if (doodad_id && doodad_id != 0xFFFFFFFFu)
           {
-            table[filled++] = doodad_id;
+            slot_ids[i] = doodad_id;
+            ++filled;
           }
         }
+        // client (wow.exe FUN_006bfc10): N = density field, default 8 when 0, NO clamp -- dense
+        // grass rows (e.g. Westfall) author 16-24 per subcell and the client places them all;
+        // multiplied by the frillDensity visit ratio (see above)
         unsigned const a = tex_rec.getUInt(GroundEffectTextureDB::Amount);
-        amount = a ? std::min(a, 16u) : 8u;
+        amount = std::max(1u, static_cast<unsigned>(static_cast<float>(a ? a : 8u) * frill_scale + 0.5f));
       }
       catch (...)
       {
@@ -2210,9 +2224,12 @@ void MapChunk::computeDetailDoodads()
         continue;
       }
 
+      unsigned const subcell = static_cast<unsigned>(sy * 8 + sx);
       for (unsigned d = 0; d < amount; ++d)
       {
-        unsigned const doodad_id = table[static_cast<std::size_t>(next01() * filled) % filled];
+        // client-exact species pick (FUN_006bfc10): raw-slot round-robin doodad[(d + subcell) & 3].
+        // An empty slot -> no doodad this iteration (species weighting + natural gaps).
+        unsigned const doodad_id = slot_ids[(d + subcell) & 3u];
         if (!doodad_id)
         {
           continue;
@@ -2247,7 +2264,7 @@ void MapChunk::computeDetailDoodads()
         glm::vec3 const world_pos = cell_pos(sx, sy, u, v);
 
         float const yaw = next01() * glm::two_pi<float>();
-        float const scale = 0.9f + next01() * 0.35f; // subtle size variation
+        float const scale = 0.9f + next01() * 0.2f; // client: rand[-1,1] * 0.1 + 1.0 = [0.9, 1.1]
 
         glm::mat4x4 transform(1.0f);
         transform = glm::translate(transform, world_pos);

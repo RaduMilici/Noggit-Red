@@ -226,6 +226,8 @@ namespace OpenGL
     NOGGIT_FORCEINLINE void genRenderbuffers (GLsizei n, GLuint* renderbuffers);
     NOGGIT_FORCEINLINE void bindRenderbuffer (GLenum target, GLuint renderbuffer);
     NOGGIT_FORCEINLINE void renderbufferStorage (GLenum target, GLenum internalformat, GLsizei width, GLsizei height);
+    NOGGIT_FORCEINLINE void renderbufferStorageMultisample (GLenum target, GLsizei samples, GLenum internalformat, GLsizei width, GLsizei height);
+    NOGGIT_FORCEINLINE void blitFramebuffer (GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1, GLint dstX0, GLint dstY0, GLint dstX1, GLint dstY1, GLbitfield mask, GLenum filter);
     NOGGIT_FORCEINLINE void framebufferRenderbuffer (GLenum target, GLenum attachment, GLenum renderbuffertarget, GLuint renderbuffer);
 
     NOGGIT_FORCEINLINE void genQueries(GLsizei n, GLuint* ids);

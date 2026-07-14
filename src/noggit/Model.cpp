@@ -587,6 +587,13 @@ Model::Model(const std::string& filename, Noggit::NoggitRenderContext context)
   , _renderer(this)
 {
   memset(&header, 0, sizeof(ModelHeader));
+
+  // Fishing-pool water-surface effect (see Model::_water_surface_effect). Keyed on the model path;
+  // all are World\SkillActivated\TradeskillEnablers\Tradeskill_FishSchool_*.
+  std::string lowered = filename;
+  std::transform(lowered.begin(), lowered.end(), lowered.begin(),
+                 [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  _water_surface_effect = lowered.find("fishschool") != std::string::npos;
 }
 
 void Model::finishLoading()
@@ -1033,10 +1040,12 @@ void Model::initCommon(const BlizzardArchive::ClientFile& f)
   ModelTextureDef const* texdef = reinterpret_cast<ModelTextureDef const*>(f.getBuffer() + header.ofsTextures);
   _textureFilenames.resize(header.nTextures);
   _specialTextures.resize(header.nTextures);
+  _texture_flags.resize(header.nTextures);
   int classic_missing_texture_placeholders = 0;
 
   for (size_t i = 0; i < header.nTextures; ++i)
   {
+    _texture_flags[i] = texdef[i].flags;
     if (texdef[i].type == 0)
     {
       _specialTextures[i] = -1;
@@ -2456,7 +2465,12 @@ bool Model::advanceIdleSchedule(int anim_id, long long anim_time,
   out_time = static_cast<int>(within % std::max(1, st.cur_len));
 
   out_do_blend = false;
-  if (st.prev_seq >= 0 && st.cur_blend > 0 && within < st.cur_blend)
+  // Blend ONLY across a change to a DIFFERENT sequence. When the scheduler re-rolls the SAME
+  // variation (a seamless loop -- e.g. a bird/dragon wing-flap replaying), prev_seq == cur_seq and
+  // the old code still cross-faded FROM that variation's FROZEN last frame INTO its restart -- which
+  // made the wings hesitate/pause for the blend duration every loop ("sometimes pause mid-animation,
+  // bad transition"). A seamless loop needs no blend; the track wraps cleanly on its own.
+  if (st.prev_seq >= 0 && st.prev_seq != st.cur_seq && st.cur_blend > 0 && within < st.cur_blend)
   {
     out_blend_seq_from = st.prev_seq;
     out_blend_time_from = std::max(0, st.prev_len - 1); // previous variation sampled at its end

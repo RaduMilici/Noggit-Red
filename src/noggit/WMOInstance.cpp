@@ -102,7 +102,15 @@ void WMOInstance::draw ( OpenGL::Scoped::use_program& wmo_shader
       }
     }
 
-    if (!no_cull && (!region_visible || (region_visible <= 1 && !frustum.intersects(extents[1], extents[0]))))
+    if (skip_tile_culling && !no_cull)
+    {
+      // not tile-registered (gameobject WMO): frustum-only
+      if (!frustum.intersects(extents[1], extents[0]))
+      {
+        return;
+      }
+    }
+    else if (!no_cull && (!region_visible || (region_visible <= 1 && !frustum.intersects(extents[1], extents[0]))))
     {
       return;
     }
@@ -126,6 +134,7 @@ void WMOInstance::draw ( OpenGL::Scoped::use_program& wmo_shader
               , display
               , !draw_exterior
               , world_renderer
+              , &portal_group_visibility
               );
   }
 
@@ -329,8 +338,16 @@ std::vector<wmo_doodad_instance*> WMOInstance::get_visible_doodads
 
   if (!wmo->is_hidden() || draw_hidden_models)
   {
+    // Portal culling parity for props: groups the last draw() portal-culled hide their doodads too.
+    bool const use_portal_vis = portal_group_visibility.size() == wmo->groups.size();
+
     for (int i = 0; i < wmo->groups.size(); ++i)
     {
+      if (use_portal_vis && !portal_group_visibility[i])
+      {
+        continue;
+      }
+
       if (wmo->groups[i].is_visible(_transform_mat, frustum, cull_distance, camera, display))
       {
         for (auto& doodad : _doodads_per_group[i])
@@ -344,7 +361,7 @@ std::vector<wmo_doodad_instance*> WMOInstance::get_visible_doodads
         }
       }
     }
-  } 
+  }
 
   return doodads;
 }

@@ -1254,6 +1254,7 @@ void MapTile::remove_model(uint32_t uid)
 
     instance->derefTile(this);
     _requires_object_extents_recalc = true;
+    _object_buckets_dirty = true;
   }
 }
 
@@ -1282,6 +1283,7 @@ void MapTile::remove_model(SceneObject* instance)
     }
 
     _requires_object_extents_recalc = true;
+    _object_buckets_dirty = true;
   }
 }
 
@@ -1316,6 +1318,7 @@ void MapTile::add_model(uint32_t uid)
       _requires_object_extents_recalc = true;
     }
 
+    _object_buckets_dirty = true;
     instance->refTile(this);
   }
 }
@@ -1349,8 +1352,79 @@ void MapTile::add_model(SceneObject* instance)
       _requires_object_extents_recalc = true;
     }
 
+    _object_buckets_dirty = true;
     instance->refTile(this);
   }
+}
+
+std::array<MapTile::ObjectBucket, 256> const& MapTile::getObjectBuckets()
+{
+  if (_object_buckets_dirty)
+  {
+    rebuildObjectBuckets();
+  }
+  return _object_buckets;
+}
+
+void MapTile::rebuildObjectBuckets()
+{
+  std::lock_guard<std::mutex> const lock(_mutex);
+
+  for (auto& bucket : _object_buckets)
+  {
+    bucket.instances.clear();
+  }
+
+  bool all_loaded = true;
+
+  for (auto& pair : object_instances)
+  {
+    for (auto* instance : pair.second)
+    {
+      glm::vec3 ext_min, ext_max;
+
+      if (instance->finishedLoading())
+      {
+        instance->ensureExtents();
+        ext_min = instance->extents[0];
+        ext_max = instance->extents[1];
+      }
+      else
+      {
+        // No extents yet: park it in a generous box around its position and keep the buckets dirty
+        // so the tile rebuilds next frame until everything has loaded (self-healing).
+        all_loaded = false;
+        ext_min = instance->pos - glm::vec3(30.0f);
+        ext_max = instance->pos + glm::vec3(30.0f);
+      }
+
+      int const i0 = std::clamp(static_cast<int>((ext_min.x - xbase) / CHUNKSIZE), 0, 15);
+      int const i1 = std::clamp(static_cast<int>((ext_max.x - xbase) / CHUNKSIZE), 0, 15);
+      int const j0 = std::clamp(static_cast<int>((ext_min.z - zbase) / CHUNKSIZE), 0, 15);
+      int const j1 = std::clamp(static_cast<int>((ext_max.z - zbase) / CHUNKSIZE), 0, 15);
+
+      for (int j = j0; j <= j1; ++j)
+      {
+        for (int i = i0; i <= i1; ++i)
+        {
+          auto& bucket = _object_buckets[j * 16 + i];
+          if (bucket.instances.empty())
+          {
+            bucket.aabb_min = ext_min;
+            bucket.aabb_max = ext_max;
+          }
+          else
+          {
+            bucket.aabb_min = glm::min(bucket.aabb_min, ext_min);
+            bucket.aabb_max = glm::max(bucket.aabb_max, ext_max);
+          }
+          bucket.instances.emplace_back(pair.first, instance);
+        }
+      }
+    }
+  }
+
+  _object_buckets_dirty = !all_loaded;
 }
 
 void MapTile::initEmptyChunks()

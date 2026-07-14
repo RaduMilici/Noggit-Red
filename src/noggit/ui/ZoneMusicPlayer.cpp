@@ -21,6 +21,7 @@
 #include <sstream>
 #include <algorithm>
 #include <cstdlib>
+#include <cmath>
 
 namespace Noggit::Ui
 {
@@ -215,41 +216,64 @@ namespace Noggit::Ui
     _song_list->clearSelection();
   }
 
-  void ZoneMusicPlayer::update_zone(int zone_music_id, bool is_day)
+  void ZoneMusicPlayer::update_zone(int zone_music_id, int intro_music_id, bool is_day)
   {
-    // Zone has NO music -> keep whatever is currently playing (do NOT stop/switch).
-    if (zone_music_id <= 0)
+    // Zone has NEITHER looping music NOR an intro -> keep whatever is currently playing (don't switch).
+    if (zone_music_id <= 0 && intro_music_id <= 0)
     {
       return;
     }
 
-    // Same music set (and day/night) -> let the current track keep playing.
-    if (zone_music_id == _current_zone_music_id && is_day == _is_day)
+    // Same music set + intro + day/night -> let the current track keep playing.
+    if (zone_music_id == _current_zone_music_id && intro_music_id == _current_intro_music_id
+        && is_day == _is_day)
     {
       return;
     }
 
-    // New zone music -> switch to it.
+    // New zone music/intro -> switch to it.
+    bool const intro_changed = (intro_music_id != _current_intro_music_id);
     _current_zone_music_id = zone_music_id;
+    _current_intro_music_id = intro_music_id;
     _is_day = is_day;
 
     rebuild_playlist();
 
-    if (_enabled && !_files.empty())
+    if (_enabled)
     {
       _silence_timer->stop();
-      play_random();
+      // CLIENT-FAITHFUL: the zone INTRO fires ONCE on entry (if off its MinDelayMinutes cooldown), at
+      // full volume, as a one-shot before the looping zone music. Play it first; when it ends the
+      // normal silence -> random-loop-track flow takes over. Otherwise hard-start a looping track.
+      if (_intro_index >= 0 && intro_changed && intro_off_cooldown(_current_intro_music_id))
+      {
+        _intro_last_played[_current_intro_music_id] = QDateTime::currentMSecsSinceEpoch();
+        play_index(_intro_index);
+      }
+      else if (!_files.empty())
+      {
+        play_random();
+      }
     }
+  }
+
+  bool ZoneMusicPlayer::intro_off_cooldown(int intro_id) const
+  {
+    auto const it = _intro_last_played.find(intro_id);
+    if (it == _intro_last_played.end()) { return true; } // never played this session
+    return (QDateTime::currentMSecsSinceEpoch() - it->second) >= _intro_min_delay_ms;
   }
 
   void ZoneMusicPlayer::rebuild_playlist()
   {
     _files.clear();
-    _dir.clear();
+    _dirs.clear();
     _song_list->clear();
     _now_playing = -1;
     _silence_min_ms = 0;
     _silence_max_ms = 0;
+    _intro_index = -1;
+    _intro_min_delay_ms = 0;
 
     std::string zone_name = "-";
     int sound_entry_id = 0;
@@ -272,40 +296,78 @@ namespace Noggit::Ui
       sound_entry_id = 0;
     }
 
-    _zone_label->setText(tr("Zone: %1").arg(QString::fromStdString(zone_name)));
-
-    try
+    // Add every non-empty file of a SoundEntries row to the playlist, each carrying its OWN directory
+    // (SoundEntries.DirectoryBase), with a UI label prefix.
+    auto add_sound_entry = [this](int se_id, char const* prefix)
     {
-      if (sound_entry_id > 0 && gSoundEntriesDB.CheckIfIdExists(sound_entry_id))
+      try
       {
-        auto const se = gSoundEntriesDB.getByID(sound_entry_id);
-        _dir = se.getString(SoundEntriesDB::FilePath);
-
+        if (se_id <= 0 || !gSoundEntriesDB.CheckIfIdExists(se_id)) { return; }
+        auto const se = gSoundEntriesDB.getByID(se_id);
+        std::string const dir = se.getString(SoundEntriesDB::FilePath);
         for (int i = 0; i < 10; ++i)
         {
           std::string const fn = se.getString(SoundEntriesDB::Filenames + i);
           if (!fn.empty())
           {
             _files.push_back(fn);
-            _song_list->addItem(QString::fromStdString(fn));
+            _dirs.push_back(dir);
+            _song_list->addItem(QString::fromStdString(std::string(prefix) + fn));
           }
+        }
+      }
+      catch (...) {}
+    };
+
+    // 1) Looping zone music (ZoneMusic.dbc day/night SoundEntries).
+    add_sound_entry(sound_entry_id, "");
+
+    // 2) Zone INTRO music (ZoneIntroMusicTable -> SoundEntries): city/instance intros such as
+    //    "IronForge Intro.mp3" and "cot_intro.mp3" live on IntroSound, not ZoneMusic -- this is what
+    //    was missing, so they never showed in the list or played. Labelled "[Intro]".
+    int intro_sound_id = 0;
+    try
+    {
+      if (_current_intro_music_id > 0 && gZoneIntroMusicTableDB.CheckIfIdExists(_current_intro_music_id))
+      {
+        auto const zi = gZoneIntroMusicTableDB.getByID(_current_intro_music_id);
+        intro_sound_id = static_cast<int>(zi.getUInt(ZoneIntroMusicTableDB::SoundId));
+        // MinDelayMinutes -> ms cooldown (client: FUN_00461440 blocks replay for MinDelayMinutes*60000).
+        _intro_min_delay_ms = static_cast<int>(zi.getUInt(ZoneIntroMusicTableDB::MinDelayMinutes)) * 60000;
+        if (zone_name == "-" || zone_name.empty())
+        {
+          zone_name = zi.getString(ZoneIntroMusicTableDB::Name); // label the zone even if it has intro-only music
         }
       }
     }
     catch (...)
     {
-      _files.clear();
+      intro_sound_id = 0;
     }
+    int const before_intro = static_cast<int>(_files.size());
+    add_sound_entry(intro_sound_id, "[Intro] ");
+    if (static_cast<int>(_files.size()) > before_intro)
+    {
+      _intro_index = before_intro; // one-shot on entry; excluded from the random loop rotation
+    }
+
+    _zone_label->setText(tr("Zone: %1").arg(QString::fromStdString(zone_name)));
   }
 
   void ZoneMusicPlayer::play_random()
   {
-    if (_files.empty())
+    // Random LOOP track only -- the intro is a one-shot fired on zone entry, never in the rotation.
+    std::vector<int> pool;
+    for (int i = 0; i < static_cast<int>(_files.size()); ++i)
+    {
+      if (i != _intro_index) { pool.push_back(i); }
+    }
+    if (pool.empty())
     {
       return;
     }
-    std::uniform_int_distribution<int> dist(0, static_cast<int>(_files.size()) - 1);
-    play_index(dist(_rng));
+    std::uniform_int_distribution<int> dist(0, static_cast<int>(pool.size()) - 1);
+    play_index(pool[dist(_rng)]);
   }
 
   void ZoneMusicPlayer::play_index(int index)
@@ -332,7 +394,7 @@ namespace Noggit::Ui
     ensure_deck(idle);
 
     std::stringstream path;
-    path << _dir << "\\" << _files[index];
+    path << _dirs[index] << "\\" << _files[index];
 
     auto* client_data = Noggit::Application::NoggitApplication::instance()->clientData();
     if (!client_data || !client_data->exists(path.str()))
@@ -363,7 +425,9 @@ namespace Noggit::Ui
       }
       _deck_files[idle] = temp;
 
-      _decks[idle]->setVolume(0);  // start silent and fade in over the old deck
+      // CLIENT-FAITHFUL: the new track HARD-STARTS at full volume -- the 1.12 client sets the stream
+      // volume instantly (FSOUND_SetVolume) with NO fade-in. Only the previous deck fades out.
+      _decks[idle]->setVolume(_master_volume);
       _decks[idle]->setMedia(QUrl::fromLocalFile(temp->fileName()));
       _decks[idle]->play();
     }
@@ -373,68 +437,65 @@ namespace Noggit::Ui
       return;
     }
 
-    // The idle deck is now the live one; the previously-live deck becomes the one we fade out.
+    // The idle deck is now the live one; the previously-live deck becomes the one we fade out (4.0 s).
     _active_deck = idle;
     _now_playing = index;
     _song_list->setCurrentRow(index);
     _track_ending = false;  // fresh track -> allow the end-of-track watchdog to fire again
 
-    _fade_timer->start(50); // ~1s crossfade
+    _fade_from_volume = (_decks[1 - _active_deck] ? _decks[1 - _active_deck]->volume() : 0);
+    _fade_ticks = 0;
+    _fade_timer->start(FADE_TICK_MS); // ramps the OUTGOING deck to silence over FADE_OUT_MS
   }
 
   void ZoneMusicPlayer::tick_fade()
   {
-    int const step = std::max(1, _master_volume / 20); // ~1s fade (20 steps x 50ms)
+    // CLIENT-FAITHFUL: only the OUTGOING deck ramps (to silence over FADE_OUT_MS = 4.0 s). The live
+    // deck holds at full volume the whole time -- the 1.12 client does NOT fade music in.
+    QMediaPlayer* const in_deck  = _decks[_active_deck];
+    QMediaPlayer* const out_deck = _decks[1 - _active_deck];
 
-    auto* in_deck = _decks[_active_deck];
-    auto* out_deck = _decks[1 - _active_deck];
-
-    // Fade the live deck IN toward the master volume.
-    bool in_done = true;
-    if (in_deck)
+    if (in_deck && in_deck->volume() != _master_volume)
     {
-      int v = in_deck->volume();
-      if (v < _master_volume)
-      {
-        v = std::min(_master_volume, v + step);
-        in_deck->setVolume(v);
-        in_done = (v >= _master_volume);
-      }
+      in_deck->setVolume(_master_volume); // hold live deck at full (guards against slider drift)
     }
 
-    // Fade the previous deck OUT, then stop it once silent so it's free for the next switch.
-    bool out_done = true;
+    _fade_ticks++;
+    float const t = std::min(1.0f,
+                             static_cast<float>(_fade_ticks * FADE_TICK_MS) / static_cast<float>(FADE_OUT_MS));
     if (out_deck)
     {
-      int v = out_deck->volume();
-      if (v > 0)
-      {
-        v = std::max(0, v - step);
-        out_deck->setVolume(v);
-        out_done = (v <= 0);
-      }
-      if (out_done && out_deck->state() != QMediaPlayer::StoppedState)
+      // CLIENT-EXACT curve: a LINEAR amplitude ramp. The 1.12 client fades in FMOD's 0-255 volume with
+      // step = 255/duration_ms (RE: FUN_007a5a50, rate const 1000 = ms/sec) -- i.e. a straight
+      // amplitude decrement per millisecond. (An earlier logarithmic curve LINGERED at low volume,
+      // which is where QMediaPlayer's coarse 0-100 steps are most audible -> the "cut out at the end".
+      // The real linear ramp passes through the low tail quickly, so 50 Hz updates read smooth.)
+      int const v = std::max(0, static_cast<int>(std::lround(_fade_from_volume * (1.0f - t))));
+      out_deck->setVolume(v);
+      if (t >= 1.0f && out_deck->state() != QMediaPlayer::StoppedState)
       {
         out_deck->stop();
       }
     }
-
-    if (in_done && out_done)
+    if (t >= 1.0f)
     {
-      if (in_deck)
-      {
-        in_deck->setVolume(_master_volume);
-      }
       _fade_timer->stop();
     }
   }
 
   void ZoneMusicPlayer::schedule_next()
   {
-    // Clamp the authored silence interval to a sane range so a new song ALWAYS reliably follows the
-    // one that just ended (garbage / very large DBC values won't leave it silent indefinitely).
-    int const lo = std::clamp(_silence_min_ms, 0, 15000);
-    int const hi = std::clamp(_silence_max_ms, lo, 15000);
+    // Silence between tracks = ZoneMusic.dbc SilenceIntervalMin..Max; when the DBC authors NO interval
+    // the client falls back to a 6000 ms gap (RE: FUN_004601f0 "+6000"). Clamp to a sane ceiling so a
+    // garbage DBC value can't leave it silent forever.
+    int lo = _silence_min_ms;
+    int hi = _silence_max_ms;
+    if (lo <= 0 && hi <= 0)
+    {
+      lo = hi = DEFAULT_SILENCE_MS;
+    }
+    lo = std::clamp(lo, 0, 30000);
+    hi = std::clamp(hi, lo, 30000);
     int wait_ms = lo;
     if (hi > lo)
     {

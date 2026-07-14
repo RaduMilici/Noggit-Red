@@ -320,8 +320,13 @@ public:
     static const size_t BracersDisplayID = 15;
     static const size_t GlovesDisplayID = 16;
     static const size_t TabardDisplayID = 17;
-    // field 18: BakeName (string) = baked composite NPC texture
-    static const size_t BakedTexture = 18;
+    // BakeName (string) = baked composite NPC texture. WotLK inserted 2 fields before it (an 11th
+    // NPCItemDisplay/cape slot + Flags), so it sits at column 18 in the 19-field Vanilla/Classic DBC
+    // but column 20 in the 21-field WotLK DBC. Verified empirically: the SAME NPC (ID 23/36) has
+    // identical item slots 8..17 in both, with the BakeName string at 18 (Turtle) vs 20 (WotLK).
+    // Reading the wrong column in WotLK returns a numeric 0 -> empty baked texture. Resolved per the
+    // loaded project's client version (Turtle byte-identical). Defined in DBC.cpp.
+    static size_t BakedTexture();
   };
 
   class CreatureModelDataDB : public DBCFile
@@ -402,16 +407,29 @@ public:
       DBCFile("DBFilesClient\\CharSections.dbc")
     { }
 
+    // Columns that DON'T move between client versions.
     static const size_t ID = 0;
     static const size_t RaceID = 1;
     static const size_t SexID = 2;
     static const size_t BaseSection = 3;
-    static const size_t VariationIndex = 4;
-    static const size_t ColorIndex = 5;
-    static const size_t TextureName1 = 6;
-    static const size_t TextureName2 = 7;
-    static const size_t TextureName3 = 8;
-    static const size_t Flags = 9;
+
+    // CharSections.dbc was REORDERED between Vanilla/Classic and WotLK: WotLK moved the Type
+    // (VariationIndex) and Color (ColorIndex) columns to AFTER the three texture names + flags.
+    // The record has the same field COUNT, so a header scan can't tell them apart -- hardcoding one
+    // order makes the other client read body textures from the wrong columns. Verified empirically
+    // against the stock DBCs (the skin ColorIndex increments 0,1,2 in lockstep with the skin texture
+    // changing Skin00_00 -> 00_01 -> 00_02 in BOTH files):
+    //   CLASSIC/Turtle: Var=4 Color=5 Tex=6,7,8 Flags=9
+    //   WotLK:          Tex=4,5,6 Flags=7 Var=8 Color=9
+    // These resolve to the correct physical column for the CURRENTLY loaded project's client version,
+    // so a CLASSIC (Turtle/Vanilla) project reads the exact same columns as before while WotLK
+    // projects read the right ones. (Defined in DBC.cpp so this header stays project-include-free.)
+    static size_t VariationIndex();
+    static size_t ColorIndex();
+    static size_t TextureName1();
+    static size_t TextureName2();
+    static size_t TextureName3();
+    static size_t Flags();
   };
 
 class WMOAreaTableDB : public DBCFile

@@ -32,7 +32,11 @@ namespace OpenGL
   }
   shader::~shader()
   {
-    gl.deleteShader (_handle);
+    // teardown-safe: never let a GL call throw from a destructor (see program::~program).
+    if (_handle && QOpenGLContext::currentContext())
+    {
+      try { gl.deleteShader (_handle); } catch (...) {}
+    }
   }
 
   std::string shader::src_from_qrc(std::string const& shader_alias)
@@ -118,9 +122,13 @@ namespace OpenGL
   }
   program::~program()
   {
-    if (_handle)
+    // teardown-safe: never let a GL call throw from a destructor -> std::terminate (e.g. the
+    // BLPRenderer atexit dtor, or Circle::_decal_program destroyed at process teardown, when the
+    // owning context is gone OR a different context is current). Swallow any throw; the program dies
+    // with its context anyway. (See scoped.ipp deferred_upload_buffers dtor for the full rationale.)
+    if (_handle && QOpenGLContext::currentContext())
     {
-      gl.deleteProgram (*_handle);
+      try { gl.deleteProgram (*_handle); } catch (...) {}
     }
   }
 

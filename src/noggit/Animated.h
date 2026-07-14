@@ -278,6 +278,16 @@ namespace Animation
             )
     {
       _interpolationType = animationBlock.type;
+      // CLIENT-CANON (1.12, RE note 29, asm @00714e31): the vanilla client treats the interp type
+      // as BINARY -- 0 = step, ANY other value = plain LINEAR lerp over FLAT key arrays. Vanilla
+      // type-2 "hermite" tracks carry NO tangent triples (nKeys == nTimes across the entire Turtle
+      // corpus: goblin/DoomGuard bones, lavahorse transparency 113/113, the kara offhand texanim)
+      // -- reading them as (value,in,out) triples sampled garbage PAST the key array. Clamp 2/3 to
+      // LINEAR; the HERMITE triple read below is for the WOTLK block format only.
+      if (_interpolationType > Animation::Interpolation::Type::LINEAR)
+      {
+        _interpolationType = Animation::Interpolation::Type::LINEAR;
+      }
 
       _globalSequences = globalSequences;
       _globalSequenceID = animationBlock.seq;

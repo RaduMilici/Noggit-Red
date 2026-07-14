@@ -77,6 +77,7 @@ public:
     std::uint32_t guid = 0;
     std::uint32_t entry = 0;
     std::uint32_t display_id = 0;
+    std::uint32_t faction = 0; // creature_template faction (FactionTemplate.dbc id) -> circle hostility color
     std::string name;
     glm::vec3 pos = glm::vec3(0.0f);
     glm::vec3 original_pos = glm::vec3(0.0f);
@@ -108,6 +109,14 @@ public:
     bool dirty = false;
     std::optional<ModelInstance> model_instance;
     std::vector<AttachmentModel> attachment_models;
+
+    // Mount (creature_addon.mount_display_id): mounted NPCs ride a mount model. The mount renders at
+    // the spawn's ground position and the rider (model_instance above) is re-seated onto the mount's
+    // MountMain attachment (id 0) at draw time. Built lazily by ensureCreatureSpawnModel.
+    std::uint32_t mount_display_id = 0;
+    std::string mount_model_path;
+    bool mount_create_failed = false;
+    std::optional<ModelInstance> mount_instance;
 
     // World radius of the ground selection circle, EXACTLY like the live client (see
     // bounding_radius above; the scale is already applied). Falls back to the model footprint
@@ -159,6 +168,9 @@ public:
     bool pending_delete = false; // marked for deletion (Del); exported as DELETE, undoable via Ctrl+Z
     bool dirty = false;
     std::optional<ModelInstance> model_instance;
+    // WMO-model gameobjects (e.g. Turtle player housing: GameObjectDisplayInfo points at a .wmo):
+    // rendered through the WMO pipeline instead of the M2 spawn path.
+    std::optional<WMOInstance> wmo_instance;
 
     GameObjectSpawnOverlay() = default;
     GameObjectSpawnOverlay(GameObjectSpawnOverlay&&) noexcept = default;
@@ -227,17 +239,38 @@ public:
   // a sub-area in Searing Gorge resolves to Searing Gorge). Returns -1 if the tile/area isn't loaded.
   unsigned int getZoneId(glm::vec3 const&);
   // ZoneMusic id for a position: WMOAreaTable.ZoneMusic when inside a WMO (dungeons/caves), else the
-  // AreaTable parent chain. 0 = no music authored.
-  unsigned int getWMOZoneMusic(glm::vec3 const&);
+  // AreaTable parent chain. 0 = no music authored. wmo_field selects the WMOAreaTable column
+  // (ZoneMusic vs IntroSound) so the same resolver serves looping music AND intro music.
+  unsigned int getWMOZoneMusic(glm::vec3 const&, size_t wmo_field);
   int getZoneMusic(glm::vec3 const&);
+  // One-shot INTRO music id (ZoneIntroMusicTable) for a position -- same resolution as getZoneMusic
+  // but reads the IntroSound columns. 0 = no intro authored.
+  int getZoneIntroMusic(glm::vec3 const&);
+  // Shared resolver behind getZoneMusic/getZoneIntroMusic: wmo_field / area_field pick which
+  // WMOAreaTable / AreaTable column to read (ZoneMusic or IntroSound).
+  int getZoneMusicField(glm::vec3 const&, size_t wmo_field, size_t area_field);
   // True if pos falls inside a loaded WMO's group AABB (i.e. the camera is standing inside a building/
   // dungeon interior, not merely inside its loose outer AABB). Used to drop the client's outdoor
   // FFXGlow floor when indoors (see renderBloomAndComposite).
   bool camera_is_inside_wmo(glm::vec3 const& pos);
+  // Sticky interior-fog state (see getInteriorFog): once a WMO fog is chosen it HOLDS while the camera
+  // stays inside that instance's outer AABB -- room-AABB containment alone is gappy (Kara: one step and
+  // the fog dropped). Cleared on leaving the WMO or entering an exterior group.
+  unsigned _sticky_fog_uid = 0;
+  int _sticky_fog_id = -1;
   // Gather every loaded indoor group's world AABB + room ambient (see InteriorVolume) once. Calls the
   // EXPENSIVE getGroupExtents per WMO -- callers MUST throttle this, never per-object-per-frame -- so
   // object interior tests become cheap AABB checks. Lights indoor objects by the room, not the sun.
   void collect_interior_volumes(std::vector<InteriorVolume>& out);
+  // Cheap fingerprint of the LOADED WMO instance set (uids of finished instances). Changes the frame
+  // a WMO finishes streaming in (or is added/removed), so the interior/fog volume gathers can refresh
+  // IMMEDIATELY -- objects were visibly re-lit up to a second AFTER their room appeared (60-frame epoch).
+  std::uint64_t loaded_wmo_fingerprint();
+  // Gather every loaded WMO instance's MFOG entries in world space (see EnvFogVolume) for the
+  // per-frame entity fog (the camera's fog context). Throttle like collect_interior_volumes.
+  // Collects the group AABBs of every loaded WMO instance whose WMO has MORE than the default
+  // MFOG entry -- the camera-fog resolve picks its containing group from these (note 27).
+  void collect_fog_volumes(std::vector<WmoGroupFogVolume>& out);
   // If the camera is inside a WMO group that has authored interior fog (MFOG), fills color/start/end
   // and returns true. Used to apply that fog to the whole scene (terrain, doodads, light shafts).
   bool getInteriorFog(glm::vec3 const& pos, glm::vec3& out_color, float& out_start, float& out_end);

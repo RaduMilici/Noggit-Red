@@ -237,6 +237,24 @@ void ModelRender::upload()
 
   _buffers.upload();
   _vertex_arrays.upload();
+  // Context-loss guard (crash-hunt 2026-07-08): during a map switch, upload() can run while no usable
+  // GL context is current -- glGenBuffers then yields 0 names and every bind after is
+  // GL_INVALID_OPERATION, feeding the NVIDIA driver poisoned commands (the sporadic nvoglv64 AV
+  // dumps). If generation failed, bail WITHOUT setting _uploaded so the next frame (with a proper
+  // context) retries cleanly.
+  if (_buffers[0] == 0 || _vertex_arrays[0] == 0)
+  {
+    static int s_ctx_guard_logs = 0;
+    if (s_ctx_guard_logs < 5)
+    {
+      ++s_ctx_guard_logs;
+      LogError << "ModelRender::upload aborted: GL name generation failed (no current context?) model='"
+               << _model->file_key().stringRepr() << "' -- retrying next frame" << std::endl;
+    }
+    _buffers.unload();
+    _vertex_arrays.unload();
+    return;
+  }
   _bone_matrices_buf_tex = 0;
   _bone_matrices_buffer_size = 0;
 
@@ -307,6 +325,7 @@ void ModelRender::draw(glm::mat4x4 const& model_view
     , bool no_cull
     , bool bloom_mask_only
     , glm::vec4 const& interior_light
+    , float dist_fade
 )
 {
   if (!_model->finishedLoading() || _model->loading_failed())
@@ -382,7 +401,14 @@ void ModelRender::draw(glm::mat4x4 const& model_view
     m2_shader.uniform("instance_interior", interior_light);
   }
 
-  if (_model->animBones)
+  // Only bind the bone-matrix samplerBuffer when it actually has storage AND matrices. Sampling a
+  // ZERO-SIZE texture buffer is undefined and the NVIDIA driver __fastfails on it -- which is the
+  // asset-browser preview crash: upload() sizes this buffer from bone_matrices at upload time (0 if
+  // bones aren't computed yet), and if animate()/updateBoneMatrices then doesn't run before the draw
+  // (animcalc already set), the buffer stays 0-size while the draw binds+samples it. Fall back to the
+  // static (unlit-bones) path in that case instead of feeding the driver an empty buffer.
+  if (_model->animBones && _bone_matrices_buf_tex != 0 && _bone_matrices_buffer_size > 0
+      && !_model->bone_matrices.empty())
   {
     gl.activeTexture(GL_TEXTURE0);
     gl.bindTexture(GL_TEXTURE_BUFFER, _bone_matrices_buf_tex);
@@ -425,7 +451,7 @@ void ModelRender::draw(glm::mat4x4 const& model_view
       {
         continue;
       }
-      if (p.prepareDraw(m2_shader, _model, &instance, model_render_state))
+      if (p.prepareDraw(m2_shader, _model, &instance, model_render_state, dist_fade))
       {
         gl.disable(GL_BLEND);
         gl.drawElements(GL_TRIANGLES, p.index_count, GL_UNSIGNED_SHORT, reinterpret_cast<void*>(p.index_start * sizeof(GLushort)));
@@ -445,7 +471,10 @@ void ModelRender::draw(glm::mat4x4 const& model_view
   // translucent against the BACKGROUND while the prepass depth keeps far-side/internal geometry from
   // ghosting through. prepareDraw promotes opaque/alpha-key batches to alpha blending for such
   // instances; here we lay the depth prepass first.
-  if (instance.model_alpha < 0.999f)
+  // Gate on the COMBINED alpha (CreatureModelAlpha x cull fade): prepareDraw promotes batches to
+  // alpha blending off the same product, and a promoted body WITHOUT the prepass ghosts its
+  // internal geometry -- the "shading changes while fading" bug.
+  if (instance.model_alpha * dist_fade < 0.999f)
   {
     gl.colorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
     for (ModelRenderPass& p : _render_passes)
@@ -454,7 +483,7 @@ void ModelRender::draw(glm::mat4x4 const& model_view
       {
         continue; // only depth-writing batches (opaque / alpha-key) participate in the prepass
       }
-      if (p.prepareDraw(m2_shader, _model, &instance, model_render_state))
+      if (p.prepareDraw(m2_shader, _model, &instance, model_render_state, dist_fade))
       {
         gl.drawElements(GL_TRIANGLES, p.index_count, GL_UNSIGNED_SHORT, reinterpret_cast<void*>(p.index_start * sizeof(GLushort)));
         p.afterDraw();
@@ -465,7 +494,7 @@ void ModelRender::draw(glm::mat4x4 const& model_view
 
   for (ModelRenderPass& p : _render_passes)
   {
-    if (p.prepareDraw(m2_shader, _model, &instance, model_render_state))
+    if (p.prepareDraw(m2_shader, _model, &instance, model_render_state, dist_fade))
     {
       gl.drawElements(GL_TRIANGLES, p.index_count, GL_UNSIGNED_SHORT, reinterpret_cast<void*>(p.index_start * sizeof(GLushort)));
       p.afterDraw();
@@ -478,7 +507,7 @@ void ModelRender::draw(glm::mat4x4 const& model_view
   // (color writes off, blending off, depth already laid by the prepass): the shader (creature_bloom == 3)
   // stamps a brightness-driven emissive mask for hot texels and discards the rest. The body's blended
   // COLOR -- and its see-through translucency -- is untouched.
-  if (instance.model_alpha < 0.999f && is_classic_creature_or_character_model(_model))
+  if (instance.model_alpha * dist_fade < 0.999f && is_classic_creature_or_character_model(_model))
   {
     gl.colorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_TRUE);
     gl.disable(GL_BLEND);
@@ -491,7 +520,7 @@ void ModelRender::draw(glm::mat4x4 const& model_view
       {
         continue; // body batches only (opaque / alpha-key), same set as the depth prepass
       }
-      if (p.prepareDraw(m2_shader, _model, &instance, model_render_state))
+      if (p.prepareDraw(m2_shader, _model, &instance, model_render_state, dist_fade))
       {
         gl.disable(GL_BLEND); // prepareDraw may have re-enabled blending for the promoted pass
         gl.drawElements(GL_TRIANGLES, p.index_count, GL_UNSIGNED_SHORT, reinterpret_cast<void*>(p.index_start * sizeof(GLushort)));
@@ -532,6 +561,7 @@ void ModelRender::draw(glm::mat4x4 const& model_view
     , bool no_cull
     , ModelInstance const* representative
     , std::vector<glm::vec4> const& instance_interior
+    , std::vector<float> const& instance_fades
 )
 {
   ZoneScopedN(NOGGIT_CURRENT_FUNCTION);
@@ -629,22 +659,56 @@ void ModelRender::draw(glm::mat4x4 const& model_view
                << std::endl;
     }
 
-    // Partition the instances by interior-light value into contiguous groups so each group can be drawn
-    // with a single `instance_interior` uniform (the shader lights indoor objects by room ambient, no
-    // outdoor sun). Common case: all-exterior -> one group with interior (0,0,0,0) == the old single draw.
-    // Mixed models (some spawns inside a building) get one extra draw per distinct room ambient.
-    struct InteriorGroup { glm::vec4 interior; std::vector<glm::mat4x4> transforms; };
+    // Partition the instances by (interior-light value, quantized distance fade) into contiguous
+    // groups so each group can be drawn with single `instance_interior` + fade uniforms. Common case:
+    // all-exterior, all-full-alpha -> one group == the old single draw. Fade is quantized to 1/64
+    // (~31 ms per step of the 2 s fade -- imperceptible; the old 1/16 stepped visibly on fading
+    // GAMEOBJECTS next to smoothly-fading individual creatures). Group count stays bounded: only
+    // instances actually mid-fade split off extra sub-draws.
+    struct InteriorGroup { glm::vec4 interior; float fade; std::vector<glm::mat4x4> transforms; };
     std::vector<InteriorGroup> interior_groups;
     for (std::size_t i = 0; i < instances.size(); ++i)
     {
       glm::vec4 const inter = (i < instance_interior.size()) ? instance_interior[i] : glm::vec4(0.f);
+      float const fade_raw = (i < instance_fades.size()) ? instance_fades[i] : 1.0f;
+      float fade = std::round(std::clamp(fade_raw, 0.0f, 1.0f) * 64.0f) / 64.0f;
+      if (fade <= 0.0f)
+      {
+        // hold the faintest visible step until the raw alpha is truly imperceptible, so the final
+        // drop happens below ~0.2% alpha instead of at the quantization floor (visible against fog)
+        if (fade_raw < 0.002f)
+        {
+          continue; // fully faded out -- beyond the render distance band
+        }
+        fade = 1.0f / 128.0f;
+      }
       InteriorGroup* grp = nullptr;
       for (auto& cand : interior_groups)
       {
-        if (cand.interior == inter) { grp = &cand; break; }
+        if (cand.interior == inter && cand.fade == fade) { grp = &cand; break; }
       }
-      if (!grp) { interior_groups.push_back({inter, {}}); grp = &interior_groups.back(); }
+      if (!grp) { interior_groups.push_back({inter, fade, {}}); grp = &interior_groups.back(); }
       grp->transforms.push_back(instances[i]);
+    }
+
+    // NOGGIT_FADE_DEBUG=1: report per-model fade group makeup (find models whose fades never move)
+    static bool const s_fade_dbg = std::getenv("NOGGIT_FADE_DEBUG") != nullptr;
+    if (s_fade_dbg && !interior_groups.empty())
+    {
+      float minf = 2.0f, maxf = -1.0f;
+      for (auto const& g : interior_groups) { minf = std::min(minf, g.fade); maxf = std::max(maxf, g.fade); }
+      if (minf < 0.999f)
+      {
+        static std::set<std::string> logged;
+        auto const& fp = _model->file_key().filepath();
+        if (logged.insert(fp).second)
+        {
+          LogError << "FADEDBG model='" << fp << "' groups=" << interior_groups.size()
+                   << " fades=" << minf << ".." << maxf
+                   << " instances=" << instances.size()
+                   << " fadesVec=" << instance_fades.size() << std::endl;
+        }
+      }
     }
 
     if (skip_mesh_passes)
@@ -655,7 +719,10 @@ void ModelRender::draw(glm::mat4x4 const& model_view
       return;
     }
 
-    if (_model->animBones)
+    // Guard as above: never bind an empty bone-matrix texture buffer (NVIDIA __fastfail -- the
+    // asset-browser preview barrel crash).
+    if (_model->animBones && _bone_matrices_buf_tex != 0 && _bone_matrices_buffer_size > 0
+        && !_model->bone_matrices.empty())
     {
       gl.activeTexture(GL_TEXTURE0);
       gl.bindTexture(GL_TEXTURE_BUFFER, _bone_matrices_buf_tex);
@@ -689,12 +756,33 @@ void ModelRender::draw(glm::mat4x4 const& model_view
       }
       m2_shader.uniform("instance_interior", group.interior);
 
+      // FADING group (cull fade < 1): prepareDraw promotes its opaque batches to alpha blending,
+      // which needs a depth prepass or internal/far-side geometry ghosts through during the fade --
+      // the same two-pass scheme as the individual translucent path (client-verified).
+      if (group.fade < 0.999f)
+      {
+        gl.colorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+        for (ModelRenderPass& p : _render_passes)
+        {
+          if (p.blend_mode > 1)
+          {
+            continue; // depth-writing batches only (opaque / alpha-key)
+          }
+          if (p.prepareDraw(m2_shader, _model, representative, model_render_state, group.fade))
+          {
+            gl.drawElementsInstanced(GL_TRIANGLES, p.index_count, GL_UNSIGNED_SHORT, reinterpret_cast<void*>(p.index_start * sizeof(GLushort)), static_cast<GLsizei>(group.transforms.size()));
+            p.afterDraw();
+          }
+        }
+        gl.colorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+      }
+
       for (ModelRenderPass& p : _render_passes)
       {
         ++passes_total;
         // Pass the representative instance so replaceable creature skins + geoset selection resolve (the
         // per-instance state the instanced draw otherwise loses -> invisible creatures). nullptr = doodads.
-        if (p.prepareDraw(m2_shader, _model, representative, model_render_state))
+        if (p.prepareDraw(m2_shader, _model, representative, model_render_state, group.fade))
         {
           ++passes_drawn;
           gl.drawElementsInstanced(GL_TRIANGLES, p.index_count, GL_UNSIGNED_SHORT, reinterpret_cast<void*>(p.index_start * sizeof(GLushort)), static_cast<GLsizei>(group.transforms.size()));
@@ -1465,7 +1553,7 @@ ModelRenderPass::ModelRenderPass(ModelTexUnit const& tex_unit, Model* m)
 {
 }
 
-bool ModelRenderPass::prepareDraw(OpenGL::Scoped::use_program& m2_shader, Model *m, ModelInstance const* instance, OpenGL::M2RenderState& model_render_state)
+bool ModelRenderPass::prepareDraw(OpenGL::Scoped::use_program& m2_shader, Model *m, ModelInstance const* instance, OpenGL::M2RenderState& model_render_state, float extra_alpha)
 {
   auto const* visible_geosets = &m->showGeosets;
   if (instance && !instance->geosetVisibility().empty())
@@ -1597,9 +1685,60 @@ bool ModelRenderPass::prepareDraw(OpenGL::Scoped::use_program& m2_shader, Model 
   // writes are off; the blended PASS B right after it is what makes the creature see-through.)
   // Implemented via the depth prepass in ModelRender::draw + promote_to_alpha_blend below. Creatures
   // are also forced fullbright (spawns get no scene light; a lit material would render black).
-  float const inst_alpha = instance ? instance->model_alpha : 1.0f;
+  // extra_alpha = distance fade for instanced draws; folds into the same channel as
+  // CreatureModelAlpha so opaque passes promote to alpha-blend and everything dims consistently.
+  float const inst_alpha = (instance ? instance->model_alpha : 1.0f) * extra_alpha;
   uint16_t effective_blend = renderflag.blend;
   bool const translucent_display = inst_alpha < 0.999f;
+
+  // Fishing-pool water-effect geosets (foam ring / bubbles / sparkles): the M2 authors them blend=0
+  // Opaque, so we'd draw the flat foam disc as a solid bright quad z-fighting the water. These effect
+  // textures are DARK-BACKGROUND wisp glows with NO/faint alpha (WaterWake3 avg RGB 13,24,30 alpha 255;
+  // Star1 37,36,37 alpha 255; Tornado 14,19,24). Opaque bloomed white; alpha painted a solid blue veil;
+  // additive glowed too bright/blue. The wake should read like the murky water it sits in -- dark and
+  // grey. So promote to Alpha blend + drop depth-write, and (via water_surface_effect below) the
+  // fragment shader desaturates the wisps to grey and uses the texel BRIGHTNESS as the alpha so the
+  // near-black field goes transparent (water colour shows through) and only a faint grey wake remains,
+  // lit by the scene. Resolved once per pass by texture name (only on _water_surface_effect models).
+  if (_water_effect_translucent < 0)
+  {
+    _water_effect_translucent = 0;
+    if (m->_water_surface_effect)
+    {
+      std::string tex_name = "(unresolved)";
+      if (textures[0] < m->_texture_lookup.size())
+      {
+        uint16_t const tex = m->_texture_lookup[textures[0]];
+        if (tex < m->_textures.size())
+        {
+          // Resolve the texture name the way bindTexture does (m->_textures[tex], NOT _textureFilenames,
+          // which is empty for these classic models) -- the ref's file_key holds the real BLP path.
+          tex_name = m->_textures[tex]->file_key().stringRepr();
+          std::transform(tex_name.begin(), tex_name.end(), tex_name.begin(),
+                         [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+          for (char const* marker : {"waterwake", "wake", "bubble", "star", "tornado", "splash", "foam", "ripple"})
+          {
+            if (tex_name.find(marker) != std::string::npos)
+            {
+              _water_effect_translucent = 1;
+              break;
+            }
+          }
+        }
+      }
+    }
+  }
+  bool const water_effect_geoset = _water_effect_translucent == 1;
+  if (water_effect_geoset && effective_blend == static_cast<uint16_t>(M2Blend::Opaque))
+  {
+    effective_blend = static_cast<uint16_t>(M2Blend::Alpha);
+  }
+  int const water_effect_uniform = water_effect_geoset ? 1 : 0;
+  if (model_render_state.water_surface_effect != water_effect_uniform)
+  {
+    m2_shader.uniform("water_surface_effect", water_effect_uniform);
+    model_render_state.water_surface_effect = water_effect_uniform;
+  }
 
   // NOTE: the "glow/mist core" placeholder mesh (the out-of-place torso pill on the arcane elementals) is
   // hidden at load time in Model.cpp via a geometric compact+dense-core-sphere test -- see showGeosets
@@ -1701,7 +1840,7 @@ bool ModelRenderPass::prepareDraw(OpenGL::Scoped::use_program& m2_shader, Model 
     model_render_state.backface_cull = backface_cull;
   }
 
-  bool const no_depth_write = renderflag.flags.z_buffered;
+  bool const no_depth_write = renderflag.flags.z_buffered || water_effect_geoset;
   if (model_render_state.z_buffered != no_depth_write)
   {
     gl.depthMask(no_depth_write ? GL_FALSE : GL_TRUE);
@@ -1718,11 +1857,32 @@ bool ModelRenderPass::prepareDraw(OpenGL::Scoped::use_program& m2_shader, Model 
   // get scene lighting, so a LIT material would render BLACK (e.g. Anomalus submesh 2 = the MANAMISTBASE
   // aura on mat1, which is LIT unlike the UNLIT body). The body (unlit) is already fullbright; force the
   // others to match so the whole creature reads as bright energy.
-  bool const effective_unlit = renderflag.flags.unlit || translucent_display;
+  // AUTHORED translucency ONLY (CreatureModelAlpha) -- NOT the distance/cull fade: a normal lit
+  // creature must keep its exact lit shading while fading, or its lighting visibly flips to
+  // fullbright the moment the fade starts and back when it completes.
+  bool const authored_translucent = (instance ? instance->model_alpha : 1.0f) < 0.999f;
+  bool const effective_unlit = renderflag.flags.unlit || authored_translucent;
   if (model_render_state.unlit != effective_unlit)
   {
     m2_shader.uniform("unlit", (int)effective_unlit);
     model_render_state.unlit = effective_unlit;
+  }
+
+  // Ground-clutter detail doodads: colored day/night lighting via the detail path + alpha-to-
+  // coverage (with MSAA) so distant sub-pixel blades blend instead of aliasing into green dots.
+  int const detail_doodad = (m && m->_force_unlit) ? 1 : 0;
+  if (model_render_state.detail_doodad != detail_doodad)
+  {
+    m2_shader.uniform("detail_doodad", detail_doodad);
+    if (detail_doodad)
+    {
+      gl.enable(GL_SAMPLE_ALPHA_TO_COVERAGE);
+    }
+    else
+    {
+      gl.disable(GL_SAMPLE_ALPHA_TO_COVERAGE);
+    }
+    model_render_state.detail_doodad = detail_doodad;
   }
 
   // Emissive bloom for bright energy creatures (Anomalus, arcane elementals, ghosts): the live client's
@@ -1739,11 +1899,17 @@ bool ModelRenderPass::prepareDraw(OpenGL::Scoped::use_program& m2_shader, Model 
   // Mode 2 = the body pass of a translucent creature: alpha is the BLEND FACTOR there, so the
   //          shader must not clobber it with the fog bloom-mask write (that overwrite made
   //          translucent creatures render opaque on any fogged map).
+  // Mode 2 ("alpha IS the blend factor -- never clobber it with the fog/bloom-mask writes") must
+  // cover EVERY translucent/fading draw, not only creature models: gated on
+  // is_classic_creature_or_character_model, GAMEOBJECTS and equipment attachments (sword, shield,
+  // helmet, shoulders -- item models) had their fade alpha REPLACED by the fog mask
+  // (color.a = 1 - fogFactor) on any fogged map, so they rendered opaque through the whole fade
+  // and POPPED while creature bodies (mode 2) faded correctly through the same pipeline.
   int const creature_bloom = model_render_state.bloom_mask_pass
     ? 3
-    : (is_classic_creature_or_character_model(m)
-        ? (translucent_display ? 2 : (effective_unlit ? 1 : 0))
-        : 0);
+    : (translucent_display
+        ? 2
+        : ((is_classic_creature_or_character_model(m) && effective_unlit) ? 1 : 0));
   if (model_render_state.creature_bloom != creature_bloom)
   {
     m2_shader.uniform("creature_bloom", creature_bloom);
@@ -1991,6 +2157,14 @@ bool ModelRenderPass::bindTexture(size_t index, Model* m, ModelInstance const* i
   gl.activeTexture(static_cast<GLenum>(GL_TEXTURE0 + index + 1));
   gl.bindTexture(GL_TEXTURE_2D_ARRAY, tex_array);
   m2_shader.uniform(index ? "tex2_index" : "tex1_index", tex_index);
+
+  // M2 texture wrap flags (0x1 wrap X, 0x2 wrap Y): an unset bit means CLAMP addressing on that
+  // axis (trace-verified against the 1.12 client). Handed to the shader inverted, as a clamp mask,
+  // where it is emulated in-shader (textures share array textures, so GL wrap state can't change).
+  uint32_t const wrap_flags = tex < m->_texture_flags.size() ? m->_texture_flags[tex] : 0x3;
+  int const clamp_mask = (~wrap_flags) & 0x3;
+  m2_shader.uniform(index ? "tex2_clamp" : "tex1_clamp", clamp_mask);
+
   model_render_state.tex_indices[index] = tex_index;
   return true;
 }

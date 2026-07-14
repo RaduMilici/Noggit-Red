@@ -145,11 +145,15 @@ wmo_liquid::wmo_liquid(BlizzardArchive::ClientFile* f,
                        int group_liquid,
                        bool use_dbc_type,
                        bool is_ocean,
-                       std::string const& wmo_path)
+                       std::string const& wmo_path,
+                       bool interior_material_color,
+                       glm::vec3 const& material_color)
   : pos(glm::vec3(header.pos.x, header.pos.z, -header.pos.y))
   , xtiles(header.A)
   , ytiles(header.B)
   , _debug_wmo_path(wmo_path)
+  , _use_material_color(interior_material_color)
+  , _material_color(material_color)
 {
   // Lava (LIQUID_Green_Lava) WMOs store authored per-vertex magma s/t flow UVs on EVERY
   // liquid vertex, but the per-tile `tile.liquid & 2` bit is unreliable on these maps:
@@ -157,7 +161,15 @@ wmo_liquid::wmo_liquid(BlizzardArchive::ClientFile* f,
   // grid coords) — so most Molten Core lava rendered as a uniform scrolling sheet while only
   // the tiles that happened to have the bit set flowed. Force the magma UV path for lava so
   // all tiles use their authored flow UVs.
-  bool const force_magma_uv = (group_liquid == LIQUID_Green_Lava);
+  // Turtle mis-types EVERY WMO liquid as group_liquid=15 (Green_Lava). Force the magma UV path ONLY for
+  // REAL lava (Molten Core / Blackrock, by path). A mis-typed WATER WMO (Timbermaw Hold, Stormwind
+  // canals, etc.) would otherwise be forced onto lava's per-vertex s/t UVs, which span 0..1 across the
+  // WHOLE pool -> the water texture renders hugely zoomed/stretched instead of the fine grid tiling.
+  // Non-lava WMOs fall through to the per-tile (tile.liquid & 2) check, which is reliably CLEAR for
+  // water tiles (so they take the grid water UV) and SET for genuine magma tiles (correctly-typed
+  // magma still resolves). The "& 2 unreliable" caveat only bites CLEAR-on-lava, which the blackrock
+  // force still covers.
+  bool const force_magma_uv = (group_liquid == LIQUID_Green_Lava) && is_blackrock_lava_wmo_path(wmo_path);
   int liquid = initGeometry(f, wmo_path, force_magma_uv);
 
   // see: https://wowdev.wiki/WMO#how_to_determine_LiquidTypeRec_to_use
@@ -217,6 +229,8 @@ wmo_liquid::wmo_liquid(wmo_liquid const& other)
   , ytiles(other.ytiles)
   , _liquid_id(other._liquid_id)
   , _debug_wmo_path(other._debug_wmo_path)
+  , _use_material_color(other._use_material_color)
+  , _material_color(other._material_color)
   , depths(other.depths)
   , tex_coords(other.tex_coords)
   , vertices(other.vertices)
@@ -515,6 +529,8 @@ void wmo_liquid::draw ( glm::mat4x4 const& transform
   water_shader.uniform ("anim_uv", anim_uv);
   water_shader.uniform ("magma_flow_dir", magma_flow_dir);
   water_shader.uniform ("magma_flow_speed", magma_flow_speed);
+  water_shader.uniform ("use_material_color", _use_material_color ? 1 : 0);
+  water_shader.uniform ("material_color", _material_color);
   water_shader.uniform ("debug_liquid_color", wmo_liquid_debug_color_enabled()
                                                   ? debug_color_from_path(_debug_wmo_path)
                                                   : glm::vec4(0.0f));

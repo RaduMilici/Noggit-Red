@@ -111,7 +111,9 @@ public:
              int group_liquid,
              bool use_dbc_type,
              bool is_ocean,
-             std::string const& wmo_path);
+             std::string const& wmo_path,
+             bool interior_material_color = false,
+             glm::vec3 const& material_color = glm::vec3(0.0f));
   wmo_liquid(wmo_liquid const& other);
 
   void upload(OpenGL::Scoped::use_program& water_shader);
@@ -128,6 +130,11 @@ private:
   int xtiles, ytiles;
   int _liquid_id;
   std::string _debug_wmo_path;
+
+  // INTERIOR WMO water: paint with the WMO material's baked MOMT.diffColor (client FUN_006b6420)
+  // instead of the zone water light. Resolved in WMO.cpp from the group EXTERIOR/exterior-lit flags.
+  bool _use_material_color = false;
+  glm::vec3 _material_color = glm::vec3(0.0f);
 
   std::vector<float> depths;
   std::vector<glm::vec2> tex_coords;

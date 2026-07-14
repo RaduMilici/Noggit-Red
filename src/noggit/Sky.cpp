@@ -11,6 +11,8 @@
 #include <ClientFile.hpp>
 #include <glm/glm.hpp>
 
+#include <QtCore/QSettings>
+
 #include <algorithm>
 #include <string>
 #include <array>
@@ -175,11 +177,17 @@ namespace
     param->set_highlight_sky(light_params.field_count > 1 && light_params.word(row, 1) != 0);
 
     bool const classic_light_params = light_params.field_count == 9;
+    // The classic 9-field LightParams.dbc is the SAME layout as modern for fields 0-8 (verified vs
+    // the Turtle DBC: f5/6 = water shallow/deep, f7/8 = ocean shallow/deep; only the trailing
+    // `flags` field 9 is absent). The old classic branch was OFF BY ONE -> ocean_shallow read
+    // waterDeepAlpha (1.0 = OPAQUE shore) and every water alpha was shifted down a column. Use the
+    // real columns for BOTH. Glow stays special: 1.12 sources it from LightFloatBand band 3 (field 3
+    // is zeroed in the data), so keep the trace-verified workaround below rather than field 4.
     std::size_t const glow_field = classic_light_params ? 3 : LightParamsDB::glow;
-    std::size_t const river_shallow_field = classic_light_params ? 4 : LightParamsDB::water_shallow_alpha;
-    std::size_t const river_deep_field = classic_light_params ? 5 : LightParamsDB::water_deep_alpha;
-    std::size_t const ocean_shallow_field = classic_light_params ? 6 : LightParamsDB::ocean_shallow_alpha;
-    std::size_t const ocean_deep_field = classic_light_params ? 7 : LightParamsDB::ocean_deep_alpha;
+    std::size_t const river_shallow_field = LightParamsDB::water_shallow_alpha;
+    std::size_t const river_deep_field = LightParamsDB::water_deep_alpha;
+    std::size_t const ocean_shallow_field = LightParamsDB::ocean_shallow_alpha;
+    std::size_t const ocean_deep_field = LightParamsDB::ocean_deep_alpha;
 
     if (light_params.field_count > glow_field)
       param->set_glow(light_params.number(row, glow_field));
@@ -431,11 +439,13 @@ SkyParam::SkyParam(int paramId, Noggit::NoggitRenderContext context)
         DBCFile::Record light_param = gLightParamsDB.getByID(paramId);
         int skybox_id = light_param.getInt(LightParamsDB::skybox);
         bool const classic_light_params = gLightParamsDB.getFieldCount() == 9;
+        // See the raw-DBC path above: the classic 9-field layout matches modern for fields 0-8, so
+        // the old off-by-one made ocean_shallow read waterDeepAlpha (opaque shore). Use real columns.
         std::size_t const glow_field = classic_light_params ? 3 : LightParamsDB::glow;
-        std::size_t const river_shallow_field = classic_light_params ? 4 : LightParamsDB::water_shallow_alpha;
-        std::size_t const river_deep_field = classic_light_params ? 5 : LightParamsDB::water_deep_alpha;
-        std::size_t const ocean_shallow_field = classic_light_params ? 6 : LightParamsDB::ocean_shallow_alpha;
-        std::size_t const ocean_deep_field = classic_light_params ? 7 : LightParamsDB::ocean_deep_alpha;
+        std::size_t const river_shallow_field = LightParamsDB::water_shallow_alpha;
+        std::size_t const river_deep_field = LightParamsDB::water_deep_alpha;
+        std::size_t const ocean_shallow_field = LightParamsDB::ocean_shallow_alpha;
+        std::size_t const ocean_deep_field = LightParamsDB::ocean_deep_alpha;
 
         _highlight_sky = light_param.getInt(LightParamsDB::highlightSky);
         _glow = light_param.getFloat(glow_field);
@@ -745,13 +755,17 @@ glm::vec3 Sky::colorFor(int r, int t) const
 
 const float rad = 400.0f;
 
-//...............................top....med....medh........horiz..........bottom
+// CLIENT-EXACT sky dome rows (wow.exe 5875 FUN_006d0d10, polar-angle table .rdata @0x81152c =
+// pi*{0, .17, .20, .23, .24, .25} on a cap flattened by cos(45 deg) -> view elevations below) --
+// and below the horizon the client fills EVERYTHING with the FOG color in one band (FUN_006d0f50
+// tail writes color 7 for the whole sub-horizon half). The old noggit rows blended the horizon
+// color down to -30 deg, which left the fog band visibly short of the true horizon line.
 const math::degrees angles[] = { math::degrees (90.0f)
-                               , math::degrees (18.0f)
-                               , math::degrees (10.0f)
-                               , math::degrees (3.0f)
+                               , math::degrees (16.8f)
+                               , math::degrees (9.9f)
+                               , math::degrees (3.7f)
+                               , math::degrees (1.8f)
                                , math::degrees (0.0f)
-                               , math::degrees (-30.0f)
                                , math::degrees (-90.0f)
                                };
 const int skycolors[] = { 2, 3, 4, 5, 6, 7, 7 };
@@ -883,6 +897,55 @@ Skies::Skies(unsigned int mapid, Noggit::NoggitRenderContext context)
            << " light rows, " << skies_with_skyboxes << " with drawable skyboxes" << std::endl;
 
   _need_color_buffer_update = true;
+}
+
+void Skies::light_at(glm::vec3 const& pos, int time, glm::vec3* out_diffuse, glm::vec3* out_ambient) const
+{
+  Sky const* default_sky = nullptr;
+  for (auto const& sky : skies)
+  {
+    if (sky.pos == glm::vec3(0, 0, 0))
+    {
+      default_sky = &sky;
+      break;
+    }
+  }
+
+  glm::vec3 diffuse(1.0f), ambient(1.0f);
+  if (default_sky)
+  {
+    diffuse = default_sky->colorFor(LIGHT_GLOBAL_DIFFUSE, time);
+    ambient = default_sky->colorFor(LIGHT_GLOBAL_AMBIENT, time);
+  }
+
+  // far -> near so nearer volumes override, mirroring update_sky_colors' weighted mix order
+  std::vector<Sky const*> ordered;
+  ordered.reserve(skies.size());
+  for (auto const& sky : skies)
+  {
+    if (&sky != default_sky && glm::distance(pos, sky.pos) <= sky.r2)
+    {
+      ordered.push_back(&sky);
+    }
+  }
+  std::sort(ordered.begin(), ordered.end(), [&](Sky const* a, Sky const* b)
+            { return glm::distance(pos, a->pos) > glm::distance(pos, b->pos); });
+
+  for (auto const* sky : ordered)
+  {
+    float const dist = glm::distance(pos, sky->pos);
+    float w = (sky->r2 - sky->r1) > 0.0f ? (sky->r2 - dist) / (sky->r2 - sky->r1) : 1.0f;
+    if (dist <= sky->r1)
+    {
+      w = 1.0f;
+    }
+    w = std::clamp(w, 0.0f, 1.0f);
+    diffuse = glm::mix(diffuse, sky->colorFor(LIGHT_GLOBAL_DIFFUSE, time), w);
+    ambient = glm::mix(ambient, sky->colorFor(LIGHT_GLOBAL_AMBIENT, time), w);
+  }
+
+  *out_diffuse = diffuse;
+  *out_ambient = ambient;
 }
 
 Sky* Skies::findSkyWeights(glm::vec3 pos)
@@ -1025,6 +1088,7 @@ void Skies::update_sky_colors(glm::vec3 pos, int time)
 
     _fog_distance = default_sky->floatParamFor(0, time);
     _fog_multiplier = default_sky->floatParamFor(1, time);
+    _cloud_coverage = default_sky->floatParamFor(CLOUD_DENSITY, time);
 
     auto default_sky_param = active_sky_param(*default_sky);
     if (default_sky_param)
@@ -1048,6 +1112,7 @@ void Skies::update_sky_colors(glm::vec3 pos, int time)
 
     _fog_multiplier = 0.f;
     _fog_distance = 0.f;
+    _cloud_coverage = 0.f;
 
     _river_shallow_alpha = 0.f;
     _river_deep_alpha = 0.f;
@@ -1078,6 +1143,7 @@ void Skies::update_sky_colors(glm::vec3 pos, int time)
 
       _fog_distance = (_fog_distance * (1.0f - sky.weight)) + (sky.floatParamFor(0, time) * sky.weight);
       _fog_multiplier = (_fog_multiplier * (1.0f - sky.weight)) + (sky.floatParamFor(1, time) * sky.weight);
+      _cloud_coverage = (_cloud_coverage * (1.0f - sky.weight)) + (sky.floatParamFor(CLOUD_DENSITY, time) * sky.weight);
       // sky.skyParams[sky.curr_sky_param]->river_shallow_alpha(); // new
       // sky.skyParams[sky.curr_sky_param].river_shallow_alpha(); // old
       auto sky_param = active_sky_param(sky);
@@ -1105,6 +1171,334 @@ void Skies::update_sky_colors(glm::vec3 pos, int time)
   _last_time = time;
 
   _need_color_buffer_update = true;  
+}
+
+namespace
+{
+  // Classic Perlin permutation table -- extracted verbatim from wow.exe 5875 .rdata @0x86f2d0
+  // (the client's cloud lattice hash, FUN_006cffc0).
+  std::uint8_t const CLOUD_PERM[256] = {
+    225,155,210,108,175,199,221,144,203,116, 70,213, 69,158, 33,252,
+      5, 82,173,133,222,139,174, 27,  9, 71, 90,246, 75,130, 91,191,
+    169,138,  2,151,194,235, 81,  7, 25,113,228,159,205,253,134,142,
+    248, 65,224,217, 22,121,229, 63, 89,103, 96,104,156, 17,201,129,
+     36,  8,165,110,237,117,231, 56,132,211,152, 20,181,111,239,218,
+    170,163, 51,172,157, 47, 80,212,176,250, 87, 49, 99,242,136,189,
+    162,115, 44, 43,124, 94,150, 16,141,247, 32, 10,198,223,255, 72,
+     53,131, 84, 57,220,197, 58, 50,208, 11,241, 28,  3,192, 62,202,
+     18,215,153, 24, 76, 41, 15,179, 39, 46, 55,  6,128,167, 23,188,
+    106, 34,187,140,164, 73,112,182,244,195,227, 13, 35, 77,196,185,
+     26,200,226,119, 31,123,168,125,249, 68,183,230,177,135,160,180,
+     12,  1,243,148,102,166, 38,238,251, 37,240,126, 64, 74,161, 40,
+    184,149,171,178,101, 66, 29, 59,146, 61,254,107, 42, 86,154,  4,
+    236,232,120, 21,233,209, 45, 98,193,114, 78, 19,206, 14,118,127,
+     48, 79,147, 85, 30,207,219, 54, 88,234,190,122, 95, 67,143,109,
+    137,214,145, 93, 92,100,245,  0,216,186, 60, 83,105, 97,204, 52,
+  };
+  // Per-octave fixed-point (8.8) lattice steps per texel for LOD 0 (128px), .rdata @0x86f3dc row 0:
+  // {16,32,64,128} -> {8,16,32,64} lattice cells across the texture, weights 1, 1/2, 1/4, 1/8.
+  int const CLOUD_OCTAVE_STEP[4] = { 16, 32, 64, 128 };
+  // Dome row polar angles (x pi, 0 = zenith .. 0.25 = 45 deg) and per-row alphas, .rdata
+  // @0x811570 / @0x8115a0. The dome is a cap flattened so its 45-deg edge sits at eye level:
+  // vertex z = cos(theta) - cos(45 deg); the last rows fade the cap out just above the horizon.
+  float const CLOUD_DOME_LAT[12] = { 0.f, 0.025f, 0.05f, 0.075f, 0.10f, 0.125f,
+                                     0.15f, 0.175f, 0.205f, 0.230f, 0.245f, 0.25f };
+}
+
+void Skies::init_cloud_gen()
+{
+  auto& c = _clouds;
+  c.rgba.assign(CloudGen::SIZE * CloudGen::SIZE * 4, 0);
+  c.partial.assign(CloudGen::SIZE, 0.f);
+  c.grad.assign(CloudGen::SIZE * CloudGen::SIZE, glm::vec2(0.f));
+  c.prev_row.assign(CloudGen::SIZE, 0.f);
+  // Client fills the lattice value table with rand()-based [-1,1] floats (FUN_006d0c90) -- the
+  // pattern is session-random even in the real client, so any fixed seed is faithful.
+  std::uint32_t s = 0x12345u;
+  for (int i = 0; i < 256; ++i)
+  {
+    s = s * 214013u + 2531011u;
+    c.value_table[i] = 1.f - static_cast<float>((s >> 16) & 0x7fff) * (2.f / 32767.f);
+    c.ease[i] = (1.f - std::cos(static_cast<float>(i) * glm::pi<float>() / 256.f)) * 0.5f;
+    // ramp built at init with the default 0.6 coverage (FUN_006d1ba0 -> FUN_006d0970(0.6) then
+    // FUN_006d0900(0.96)): step = (255 - 102)/255 = 0.6; ramp[i] = 255 - 255 * 0.96^(0.6*i).
+    c.ramp[i] = static_cast<std::uint8_t>(glm::clamp(
+        255.f - 255.f * std::pow(0.96f, 0.6f * static_cast<float>(i)), 0.f, 255.f));
+  }
+  gl.genTextures(1, &c.texture);
+  gl.bindTexture(GL_TEXTURE_2D, c.texture);
+  gl.texImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, CloudGen::SIZE, CloudGen::SIZE, 0, GL_RGBA, GL_UNSIGNED_BYTE, c.rgba.data());
+  gl.texParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+  gl.texParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+  gl.texParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+  gl.texParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+  c.initialized = true;
+}
+
+void Skies::tick_clouds(float dt_sec)
+{
+  auto& c = _clouds;
+  c.timer -= dt_sec;
+  if (c.timer > 0.f)
+    return;
+  c.timer = 0.1f; // regen period, .rdata @0x8115b4
+
+  int const S = CloudGen::SIZE;
+  // Coverage threshold: FUN_006d0970(band3) -> T = (1 - clamp01(coverage)) * 255. idx below T -> no cloud.
+  int const T = static_cast<int>(std::lround((1.f - glm::clamp(_cloud_coverage, 0.f, 1.f)) * 255.f));
+
+  // 3D value noise lattice hash (FUN_006cffc0): h(y,z) = perm[(perm[z] + y) & 255];
+  // value(x) = value_table[perm[(h + x) & 255]].
+  int const zc = (c.pass_counter >> 8) & 0xff;
+  int const zh0 = CLOUD_PERM[zc];
+  int const zh1 = CLOUD_PERM[(zc + 1) & 0xff];
+  float const ez = c.ease[c.pass_counter & 0xff];
+
+  // Per-texel sun lighting (FUN_006cfb00): light direction projected onto the cloud cap with the
+  // client's LINEAR theta->radius map (FUN_006cf870), z offset 64 texels (storm-free: 0*192+64).
+  glm::vec3 const ld = _celestial_dir;
+  float const l_elev = std::asin(glm::clamp(ld.y, -1.f, 1.f));
+  float const l_theta = glm::clamp(std::acos(glm::clamp(0.70710678f * std::cos(l_elev), -1.f, 1.f)) - l_elev,
+                                   0.f, glm::quarter_pi<float>());
+  float const l_rad = l_theta / glm::quarter_pi<float>() * 0.5f;
+  glm::vec2 lh(ld.x, ld.z);
+  float const lhl = glm::length(lh);
+  lh = (lhl > 1e-5f) ? lh / lhl : glm::vec2(0.f);
+  float const lx = (lh.x * l_rad + 0.5f) * static_cast<float>(S);
+  float const ly = (lh.y * l_rad + 0.5f) * static_cast<float>(S);
+  float const dz = 64.f;
+  // Highlight strength: the client scales by the sun/moon HANDOFF curve (8-key table @0xce9ab8,
+  // built by FUN_006ce390, evaluated by FUN_006cf6c0 in FUN_006cfb00): 1.0 for the WHOLE day
+  // 05:30-21:30 (so the sun-behind-cloud glow stays at full power through sunset), fading to 0
+  // only across the 04:00-05:30 / 21:30-22:10 celestial handoffs where the moon takes over at 1.0.
+  static std::pair<float, float> const handoff_keys[] = {
+    { 0.166667f, 1.0f }, // 04:00 moon full
+    { 0.194444f, 0.0f }, // 04:40 moon faded out
+    { 0.201389f, 0.0f }, // 04:50
+    { 0.229167f, 1.0f }, // 05:30 sun full
+    { 0.895833f, 1.0f }, // 21:30 sun still full
+    { 0.923611f, 0.0f }, // 22:10 sun faded out
+    { 0.888889f, 0.0f }, // (moon rise window, client stores these two out of order)
+    { 0.916667f, 1.0f }, // 22:00 moon full
+  };
+  float const strength = sky_keyframe(handoff_keys, 8, glm::fract(static_cast<float>(_last_time) / 2880.f));
+
+  glm::vec3 const c_high = color_set[SUN_HALO_COLOR];  // DBC color 10: sun-facing highlight
+  glm::vec3 const c_tint = color_set[CLOUD_EDGE_COLOR]; // DBC color 11: density-shade tint
+  glm::vec3 const c_base = color_set[CLOUD_COLOR];      // DBC color 12: dense-core base
+
+  int const row0 = c.row_cursor;
+  for (int y = row0; y < row0 + CloudGen::ROWS_PER_TICK; ++y)
+  {
+    // density: 4-octave fBm; capture the octave-0..2 partial per texel for the light gradient
+    float prev_partial = 0.f;
+    for (int x = 0; x < S; ++x)
+    {
+      float total = 0.f;
+      float part = 0.f;
+      for (int o = 0; o < 4; ++o)
+      {
+        int const step = CLOUD_OCTAVE_STEP[o];
+        int const fx = (x * step) & 0xffff;
+        int const fy = (y * step) & 0xffff;
+        int const cx = fx >> 8, cy = fy >> 8;
+        float const ex = c.ease[fx & 0xff];
+        float const ey = c.ease[fy & 0xff];
+        auto corner = [&](int hy, int hz) -> float {
+          int const h = CLOUD_PERM[(hz + hy) & 0xff];
+          float const v0 = c.value_table[CLOUD_PERM[(h + cx) & 0xff]];
+          float const v1 = c.value_table[CLOUD_PERM[(h + cx + 1) & 0xff]];
+          return v0 + (v1 - v0) * ex;
+        };
+        float const vz0 = glm::mix(corner(cy, zh0), corner(cy + 1, zh0), ey);
+        float const vz1 = glm::mix(corner(cy, zh1), corner(cy + 1, zh1), ey);
+        float const val = glm::mix(vz0, vz1, ez);
+        total += val / static_cast<float>(1 << o);
+        if (o == 2)
+        {
+          part = total;
+          // gradient of the partial density, backward differences (FUN_006cffc0 octave-2 block);
+          // scale 2^(shift-7) = 1 at LOD 0
+          c.grad[y * S + x] = glm::vec2(prev_partial - part, c.prev_row[x] - part);
+          prev_partial = part;
+          c.prev_row[x] = part;
+        }
+      }
+      // alpha: idx = byte(density*64 + 128) (.rdata 0x808de4/0x80653c); minus coverage threshold;
+      // through the exponential ramp
+      int const idx = glm::clamp(static_cast<int>(std::lround(total * 64.f + 128.f)), 0, 255);
+      int const ri = idx - T;
+      std::uint8_t const a = (ri < 0) ? 0 : c.ramp[glm::min(ri, 255)];
+
+      std::uint8_t* px = &c.rgba[(y * S + x) * 4];
+      if (a == 0)
+      {
+        // client copies the left neighbour's RGB for empty texels (keeps bilinear edges clean)
+        if (x > 0) { px[0] = px[-4]; px[1] = px[-3]; px[2] = px[-2]; }
+        px[3] = 0;
+        continue;
+      }
+      // shade = ((255 - a) >> 1) + 64: thin cloud -> bright, dense core -> dark (FUN_006cfb00)
+      float const s = static_cast<float>(((255 - a) >> 1) + 64) / 255.f;
+      glm::vec3 rgb = c_base + c_tint * s;
+      glm::vec2 const g = c.grad[y * S + x];
+      float const dx = lx - static_cast<float>(x);
+      float const dy = ly - static_cast<float>(y);
+      float const dot = (dx * g.x + dy * g.y + dz)
+                      / (std::sqrt(dx * dx + dy * dy + dz * dz) * std::sqrt(g.x * g.x + g.y * g.y + 1.f));
+      if (dot > 0.f)
+        rgb += c_high * (dot * strength);
+      rgb = glm::clamp(rgb, 0.f, 1.f);
+      px[0] = static_cast<std::uint8_t>(rgb.r * 255.f);
+      px[1] = static_cast<std::uint8_t>(rgb.g * 255.f);
+      px[2] = static_cast<std::uint8_t>(rgb.b * 255.f);
+      px[3] = a;
+    }
+  }
+
+  gl.bindTexture(GL_TEXTURE_2D, c.texture);
+  gl.texSubImage2D(GL_TEXTURE_2D, 0, 0, row0, S, CloudGen::ROWS_PER_TICK,
+                   GL_RGBA, GL_UNSIGNED_BYTE, &c.rgba[row0 * S * 4]);
+
+  c.row_cursor += CloudGen::ROWS_PER_TICK;
+  if (c.row_cursor >= S)
+  {
+    c.row_cursor = 0;
+    ++c.pass_counter; // z axis: 1 lattice cell per 256 full passes (counter high byte)
+  }
+}
+
+void Skies::draw_clouds(glm::mat4x4 const& mvp, glm::vec3 const& camera_pos, int animtime)
+{
+  QSettings cs;
+  bool const on = cs.value("render/draw_clouds", true).toBool();
+  float const opacity = on ? cs.value("render/cloud_density", 0.9f).toFloat() : 0.0f;
+
+  if (!_clouds.initialized)
+    init_cloud_gen();
+
+  float dt = static_cast<float>(animtime - _last_cloud_animtime) * 0.001f;
+  _last_cloud_animtime = animtime;
+  if (on)
+    tick_clouds(glm::clamp(dt, 0.f, 0.5f));
+  if (opacity <= 0.001f)
+    return;
+
+  if (!_cloud_program)
+  {
+    _cloud_program.reset(new OpenGL::program(
+      {
+        {GL_VERTEX_SHADER, R"code(
+#version 330 core
+uniform mat4 model_view_projection;
+uniform vec3 camera_pos;
+in vec3 position;
+in vec2 uv;
+in float alpha;
+out vec2 f_uv;
+out float f_alpha;
+void main()
+{
+  gl_Position = model_view_projection * vec4(position + camera_pos, 1.0);
+  f_uv = uv;
+  f_alpha = alpha;
+}
+)code"},
+        {GL_FRAGMENT_SHADER, R"code(
+#version 330 core
+uniform sampler2D cloud_tex;
+uniform float cloud_opacity;
+in vec2 f_uv;
+in float f_alpha;
+out vec4 out_color;
+void main()
+{
+  vec4 t = texture(cloud_tex, f_uv);
+  out_color = vec4(t.rgb, t.a * f_alpha * cloud_opacity);
+}
+)code"}
+      }));
+
+    // ===== CLIENT CLOUD DOME MESH (wow.exe 5875 FUN_006d0530, tables .rdata 0x811570/0x8115a0):
+    // pole vertex + 11 rings x 17 columns at polar angles pi*lat[i] on a cap flattened by
+    // cos(45 deg) (edge at eye level), UV = (sin az, cos az) * (row/11 * 0.5) + 0.5, per-row
+    // vertex alpha {255 x9, 128, 0, 0}. =====
+    static float const lat[12] = { 0.f, 0.025f, 0.05f, 0.075f, 0.10f, 0.125f,
+                                   0.15f, 0.175f, 0.205f, 0.230f, 0.245f, 0.25f };
+    static float const row_alpha[12] = { 1.f, 1.f, 1.f, 1.f, 1.f, 1.f, 1.f, 1.f, 1.f, 0.502f, 0.f, 0.f };
+    float const R = 400.0f; // same scale class as the sky sphere; camera-centred, depth writes off
+    float const c45 = 0.70710678f;
+
+    std::vector<float> verts; // pos3 uv2 alpha1
+    auto push = [&](glm::vec3 const& p, glm::vec2 const& t, float a) {
+      verts.insert(verts.end(), { p.x, p.y, p.z, t.x, t.y, a });
+    };
+    // pole
+    push(glm::vec3(0.f, (1.f - c45) * R, 0.f), glm::vec2(0.5f, 0.5f), row_alpha[0]);
+    for (int i = 1; i < 12; ++i)
+    {
+      float const th = glm::pi<float>() * lat[i];
+      float const r = static_cast<float>(i) / 11.f * 0.5f;
+      for (int j = 0; j <= 16; ++j)
+      {
+        float const az = static_cast<float>(j) * (glm::two_pi<float>() / 16.f);
+        float const sa = std::sin(az), ca = std::cos(az);
+        push(glm::vec3(std::sin(th) * sa * R, (std::cos(th) - c45) * R, std::sin(th) * ca * R),
+             glm::vec2(sa * r + 0.5f, ca * r + 0.5f), row_alpha[i]);
+      }
+    }
+    auto ring = [](int i, int j) -> std::uint16_t { return static_cast<std::uint16_t>(1 + (i - 1) * 17 + j); };
+    std::vector<std::uint16_t> idx;
+    for (int j = 0; j < 16; ++j) // pole fan
+    {
+      idx.push_back(0);
+      idx.push_back(ring(1, j));
+      idx.push_back(ring(1, j + 1));
+    }
+    for (int i = 1; i < 11; ++i)
+      for (int j = 0; j < 16; ++j)
+      {
+        std::uint16_t const a = ring(i, j), b = ring(i, j + 1), c = ring(i + 1, j + 1), d = ring(i + 1, j);
+        idx.insert(idx.end(), { a, b, c, a, c, d });
+      }
+    _cloud_indices_count = static_cast<int>(idx.size());
+
+    gl.genVertexArrays(1, &_cloud_vao);
+    gl.genBuffers(1, &_cloud_vbo);
+    gl.genBuffers(1, &_cloud_ibo);
+    {
+      OpenGL::Scoped::use_program sh{*_cloud_program.get()};
+      gl.bindVertexArray(_cloud_vao);
+      gl.bindBuffer(GL_ARRAY_BUFFER, _cloud_vbo);
+      gl.bufferData(GL_ARRAY_BUFFER, verts.size() * sizeof(float), verts.data(), GL_STATIC_DRAW);
+      sh.attrib("position", 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float), nullptr);
+      sh.attrib("uv", 2, GL_FLOAT, GL_FALSE, 6 * sizeof(float), reinterpret_cast<void const*>(3 * sizeof(float)));
+      sh.attrib("alpha", 1, GL_FLOAT, GL_FALSE, 6 * sizeof(float), reinterpret_cast<void const*>(5 * sizeof(float)));
+      gl.bindBuffer(GL_ELEMENT_ARRAY_BUFFER, _cloud_ibo);
+      gl.bufferData(GL_ELEMENT_ARRAY_BUFFER, idx.size() * sizeof(std::uint16_t), idx.data(), GL_STATIC_DRAW);
+      gl.bindVertexArray(0);
+    }
+  }
+
+  OpenGL::Scoped::use_program shader{*_cloud_program.get()};
+  shader.uniform("model_view_projection", mvp);
+  shader.uniform("camera_pos", camera_pos);
+  gl.activeTexture(GL_TEXTURE0);
+  gl.bindTexture(GL_TEXTURE_2D, _clouds.texture);
+  shader.uniform("cloud_tex", 0);
+  shader.uniform("cloud_opacity", opacity);
+
+  // alpha blend over the sky; keep the framebuffer ALPHA untouched (it is the bloom emissive
+  // mask the sky wrote as 0). ZWRITE off, fog off, like the client (state block calls 6335-6339).
+  gl.enable(GL_BLEND);
+  gl.blendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ZERO, GL_ONE);
+  OpenGL::Scoped::bool_setter<GL_CULL_FACE, GL_FALSE> const no_cull;
+  OpenGL::Scoped::depth_mask_setter<GL_FALSE> const no_depth_write;
+  gl.bindVertexArray(_cloud_vao);
+  gl.drawElements(GL_TRIANGLES, _cloud_indices_count, GL_UNSIGNED_SHORT, nullptr);
+  gl.bindVertexArray(0);
+  gl.blendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+  gl.disable(GL_BLEND);
 }
 
 bool Skies::draw(glm::mat4x4 const& model_view
@@ -1148,6 +1542,8 @@ bool Skies::draw(glm::mat4x4 const& model_view
     gl.disable(GL_BLEND);
     gl.drawElements(GL_TRIANGLES, _indices_count, GL_UNSIGNED_SHORT, nullptr);
 
+    draw_clouds(projection * model_view, camera_pos, animtime);
+
     return true;
   }
 
@@ -1183,6 +1579,8 @@ bool Skies::draw(glm::mat4x4 const& model_view
     }
   }
 
+  draw_clouds(projection * model_view, camera_pos, animtime);
+
   bool has_skybox = false;
   for (Sky& sky : skies)
   {
@@ -1215,8 +1613,11 @@ bool Skies::draw(glm::mat4x4 const& model_view
       model.model->renderer()->draw(model_view, model, m2_shader, model_render_state, frustum, 1000000, camera_pos, animtime, display_mode::in_3D);
     }
   }
-  // if it's night, draw the stars
-  if (light_stats.nightIntensity > 0 && !has_skybox)
+  // if it's night, draw the stars. CANON (confirmed via wow_westfall_night.trace: the client draws a
+  // full star group -- textured star sprites + an ~863-vert star sphere -- before the gradient dome).
+  // Kept behind render/draw_stars (default ON) as a toggle.
+  if (light_stats.nightIntensity > 0 && !has_skybox
+      && QSettings().value("render/draw_stars", true).toBool())
   {
     stars.model->trans = light_stats.nightIntensity;
     stars.pos = camera_pos;
@@ -1299,6 +1700,22 @@ void Skies::unload()
   _buffers.unload();
   _sphere_render.unload();
 
+  if (_clouds.texture)
+  {
+    gl.deleteTextures(1, &_clouds.texture);
+    _clouds.texture = 0;
+  }
+  _clouds.initialized = false;
+  _cloud_program.reset();
+  if (_cloud_vao)
+  {
+    gl.deleteVertexArray(1, &_cloud_vao);
+    gl.deleteBuffers(1, &_cloud_vbo);
+    gl.deleteBuffers(1, &_cloud_ibo);
+    _cloud_vao = _cloud_vbo = _cloud_ibo = 0;
+    _cloud_indices_count = 0;
+  }
+
   _uploaded = false;
   _need_vao_update = true;
 
@@ -1318,28 +1735,32 @@ in vec3 position;
 in vec3 color;
 
 out vec3 f_color;
+out vec3 f_dir;
 
 void main()
 {
   vec4 pos = vec4(position + camera_pos, 1.f);
   gl_Position = model_view_projection * pos;
   f_color = color;
+  f_dir = normalize(position); // dome direction for the cloud layer
 }
 )code" }
         , {GL_FRAGMENT_SHADER, R"code(
 #version 330 core
 
 in vec3 f_color;
+in vec3 f_dir;
 
 out vec4 out_color;
 
 void main()
 {
-  // Alpha is the bloom mask. The sky dome is the bright background backdrop -- writing 1.0 put it in the
-  // reserved EMISSIVE bloom range (>0.88), so the whole bright sky bloomed via the lowered emissive
-  // threshold (overbearing). Write 0.0 so the sky opts OUT of bloom (like the WDL horizon backdrop); the
-  // sun/cloud highlights in the skybox M2 still bloom through their own path.
-  out_color = vec4(f_color, 0.);
+  // Pure gradient dome -- the cloud layer is separate GEOMETRY (Skies::draw_clouds), exactly like
+  // the client: a real mesh with baked polar UVs, so triangle interpolation shapes the zenith.
+  vec3 col = f_color;
+  // Alpha = bloom mask; write 0 so the sky opts out of the emissive bloom range (bright cloud/sun
+  // still bloom via their own luminance through the FFXGlow blur^2 composite).
+  out_color = vec4(col, 0.);
 }
 )code" }
     }
@@ -1431,12 +1852,41 @@ void Skies::update_color_buffer()
 }
 
 
+// Circular piecewise-linear keyframe interpolation over (day-fraction, value) pairs -- the exact
+// algorithm of the 1.12 client's celestial-path evaluator (wow.exe 5875 FUN_006cf6c0): find the
+// first key with time > t, lerp from the previous key with midnight wrap-around.
+float sky_keyframe(std::pair<float, float> const* keys, int count, float t)
+{
+  t = glm::clamp(t, 0.f, 1.f);
+  int next = 0;
+  while (next < count && keys[next].first <= t)
+    ++next;
+  int const prev = (next == 0 || next == count) ? count - 1 : next - 1;
+  if (next == count)
+    next = 0;
+  float span = keys[next].first - keys[prev].first;
+  if (std::abs(span) < 1e-5f)
+    return keys[prev].second;
+  if (span < 0.f)
+    span += 1.f;
+  float f = t - keys[prev].first;
+  if (f < 0.f)
+    f += 1.f;
+  return glm::mix(keys[prev].second, keys[next].second, f / span);
+}
+
 void OutdoorLightStats::interpolate(OutdoorLightStats *a, OutdoorLightStats *b, float r)
 {
   static constexpr unsigned DayNight_SecondsPerDay = 86400;
 
   float progressDayAndNight = r / DayNight_SecondsPerDay;
 
+  // SCENE LIGHT direction -- CLIENT-CANON (wow.exe 5875 FUN_006d3a10 key tables): the 1.12 scene
+  // light does NOT follow the visible sun disc. It oscillates gently between polar 110 deg
+  // (2.2165682) and 127 deg (1.9198623... swapped naming aside, the exact values below) at a
+  // FIXED azimuth of 225 deg (pi*1.25) -- i.e. light always arrives from the sun's compass
+  // bearing (45 deg) at a 20-37 deg incidence, day and night. The visible sun disc rides its own
+  // keyframed path (WorldRender) that shares this azimuth, so disc and lighting always agree.
   float phiValue = 0;
   const float thetaValue = 3.926991f;
   const float phiTable[4] =

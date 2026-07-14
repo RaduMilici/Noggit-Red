@@ -14,6 +14,7 @@
 
 #include <QDir>
 #include <QBuffer>
+#include <QtCore/QElapsedTimer>
 
 #include <algorithm>
 #include <cmath>
@@ -180,6 +181,57 @@ namespace
       return v != nullptr && std::string(v) != "0";
     }();
     return enabled;
+  }
+
+  // --- Coarse WDL-horizon occlusion (checklist D3/15.3) -----------------------------------------
+  // Cull tiles whose ENTIRE AABB sits below the terrain silhouette formed by NEARER low-res (WDL)
+  // terrain along the camera ray. Uses the WDL heightmap already loaded for the horizon render, so
+  // it costs no extra I/O. Default OFF (opt-in QSetting) + deliberately CONSERVATIVE (safety margin,
+  // only far tiles) because OVER-culling is exactly what got the old GPU-query occlusion disabled.
+
+  // Coarse terrain height (world units) from the WDL 17x17-per-tile grid. Very low where no WDL tile
+  // exists (== "no occluder here").
+  float wdl_height_at(World* world, float wx, float wz)
+  {
+    if (wx < 0.0f || wz < 0.0f) return -1.0e9f;
+    int const tx = static_cast<int>(wx / TILESIZE);
+    int const tz = static_cast<int>(wz / TILESIZE);
+    if (tx < 0 || tx > 63 || tz < 0 || tz > 63) return -1.0e9f;
+    auto const* ht = world->horizon.get_horizon_tile(tz, tx);
+    if (!ht) return -1.0e9f;
+    float const cell = TILESIZE / 16.0f; // 17x17 grid spans the 533yd tile
+    int const gi = std::clamp(static_cast<int>((wx - tx * TILESIZE) / cell + 0.5f), 0, 16);
+    int const gj = std::clamp(static_cast<int>((wz - tz * TILESIZE) / cell + 0.5f), 0, 16);
+    return static_cast<float>(ht->height_17[gj][gi]);
+  }
+
+  // True when the tile AABB [mn,mx] is fully hidden behind nearer WDL terrain from the camera. Tests
+  // the tile's TOP at its NEAREST horizontal point (the hardest point to hide -> if that's occluded
+  // the whole tile is). Marches the WDL along the camera->tile ray, tracking the max terrain
+  // elevation angle; the tile is occluded when even its top-angle is below that silhouette by a
+  // margin.
+  bool wdl_horizon_occluded(World* world, glm::vec3 const& cam, glm::vec3 const& mn, glm::vec3 const& mx)
+  {
+    float const nx = std::clamp(cam.x, mn.x, mx.x);
+    float const nz = std::clamp(cam.z, mn.z, mx.z);
+    float const dx = nx - cam.x;
+    float const dz = nz - cam.z;
+    float const d = std::sqrt(dx * dx + dz * dz);
+    if (d < 2.0f * TILESIZE) return false;                      // never occlude nearby tiles
+    float const occludee_angle = std::atan2(mx.y - cam.y, d);   // tile TOP at nearest point
+    float const inv = 1.0f / d;
+    float const ux = dx * inv;
+    float const uz = dz * inv;
+    float const step = TILESIZE / 16.0f;                        // ~33yd (one WDL cell)
+    float max_terrain_angle = -3.15f;
+    for (float t = step; t < d - step; t += step)
+    {
+      float const h = wdl_height_at(world, cam.x + ux * t, cam.z + uz * t);
+      if (h <= -1.0e8f) continue;
+      float const a = std::atan2(h - cam.y, t);
+      if (a > max_terrain_angle) max_terrain_angle = a;
+    }
+    return occludee_angle + 0.02f < max_terrain_angle;          // ~1.1deg conservative margin
   }
 
   bool should_trace_creature_spawn(World::CreatureSpawnOverlay const& spawn, float distance)
@@ -682,7 +734,7 @@ void WorldRender::draw (glm::mat4x4 const& model_view
     gl.getIntegerv(GL_FRAMEBUFFER_BINDING, &bloom_prev_fbo);
     gl.getIntegerv(GL_VIEWPORT, bloom_vp);
     ensureBloomTargets(bloom_vp[2], bloom_vp[3]);
-    gl.bindFramebuffer(GL_FRAMEBUFFER, _bloom_scene_fbo);
+    gl.bindFramebuffer(GL_FRAMEBUFFER, _msaa_samples > 0 ? _msaa_fbo : _bloom_scene_fbo);
     gl.viewport(0, 0, _bloom_w, _bloom_h);
   }
 
@@ -719,6 +771,10 @@ void WorldRender::draw (glm::mat4x4 const& model_view
   // and can hide visible ADTs while their objects still render.
   constexpr bool occlusion_cull = false;
 
+  // Opt-in coarse WDL-horizon occlusion (default off; conservative -- see wdl_horizon_occluded).
+  bool const wdl_occ_on = !minimap_render
+    && QSettings().value("render/wdl_horizon_occlusion", false).toBool();
+
   // Frustum culling
   _world->_n_loaded_tiles = 0;
   unsigned tile_counter = 0;
@@ -753,6 +809,16 @@ void WorldRender::draw (glm::mat4x4 const& model_view
     {
       tile->renderer()->discardTileOcclusionQuery();
       tile->renderer()->setOccluded(false);
+    }
+
+    // Coarse WDL-horizon occlusion (opt-in): mark a frustum-visible tile occluded when it is fully
+    // hidden behind nearer low-res terrain. setOccluded(true) makes the terrain/object/water draws
+    // skip it (see isOccluded() gates). Clear any stale frustum-cull override so it takes effect.
+    if (wdl_occ_on && tile_in_frustum
+        && wdl_horizon_occluded(_world, camera_pos, tile_extents[0], tile_extents[1]))
+    {
+      tile->renderer()->setOverrideOcclusionCulling(false);
+      tile->renderer()->setOccluded(true);
     }
 
     if (tile_in_frustum && frustum.contains(tile_extents[0]) && frustum.contains(tile_extents[1]))
@@ -846,6 +912,192 @@ void WorldRender::draw (glm::mat4x4 const& model_view
           , _world->animtime
           , _outdoor_light_stats
       );
+
+      // THE SUN (1.12 sky): a bright disc billboard at the sun direction, drawn into the scene so
+      // the existing FFXGlow hazes it (the halo you see in-game). Only outdoors (no global-WMO/
+      // interior) and only when the sun is above the horizon. Additive; depth-tested so mountains/
+      // terrain occlude it, no depth write so it never occludes the world.
+      if (!_world->mapIndex.hasAGlobalWMO())
+      {
+        // ===== CLIENT-EXACT CELESTIAL PATHS (wow.exe 5875, key tables built in FUN_006d3b80,
+        // values .rdata 0x811508..0x811650, evaluator FUN_006cf6c0 = sky_keyframe): the vanilla
+        // sun/moon have a FIXED compass azimuth all day (the scene light's bearing -- so the disc
+        // and the terrain lighting always agree) and only their POLAR angle is keyframed. The sun
+        // NEVER crosses the sky: 10 deg below the horizon overnight, rising from 05:30 to 85 deg
+        // elevation at noon (plateau 11:55-12:05), back below the horizon by 21:30. =====
+        // day_t: 0 = midnight, 0.5 = noon (time is in half-minutes, 2880/day).
+        float const day_t = glm::fract(_world->time / 2880.0f);
+        static std::pair<float, float> const sun_phi_keys[] = {
+          { 0.229167f, 1.7453293f }, // 05:30  polar 100 deg = 10 deg below the horizon
+          { 0.496528f, 0.0872665f }, // 11:55  polar 5 deg = 85 deg up
+          { 0.503472f, 0.0872665f }, // 12:05  noon plateau
+          { 0.895833f, 1.7453293f }, // 21:30  below the horizon again (constant overnight via wrap)
+        };
+        static std::pair<float, float> const moon_phi_keys[] = {
+          { 0.0f,      0.6108652f }, // 00:00  polar 35 deg = 55 deg up
+          { 0.003472f, 0.6108652f },
+          { 0.166667f, 1.7453293f }, // 04:00  sets 10 deg below the horizon
+          { 0.916667f, 1.7453293f }, // 22:00  starts rising
+          { 0.996528f, 0.6108652f }, // 23:55  back at 55 deg
+        };
+        // sun GLARE grows modestly near dawn/dusk (a low-sun looks larger/warmer). Kept gentle
+        // (1.3x, was a too-aggressive 2x that ballooned the disc) and applied to the halo only --
+        // the hard bloomed disc stays a fixed angular size like the client's sunCenter.
+        static std::pair<float, float> const sun_scale_keys[] = {
+          { 0.25f, 1.3f }, { 0.30f, 1.0f }, { 0.83f, 1.0f }, { 0.895833f, 1.3f },
+        };
+        // Blue Child (moon02): its OWN client path (FUN_006d3b80 key tables, flags 0x10/0x20):
+        // SAME elevation keyframes as the White Lady -- they rise and set together -- but its own
+        // wow-frame azimuth that DRIFTS through the night, ~90-120 deg around the horizon from
+        // the Lady. Its time input is the plain day fraction (offset global 0xce9b68 stays 0).
+        static std::pair<float, float> const moon2_theta_keys[] = {
+          { 0.0f,      2.3561945f }, // 00:00  pi*0.75      (135 deg)
+          { 0.166667f, 2.6179939f }, // 04:00  pi*0.833333  (150 deg)
+          { 0.916667f, 2.8797933f }, // 22:00  pi*0.916667  (165 deg)
+        };
+        // Direction in the render frame: same conversion as the scene light above (dayDir is the
+        // light FROM the celestial at wow azimuth theta+180, so the celestial itself sits on the
+        // (cos(theta+180), sin(theta+180)) horizontal bearing in render space).
+        auto const celestial_dir = [](float phi, float theta_wow) {
+          float const a = theta_wow + glm::pi<float>();
+          return glm::normalize(glm::vec3(std::cos(a) * std::sin(phi), std::cos(phi), std::sin(a) * std::sin(phi)));
+        };
+        float const moon_phi = sky_keyframe(moon_phi_keys, 5, day_t);
+        glm::vec3 const to_sun = celestial_dir(sky_keyframe(sun_phi_keys, 4, day_t), glm::quarter_pi<float>());
+        glm::vec3 const to_moon = celestial_dir(moon_phi, glm::quarter_pi<float>());
+        glm::vec3 const to_moon2 = celestial_dir(moon_phi, sky_keyframe(moon2_theta_keys, 3, day_t));
+        float const sun_scale = sky_keyframe(sun_scale_keys, 4, day_t);
+        // DAY/NIGHT: also fade by nightIntensity (the signal that fades the Stars.m2 skybox IN),
+        // so the sun is gone at night regardless of the path.
+        float const day_factor = glm::clamp(1.0f - _outdoor_light_stats.nightIntensity, 0.0f, 1.0f);
+        float const moon_factor = glm::clamp(_outdoor_light_stats.nightIntensity, 0.0f, 1.0f);
+        // feed the procedural cloud lighting -- the client lights cloud texels from the SUN while
+        // day_t is in (0.229167-0.027778, 0.895833+0.027778], else the moon (FUN_006cfb00 window)
+        _skies->set_celestial_dir((day_t > 0.2013889f && day_t <= 0.9236111f) ? to_sun : to_moon);
+        glm::vec3 const fwd = -glm::vec3(model_view[0][2], model_view[1][2], model_view[2][2]);
+
+        // Celestial billboards (sun/moon disc + glare) all use the CANON Textures\ BLPs (from the
+        // wow.exe strings: sunCenter/sunGlare/moon/moon02/moonGlare) drawn through one textured-quad
+        // shader. Lazily create the program + textures.
+        if (!_moon_program)
+        {
+          _moon_program.reset(new OpenGL::program(
+            { { GL_VERTEX_SHADER,   OpenGL::shader::src_from_qrc("moon_vs") }
+            , { GL_FRAGMENT_SHADER, OpenGL::shader::src_from_qrc("moon_fs") } }));
+        }
+        if (!_bloom_vao) { gl.genVertexArrays(1, &_bloom_vao); }
+        auto const ctx = _world->getRenderContext();
+        if (!_moon_texture)       _moon_texture       = std::make_unique<scoped_blp_texture_reference>("textures/moon.blp", ctx);
+        if (!_moon2_texture)      _moon2_texture      = std::make_unique<scoped_blp_texture_reference>("textures/moon02.blp", ctx);
+        if (!_moon_glare_texture) _moon_glare_texture = std::make_unique<scoped_blp_texture_reference>("textures/moonglare.blp", ctx);
+        if (!_sun_center_texture) _sun_center_texture = std::make_unique<scoped_blp_texture_reference>("textures/suncenter.blp", ctx);
+        if (!_sun_glare_texture)  _sun_glare_texture  = std::make_unique<scoped_blp_texture_reference>("textures/sunglare.blp", ctx);
+
+        glm::mat4 const cel_mvp = projection * model_view;
+        glm::vec3 const cam_right(model_view[0][0], model_view[1][0], model_view[2][0]);
+        glm::vec3 const cam_up   (model_view[0][1], model_view[1][1], model_view[2][1]);
+        float const cel_dist = std::min(_view_distance * 0.5f, 900.0f);
+
+        // Draw one textured celestial billboard. `additive` = glow (glare/sun disc); else alpha-blend
+        // (moon discs, which carry their shape + craters in the BLP). Depth-tested (mountains occlude).
+        auto draw_celestial = [&](scoped_blp_texture_reference& tex, glm::vec3 const& dir,
+                                  float half_frac, glm::vec3 const& color, float opacity, bool additive)
+        {
+          if (opacity <= 0.002f) return;
+          if (!tex->finishedLoading() || tex->loading_failed()) return;
+          glm::vec3 const center = camera_pos + dir * cel_dist;
+          OpenGL::Scoped::use_program sh{*_moon_program.get()};
+          // additive = premultiplied glow added with GL_ONE (opacity is a real, unclamped multiplier);
+          // else standard alpha blend for the moon discs.
+          gl.blendFunc(additive ? GL_ONE : GL_SRC_ALPHA, additive ? GL_ONE : GL_ONE_MINUS_SRC_ALPHA);
+          gl.activeTexture(GL_TEXTURE0);
+          tex->bind();
+          sh.uniform("moon_tex", 0);
+          sh.uniform("additive", additive ? 1 : 0);
+          sh.uniform("tex_index", tex->array_index());
+          sh.uniform("model_view_projection", cel_mvp);
+          sh.uniform("center", center);
+          sh.uniform("camera_pos", camera_pos);
+          sh.uniform("cam_right", cam_right);
+          sh.uniform("cam_up", cam_up);
+          sh.uniform("half_size", cel_dist * half_frac);
+          sh.uniform("moon_color", color);
+          sh.uniform("opacity", opacity);
+          gl.bindVertexArray(_bloom_vao);
+          gl.drawArraysInstanced(GL_TRIANGLE_STRIP, 0, 4, 1);
+        };
+
+        gl.enable(GL_DEPTH_TEST);
+        gl.depthFunc(GL_LEQUAL);
+        OpenGL::Scoped::bool_setter<GL_CULL_FACE, GL_FALSE> const cel_cull;
+        OpenGL::Scoped::depth_mask_setter<GL_FALSE> const cel_depth_mask;
+        gl.enable(GL_BLEND);
+
+        // ===== SUN: the CANON client textures only -- sunCenter.blp (disc) + sunGlare.blp (glow). No
+        // procedural star. Both decoded from the BLPs as filled disc + filled glow (no ray texture
+        // exists); the client's few soft rays are the FFXGlow blooming the bright disc. =====
+        // -0.05: keep drawing while any part of the disc is still above the horizon; the shader's
+        // per-fragment horizon clip cuts everything below it (the sprite sets BEHIND the fog band).
+        if (to_sun.y > -0.05f && day_factor > 0.02f
+            && _world->_settings->value("render/draw_sun", true).toBool())
+        {
+          float const align = glm::clamp(glm::dot(glm::normalize(fwd), to_sun), 0.0f, 1.0f);
+          float const grow  = glm::smoothstep(0.82f, 0.999f, align);
+          glm::vec3 const sun_band = _skies->color_set[SUN_COLOR];
+          glm::vec3 const sun_col = glm::clamp(glm::mix(sun_band, glm::vec3(1.0f), 0.6f), 0.0f, 1.0f);
+
+          // 1) HALO: the CANON sunGlare.blp glow (a filled radial glow, 256px) drawn around the disc --
+          // this is the visible sun halo, same idea as the moon halo. Always visible in daytime, and it
+          // grows + brightens as you look straight at the sun.
+          // 1) GLARE: sunGlare.blp (the halo + faint rays live in this one texture). Opacity is
+          // ELEVATION-driven: brightest with the sun high at noon, dropping as it sinks (the
+          // dusk trace measured alpha 0.15..0.23 at ~17 deg elevation, anchoring the low end; no
+          // opacity growth with view alignment -- the apparent growth is size + FFXGlow). The
+          // sprite doubles in size near dawn/dusk (client sun_scale curve).
+          float const elev_f = glm::clamp(to_sun.y / 0.9962f, 0.0f, 1.0f); // 1 at the 85 deg noon peak
+          // VIEW-ALIGNMENT growth, verified in the binary + traces: the client's glare quad SIZE
+          // is STATIC (init consts 0xce9838-40, only the time-of-day 2x dawn/dusk slot 0xce986c is
+          // animated) -- the growth when facing the sun is additive LAYER STACKING (3 draws away
+          // -> 25 centred), i.e. BRIGHTNESS. Emulate the stack with an alignment opacity ramp; the
+          // size ramp below stands in for the footprint widening that stacking produces.
+          float const glare_op = glm::mix(0.22f, 0.45f, elev_f) * glm::mix(0.3f, 1.0f, grow);
+          draw_celestial(*_sun_glare_texture, to_sun, glm::mix(0.16f, 0.48f, grow) * sun_scale, sun_col,
+                         glare_op * day_factor, true);
+
+          // 2) DISC: sunCenter.blp hot bright core, always on. Additive -> blooms via the FFXGlow.
+          // The dawn/dusk 2x curve stays on the GLARE only: doubling the DISC in its last ~2.5 deg
+          // of elevation read as the sun ballooning to planet size right before it set.
+          draw_celestial(*_sun_center_texture, to_sun, 0.04f, sun_col,
+                         1.3f * day_factor, true);
+        }
+
+        // ===== MOONS (night): White Lady (moon.blp disc + moonGlare halo) and the smaller Blue Child
+        // (moon02.blp, no halo). The white moon's HALO grows in size + opacity with aim, disc fixed. =====
+        if (moon_factor > 0.02f && _world->_settings->value("render/draw_moon", true).toBool())
+        {
+          float const disc_half = 0.07f;
+          if (to_moon.y > -0.05f) // shader horizon clip handles the below-horizon part
+          {
+            float const m_align = glm::clamp(glm::dot(glm::normalize(fwd), to_moon), 0.0f, 1.0f);
+            float const m_grow  = glm::smoothstep(0.82f, 0.999f, m_align);
+            glm::vec3 const white_col(0.86f, 0.92f, 1.0f);
+            // moonGlare.blp is a RING (bright annulus peaking at ~0.54 of the quad radius, dark centre,
+            // decoded from the BLP). To read as a GLOW (brightest at the disc, fading out) rather than a
+            // detached ring, size the quad so the ring's PEAK sits at/just inside the disc edge -> only
+            // the ring's OUTWARD falloff is visible past the disc. peak = 0.54*glare, so glare ~= disc/0.54.
+            draw_celestial(*_moon_glare_texture, to_moon, glm::mix(0.115f, 0.135f, m_grow), white_col, m_grow * moon_factor, true);
+            draw_celestial(*_moon_texture,       to_moon, disc_half, white_col, moon_factor, false); // disc
+          }
+          // Blue Child: rides its OWN client keyframe path (to_moon2 above) -- rises from the
+          // horizon with the White Lady at 22:00 but ~90-120 deg around the horizon from her,
+          // drifting slowly through the night. Independent; no screen-space relation to the Lady.
+          if (to_moon2.y > -0.05f) // shader horizon clip sinks it behind the fog band
+          {
+            draw_celestial(*_moon2_texture, to_moon2, 0.042f, glm::vec3(0.55f, 0.74f, 1.0f), moon_factor, false);
+          }
+        }
+        gl.blendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+      }
     }
   }
 
@@ -858,18 +1110,22 @@ void WorldRender::draw (glm::mat4x4 const& model_view
   // Fog is deliberately tied to the RENDER distance, not the object distance, so dragging the object
   // slider never moves the fog wall (that coupling was the reported bug).
   _view_distance = _world->_settings->value("view_distance", 2000.f).toFloat();
-  // Terrain/fog render distance. With fog ON we still cull at the fog end when that's NEARER (no point
-  // drawing what the fog hides), but a fog end larger than the view distance must NOT push it past the
-  // view distance -- otherwise enabling fog renders further than the view distance allows.
-  _terrain_cull_distance = draw_fog
-                         ? std::min(_skies->fog_distance_end(), _view_distance)
-                         : _view_distance;
+  // Fog does NOT drive render distance (user rule: "fog is fog -- it adds the fog band, nothing
+  // else"). The old min(fog_end, view_distance) clamp was tolerable while fog ends were inflated by
+  // the /20 divisor, but with authored /36 distances (kara: 361yd) it visibly ate doodads/terrain.
+  // The fog band itself still hides geometry past the fog end visually; the shader fog is the sole
+  // fog effect.
+  _terrain_cull_distance = _view_distance;
+  // Editor lever: scales the authored fog start/end distances (zone + WMO room fog), default 1.0 =
+  // client-authored. Applied in updateLightingUniformBlock and WMORender's per-group fog.
+  _fog_distance_scale = _world->_settings->value("fog_distance_scale", 1.0f).toFloat();
   // Object render distance: its own slider, defaulting to the view distance (so first run / unset =
   // old behaviour). Clamped to the terrain distance -- objects past the terrain/fog horizon would just
   // float in the void, so there's no point drawing them further than the world itself renders.
   float const object_render_distance =
     _world->_settings->value("object_render_distance", _view_distance).toFloat();
   _cull_distance = std::min(_terrain_cull_distance, object_render_distance);
+  _decal_depth_ready = false; // fresh depth snapshot needed this frame (shadows + selection circles)
 
   // Draw verylowres heightmap (distant horizon backdrop). Toggleable live via Settings
   // ("render_horizon", default on) so it can be disabled to stop fog rendering distant mesh.
@@ -905,6 +1161,21 @@ void WorldRender::draw (glm::mat4x4 const& model_view
 
       mcnk_shader.uniform("camera", glm::vec3(camera_pos.x, camera_pos.y, camera_pos.z));
       mcnk_shader.uniform("animtime", static_cast<int>(_world->animtime));
+      // TERRAIN SPECULAR (client-exact, Westfall trace): sun-band colour (SUN_COLOR = LightIntBand
+      // band 9, "sun/specular") drives the FF specular the client adds on terrain. Toggleable
+      // (render/terrain_specular, default on -- the client ships with `specular` enabled).
+      {
+        static QElapsedTimer spec_timer;
+        static bool spec_on = true;
+        if (!spec_timer.isValid() || spec_timer.elapsed() > 500)
+        {
+          spec_on = _world->_settings->value("render/terrain_specular", true).toBool();
+          spec_timer.restart();
+        }
+        glm::vec3 const sun_spec = _skies->color_set[SUN_COLOR];
+        mcnk_shader.uniform("draw_terrain_specular", spec_on ? 1 : 0);
+        mcnk_shader.uniform("sun_spec_color", sun_spec);
+      }
 
       if (cursor_type != CursorType::NONE)
       {
@@ -1014,6 +1285,18 @@ void WorldRender::draw (glm::mat4x4 const& model_view
   std::vector<Model*> deferred_light_effects;
 
   tsl::robin_map<Model*, std::vector<glm::mat4x4>> models_to_draw;
+  // Models used by GAMEOBJECT spawns this frame: gameobjects are fade-mechanic objects (like
+  // creatures), so their buckets draw with the per-pixel slice OFF -- the fade in
+  // models_to_draw_fades is their boundary, not the slice knife.
+  std::set<Model*> go_bucket_models;
+  // Gameobject spawns that are MID-FADE this frame: routed through the exact INDIVIDUAL draw path
+  // creatures use (continuous alpha, depth prepass, identical blend promotion) so their fade is
+  // pixel-identical to a creature's. Full-alpha gameobjects stay batched in models_to_draw.
+  std::vector<std::pair<ModelInstance*, float>> go_fading_individual;
+  // Parallel per-instance cull-fade alphas (same push order as models_to_draw / creature_instanced).
+  // Sites that don't fade (WMO doodads, ground clutter) push 1.0 to keep the vectors aligned.
+  tsl::robin_map<Model*, std::vector<float>> models_to_draw_fades;
+  std::map<std::pair<Model*, std::uint32_t>, std::vector<float>> creature_instanced_fades;
   // Instanced creature batches keyed by (model, display_id): each batch is ONE skin, so the representative
   // instance's replaceable creature textures + geoset selection apply to the whole draw. Molten Giant /
   // Destroyer / Golemagg share mountaingiant.m2 but have different display skins, so keying by model alone
@@ -1026,6 +1309,9 @@ void WorldRender::draw (glm::mat4x4 const& model_view
     std::uint32_t guid = 0;
     ModelInstance* instance = nullptr;
     World::CreatureSpawnOverlay* spawn = nullptr;
+    // The unit's cull-fade alpha this frame: ONE value shared by the body, attachments, blob
+    // shadow and bloom-mask re-stamp, so every visual component fades in lockstep.
+    float fade = 1.0f;
   };
   std::vector<CreatureSpawnInstanceDraw> creature_spawn_instances_to_draw;
   // WMO doodads needing PER-INSTANCE animation (billboarded glow cards, global-seq flicker): drawn
@@ -1046,8 +1332,14 @@ void WorldRender::draw (glm::mat4x4 const& model_view
   // so WMOs that stream in late are honoured without paying the gather cost every frame.
   // NOGGIT_NO_INTERIOR_OBJECT_LIGHT=1 disables (objects indoors then get the outdoor sun like before).
   static bool const s_no_interior_object_light = std::getenv("NOGGIT_NO_INTERIOR_OBJECT_LIGHT") != nullptr;
-  if ((_interior_light_epoch++ % 60u) == 0u)
+  static bool const s_interior_light_debug = std::getenv("NOGGIT_LIGHT_DEBUG") != nullptr;
+  // Refresh on the 60-frame epoch OR the moment the loaded-WMO set changes: with only the epoch,
+  // an object could fade in fully and THEN visibly re-light ~a second later when its room's volumes
+  // finally got gathered. The fingerprint walk is cheap (no extents math).
+  std::uint64_t const wmo_fingerprint = _world->loaded_wmo_fingerprint();
+  if ((_interior_light_epoch++ % 60u) == 0u || wmo_fingerprint != _last_wmo_fingerprint)
   {
+    _last_wmo_fingerprint = wmo_fingerprint;
     _interior_light_cache.clear();
     if (!s_no_interior_object_light)
     {
@@ -1057,6 +1349,7 @@ void WorldRender::draw (glm::mat4x4 const& model_view
     {
       _interior_volumes.clear(); // empty -> interior_light_at returns outdoor for everything
     }
+    _world->collect_fog_volumes(_env_fog_volumes);
   }
   // Client unit interior lighting (RE_notes/15): a unit standing in a WMO indoor group is lit from the
   // baked MOCV floor colour under its feet -- NOT the sun, NOT MOHD ambient, and (for classic WMOs with
@@ -1078,12 +1371,17 @@ void WorldRender::draw (glm::mat4x4 const& model_view
     return key;
   };
 
-  auto interior_light_at = [this](glm::vec3 const& pos) -> glm::vec4
+  // Per-object ZONE tint (client-canon, trace: wow_cap_timbermaw): outdoor entities are lit by the
+  // zone light at THEIR position, not the camera's. Encoded in the same vec4 as the interior light:
+  // a == 0 with rgb = light_at(object)/light_at(camera); rgb == 0 is the legacy no-tint sentinel.
+  // NOGGIT_NO_ZONE_TINT=1 restores camera-only zone lighting for A/B.
+  static bool const s_no_zone_tint = std::getenv("NOGGIT_NO_ZONE_TINT") != nullptr;
+  glm::vec3 const cam_light_sum = glm::vec3(_lighting_ubo_data.DiffuseColor_FogStart)
+                                + glm::vec3(_lighting_ubo_data.AmbientColor_FogEnd);
+  int const zone_tint_time = static_cast<int>(_world->time);
+
+  auto interior_light_at = [this, &camera_pos, cam_light_sum, zone_tint_time](glm::vec3 const& pos) -> glm::vec4
   {
-    if (_interior_volumes.empty())
-    {
-      return glm::vec4(0.f);
-    }
     std::int64_t const kx = static_cast<std::int64_t>(std::floor(pos.x));
     std::int64_t const ky = static_cast<std::int64_t>(std::floor(pos.y));
     std::int64_t const kz = static_cast<std::int64_t>(std::floor(pos.z));
@@ -1111,8 +1409,145 @@ void WorldRender::draw (glm::mat4x4 const& model_view
         // the object stays on the outdoor path (matches the client's "not linked to a WMO" fallback)
       }
     }
+
+    if (light.a == 0.f && !s_no_zone_tint)
+    {
+      glm::vec3 dif, amb;
+      _skies->light_at(pos, zone_tint_time, &dif, &amb);
+      glm::vec3 const obj_sum = dif + amb;
+      glm::vec3 tint(1.0f);
+      for (int ch = 0; ch < 3; ++ch)
+      {
+        tint[ch] = cam_light_sum[ch] > 0.004f ? obj_sum[ch] / cam_light_sum[ch] : 1.0f;
+      }
+      // quantize so instanced draws group well; near-1 stays the exact legacy path (0,0,0,0)
+      tint = glm::clamp(glm::round(tint * 32.0f) / 32.0f, glm::vec3(0.03125f), glm::vec3(4.0f));
+      if (tint != glm::vec3(1.0f))
+      {
+        light = glm::vec4(tint, 0.0f);
+      }
+    }
+
     _interior_light_cache.emplace(key, light);
     return light;
+  };
+
+  // Live diagnosis for "doodads sunlit indoors" reports: prints the interior classification of the
+  // CAMERA position (stand next to the mis-lit doodad) + how many indoor volumes exist.
+  if (s_interior_light_debug)
+  {
+    static QElapsedTimer dbg_timer;
+    if (!dbg_timer.isValid() || dbg_timer.elapsed() > 2000)
+    {
+      dbg_timer.restart();
+      glm::vec4 const probe = interior_light_at(camera_pos);
+      int containing = 0;
+      for (auto const& v : _interior_volumes)
+      {
+        if (camera_pos.x >= v.min.x && camera_pos.x <= v.max.x
+         && camera_pos.y >= v.min.y && camera_pos.y <= v.max.y
+         && camera_pos.z >= v.min.z && camera_pos.z <= v.max.z) { ++containing; }
+      }
+      LogError << "[interior-light] volumes=" << _interior_volumes.size()
+               << " containing_cam=" << containing
+               << " probe=(" << probe.x << "," << probe.y << "," << probe.z << " a=" << probe.a << ")"
+               << " cam=(" << camera_pos.x << "," << camera_pos.y << "," << camera_pos.z << ")" << std::endl;
+    }
+  }
+
+  // Cull-range fade -- CREATURES AND GAMEOBJECTS ONLY (tile doodads/trees do NOT fade: they get
+  // the terrain-parity per-pixel slice, see slice_dist). CLIENT-EXACT timer model (note 24,
+  // user-confirmed): the range test is BINARY -- inside the spawn render distance the unit plays
+  // the 2000 ms cubic fade-IN (t^3) to full and STAYS full; the moment it is outside, it plays the
+  // 2000 ms fade-OUT (smoothstep((1-t) * a0)) to zero regardless of further camera movement.
+  // Alpha is never tied to distance itself, so stopping mid-flight never leaves a half-faded unit.
+  // NOGGIT_NO_DIST_FADE=1 disables fade + slice.
+  static bool const s_no_dist_fade = std::getenv("NOGGIT_NO_DIST_FADE") != nullptr;
+  float const fade_now_ms = static_cast<float>(
+    std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now().time_since_epoch()).count() % 360000000LL);
+  // Phases: 0 = gone, 1 = fading in (t^3 / 2000 ms), 2 = fully shown, 3 = fading OUT
+  // (client SWModelFadeout, note 24: alpha = smoothstep((1-t) * a0) over 2000 ms, a0 = the alpha the
+  // object was last shown at). An object leaving its range NEVER hard-disappears: it keeps drawing
+  // through the fade-out and is dropped only at alpha 0. Reversals are continuous (client behaviour).
+  auto cull_fade_alpha = [&](SceneObject* o, bool drawable, float dist_alpha) -> float
+  {
+    if (s_no_dist_fade)
+    {
+      return drawable ? 1.0f : 0.0f;
+    }
+    bool const want_visible = drawable && dist_alpha > 0.0f;
+    if (!want_visible)
+    {
+      if (o->_cull_fade_phase == 0)
+      {
+        return 0.0f;
+      }
+      if (o->_cull_fade_phase != 3)
+      {
+        // start the timed fade-out from the last SHOWN alpha (_cull_fade_out_a0, tracked below)
+        o->_cull_fade_ms_ref = fade_now_ms;
+        o->_cull_fade_phase = 3;
+      }
+      float const t = (fade_now_ms - o->_cull_fade_ms_ref) / 2000.0f;
+      if (t >= 1.0f)
+      {
+        o->_cull_fade_phase = 0; // gone: next appearance fades in from zero
+        return 0.0f;
+      }
+      float const x = std::clamp((1.0f - t) * o->_cull_fade_out_a0, 0.0f, 1.0f);
+      return x * x * (3.0f - 2.0f * x); // client smoothstep (note 24)
+    }
+
+    if (o->_cull_fade_phase == 3)
+    {
+      // back in range mid-fade-out: resume the fade-in from the CURRENT fade-out alpha
+      float const t = std::clamp((fade_now_ms - o->_cull_fade_ms_ref) / 2000.0f, 0.0f, 1.0f);
+      float const x = std::clamp((1.0f - t) * o->_cull_fade_out_a0, 0.0f, 1.0f);
+      float const cur = x * x * (3.0f - 2.0f * x);
+      float const t_resume = std::cbrt(std::clamp(cur, 0.0f, 1.0f));
+      o->_cull_fade_ms_ref = fade_now_ms - t_resume * 2000.0f;
+      o->_cull_fade_phase = t_resume >= 1.0f ? 2 : 1;
+    }
+
+    float t_in = 1.0f;
+    if (o->_cull_fade_phase == 0)
+    {
+      o->_cull_fade_phase = 1;
+      o->_cull_fade_ms_ref = fade_now_ms;
+      t_in = 0.0f;
+    }
+    else if (o->_cull_fade_phase == 1)
+    {
+      float const t = (fade_now_ms - o->_cull_fade_ms_ref) / 2000.0f;
+      if (t >= 1.0f)
+      {
+        o->_cull_fade_phase = 2;
+      }
+      else
+      {
+        t_in = t * t * t; // client cubic (note 24)
+      }
+    }
+    float const alpha = std::min(t_in, dist_alpha);
+    o->_cull_fade_out_a0 = alpha; // a later fade-out starts exactly here -- no pop-up, no pop-out
+    return alpha;
+  };
+
+  // Tile-M2 range test (BINARY, no fade). Limit = the object render distance (defaults to the
+  // view distance), radius-extended so a model is gathered while ANY part of it is inside the
+  // boundary; the fragment-shader slice (slice_dist) then clips its pixels at the exact distance,
+  // so trees slice in/out of view the same way terrain does at the far plane -- never as a whole.
+  auto m2_dist_envelope = [&](ModelInstance* mi) -> float
+  {
+    float const radius = mi->model->rad * mi->scale;
+    float const dist = (display == display_mode::in_3D
+                        ? glm::distance(camera_pos, mi->pos)
+                        : std::abs(mi->pos.y - camera_pos.y)) - radius;
+    float const limit = _cull_distance;
+    // Binary: the per-pixel slice in the shader (slice_dist) handles the visual boundary exactly
+    // like terrain's far plane; the model is gathered while ANY of it is inside the boundary.
+    return dist <= limit ? 1.0f : 0.0f;
   };
 
   // frame counter loop. pretty hacky but works
@@ -1147,9 +1582,11 @@ void WorldRender::draw (glm::mat4x4 const& model_view
     if (tile->renderer()->isOccluded() && !tile->getChunkUpdateFlags() && !tile->renderer()->isOverridingOcclusionCulling())
       continue;
 
-    // early dist check
-    // TODO: optional
-    if (tile->camDist() > _terrain_cull_distance)
+    // Early dist check. camDist is to the tile CENTER, so gather objects one TILESIZE beyond the
+    // terrain distance: objects near a far tile's close edge (and tall trees whose radius extends
+    // their fade range) must keep drawing until their own distance envelope reaches zero --
+    // otherwise the whole tile's objects pop at full alpha while still visible above the fog.
+    if (tile->camDist() > _terrain_cull_distance + TILESIZE)
       continue;
 
     // Frustum-cull the whole tile's OBJECTS. objectsFrustumCullTest()==0 means the tile's COMBINED extents
@@ -1163,6 +1600,80 @@ void WorldRender::draw (glm::mat4x4 const& model_view
       continue;
 
 
+    // Per-chunk object gather (client MCRF semantics, checklist D1): on a PARTIALLY visible tile,
+    // frustum-test the tile's 16x16 object buckets (~33yd cells) and only per-instance-test the
+    // survivors -- instead of testing every instance on the tile. Fully-visible tiles keep the
+    // straight per-model walk below (bucket tests would only add work there). The frame stamp
+    // already dedupes instances that sit in several buckets/tiles. NOGGIT_NO_MCRF_BUCKETS=1 bisect.
+    static bool const mcrf_buckets_disabled = []
+    {
+      char const* v = std::getenv("NOGGIT_NO_MCRF_BUCKETS");
+      return v && *v && *v != '0';
+    }();
+
+    if (!minimap_render && !mcrf_buckets_disabled && tile->renderer()->objectsFrustumCullTest() == 1)
+    {
+      for (auto const& bucket : tile->getObjectBuckets())
+      {
+        if (bucket.instances.empty() || !frustum.intersects(bucket.aabb_max, bucket.aabb_min))
+        {
+          continue;
+        }
+
+        for (auto const& [obj, instance] : bucket.instances)
+        {
+          if (instance->frame == frame)
+          {
+            continue;
+          }
+
+          if (instance->which() == eMODEL)
+          {
+            if (!draw_models)
+            {
+              continue;
+            }
+
+            instance->frame = frame;
+            auto m2_instance = static_cast<ModelInstance*>(instance);
+
+            if (should_suppress_legacy_creature_instance(_world, *m2_instance, _legacy_suppress_index))
+            {
+              continue;
+            }
+
+            // Tile doodads carry NO opacity fade (fade is a creature/GO mechanic): they are gathered
+            // while ANY part is inside the boundary and the shader's per-pixel slice (slice_dist)
+            // clips them at the object cull distance exactly like the far plane clips terrain.
+            bool const drawable = m2_instance->model->finishedLoading()
+                               && m2_dist_envelope(m2_instance) > 0.0f;
+            if (drawable && m2_instance->isInFrustum(frustum))
+            {
+              models_to_draw[reinterpret_cast<Model*>(obj)].push_back(m2_instance->transformMatrix());
+              models_to_draw_fades[reinterpret_cast<Model*>(obj)].push_back(1.0f);
+            }
+          }
+          else if (instance->which() == eWMO)
+          {
+            if (!draw_wmo)
+            {
+              continue;
+            }
+
+            instance->frame = frame;
+            auto wmo_instance = static_cast<WMOInstance*>(instance);
+
+            if (frustum.intersects(wmo_instance->extents[1], wmo_instance->extents[0]))
+            {
+              wmos_to_draw.push_back(wmo_instance);
+            }
+          }
+        }
+      }
+
+      continue; // this tile is done -- skip the per-model walk below
+    }
+
     // TODO: subject to potential generalization
     for (auto& pair : tile->getObjectInstances())
     {
@@ -1172,6 +1683,7 @@ void WorldRender::draw (glm::mat4x4 const& model_view
           continue;
 
         auto& instances = models_to_draw[reinterpret_cast<Model*>(pair.first)];
+        auto& fades = models_to_draw_fades[reinterpret_cast<Model*>(pair.first)];
 
         // memory allocation heuristic. all objects will pass if tile is entirely in frustum.
         // otherwise we only allocate for a half
@@ -1203,9 +1715,16 @@ void WorldRender::draw (glm::mat4x4 const& model_view
             continue;
           }
 
-          if ((tile->renderer()->objectsFrustumCullTest() > 1 || m2_instance->isInFrustum(frustum)) && m2_instance->isInRenderDist(_cull_distance, camera_pos, display))
+          // tile doodads: no fade (creature/GO mechanic) -- per-pixel slice clips at the boundary
+          bool const drawable = m2_instance->model->finishedLoading()
+                             && (minimap_render
+                                 ? m2_instance->isInRenderDist(_cull_distance, camera_pos, display)
+                                 : m2_dist_envelope(m2_instance) > 0.0f);
+          if (drawable
+              && (tile->renderer()->objectsFrustumCullTest() > 1 || m2_instance->isInFrustum(frustum)))
           {
             instances.push_back(m2_instance->transformMatrix());
+            fades.push_back(1.0f);
           }
 
         }
@@ -1246,6 +1765,49 @@ void WorldRender::draw (glm::mat4x4 const& model_view
           }
         }
       }
+    }
+  }
+
+  // WMO-model GAMEOBJECTS (Turtle player housing etc.): their WMOInstances join the same draw list as
+  // world WMOs -- walls, doodad sets, fog and liquids all render through the standard WMO pipeline.
+  if (!minimap_render && (_world->drawCreatureSpawns() || _world->drawGameObjectSpawns()))
+  {
+    _world->ensureGameObjectSpawnsLoaded();
+    static int s_gowmo_logs = 0;
+    int gowmo_total = 0, gowmo_queued = 0, gowmo_failed = 0, gowmo_loading = 0;
+    for (auto& spawn : _world->gameObjectSpawns())
+    {
+      if (spawn.pending_delete || !spawn.model_path.ends_with(".wmo"))
+      {
+        continue;
+      }
+      ++gowmo_total;
+      if (!_world->ensureGameObjectSpawnModel(spawn) || !spawn.wmo_instance.has_value())
+      {
+        ++gowmo_failed;
+        continue;
+      }
+      WMOInstance* wi = &*spawn.wmo_instance;
+      if (!wi->finishedLoading())
+      {
+        // async load in flight: extents are not valid yet -- queue it anyway (the WMO draw path
+        // guards unloaded instances) so it appears the moment loading completes.
+        wmos_to_draw.push_back(wi);
+        ++gowmo_loading;
+        continue;
+      }
+      wi->ensureExtents();
+      if (frustum.intersects(wi->extents[1], wi->extents[0]))
+      {
+        wmos_to_draw.push_back(wi);
+        ++gowmo_queued;
+      }
+    }
+    if (gowmo_total > 0 && s_gowmo_logs < 8)
+    {
+      ++s_gowmo_logs;
+      LogError << "GOWMO gather: total=" << gowmo_total << " queued=" << gowmo_queued
+               << " loading=" << gowmo_loading << " failed=" << gowmo_failed << std::endl;
     }
   }
 
@@ -1508,6 +2070,7 @@ void WorldRender::draw (glm::mat4x4 const& model_view
           else
           {
             models_to_draw[doodad->model.get()].push_back(doodad->transformMatrix());
+            models_to_draw_fades[doodad->model.get()].push_back(1.0f); // WMO doodads cull with their group
           }
         }
       }
@@ -1543,11 +2106,18 @@ void WorldRender::draw (glm::mat4x4 const& model_view
       // creature on the (working) individual path renders them all to the full creature draw distance.
       // The dual-path exclusion below is still correct and stays ready for when the instanced-render bug
       // is fixed; set this setting low to re-enable batching then.
+      // DEFAULT 1e9 = instancing OFF (as the comment above documents). It was WRONGLY 80.0f, so
+      // instancing kicked in at 80 yd and crossing that boundary switched a creature between the
+      // INDIVIDUAL path (per-spawn animation timeline + guid-keyed idle schedule) and the INSTANCED
+      // path (shared timeline, stale idle key) -- desyncing its idle schedule so the animation RESET
+      // every time the camera crossed 80 yd in or out (user-reported bird/dragon wing-flap reset at
+      // a fixed distance). Instancing stays off until the instanced-render path is repaired.
       float const creature_instance_lod_dist =
-        QSettings().value("render/creature_instance_lod_distance", 80.0f).toFloat();
+        QSettings().value("render/creature_instance_lod_distance", 1.0e9f).toFloat();
       // Models that have at least one INDIVIDUAL copy this frame (near, or complex at any distance). Any
       // far/simple copy of such a model must also go individual, never instanced.
       std::set<Model*> models_drawn_individually;
+      _creature_fade_by_guid.clear();
       // Simple + far copies whose instanced-vs-individual routing is deferred until the set above is complete.
       std::vector<World::CreatureSpawnOverlay*> far_instance_candidates;
       for (auto& spawn : _world->creatureSpawns())
@@ -1559,7 +2129,11 @@ void WorldRender::draw (glm::mat4x4 const& model_view
         float const creature_distance = glm::distance(camera_pos, spawn.pos);
         trace_creature_spawn("candidate", spawn, creature_distance);
 
-        if (creature_distance > creature_spawn_model_distance)
+        bool const creature_in_range = creature_distance <= creature_spawn_model_distance;
+        // Out of range: still process spawns whose cull fade is mid-flight (they keep drawing while
+        // fading out, client behaviour); everything else skips as before.
+        if (!creature_in_range
+            && (!spawn.model_instance.has_value() || spawn.model_instance->_cull_fade_phase == 0))
         {
           trace_creature_spawn("skip-distance", spawn, creature_distance, "draw distance");
           continue;
@@ -1597,12 +2171,30 @@ void WorldRender::draw (glm::mat4x4 const& model_view
           continue;
         }
 
+        // BINARY range test (client model, user-confirmed): inside the knob -> play the 2 s fade-in
+        // to FULL and stay full; outside -> play the 2 s fade-out to zero. No distance-proportional
+        // alpha -- stopping mid-flight never leaves a half-faded creature.
+        float const creature_fade = cull_fade_alpha(&mi, true, creature_in_range ? 1.0f : 0.0f);
+        _creature_fade_by_guid[spawn.guid] = creature_fade; // for the selection circle fade
+        if (creature_fade <= 0.0f)
+        {
+          trace_creature_spawn("skip-faded", spawn, creature_distance, "fade complete", &mi);
+          continue;
+        }
+
         // UNIFORM creature render distance: every creature draws out to the full creature/draw_distance
         // knob (the create-gate distance above) regardless of model size. No size-proportional culling --
         // a big giant and a small critter both render to the same knob distance (user preference; the
         // client's size-scaled SmallCull made noggit's small model->rad cull giants too soon).
         if (!mi.isInFrustum(frustum))
         {
+          static bool const s_anim_skip_dbg = std::getenv("NOGGIT_ANIM_SKIP_DEBUG") != nullptr;
+          if (s_anim_skip_dbg && mi._cull_fade_phase != 0)
+          {
+            LogError << "ANIMSKIP guid=" << spawn.guid << " '" << mi.model->file_key().stringRepr()
+                     << "' DROPPED (out of frustum) while fadePhase=" << (int)mi._cull_fade_phase
+                     << " fade=" << creature_fade << " dist=" << creature_distance << std::endl;
+          }
           trace_creature_spawn("skip-frustum", spawn, creature_distance, "frustum", &mi);
           continue;
         }
@@ -1633,7 +2225,7 @@ void WorldRender::draw (glm::mat4x4 const& model_view
           // Individual path (near, or a complex creature at any distance). Mark the model so no far/simple
           // copy of it gets instanced -- a model drawn on BOTH paths in one frame renders nothing when
           // instanced (the molten-giant-invisibility bug).
-          creature_spawn_instances_to_draw.push_back({spawn.guid, &mi, &spawn});
+          creature_spawn_instances_to_draw.push_back({spawn.guid, &mi, &spawn, creature_fade});
           models_drawn_individually.insert(mi.model.get());
           trace_creature_spawn("draw-queued", spawn, creature_distance, nullptr, &mi);
         }
@@ -1657,9 +2249,13 @@ void WorldRender::draw (glm::mat4x4 const& model_view
         }
         auto& fmi = *spawnp->model_instance;
         Model* const fmodel = fmi.model.get();
+        // second cull_fade_alpha call this frame is a stable read (same frame timestamp)
+        bool const f_in_range = glm::distance(camera_pos, spawnp->pos) <= creature_spawn_model_distance;
+        float const f_fade = cull_fade_alpha(&fmi, true, f_in_range ? 1.0f : 0.0f);
+        _creature_fade_by_guid[spawnp->guid] = f_fade; // for the selection circle fade
         if (models_drawn_individually.find(fmodel) != models_drawn_individually.end())
         {
-          creature_spawn_instances_to_draw.push_back({spawnp->guid, &fmi, spawnp});
+          creature_spawn_instances_to_draw.push_back({spawnp->guid, &fmi, spawnp, f_fade});
         }
         else
         {
@@ -1667,6 +2263,7 @@ void WorldRender::draw (glm::mat4x4 const& model_view
           // skin/geoset resolve the instanced draw needs.
           auto const key = std::make_pair(fmodel, spawnp->display_id);
           creature_instanced[key].push_back(fmi.transformMatrix());
+          creature_instanced_fades[key].push_back(f_fade);
           creature_instanced_rep.emplace(key, &fmi); // first instance of this group wins
         }
       }
@@ -1683,7 +2280,9 @@ void WorldRender::draw (glm::mat4x4 const& model_view
         float const gameobject_distance = glm::distance(camera_pos, spawn.pos);
         trace_gameobject_spawn("candidate", spawn, gameobject_distance);
 
-        if (gameobject_distance > creature_spawn_model_distance)
+        bool const go_in_range = gameobject_distance <= creature_spawn_model_distance;
+        if (!go_in_range
+            && (!spawn.model_instance.has_value() || spawn.model_instance->_cull_fade_phase == 0))
         {
           trace_gameobject_spawn("skip-distance", spawn, gameobject_distance, "draw distance");
           continue;
@@ -1721,6 +2320,14 @@ void WorldRender::draw (glm::mat4x4 const& model_view
           continue;
         }
 
+        // binary range test (client model): the 2 s fade animations do all the work
+        float const go_fade = cull_fade_alpha(&mi, true, go_in_range ? 1.0f : 0.0f);
+        if (go_fade <= 0.0f)
+        {
+          trace_gameobject_spawn("skip-faded", spawn, gameobject_distance, "fade complete", &mi);
+          continue;
+        }
+
         // UNIFORM gameobject render distance: draw to the full knob distance regardless of model size
         // (same as creatures -- no size-proportional culling).
         if (!mi.isInFrustum(frustum))
@@ -1733,7 +2340,18 @@ void WorldRender::draw (glm::mat4x4 const& model_view
         {
           mi.model->animcalc = false;
         }
-        models_to_draw[mi.model.get()].push_back(mi.transformMatrix());
+        if (go_fade < 0.999f)
+        {
+          // mid-fade: EXACT creature treatment (individual draw, continuous alpha) -- see the
+          // dedicated loop after the creature spawn draws
+          go_fading_individual.push_back({&mi, go_fade});
+        }
+        else
+        {
+          models_to_draw[mi.model.get()].push_back(mi.transformMatrix());
+          models_to_draw_fades[mi.model.get()].push_back(1.0f);
+          go_bucket_models.insert(mi.model.get());
+        }
         trace_gameobject_spawn("draw-queued", spawn, gameobject_distance, nullptr, &mi);
       }
     }
@@ -1754,7 +2372,7 @@ void WorldRender::draw (glm::mat4x4 const& model_view
       // so the slider takes effect without a restart.
       QSettings clutter_settings;
       float const clutter_density = std::clamp(clutter_settings.value("render/ground_clutter_density", 100.0f).toFloat(), 0.0f, 100.0f) / 100.0f;
-      float const clutter_dist = clutter_settings.value("render/ground_clutter_distance", 120.0f).toFloat();
+      float const clutter_dist = clutter_settings.value("render/ground_clutter_distance", 200.0f).toFloat();
 
       auto dist2 = [](glm::vec3 const& a, glm::vec3 const& b)
       {
@@ -1765,6 +2383,11 @@ void WorldRender::draw (glm::mat4x4 const& model_view
       if (draw_ground_clutter && clutter_density > 0.0f && draw_models && !minimap_render)
       {
         float const clutter_dist2 = clutter_dist * clutter_dist;
+        // Density-parity diagnostics (Westfall tile 30_52 ground truth = ~426 instances/chunk,
+        // simulated from the ADT+DBC): log the funnel every ~5s so instance loss is attributable.
+        static int clutter_dbg_frame = 0;
+        bool const clutter_dbg = (++clutter_dbg_frame % 300) == 0;
+        int dbg_chunks = 0, dbg_deferred = 0, dbg_placed = 0, dbg_submitted = 0, dbg_notloaded = 0, dbg_far = 0;
         // First-time clutter computation (DBC pick + RNG scatter + height interp per chunk) is done lazily
         // on this draw thread. When crossing into a new area ~40 chunks would compute in ONE frame -> a
         // visible hitch. Budget it: at most a few NEW chunks per frame, so clutter fades in over a handful
@@ -1796,9 +2419,12 @@ void WorldRender::draw (glm::mat4x4 const& model_view
               {
                 continue;
               }
-              // Cheap chunk-centre distance gate before touching per-doodad work.
+              // Cheap chunk-centre distance gate before touching per-doodad work. Slack must be
+              // added to the RADIUS before squaring (adding to the squared value shrinks the slack
+              // to ~3yd at range and clipped whole edge chunks whose content was in radius).
               glm::vec3 const ccenter = chunk->vcenter;
-              if (dist2(camera_pos, ccenter) > clutter_dist2 + 1600.0f) // + ~one chunk radius slack
+              float const gate = clutter_dist + 24.0f; // ~chunk half-diagonal
+              if (dist2(camera_pos, ccenter) > gate * gate)
               {
                 continue;
               }
@@ -1816,41 +2442,53 @@ void WorldRender::draw (glm::mat4x4 const& model_view
               {
                 if (clutter_compute_budget <= 0)
                 {
+                  ++dbg_deferred;
                   continue; // defer this chunk's clutter to a later frame -> no load hitch
                 }
                 --clutter_compute_budget;
               }
               auto const& doodads = chunk->detailDoodads();
-              // Per-doodad keep test = a stable per-index hash (deterministic -> no per-frame flicker,
-              // spatially uniform) compared against a DISTANCE-FADED density cut. The client fades grass
-              // out over a short range instead of drawing it at full density all the way to the edge, so
-              // near grass stays full while distant grass thins -- the biggest GPU-fill win for grass views
-              // and MORE client-faithful. `clutter_density` (the slider) scales the whole curve.
+              ++dbg_chunks;
+              dbg_placed += static_cast<int>(doodads.size());
+              // Interior chunks (entirely inside the pre-fade radius) skip ALL per-instance
+              // distance/fade math -- with frillDensity-level counts (up to ~2k/chunk) the
+              // per-instance work is the CPU cost, so pay it only in the outer fade band.
+              bool const chunk_in_fade_band =
+                dist2(camera_pos, ccenter) > (clutter_dist * 0.75f - 24.0f) * (clutter_dist * 0.75f - 24.0f);
+              // CLIENT-EXACT density model (wow.exe FUN_006b2b80/FUN_006bfc10): grass draws at FULL
+              // authored density across the whole radius -- the client NEVER drops instances by
+              // distance. It only ALPHA-FADES the outer quarter of the radius (fade ramp scale
+              // 1/(radius*0.25), .rdata 0x867958/0x810c68). The old random distance-thinning is what
+              // made our fields read sparse vs the game. The density slider remains as a uniform
+              // user override (100% = client).
               std::size_t idx = 0;
               for (auto const& dd : doodads)
               {
-                glm::vec3 const dpos(dd.transform[3]);
-                float const dd2 = dist2(camera_pos, dpos);
-                if (dd2 > clutter_dist2)
+                float fade_alpha = 1.0f;
+                if (chunk_in_fade_band)
                 {
-                  continue;
+                  glm::vec3 const dpos(dd.transform[3]);
+                  float const dd2 = dist2(camera_pos, dpos);
+                  if (dd2 > clutter_dist2)
+                  {
+                    ++dbg_far;
+                    continue;
+                  }
+                  // client fade: alpha ramp over the last quarter of the clutter radius
+                  float const dfrac = std::sqrt(dd2 / clutter_dist2);
+                  if (dfrac > 0.75f)
+                  {
+                    fade_alpha = glm::clamp((1.0f - dfrac) * 4.0f, 0.0f, 1.0f);
+                  }
                 }
-                // Distance fade: full density for the near ~35%, then ramp down to CLUTTER_MIN_FRAC at the
-                // edge. Keeps the foreground identical; only thins grass that's already small on screen.
-                constexpr float CLUTTER_FADE_START = 0.35f; // fraction of clutter_dist where thinning begins
-                constexpr float CLUTTER_MIN_FRAC = 0.15f;   // density retained at the very edge
-                float const dfrac = std::sqrt(dd2 / clutter_dist2); // 0 near .. 1 at edge (sqrt -> linear in distance)
-                float fade = 1.0f;
-                if (dfrac > CLUTTER_FADE_START)
+                if (clutter_density < 1.0f)
                 {
-                  float const t = (dfrac - CLUTTER_FADE_START) / (1.0f - CLUTTER_FADE_START);
-                  fade = 1.0f - (1.0f - CLUTTER_MIN_FRAC) * t;
-                }
-                std::uint32_t const cut = static_cast<std::uint32_t>(clutter_density * fade * 65536.0f);
-                std::uint32_t const h = ((static_cast<std::uint32_t>(idx++) * 2654435761u) >> 16) & 0xFFFFu;
-                if (h >= cut)
-                {
-                  continue;
+                  std::uint32_t const cut = static_cast<std::uint32_t>(clutter_density * 65536.0f);
+                  std::uint32_t const h = ((static_cast<std::uint32_t>(idx++) * 2654435761u) >> 16) & 0xFFFFu;
+                  if (h >= cut)
+                  {
+                    continue;
+                  }
                 }
                 Model* m = dd.cached_model;
                 if (!m)
@@ -1866,12 +2504,42 @@ void WorldRender::draw (glm::mat4x4 const& model_view
                   m = it->second.get();
                   if (!m || !m->finishedLoading() || m->loading_failed())
                   {
+                    ++dbg_notloaded;
                     continue; // not loaded yet -> don't cache; retry next frame
                   }
+                  // Marker for the DETAIL-DOODAD shading path: dimmed by day/night BRIGHTNESS but
+                  // NOT the zone light COLOUR (which greened the yellow atlas) -- grass keeps its own
+                  // hue and just darkens at night, like the client's ground effects.
+                  m->_force_unlit = true;
                   dd.cached_model = m; // loaded -> cache so this doodad never string-hashes again
                 }
                 models_to_draw[m].push_back(dd.transform);
+                models_to_draw_fades[m].push_back(fade_alpha); // client edge fade (last 25% of radius)
+                ++dbg_submitted;
               }
+            }
+          }
+        }
+        if (clutter_dbg)
+        {
+          LogDebug << "[clutter] chunks=" << dbg_chunks << " deferred=" << dbg_deferred
+                   << " placed=" << dbg_placed << " submitted=" << dbg_submitted
+                   << " far=" << dbg_far << " notloaded=" << dbg_notloaded
+                   << " dist=" << clutter_dist << " density=" << clutter_density << std::endl;
+          // Species histogram: which detail models are actually drawing (answers "wrong asset for
+          // the zone" reports without guessing -- compare against the zone's GroundEffect rows).
+          for (auto const& mp : _detail_doodad_models)
+          {
+            Model* m = mp.second.get();
+            auto it = models_to_draw.find(m);
+            if (it != models_to_draw.end() && !it->second.empty())
+            {
+              LogDebug << "[clutter]   " << mp.first << " x" << it->second.size()
+                       << (m->loading_failed() ? " LOAD-FAILED" : "") << std::endl;
+            }
+            else if (m && m->loading_failed())
+            {
+              LogDebug << "[clutter]   " << mp.first << " LOAD-FAILED" << std::endl;
             }
           }
         }
@@ -1912,6 +2580,9 @@ void WorldRender::draw (glm::mat4x4 const& model_view
         m2_shader.uniform("tex_unit_lookup_2", 0);
         m2_shader.uniform("pixel_shader", 0);
         m2_shader.uniform("model_origin", glm::vec3(0.0f)); // instanced: transform carries full world pos
+        // Terrain-parity boundary for tile doodads: pixels past the object cull distance are
+        // discarded in the fragment shader, slicing models in/out like the far plane does terrain.
+        m2_shader.uniform("slice_dist", s_no_dist_fade ? 0.0f : _cull_distance);
 
         for (auto& pair : models_to_draw)
         {
@@ -2026,9 +2697,21 @@ void WorldRender::draw (glm::mat4x4 const& model_view
             for (auto const& tr : pair.second)
             {
               glm::vec4 const in_light = interior_light_at(glm::vec3(tr[3]));
+              // indoors -> flat room-light mode (a=0.5); outdoors -> pass through (a=0, rgb may carry
+              // the per-object zone tint)
               bucket_interior.push_back(in_light.a > 0.f ? glm::vec4(glm::vec3(in_light), 0.5f)
-                                                         : glm::vec4(0.f));
+                                                         : in_light);
             }
+            // Per-instance cull-fade alphas gathered in lockstep with the transforms (defensive pad
+            // with 1.0 if a push site missed the parallel vector).
+            std::vector<float>& bucket_fades = models_to_draw_fades[pair.first];
+            bucket_fades.resize(pair.second.size(), 1.0f);
+
+            // Gameobject buckets fade (creature mechanic) instead of slicing: slice off for them.
+            // (A model shared by tile doodads AND a GO spawn loses the slice for its doodads too --
+            // acceptable, the bucket is drawn in one call.)
+            m2_shader.uniform("slice_dist",
+                              (s_no_dist_fade || go_bucket_models.count(pair.first)) ? 0.0f : _cull_distance);
 
             pair.first->renderer()->draw( model_view
                 , pair.second
@@ -2044,6 +2727,7 @@ void WorldRender::draw (glm::mat4x4 const& model_view
                 , /*no_cull*/ false
                 , /*representative*/ nullptr
                 , bucket_interior
+                , bucket_fades
             );
             _world->_n_rendered_objects += pair.second.size();
 
@@ -2062,6 +2746,14 @@ void WorldRender::draw (glm::mat4x4 const& model_view
             }
           }
         }
+
+        // A grass bucket may have left alpha-to-coverage enabled; clear it before the rest of the
+        // draws so it can't affect creatures / other passes.
+        gl.disable(GL_SAMPLE_ALPHA_TO_COVERAGE);
+
+        // Creatures keep the opacity-fade mechanic (no pixel slicing) -- turn the slice off for
+        // the rest of this program's draws (occlusion/other passes inherit 0 = off too).
+        m2_shader.uniform("slice_dist", 0.0f);
 
         // Instanced creature batches, grouped by (model, display) so each call is a single skin. Same
         // instanced program/state as the doodad buckets above, but each gets its group's REPRESENTATIVE
@@ -2087,9 +2779,12 @@ void WorldRender::draw (glm::mat4x4 const& model_view
           {
             creature_interior.push_back(interior_light_at(glm::vec3(tr[3])));
           }
+          std::vector<float>& creature_fades = creature_instanced_fades[entry.first];
+          creature_fades.resize(transforms.size(), 1.0f);
           m->renderer()->draw(model_view, transforms, m2_shader, model_render_state, frustum,
                               _cull_distance, camera_pos, _world->model_animtime, draw_models_with_box,
-                              model_boxes_to_draw, display, /*no_cull*/ false, rep, creature_interior);
+                              model_boxes_to_draw, display, /*no_cull*/ false, rep, creature_interior,
+                              creature_fades);
           _world->_n_rendered_objects += transforms.size();
         }
 
@@ -2240,41 +2935,126 @@ void WorldRender::draw (glm::mat4x4 const& model_view
           return false; // both opaque: keep original order
         });
 
-      // Unit blob shadows (faithful to the client's ShadowBlob decal under units): a soft dark circle
-      // under each creature, grounding it on the terrain. Doodads don't get this (they use baked MCSH).
-      // Procedural radial blob == ShadowBlob.blp's look without a texture. Drawn first so creature meshes
-      // sit on top; depth-tested against terrain with depth-write off (terrain in front still occludes).
+      // Unit blob shadows, CLIENT-EXACT (wow.exe 5875 @006d7920/@006d7480, RE'd): the REAL
+      // Textures\ShadowBlob.blp decal (32x32 grayscale, white rim -> ~0.63 gray centre, 1-bit
+      // alpha oval), drawn MODULATE (dst * src) over the terrain. The quad is the unit's model
+      // bbox FOOTPRINT (x/y extents clamped to +-5 like the client) transformed by the instance
+      // matrix -- the iconic 1.12 oval that elongates with the creature and turns with its facing.
+      // Doodads don't get this (they use baked MCSH). Drawn first so creature meshes sit on top;
+      // depth-tested against terrain with depth-write off. (Client refinement not replicated:
+      // terrain-triangle projection + height-fade ramp; ours is a flat decal at foot height.)
       {
-        OpenGL::Scoped::use_program blob_shader {*_blob_shadow_program.get()};
-        OpenGL::Scoped::bool_setter<GL_CULL_FACE, GL_FALSE> const cull;
-        OpenGL::Scoped::depth_mask_setter<GL_FALSE> const depth_mask;
-        gl.enable(GL_BLEND);
-        gl.blendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-        blob_shader.uniform("model_view_projection", mvp);
-        blob_shader.uniform("strength", 0.45f);
-        gl.bindVertexArray(_bloom_vao); // reuse an empty VAO (corners come from gl_VertexID)
-        for (auto const& draw_item : creature_spawn_instances_to_draw)
+        if (!_shadow_blob_texture)
         {
-          ModelInstance* instance = draw_item.instance;
-          if (!instance || !instance->model.get() || instance->model->loading_failed())
+          _shadow_blob_texture = std::make_unique<scoped_blp_texture_reference>(
+            "textures/ShadowBlob.blp", _world->getRenderContext());
+        }
+        if ((*_shadow_blob_texture)->finishedLoading() && !(*_shadow_blob_texture)->loading_failed()
+            && snapshotDecalDepth())
+        {
+          GLint vp[4] = {0, 0, 0, 0};
+          gl.getIntegerv(GL_VIEWPORT, vp);
+
+          OpenGL::Scoped::use_program blob_shader {*_blob_shadow_program.get()};
+          OpenGL::Scoped::bool_setter<GL_CULL_FACE, GL_FALSE> const cull;
+          OpenGL::Scoped::bool_setter<GL_DEPTH_TEST, GL_FALSE> const no_depth_test;
+          OpenGL::Scoped::depth_mask_setter<GL_FALSE> const depth_mask;
+          gl.enable(GL_BLEND);
+          gl.blendFunc(GL_DST_COLOR, GL_ZERO); // modulate, like the client
+          blob_shader.uniform("model_view_projection", mvp);
+          blob_shader.uniform("inv_view_projection", glm::inverse(mvp));
+          blob_shader.uniform("inv_viewport", glm::vec2(1.0f / std::max(vp[2], 1),
+                                                        1.0f / std::max(vp[3], 1)));
+          gl.activeTexture(GL_TEXTURE0);
+          (*_shadow_blob_texture)->bind();
+          blob_shader.uniform("shadow_tex", 0);
+          blob_shader.uniform("tex_index", (*_shadow_blob_texture)->array_index());
+          gl.activeTexture(GL_TEXTURE1);
+          gl.bindTexture(GL_TEXTURE_2D, _decal_depth_tex);
+          blob_shader.uniform("scene_depth", 1);
+          gl.activeTexture(GL_TEXTURE0);
+          gl.bindVertexArray(_bloom_vao); // reuse an empty VAO (corners come from gl_VertexID)
+          for (auto const& draw_item : creature_spawn_instances_to_draw)
           {
-            continue;
+            ModelInstance* instance = draw_item.instance;
+            if (!instance || !instance->model.get() || instance->model->loading_failed()
+                || !instance->model->finishedLoading())
+            {
+              continue;
+            }
+            if (!draw_hidden_models && instance->model->is_hidden())
+            {
+              continue;
+            }
+            glm::vec3 const p = instance->get_pos();
+            if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z))
+            {
+              continue;
+            }
+
+            // Footprint = the STAND SEQUENCE's bounds box x/y clamped to +-5. CLIENT-EXACT source
+            // (@00711a20): the client walks the sequence table and uses the CURRENT animation's
+            // bounds -- NOT the header bbox, which unions every animation's extremes and oversizes
+            // the oval (that mismatch is also why the shadow looked bigger than the selection
+            // circle and its dark centre spread too thin). Header bbox stays as the fallback.
+            auto const& hdr = instance->model->header;
+            glm::vec3 bmin = hdr.bounding_box_min;
+            glm::vec3 bmax = hdr.bounding_box_max;
+            {
+              auto const it = instance->model->_animations_seq_per_id.find(0);
+              if (it != instance->model->_animations_seq_per_id.end() && !it->second.empty())
+              {
+                auto const& seq = it->second.begin()->second;
+                glm::vec3 const a = glm::min(seq.boxA, seq.boxB);
+                glm::vec3 const b = glm::max(seq.boxA, seq.boxB);
+                if (b.x > a.x && b.y > a.y)
+                {
+                  bmin = a;
+                  bmax = b;
+                }
+              }
+            }
+            float x0 = std::max(bmin.x, -5.0f);
+            float x1 = std::min(bmax.x,  5.0f);
+            float y0 = std::max(bmin.y, -5.0f);
+            float y1 = std::min(bmax.y,  5.0f);
+            if (!(x1 > x0) || !(y1 > y0)
+                || !std::isfinite(x0) || !std::isfinite(x1) || !std::isfinite(y0) || !std::isfinite(y1))
+            {
+              // degenerate bbox: square footprint from size_cat, like the old fallback
+              float foot = instance->size_cat * 0.35f;
+              if (!std::isfinite(foot) || foot <= 0.0f) { foot = 2.0f; }
+              float const half = glm::clamp(foot, 0.6f, 14.0f) / std::max(instance->scale, 0.001f);
+              x0 = y0 = -half;
+              x1 = y1 =  half;
+            }
+            glm::mat4 const tr = instance->transformMatrix();
+            glm::mat3 const rot(tr);
+            glm::vec3 const c_m(0.5f * (x0 + x1), 0.0f, -0.5f * (y0 + y1));
+            glm::vec3 axis_x = rot * glm::vec3(0.5f * (x1 - x0), 0.0f, 0.0f);
+            glm::vec3 axis_y = rot * glm::vec3(0.0f, 0.0f, -0.5f * (y1 - y0));
+            glm::vec3 center = glm::vec3(tr * glm::vec4(c_m, 1.0f));
+            axis_x.y = 0.0f;
+            axis_y.y = 0.0f;
+            center.y = p.y; // foot plane; the decal projects onto the actual ground around it
+
+            // vertical fade range: size-proportional like the client's ramp; the coverage quad is
+            // expanded so sloped ground within that range still falls inside it on screen
+            float const half_x = glm::length(axis_x);
+            float const half_y = glm::length(axis_y);
+            float const v_range = std::max(std::max(half_x, half_y), 0.5f);
+            glm::vec2 const expand(1.0f + v_range / std::max(half_x, 0.001f),
+                                   1.0f + v_range / std::max(half_y, 0.001f));
+
+            blob_shader.uniform("center", center);
+            blob_shader.uniform("axis_x", axis_x);
+            blob_shader.uniform("axis_y", axis_y);
+            blob_shader.uniform("expand", expand);
+            blob_shader.uniform("v_range", v_range);
+            // shadow fades with its owner (modulates toward white = no darkening)
+            blob_shader.uniform("fade", draw_item.fade);
+            gl.drawArraysInstanced(GL_TRIANGLE_STRIP, 0, 4, 1);
           }
-          if (!draw_hidden_models && instance->model->is_hidden())
-          {
-            continue;
-          }
-          float foot = instance->size_cat * 0.35f; // size_cat = longest world-space AABB side (scaled)
-          if (!std::isfinite(foot) || foot <= 0.0f) { foot = 2.0f; }
-          float const radius = glm::clamp(foot, 0.6f, 14.0f);
-          glm::vec3 const p = instance->get_pos();
-          if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z))
-          {
-            continue;
-          }
-          blob_shader.uniform("center", glm::vec3(p.x, p.y + 0.1f, p.z));
-          blob_shader.uniform("radius", radius);
-          gl.drawArraysInstanced(GL_TRIANGLE_STRIP, 0, 4, 1);
         }
       }
 
@@ -2326,6 +3106,48 @@ void WorldRender::draw (glm::mat4x4 const& model_view
             instance->model->animcalc = false;
           }
 
+          // One fade for the whole unit (computed once at gather, carried on the draw item): the
+          // body AND every attached model (helmet, shoulders, weapon, aura kits) share this alpha.
+          float const creature_fade = draw_item.fade;
+
+          // MOUNT: a mounted NPC (creature_addon.mount_display_id) rides a mount model. Draw the mount
+          // at the spawn's ground position, then re-seat the rider onto the mount's MountMain point
+          // (attachment 0) so it sits on the saddle instead of standing inside the mount. Drawing the
+          // mount first populates its animated bone_matrices, which the seat position reads.
+          if (draw_item.spawn && draw_item.spawn->mount_instance.has_value())
+          {
+            auto& mount = *draw_item.spawn->mount_instance;
+            Model* mount_model = mount.model.get();
+            if (mount_model && mount_model->finishedLoading() && !mount_model->loading_failed()
+                && (draw_hidden_models || !mount_model->is_hidden()))
+            {
+              if (draw_model_animations)
+              {
+                mount_model->animcalc = false;
+              }
+              mount_model->renderer()->draw(model_view, mount, m2_shader, model_render_state, frustum,
+                _cull_distance, camera_pos, creature_animtime, display, /*no_cull*/ false,
+                /*bloom_mask_only*/ false, interior_light_at(mount.get_pos()), creature_fade);
+              ++_world->_n_rendered_objects;
+
+              // World seat = mount transform * (mount bone matrix * fixCoordSystem(attachment.pos)).
+              // Keep the rider's OWN scale; take the mount's position + facing.
+              if (auto const* seat = find_attachment_def(mount_model, 0))
+              {
+                glm::mat4x4 att = glm::translate(glm::mat4x4(1.0f), fixCoordSystem(seat->pos));
+                if (seat->bone >= 0
+                    && static_cast<std::size_t>(seat->bone) < mount_model->bone_matrices.size())
+                {
+                  att = mount_model->bone_matrices[seat->bone] * att;
+                }
+                glm::vec4 const seat_world = mount.transformMatrix() * att * glm::vec4(0.0f, 0.0f, 0.0f, 1.0f);
+                instance->pos = glm::vec3(seat_world);
+                instance->dir = mount.dir;
+                instance->updateTransformMatrix();
+              }
+            }
+          }
+
           instance->model->renderer()->draw(model_view
             , *instance
             , m2_shader
@@ -2338,6 +3160,7 @@ void WorldRender::draw (glm::mat4x4 const& model_view
             , /*no_cull*/ false
             , /*bloom_mask_only*/ false
             , interior_light_at(instance->get_pos())
+            , creature_fade
           );
           ++_world->_n_rendered_objects;
 
@@ -2496,6 +3319,10 @@ void WorldRender::draw (glm::mat4x4 const& model_view
                 // Attachments (weapons, shoulders, helmets) share their OWNER's light: without this they
                 // defaulted to the outdoor sun and glowed on a dark interior body (visible by day only).
                 , interior_light_at(instance->get_pos())
+                // ...and their OWNER's cull fade capped by their OWN stream-in fade: item models
+                // load async AFTER the body, and without their own 2 s ramp they popped in at the
+                // body's current mid-fade alpha instead of fading in from zero.
+                , std::min(creature_fade, cull_fade_alpha(&attachment_instance, true, 1.0f))
               );
               ++_world->_n_rendered_objects;
 
@@ -2528,6 +3355,63 @@ void WorldRender::draw (glm::mat4x4 const& model_view
     gl.disable(GL_BLEND);
     gl.enable(GL_CULL_FACE);
     gl.depthMask(GL_TRUE);
+
+    // FADING gameobjects: the same individual body draw creatures get, so gameobject fades are
+    // EXACTLY the creature fade -- continuous alpha (no instanced quantization), depth prepass,
+    // identical blend promotion and bloom-mask handling.
+    if (!go_fading_individual.empty())
+    {
+      OpenGL::Scoped::use_program go_m2_shader {*_m2_program.get()};
+
+      OpenGL::M2RenderState go_render_state;
+      go_render_state.tex_arrays = {0, 0};
+      go_render_state.tex_indices = {0, 0};
+      go_render_state.tex_unit_lookups = {0, 0};
+      gl.blendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+      gl.disable(GL_BLEND);
+      gl.depthMask(GL_TRUE);
+      gl.enable(GL_CULL_FACE);
+      go_m2_shader.uniform("blend_mode", 0);
+      go_m2_shader.uniform("unfogged", static_cast<int>(go_render_state.unfogged));
+      go_m2_shader.uniform("unlit",  static_cast<int>(go_render_state.unlit));
+      go_m2_shader.uniform("tex_unit_lookup_1", 0);
+      go_m2_shader.uniform("tex_unit_lookup_2", 0);
+      go_m2_shader.uniform("pixel_shader", 0);
+
+      for (auto const& go_item : go_fading_individual)
+      {
+        ModelInstance* go_instance = go_item.first;
+        if (!go_instance->model.get() || !go_instance->model->finishedLoading()
+            || go_instance->model->loading_failed()
+            || (!draw_hidden_models && go_instance->model->is_hidden()))
+        {
+          continue;
+        }
+        if (draw_model_animations)
+        {
+          go_instance->model->animcalc = false;
+        }
+        go_instance->model->renderer()->draw(model_view
+          , *go_instance
+          , go_m2_shader
+          , go_render_state
+          , frustum
+          , _cull_distance
+          , camera_pos
+          , static_cast<int>(_world->model_animtime)
+          , display
+          , /*no_cull*/ false
+          , /*bloom_mask_only*/ false
+          , interior_light_at(go_instance->get_pos())
+          , go_item.second
+        );
+        ++_world->_n_rendered_objects;
+      }
+
+      gl.disable(GL_BLEND);
+      gl.enable(GL_CULL_FACE);
+      gl.depthMask(GL_TRUE);
+    }
 
     // unsigned int wmos_todraw_count = wmos_to_draw.size();
     // unsigned int models_todraw_count = models_to_draw.size();
@@ -2575,7 +3459,7 @@ void WorldRender::draw (glm::mat4x4 const& model_view
       std::uint32_t closest_guid = 0;
       glm::vec3 closest_pos = glm::vec3(0.0f);
 
-      struct MarkerData { std::uint32_t guid; glm::vec4 color; };
+      struct MarkerData { std::uint32_t guid; glm::vec4 color; glm::vec3 pos; float radius; };
       std::vector<MarkerData> markers;
       markers.reserve(512);
 
@@ -2599,89 +3483,65 @@ void WorldRender::draw (glm::mat4x4 const& model_view
           closest_guid = spawn.guid;
           closest_pos = spawn.pos;
         }
-        if (distance > creature_spawn_marker_distance) continue;
+        // Only show the selection circle when the creature is actually within its RENDER range
+        // (the same knob the creature model uses) -- previously it used a separate 300yd marker
+        // distance, so circles appeared for creatures that weren't even being drawn.
+        if (distance > creature_spawn_model_distance) continue;
         ++nearby_spawns;
 
         // Game-exact circle size: server bounding radius x creature scale (what the client renders
         // via UNIT_FIELD_BOUNDINGRADIUS); falls back to the model footprint when the DB lacks it.
         float const ring_radius = spawn.selectionRingWorldRadius();
 
-        // Terrain-draped disc mesh, cached per spawn and rebuilt only when the spawn moves or its
-        // radius changes -- so the circle bends with the ground like the client's instead of being
-        // a flat plate clipping into slopes.
-        auto& disc = _creature_disc_cache[spawn.guid];
-        if (disc.radius != ring_radius || glm::distance(disc.pos, spawn.pos) > 0.001f)
+        // Base color = the creature's HOSTILITY toward players, resolved from its faction via
+        // FactionTemplate.dbc (calibrated: mask bit 0x1 = all-players, 0x2 = Alliance, 0x4 = Horde):
+        //   hostile-to-all-players (HostileMask & 0x1) -> RED, friendly-to-any-player-faction
+        //   (FriendlyMask & 0x7) -> GREEN, otherwise -> YELLOW (neutral). Non-partisan (both
+        //   Alliance and Horde town NPCs read friendly; only mobs hostile to everyone read red).
+        // Cached per faction id so we don't walk the DBC every spawn every frame.
+        glm::vec4 reaction_color(1.0f, 1.0f, 0.0f, 1.0f); // neutral yellow (also the fallback)
         {
-          disc.pos = spawn.pos;
-          disc.radius = ring_radius;
-          disc.vertices.clear();
-          disc.locals.clear();
-          disc.indices.clear();
-
-          int constexpr segments = 24;
-          float constexpr ring_fractions[] = { 0.35f, 0.65f, 0.85f, 1.0f };
-          int constexpr ring_count = 4;
-
-          auto const ground_y = [&](float x, float z) -> float
+          auto const it = _faction_reaction_cache.find(spawn.faction);
+          if (it != _faction_reaction_cache.end())
           {
-            // Probe from slightly above the spawn so slopes uphill of it still get hit.
-            glm::vec3 const hit = _world->get_ground_height(glm::vec3(x, spawn.pos.y + 3.0f, z));
-            // Guard: failed probes return (0,0,0); also ignore hits wildly off the spawn plane
-            // (overhangs / WMO roofs) and keep the disc's own plane instead.
-            if (hit == glm::vec3(0.0f) || std::abs(hit.y - spawn.pos.y) > ring_radius * 2.0f + 4.0f)
-            {
-              return spawn.pos.y;
-            }
-            return hit.y;
-          };
-
-          // centre vertex
-          disc.vertices.push_back(glm::vec3(spawn.pos.x, ground_y(spawn.pos.x, spawn.pos.z) + 0.08f, spawn.pos.z));
-          disc.locals.push_back(glm::vec2(0.0f, 0.0f));
-
-          for (int ring = 0; ring < ring_count; ++ring)
-          {
-            float const fr = ring_fractions[ring];
-            for (int seg = 0; seg < segments; ++seg)
-            {
-              float const angle = glm::two_pi<float>() * seg / float(segments);
-              float const lx = std::cos(angle) * fr;
-              float const lz = std::sin(angle) * fr;
-              float const wx = spawn.pos.x + lx * ring_radius;
-              float const wz = spawn.pos.z + lz * ring_radius;
-              disc.vertices.push_back(glm::vec3(wx, ground_y(wx, wz) + 0.08f, wz));
-              disc.locals.push_back(glm::vec2(lx, lz));
-            }
+            reaction_color = it->second;
           }
-
-          auto const ring_start = [&](int ring) { return static_cast<std::uint16_t>(1 + ring * segments); };
-          // centre fan to ring 0
-          for (int seg = 0; seg < segments; ++seg)
+          else
           {
-            disc.indices.push_back(0);
-            disc.indices.push_back(static_cast<std::uint16_t>(ring_start(0) + seg));
-            disc.indices.push_back(static_cast<std::uint16_t>(ring_start(0) + (seg + 1) % segments));
-          }
-          // quads between consecutive rings
-          for (int ring = 0; ring + 1 < ring_count; ++ring)
-          {
-            for (int seg = 0; seg < segments; ++seg)
+            glm::vec4 c(1.0f, 1.0f, 0.0f, 1.0f);
+            if (spawn.faction != 0)
             {
-              std::uint16_t const a = static_cast<std::uint16_t>(ring_start(ring) + seg);
-              std::uint16_t const b = static_cast<std::uint16_t>(ring_start(ring) + (seg + 1) % segments);
-              std::uint16_t const c = static_cast<std::uint16_t>(ring_start(ring + 1) + seg);
-              std::uint16_t const d = static_cast<std::uint16_t>(ring_start(ring + 1) + (seg + 1) % segments);
-              disc.indices.insert(disc.indices.end(), { a, c, d, a, d, b });
+              try
+              {
+                auto const rec = gFactionTemplateDB.getByID(spawn.faction);
+                std::uint32_t const friendly = rec.getUInt(FactionTemplateDB::FriendlyMask);
+                std::uint32_t const hostile  = rec.getUInt(FactionTemplateDB::HostileMask);
+                // Client reaction colors (UnitReactionColor): pure red / green / yellow.
+                if (hostile & 0x1u)        { c = glm::vec4(1.0f, 0.0f, 0.0f, 1.0f); } // RED hostile
+                else if (friendly & 0x7u)  { c = glm::vec4(0.0f, 1.0f, 0.0f, 1.0f); } // GREEN friendly
+                // else stays neutral yellow (1, 1, 0)
+              }
+              catch (...) { /* unknown faction template -> neutral */ }
             }
+            _faction_reaction_cache.emplace(spawn.faction, c);
+            reaction_color = c;
           }
         }
 
-        // Selected = the client's yellow target blob; the rest keep editor-distinct colors.
-        glm::vec4 color = spawn.selected ? glm::vec4(1.0f, 0.85f, 0.13f, 1.0f)
-            : spawn.hovered  ? glm::vec4(0.2f, 0.9f,  1.0f,  1.0f)
-            : spawn.dirty    ? glm::vec4(0.2f, 1.0f,  0.35f, 1.0f)
-                 : glm::vec4(1.0f, 0.55f, 0.08f, 1.0f);
-        markers.push_back({spawn.guid, color});
+        // Editor states override the hostility color so selection/hover/edit stay obvious.
+        glm::vec4 color = spawn.selected ? glm::vec4(1.0f, 0.85f, 0.13f, 1.0f)   // selected: bright yellow
+            : spawn.hovered  ? glm::vec4(0.2f, 0.9f,  1.0f,  1.0f)               // hovered: cyan
+            : spawn.dirty    ? glm::vec4(0.2f, 1.0f,  0.35f, 1.0f)               // unsaved edit: green
+                 : reaction_color;                                              // default: hostility
+
+        // Fade the circle WITH the creature (same cull-fade pipeline): multiply its alpha by the
+        // spawn's fade so the ring fades in/out in lockstep with the model instead of popping.
+        auto const fade_it = _creature_fade_by_guid.find(spawn.guid);
+        if (fade_it != _creature_fade_by_guid.end())
+        {
+          color.a *= fade_it->second;
+        }
+        markers.push_back({spawn.guid, color, spawn.pos, ring_radius});
       }
 
       if (capture_debug_enabled())
@@ -2693,39 +3553,44 @@ void WorldRender::draw (glm::mat4x4 const& model_view
                  << std::endl;
       }
 
-      gl.blendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-      gl.enable(GL_DEPTH_TEST);
+      // Selection circle as a SCREEN-SPACE PROJECTED DECAL, identical machinery to the unit blob
+      // shadow above (which works): snapshot the scene depth (terrain + WMO + doodads), and for each
+      // covered pixel reconstruct its world position and paint UnitSelectTexture's ring onto whatever
+      // ground is actually there. This DRAPES over the real WMO mesh (Molten Core floor) with ZERO
+      // CPU raycasts -- so it never clips through the floor and never stutters. A flat/conforming
+      // vertex mesh can't be both non-clipping on a bumpy floor AND non-stuttering; the decal is.
+      // (The client does the fixed-function equivalent -- projective texgen onto the re-drawn ground
+      // geometry, RE'd from wow.exe/apitrace; the depth decal is the modern-GL equivalent.)
+      // Blend: additive on RGB (SRCALPHA/ONE), leave framebuffer alpha (the bloom emissive mask) alone.
+      gl.blendFuncSeparate(GL_SRC_ALPHA, GL_ONE, GL_ZERO, GL_ONE);
 
-      // Orient the crescent texture so its bright arc faces the camera (the client's "incomplete
-      // circle" points its opening toward the viewer). Same rotation for every disc this frame.
       auto const uv_rotation_for = [&](glm::vec3 const& pos) -> float
       {
         glm::vec2 const to_cam(camera_pos.x - pos.x, camera_pos.z - pos.z);
         return std::atan2(to_cam.x, to_cam.y);
       };
 
-      // Pass 1: visible pixels (normal depth, full alpha)
-      gl.depthFunc(GL_LEQUAL);
-      for (auto const& m : markers)
+      // DEPTH CORRECTNESS: re-snapshot the depth NOW (creatures + gameobjects are already drawn into
+      // the scene framebuffer at this point) instead of reusing the blob-shadow pass's pre-creature
+      // snapshot. With the models in the depth buffer, the decal's per-pixel reconstruction lands on
+      // the creature SURFACE (high rel.y) over the body -- which the shader's height-band then rejects
+      // -- so the ring is occluded by the model and only paints the visible ground around it.
+      _decal_depth_ready = false;
+      if (snapshotDecalDepth())
       {
-        auto const& disc = _creature_disc_cache[m.guid];
-        _circle_render.drawWorldSpace(mvp, disc.vertices, disc.locals, disc.indices, m.color,
-                                      uv_rotation_for(disc.pos));
+        GLint cvp[4] = {0, 0, 0, 0};
+        gl.getIntegerv(GL_VIEWPORT, cvp);
+        glm::vec2 const inv_vp(1.0f / std::max(cvp[2], 1), 1.0f / std::max(cvp[3], 1));
+        glm::mat4x4 const inv_mvp = glm::inverse(mvp);
+        for (auto const& m : markers)
+        {
+          _circle_render.drawProjectedDecal(mvp, inv_mvp, inv_vp, _decal_depth_tex, _bloom_vao,
+                                            m.pos, m.radius, m.color, uv_rotation_for(m.pos));
+        }
       }
 
-      // Pass 2: occluded pixels (behind terrain, 10% alpha)
-      gl.depthFunc(GL_GREATER);
-      for (auto const& m : markers)
-      {
-        auto const& disc = _creature_disc_cache[m.guid];
-        glm::vec4 c = m.color;
-        c.a *= 0.1f;
-        _circle_render.drawWorldSpace(mvp, disc.vertices, disc.locals, disc.indices, c,
-                                      uv_rotation_for(disc.pos));
-      }
-
-      // Restore depth function
-      gl.depthFunc(GL_LEQUAL);
+      // Restore blend func for subsequent passes.
+      gl.blendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
       if (capture_debug_enabled())
       {
@@ -2756,7 +3621,7 @@ void WorldRender::draw (glm::mat4x4 const& model_view
       OpenGL::Scoped::bool_setter<GL_BLEND, GL_TRUE> const enable_blend;
       OpenGL::Scoped::depth_mask_setter<GL_FALSE> const no_depth_write;
 
-      struct MarkerData { std::uint32_t guid; glm::vec4 color; };
+      struct MarkerData { std::uint32_t guid; glm::vec4 color; glm::vec3 pos; float radius; };
       std::vector<MarkerData> markers;
       markers.reserve(256);
 
@@ -2774,111 +3639,37 @@ void WorldRender::draw (glm::mat4x4 const& model_view
         }
         ring_radius = std::max(0.25f, ring_radius);
 
-        // Same terrain-draped disc mesh as creature markers, cached per spawn and rebuilt only when
-        // the spawn moves or its radius changes -- so the circle bends with the ground instead of
-        // being a flat plate clipping into slopes.
-        auto& disc = _gameobject_disc_cache[spawn.guid];
-        if (disc.radius != ring_radius || glm::distance(disc.pos, spawn.pos) > 0.001f)
-        {
-          disc.pos = spawn.pos;
-          disc.radius = ring_radius;
-          disc.vertices.clear();
-          disc.locals.clear();
-          disc.indices.clear();
-
-          int constexpr segments = 24;
-          float constexpr ring_fractions[] = { 0.35f, 0.65f, 0.85f, 1.0f };
-          int constexpr ring_count = 4;
-
-          auto const ground_y = [&](float x, float z) -> float
-          {
-            glm::vec3 const hit = _world->get_ground_height(glm::vec3(x, spawn.pos.y + 3.0f, z));
-            if (hit == glm::vec3(0.0f) || std::abs(hit.y - spawn.pos.y) > ring_radius * 2.0f + 4.0f)
-            {
-              return spawn.pos.y;
-            }
-            return hit.y;
-          };
-
-          // centre vertex
-          disc.vertices.push_back(glm::vec3(spawn.pos.x, ground_y(spawn.pos.x, spawn.pos.z) + 0.08f, spawn.pos.z));
-          disc.locals.push_back(glm::vec2(0.0f, 0.0f));
-
-          for (int ring = 0; ring < ring_count; ++ring)
-          {
-            float const fr = ring_fractions[ring];
-            for (int seg = 0; seg < segments; ++seg)
-            {
-              float const angle = glm::two_pi<float>() * seg / float(segments);
-              float const lx = std::cos(angle) * fr;
-              float const lz = std::sin(angle) * fr;
-              float const wx = spawn.pos.x + lx * ring_radius;
-              float const wz = spawn.pos.z + lz * ring_radius;
-              disc.vertices.push_back(glm::vec3(wx, ground_y(wx, wz) + 0.08f, wz));
-              disc.locals.push_back(glm::vec2(lx, lz));
-            }
-          }
-
-          auto const ring_start = [&](int ring) { return static_cast<std::uint16_t>(1 + ring * segments); };
-          // centre fan to ring 0
-          for (int seg = 0; seg < segments; ++seg)
-          {
-            disc.indices.push_back(0);
-            disc.indices.push_back(static_cast<std::uint16_t>(ring_start(0) + seg));
-            disc.indices.push_back(static_cast<std::uint16_t>(ring_start(0) + (seg + 1) % segments));
-          }
-          // quads between consecutive rings
-          for (int ring = 0; ring + 1 < ring_count; ++ring)
-          {
-            for (int seg = 0; seg < segments; ++seg)
-            {
-              std::uint16_t const a = static_cast<std::uint16_t>(ring_start(ring) + seg);
-              std::uint16_t const b = static_cast<std::uint16_t>(ring_start(ring) + (seg + 1) % segments);
-              std::uint16_t const c = static_cast<std::uint16_t>(ring_start(ring + 1) + seg);
-              std::uint16_t const d = static_cast<std::uint16_t>(ring_start(ring + 1) + (seg + 1) % segments);
-              disc.indices.insert(disc.indices.end(), { a, c, d, a, d, b });
-            }
-          }
-        }
-
         // Distinct palette from creatures (which are orange/green): gameobjects use blue/purple.
         glm::vec4 const color = spawn.selected ? glm::vec4(0.35f, 1.0f, 0.45f, 1.0f)
             : spawn.hovered  ? glm::vec4(0.45f, 0.85f, 1.0f, 1.0f)
             : spawn.dirty    ? glm::vec4(1.0f,  0.9f,  0.15f, 1.0f)
                  : glm::vec4(0.55f, 0.45f, 1.0f, 1.0f);
-        markers.push_back({spawn.guid, color});
+        markers.push_back({spawn.guid, color, spawn.pos, ring_radius});
       }
 
-      gl.blendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-      gl.enable(GL_DEPTH_TEST);
+      // Projected-decal circle (see the creature block): painted onto the real terrain/WMO ground via
+      // the scene depth, draping over the WMO mesh with no raycasts, no clipping, no stutter.
+      gl.blendFuncSeparate(GL_SRC_ALPHA, GL_ONE, GL_ZERO, GL_ONE);
 
-      // Orient the crescent texture so its bright arc faces the camera (matches creature markers).
       auto const uv_rotation_for = [&](glm::vec3 const& pos) -> float
       {
         glm::vec2 const to_cam(camera_pos.x - pos.x, camera_pos.z - pos.z);
         return std::atan2(to_cam.x, to_cam.y);
       };
 
-      // Pass 1: visible pixels (normal depth, full alpha)
-      gl.depthFunc(GL_LEQUAL);
-      for (auto const& m : markers)
+      if (snapshotDecalDepth())
       {
-        auto const& disc = _gameobject_disc_cache[m.guid];
-        _circle_render.drawWorldSpace(mvp, disc.vertices, disc.locals, disc.indices, m.color,
-                                      uv_rotation_for(disc.pos));
+        GLint gvp[4] = {0, 0, 0, 0};
+        gl.getIntegerv(GL_VIEWPORT, gvp);
+        glm::vec2 const inv_vp(1.0f / std::max(gvp[2], 1), 1.0f / std::max(gvp[3], 1));
+        glm::mat4x4 const inv_mvp = glm::inverse(mvp);
+        for (auto const& m : markers)
+        {
+          _circle_render.drawProjectedDecal(mvp, inv_mvp, inv_vp, _decal_depth_tex, _bloom_vao,
+                                            m.pos, m.radius, m.color, uv_rotation_for(m.pos));
+        }
       }
-
-      // Pass 2: occluded pixels (behind terrain, 10% alpha)
-      gl.depthFunc(GL_GREATER);
-      for (auto const& m : markers)
-      {
-        auto const& disc = _gameobject_disc_cache[m.guid];
-        glm::vec4 c = m.color;
-        c.a *= 0.1f;
-        _circle_render.drawWorldSpace(mvp, disc.vertices, disc.locals, disc.indices, c,
-                                      uv_rotation_for(disc.pos));
-      }
-      gl.depthFunc(GL_LEQUAL);
+      gl.blendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     }
 
     // Creature patrol paths: draw a line through each patrolling creature's waypoints (spawn -> wp1
@@ -3027,8 +3818,14 @@ void WorldRender::draw (glm::mat4x4 const& model_view
   }
   // Draw water BEFORE the additive model particles/ribbons and the deferred light effects, so
   // those additive glows paint OVER the (now opaque-in-deep-water) water instead of being hidden.
+  // DECOUPLE water opacity from the bloom mask: RGB uses normal src-alpha translucency, but the
+  // ALPHA channel (= the scene bloom-emissive mask) is only PULLED DOWN by water coverage
+  // (GL_ZERO, GL_ONE_MINUS_SRC_ALPHA), never raised. Without this the water's own opacity leaked into
+  // the mask, so deep water had to be capped at 0.85 to avoid blooming -- which left ~15% of the
+  // bright green seafloor bleeding through (the "green transparent water"). Now deep water can be
+  // fully OPAQUE dark blue (like the 1.12 client) and still never blooms. Matches the particle pass.
   gl.enable(GL_BLEND);
-  gl.blendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+  gl.blendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ZERO, GL_ONE_MINUS_SRC_ALPHA);
 
   if (draw_water)
   {
@@ -3060,6 +3857,13 @@ void WorldRender::draw (glm::mat4x4 const& model_view
     // dragging the Settings slider updates the water immediately.
     water_shader.uniform ("water_alpha_mult"
                           , _world->_settings->value("water/transparency", 1.0f).toFloat());
+
+    // Water surface specular (sun sheen): same sun-band colour as the terrain specular; toggle via
+    // render/water_specular (default on, like the client's reflective water).
+    water_shader.uniform ("camera", glm::vec3(camera_pos.x, camera_pos.y, camera_pos.z));
+    water_shader.uniform ("sun_spec_color", _skies->color_set[SUN_COLOR]);
+    water_shader.uniform ("draw_water_specular"
+                          , _world->_settings->value("render/water_specular", true).toBool() ? 1 : 0);
 
     for (auto& pair : _world->_loaded_tiles_buffer)
     {
@@ -3402,7 +4206,9 @@ void WorldRender::draw (glm::mat4x4 const& model_view
       }
       m->renderer()->draw(model_view, *instance, m2_shader, mask_state, frustum,
                           _cull_distance, camera_pos, mask_animtime, display,
-                          /*no_cull*/ false, /*bloom_mask_only*/ true);
+                          /*no_cull*/ false, /*bloom_mask_only*/ true,
+                          /*interior_light*/ glm::vec4(0.f),
+                          /*dist_fade*/ draw_item.fade);
     }
     gl.enable(GL_CULL_FACE);
     gl.depthMask(GL_TRUE);
@@ -3530,6 +4336,56 @@ void WorldRender::draw (glm::mat4x4 const& model_view
   }
 }
 
+bool WorldRender::snapshotDecalDepth()
+{
+  if (_decal_depth_ready)
+  {
+    return _decal_depth_tex != 0;
+  }
+
+  GLint vp[4] = {0, 0, 0, 0};
+  gl.getIntegerv(GL_VIEWPORT, vp);
+  if (vp[2] <= 0 || vp[3] <= 0)
+  {
+    return false;
+  }
+
+  GLint prev_draw_fbo = 0;
+  gl.getIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prev_draw_fbo);
+
+  if (_decal_depth_w != vp[2] || _decal_depth_h != vp[3] || !_decal_depth_tex)
+  {
+    if (!_decal_depth_tex)
+    {
+      gl.genTextures(1, &_decal_depth_tex);
+      gl.genFramebuffers(1, &_decal_depth_fbo);
+    }
+    _decal_depth_w = vp[2];
+    _decal_depth_h = vp[3];
+    gl.activeTexture(GL_TEXTURE1);
+    gl.bindTexture(GL_TEXTURE_2D, _decal_depth_tex);
+    gl.texImage2D(GL_TEXTURE_2D, 0, GL_DEPTH24_STENCIL8, vp[2], vp[3], 0,
+                  GL_DEPTH_STENCIL, GL_UNSIGNED_INT_24_8, nullptr);
+    gl.texParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    gl.texParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    gl.texParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    gl.texParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    gl.bindFramebuffer(GL_DRAW_FRAMEBUFFER, _decal_depth_fbo);
+    gl.framebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT,
+                            GL_TEXTURE_2D, _decal_depth_tex, 0);
+    gl.bindFramebuffer(GL_DRAW_FRAMEBUFFER, static_cast<GLuint>(prev_draw_fbo));
+  }
+
+  gl.bindFramebuffer(GL_READ_FRAMEBUFFER, static_cast<GLuint>(prev_draw_fbo));
+  gl.bindFramebuffer(GL_DRAW_FRAMEBUFFER, _decal_depth_fbo);
+  gl.blitFramebuffer(0, 0, vp[2], vp[3], 0, 0, vp[2], vp[3], GL_DEPTH_BUFFER_BIT, GL_NEAREST);
+  gl.bindFramebuffer(GL_FRAMEBUFFER, static_cast<GLuint>(prev_draw_fbo));
+
+  _decal_inv_viewport = glm::vec2(1.0f / static_cast<float>(vp[2]), 1.0f / static_cast<float>(vp[3]));
+  _decal_depth_ready = true;
+  return true;
+}
+
 void WorldRender::ensureBloomTargets(int w, int h)
 {
   if (w < 1) w = 1;
@@ -3563,10 +4419,22 @@ void WorldRender::ensureBloomTargets(int w, int h)
     _bloom_w = _bloom_h = -1; // force the (re)allocation below
   }
 
-  if (_bloom_w == w && _bloom_h == h && _bloom_bw == bw && _bloom_bh == bh)
+  // MSAA sample count (Settings -> Render features): 0/2/4/8, clamped to the driver max. Read every
+  // call so a settings change reallocates live.
+  int msaa = QSettings().value("render/msaa", 0).toInt();
+  if (msaa != 0 && msaa != 2 && msaa != 4 && msaa != 8) { msaa = 0; }
+  if (msaa > 0)
   {
-    return; // also compare blur-buffer dims: a blur-res change alone must reallocate too
+    GLint max_samples = 0;
+    gl.getIntegerv(GL_MAX_SAMPLES, &max_samples);
+    msaa = std::min(msaa, static_cast<int>(max_samples));
   }
+
+  if (_bloom_w == w && _bloom_h == h && _bloom_bw == bw && _bloom_bh == bh && _msaa_samples == msaa)
+  {
+    return; // also compare blur-buffer dims + msaa: either change alone must reallocate
+  }
+  _msaa_samples = msaa;
 
   _bloom_w = w;
   _bloom_h = h;
@@ -3594,6 +4462,24 @@ void WorldRender::ensureBloomTargets(int w, int h)
   gl.framebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, _bloom_scene_color, 0);
   gl.framebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, _bloom_scene_depth);
 
+  // Multisampled scene targets (resolved into _bloom_scene_color before the bloom chain).
+  if (_msaa_samples > 0)
+  {
+    if (!_msaa_fbo)
+    {
+      gl.genFramebuffers(1, &_msaa_fbo);
+      gl.genRenderbuffers(1, &_msaa_color_rb);
+      gl.genRenderbuffers(1, &_msaa_depth_rb);
+    }
+    gl.bindRenderbuffer(GL_RENDERBUFFER, _msaa_color_rb);
+    gl.renderbufferStorageMultisample(GL_RENDERBUFFER, _msaa_samples, GL_RGBA8, w, h);
+    gl.bindRenderbuffer(GL_RENDERBUFFER, _msaa_depth_rb);
+    gl.renderbufferStorageMultisample(GL_RENDERBUFFER, _msaa_samples, GL_DEPTH24_STENCIL8, w, h);
+    gl.bindFramebuffer(GL_FRAMEBUFFER, _msaa_fbo);
+    gl.framebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, _msaa_color_rb);
+    gl.framebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, _msaa_depth_rb);
+  }
+
   // half-res ping-pong targets for the blur
   for (int i = 0; i < 2; ++i)
   {
@@ -3605,6 +4491,14 @@ void WorldRender::ensureBloomTargets(int w, int h)
 
 void WorldRender::renderBloomAndComposite(GLuint target_fbo, int w, int h, glm::vec3 const& camera_pos)
 {
+  // MSAA resolve: blit the multisampled scene into the single-sample colour texture the bloom chain
+  // (and the final composite) samples from.
+  if (_msaa_samples > 0)
+  {
+    gl.bindFramebuffer(GL_READ_FRAMEBUFFER, _msaa_fbo);
+    gl.bindFramebuffer(GL_DRAW_FRAMEBUFFER, _bloom_scene_fbo);
+    gl.blitFramebuffer(0, 0, _bloom_w, _bloom_h, 0, 0, _bloom_w, _bloom_h, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+  }
   // CANON FFXGlow strength for this frame. The 1.12 client applies a full-screen additive glow whose
   // weight = the per-zone LightParams.glow (0..1, `Skies::glow()` = the same interpolated value the
   // client reads), floored at 84/255 = 0.329. (RE'd from wow.exe FFXEffects.cpp -- see
@@ -4044,34 +4938,16 @@ void WorldRender::updateLightingUniformBlock(bool draw_fog, glm::vec3 const& cam
     fog_start = 0.25f;
     fog_end = 500.0f;
   }
+  // Editor fog-distance scale (Settings, default 1.0 = client-authored). fog_start is a fraction of
+  // fog_end, so scaling the end stretches the whole band uniformly.
+  fog_end *= _fog_distance_scale;
 
-  // Inside a WMO with authored interior fog (MFOG)? The client applies that fog to the WHOLE scene
-  // inside, not just the WMO geometry. Override the global fog so terrain, doodads, the WMO and light
-  // shafts all fade together (otherwise only the WMO fogs and doodads/shafts float clear in front).
-  if (draw_fog)
-  {
-    try
-    {
-      glm::vec3 wmo_fog_color;
-      float wmo_fog_start = 0.f, wmo_fog_end = 0.f;
-      if (_world->getInteriorFog(camera_pos, wmo_fog_color, wmo_fog_start, wmo_fog_end))
-      {
-        // Warm the (cool) authored interior fog so it doesn't chill the atmosphere. Keep the model's
-        // authored distance/density. Tune: the warm channel multiplier.
-        fog_color = glm::clamp(wmo_fog_color * glm::vec3(1.25f, 1.02f, 0.78f), 0.0f, 1.0f);
-        fog_end = wmo_fog_end;
-        // The global fog formula treats fog_start as a FRACTION of fog_end (start = fog_end * fog_start),
-        // but MFOG fogstart is an absolute distance -- convert to the fraction so the math matches and
-        // near geometry isn't fully fogged (which painted the whole interior flat fog colour).
-        fog_start = (wmo_fog_end > 0.001f) ? std::clamp(wmo_fog_start / wmo_fog_end, 0.0f, 0.99f) : 0.25f;
-      }
-    }
-    catch (...)
-    {
-      // WMO extents/fog access can throw mid-load (same reason getWMOAreaID is guarded); ignore and
-      // keep the outdoor fog this frame.
-    }
-  }
+  // NOTE (trace: wow_cap_kara_cull_fog, per-draw fog attribution): the client does NOT override the
+  // scene fog when the camera enters a WMO. Fog is PER-REGION within the frame -- terrain/doodads keep
+  // the zone fog while WMO geometry inside an MFOG volume is drawn with that fog's authored values
+  // (blended toward zone fog by the camera's position in the fog sphere's r_start..r_end falloff).
+  // The per-WMO fog is applied in WMORender::draw via shader uniforms; the global UBO fog here is
+  // always the zone fog.
 
   // Client-canon farclip clamp (verified via apitrace on Elwynn): the world fog END is clamped to the
   // view distance (farclip). At a short view distance the fog is pulled in to the horizon; extending the
@@ -4080,9 +4956,67 @@ void WorldRender::updateLightingUniformBlock(bool draw_fog, glm::vec3 const& cam
   // start scales with the clamp automatically (0.25 * 777 = 194.25, matching the trace).
   fog_end = std::min(fog_end, _view_distance);
 
+  // (An earlier temporal fog lerp lived here; the per-draw trace showed the client's fog transitions
+  // are SPATIAL -- Light.dbc falloff radii for the zone fog, MFOG sphere falloff for WMO fog -- both
+  // of which are handled at their sources, so no temporal smoothing is needed or canon.)
+
   _lighting_ubo_data.DiffuseColor_FogStart = {diffuse.x,diffuse.y,diffuse.z, fog_start};
   _lighting_ubo_data.AmbientColor_FogEnd = {ambient.x,ambient.y,ambient.z, fog_end};
   _lighting_ubo_data.FogColor_FogOn = {fog_color.x,fog_color.y,fog_color.z, static_cast<float>(draw_fog)};
+
+  // ENTITY fog (client-canon, note 16: inside the inn the M2 fog constants equal the inn MFOG): the
+  // camera's fog context = zone fog blended toward the strongest containing MFOG volume. Written to
+  // the Env UBO slots read by the M2/particle/ribbon/WMO-liquid shaders; terrain keeps zone fog.
+  // NOGGIT_NO_M2_ENV_FOG=1 disables (entities then always use the zone fog, the old behaviour).
+  {
+    static bool const s_no_env_fog = std::getenv("NOGGIT_NO_M2_ENV_FOG") != nullptr;
+    float env_w = 0.0f;
+    glm::vec3 env_color = fog_color;
+    float env_end = fog_end;
+    float env_start_abs = fog_start * fog_end;
+
+    if (!s_no_env_fog && draw_fog)
+    {
+      // CLIENT-EXACT (wow.exe @0069de20, note 27): the camera fog comes from the GROUP the camera
+      // is standing in (smallest containing group AABB approximates the client's portal-resolved
+      // current group). The evaluator blends that group's in-range MOGP fogs (farthest -> nearest,
+      // w = 1 inside r1 -> 0 at r2) over the WMO's DEFAULT MFOG entry; default-only WMOs keep the
+      // zone fog. The old best-sphere heuristic (any WMO, blend toward zone) is replaced.
+      WmoGroupFogVolume const* cam_group = nullptr;
+      float best_volume = std::numeric_limits<float>::max();
+      for (auto const& v : _env_fog_volumes)
+      {
+        if (camera_pos.x < v.min.x || camera_pos.x > v.max.x
+         || camera_pos.y < v.min.y || camera_pos.y > v.max.y
+         || camera_pos.z < v.min.z || camera_pos.z > v.max.z)
+        {
+          continue;
+        }
+        glm::vec3 const e = v.max - v.min;
+        float const vol = e.x * e.y * e.z;
+        if (vol < best_volume)
+        {
+          best_volume = vol;
+          cam_group = &v;
+        }
+      }
+      glm::vec3 mf_color;
+      float mf_end = 0.0f, mf_start = 0.0f;
+      if (cam_group
+          && cam_group->wmo->evaluate_camera_fog(*cam_group->group, cam_group->transform,
+                                                 camera_pos, &mf_color, &mf_end, &mf_start))
+      {
+        env_w = 1.0f;
+        env_color = mf_color;
+        env_end = std::min(mf_end * _fog_distance_scale, _view_distance);
+        env_start_abs = mf_start * _fog_distance_scale;
+      }
+    }
+
+    float const env_start_frac = env_end > 0.001f ? std::clamp(env_start_abs / env_end, -5.0f, 0.99f) : 0.25f;
+    _lighting_ubo_data.EnvFogColor_On = {env_color.x, env_color.y, env_color.z, env_w};
+    _lighting_ubo_data.EnvFogDist = {env_start_frac, env_end, 0.0f, 0.0f};
+  }
   _lighting_ubo_data.LightDir_FogRate = {_outdoor_light_stats.dayDir.x, _outdoor_light_stats.dayDir.y, _outdoor_light_stats.dayDir.z, _skies->fogRate()};
   _lighting_ubo_data.OceanColorLight = { ocean_color_light.x,ocean_color_light.y,ocean_color_light.z, _skies->ocean_shallow_alpha()};
   _lighting_ubo_data.OceanColorDark = { ocean_color_dark.x,ocean_color_dark.y,ocean_color_dark.z, _skies->ocean_deep_alpha()};

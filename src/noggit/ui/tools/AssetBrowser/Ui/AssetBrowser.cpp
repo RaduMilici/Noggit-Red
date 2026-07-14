@@ -84,10 +84,6 @@ AssetBrowserWidget::AssetBrowserWidget(MapView* map_view, QWidget *parent)
       Noggit::NoggitRenderContext::ASSET_BROWSER_PREVIEW, this);
   _preview_renderer->setVisible(false);
 
-  // just to initialize context, ugly-ish
-  _preview_renderer->setModelOffscreen("world/wmo/azeroth/buildings/human_farm/farm.wmo");
-  _preview_renderer->renderToPixmap();
-
   connect(ui->listfileTree->selectionModel(), &QItemSelectionModel::selectionChanged
       ,[=] (const QItemSelection& selected, const QItemSelection& deselected)
         {
@@ -327,5 +323,20 @@ void AssetBrowserWidget::keyPressEvent(QKeyEvent *event)
   if (event->key() == Qt::Key_Enter || event->key() == Qt::Key_Return)
   {
     _sort_model->setFilterFixedString(ui->searchField->text());
+  }
+}
+
+void AssetBrowserWidget::showEvent(QShowEvent* event)
+{
+  QMainWindow::showEvent(event);
+
+  // Warm the preview context on first open, NOT in the constructor: doing the offscreen GL burst
+  // (context creation + shader compiles + model upload + readback) during MapView construction
+  // intermittently fail-fasts the NVIDIA driver (0xC0000409 in nvoglv64) on map load.
+  if (!_preview_context_warmed)
+  {
+    _preview_context_warmed = true;
+    _preview_renderer->setModelOffscreen("world/wmo/azeroth/buildings/human_farm/farm.wmo");
+    _preview_renderer->renderToPixmap();
   }
 }

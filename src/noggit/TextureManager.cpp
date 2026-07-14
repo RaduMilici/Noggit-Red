@@ -625,6 +625,38 @@ void blp_texture::finishLoading()
   {
     loadFromCompressedData(lHeader, lData);
   }
+  else if (lHeader->attr_0_compression == 3)
+  {
+    // Uncompressed 32-bit BLP (D3DFMT_A8R8G8B8 -> BGRA bytes per pixel, e.g. Textures\sunGlare.blp).
+    // Convert to RGBA for the GL_RGBA/GL_UNSIGNED_BYTE array upload (same target as the palettized path).
+    int width = _width, height = _height;
+    for (int i = 0; i < 16; ++i)
+    {
+      width = std::max(1, width);
+      height = std::max(1, height);
+      if (lHeader->offsets[i] > 0 && lHeader->sizes[i] > 0)
+      {
+        uint32_t const* src = reinterpret_cast<uint32_t const*>(&lData[lHeader->offsets[i]]);
+        int const n = width * height;
+        std::vector<uint32_t> data(n);
+        for (int j = 0; j < n; ++j)
+        {
+          uint32_t const s = src[j]; // 0xAARRGGBB (BGRA byte order in memory)
+          data[j] = ((s >> 16) & 0x000000FFu)  // R -> byte 0
+                  | (s & 0x0000FF00u)           // G stays byte 1
+                  | ((s & 0x000000FFu) << 16)   // B -> byte 2
+                  | (s & 0xFF000000u);          // A stays byte 3
+        }
+        _data[i] = std::move(data);
+      }
+      else
+      {
+        break;
+      }
+      width >>= 1;
+      height >>= 1;
+    }
+  }
   else
   {
     finished = true;

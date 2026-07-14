@@ -48,6 +48,13 @@ namespace OpenGL
     glm::vec4 PointLightParams;
     glm::vec4 PointLightPos[MAX_POINT_LIGHTS];
     glm::vec4 PointLightColor[MAX_POINT_LIGHTS];
+    // ENTITY fog: the fog context at the CAMERA (zone fog blended toward the containing WMO fog
+    // volume). The client fogs M2s/doodads/particles/WMO-liquid with the CAMERA's fog, not the zone
+    // fog (note 16: inside the inn, the M2 fog constants equal the inn MFOG). Terrain keeps the zone
+    // slots above; WMO geometry has its own per-group fog. .w of EnvFogColor_On = 1 when active
+    // (else the shaders fall back to the zone slots). EnvFogDist = (start FRACTION, end, 0, 0).
+    glm::vec4 EnvFogColor_On;
+    glm::vec4 EnvFogDist;
   };
 
   struct TerrainParamsUniformBlock
@@ -112,7 +119,9 @@ namespace OpenGL
     bool z_buffered = false;
     bool unfogged = false;
     bool unlit = false;
+    int detail_doodad = -1; // -1 unset; 1 = ground-clutter (day/night grayscale dim, keeps texture hue)
     bool masked_additive = false;
+    int water_surface_effect = -1; // -1 unset; 1 = fishing-pool wake geoset (grey luminance-alpha, blends into water)
     int creature_bloom = -1; // -1 = unset; 1 = opaque energy creature (mask direct); 3 = alpha-only mask pass
     bool bloom_mask_pass = false; // drawing the alpha-only bloom-mask re-draw of a translucent creature
     int discard_invisible = 0; // promoted creature pass: discard texels that add nothing (no depth write)

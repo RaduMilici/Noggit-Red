@@ -434,27 +434,23 @@ void Square::setup_buffers()
     gl.drawElements(GL_TRIANGLE_STRIP, _indices_vbo, _indice_count, GL_UNSIGNED_SHORT, nullptr);
   }
 
-  void Circle::drawWorldSpace(glm::mat4x4 const& mvp
-                             , std::vector<glm::vec3> const& world_vertices
-                             , std::vector<glm::vec2> const& local_coords
-                             , std::vector<std::uint16_t> const& indices
-                             , glm::vec4 const& color
-                             , float uv_rotation)
+  void Circle::drawProjectedDecal(glm::mat4x4 const& mvp
+                                 , glm::mat4x4 const& inv_view_projection
+                                 , glm::vec2 const& inv_viewport
+                                 , GLuint scene_depth_tex
+                                 , GLuint empty_vao
+                                 , glm::vec3 const& center
+                                 , float radius
+                                 , glm::vec4 const& color
+                                 , float uv_rotation)
   {
-    if (world_vertices.empty() || indices.empty())
-      return;
-
-    if (!_buffers_are_setup)
-      setup_buffers(); // shares the shader program
-
-    if (!_ws_buffers_are_setup)
+    if (!_decal_program)
     {
-      _ws_vao.upload();
-      _ws_buffers.upload();
-      _ws_buffers_are_setup = true;
+      _decal_program.reset(new OpenGL::program(
+        {{ GL_VERTEX_SHADER,   OpenGL::shader::src_from_qrc("circle_decal_vs") }
+        ,{ GL_FRAGMENT_SHADER, OpenGL::shader::src_from_qrc("circle_decal_fs") }}));
     }
 
-    // Lazily load the client's selection-circle texture.
     if (!_select_texture && !_select_texture_failed)
     {
       try
@@ -471,38 +467,46 @@ void Square::setup_buffers()
         _select_texture_failed = true;
       }
     }
-
+    if (!scene_depth_tex)
+    {
+      return; // no depth snapshot -> can't project; but a missing texture is fine (procedural fallback)
+    }
     bool const use_texture = _select_texture && _select_texture->is_uploaded();
 
-    gl.bufferData<GL_ARRAY_BUFFER, glm::vec3>(_ws_vertices_vbo, world_vertices, GL_STREAM_DRAW);
-    gl.bufferData<GL_ARRAY_BUFFER, glm::vec2>(_ws_locals_vbo, local_coords, GL_STREAM_DRAW);
-    gl.bufferData<GL_ELEMENT_ARRAY_BUFFER, std::uint16_t>(_ws_indices_vbo, indices, GL_STREAM_DRAW);
-
-    OpenGL::Scoped::use_program shader {*_program.get()};
+    OpenGL::Scoped::use_program shader {*_decal_program.get()};
+    // Same GL state as the WORKING blob-shadow decal (WorldRender): the coverage quad must NOT be
+    // depth-tested (it sits at foot height; depth-testing it clips it into the floor -- the "clips
+    // thru the WMO mesh" bug). The fragment shader reconstructs each pixel's world pos from the
+    // depth TEXTURE and paints onto whatever ground is there, so occlusion is handled per-pixel.
+    OpenGL::Scoped::bool_setter<GL_DEPTH_TEST, GL_FALSE> const no_depth_test;
+    OpenGL::Scoped::bool_setter<GL_CULL_FACE, GL_FALSE> const no_cull;
     shader.uniform("model_view_projection", mvp);
-    shader.uniform("world_space", 1);
-    shader.uniform("use_texture", use_texture ? 1 : 0);
+    shader.uniform("inv_view_projection", inv_view_projection);
+    shader.uniform("inv_viewport", inv_viewport);
+    shader.uniform("center", center);
+    shader.uniform("radius", radius);
+    // vertical range generous enough that a bumpy WMO floor within the disc still gets painted
+    shader.uniform("v_range", std::max(radius, 3.0f));
     shader.uniform("color", color);
+    shader.uniform("uv_rotation", uv_rotation);
+    shader.uniform("expand", 2.0f);
+    shader.uniform("use_texture", use_texture ? 1 : 0);
+
+    gl.activeTexture(GL_TEXTURE0);
     if (use_texture)
     {
-      gl.activeTexture(GL_TEXTURE0);
       gl.bindTexture(GL_TEXTURE_2D_ARRAY, _select_texture->texture_array());
       shader.uniform("tex", 0);
       shader.uniform("tex_index", static_cast<float>(_select_texture->array_index()));
-      shader.uniform("uv_rotation", uv_rotation);
     }
 
-    OpenGL::Scoped::vao_binder const _ (_ws_vao[0]);
-    {
-      OpenGL::Scoped::buffer_binder<GL_ARRAY_BUFFER> const vb (_ws_vertices_vbo);
-      shader.attrib("position", 3, GL_FLOAT, GL_FALSE, 0, 0);
-    }
-    {
-      OpenGL::Scoped::buffer_binder<GL_ARRAY_BUFFER> const lb (_ws_locals_vbo);
-      shader.attrib("local", 2, GL_FLOAT, GL_FALSE, 0, 0);
-    }
-    OpenGL::Scoped::buffer_binder<GL_ELEMENT_ARRAY_BUFFER> const ib (_ws_indices_vbo);
-    gl.drawElements(GL_TRIANGLES, static_cast<GLsizei>(indices.size()), GL_UNSIGNED_SHORT, nullptr);
+    gl.activeTexture(GL_TEXTURE1);
+    gl.bindTexture(GL_TEXTURE_2D, scene_depth_tex);
+    shader.uniform("scene_depth", 1);
+    gl.activeTexture(GL_TEXTURE0);
+
+    gl.bindVertexArray(empty_vao); // corners from gl_VertexID (TRIANGLE_STRIP, 4 verts)
+    gl.drawArraysInstanced(GL_TRIANGLE_STRIP, 0, 4, 1);
   }
 
   void Circle::setup_buffers()
@@ -552,6 +556,7 @@ void Square::setup_buffers()
     _vao.unload();
     _buffers.unload();
     _program.reset();
+    _decal_program.reset();
     _buffers_are_setup = false;
   }
 

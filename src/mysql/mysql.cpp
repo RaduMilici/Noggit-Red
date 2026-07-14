@@ -220,44 +220,83 @@ namespace
 		return has_row;
 	}
 
-	bool hasCreatureEquipmentSchema(MYSQL* connection)
+	// Held-weapon (creature equipment) schema, tolerant of BOTH namings: TrinityCore/AC
+	// (equipment_id / item_template.display_id / inventory_type) AND CMaNGOS (EquipmentTemplateId /
+	// item_template.displayid / InventoryType). Without the CMaNGOS variants, cm_world resolves NO
+	// weapons even though creature_equip_template + item_template hold valid data (Defias Blackguard
+	// 636 -> equip 134 -> item 5285 -> displayid 6469).
+	struct CreatureEquipmentSchema
 	{
-		return tableHasColumn(connection, "creature_template", "equipment_id")
-		    && tableExists(connection, "creature_equip_template")
-		    && tableHasColumn(connection, "creature_equip_template", "entry")
-		    && tableHasColumn(connection, "creature_equip_template", "equipentry1")
-		    && tableHasColumn(connection, "creature_equip_template", "equipentry2")
-		    && tableHasColumn(connection, "creature_equip_template", "equipentry3")
-		    && tableExists(connection, "item_template")
-		    && tableHasColumn(connection, "item_template", "entry")
-		    && tableHasColumn(connection, "item_template", "display_id")
-		    && tableHasColumn(connection, "item_template", "inventory_type");
+		bool valid = false;
+		std::string ct_equip_col;   // creature_template equipment ref column
+		std::string it_display_col; // item_template display column
+		std::string it_invtype_col; // item_template inventory-type column
+	};
+
+	CreatureEquipmentSchema resolveCreatureEquipmentSchema(MYSQL* connection)
+	{
+		CreatureEquipmentSchema schema;
+
+		if (tableHasColumn(connection, "creature_template", "equipment_id"))
+			schema.ct_equip_col = "equipment_id";
+		else if (tableHasColumn(connection, "creature_template", "EquipmentTemplateId"))
+			schema.ct_equip_col = "EquipmentTemplateId";
+		else
+			return schema;
+
+		if (!tableExists(connection, "creature_equip_template")
+		    || !tableHasColumn(connection, "creature_equip_template", "entry")
+		    || !tableHasColumn(connection, "creature_equip_template", "equipentry1")
+		    || !tableHasColumn(connection, "creature_equip_template", "equipentry2")
+		    || !tableHasColumn(connection, "creature_equip_template", "equipentry3")
+		    || !tableExists(connection, "item_template")
+		    || !tableHasColumn(connection, "item_template", "entry"))
+			return schema;
+
+		if (tableHasColumn(connection, "item_template", "display_id"))
+			schema.it_display_col = "display_id";
+		else if (tableHasColumn(connection, "item_template", "displayid"))
+			schema.it_display_col = "displayid";
+		else
+			return schema;
+
+		if (tableHasColumn(connection, "item_template", "inventory_type"))
+			schema.it_invtype_col = "inventory_type";
+		else if (tableHasColumn(connection, "item_template", "InventoryType"))
+			schema.it_invtype_col = "InventoryType";
+		else
+			return schema;
+
+		schema.valid = true;
+		return schema;
 	}
 
-	std::string creatureEquipmentSelectExpr(bool has_equipment_schema)
+	std::string creatureEquipmentSelectExpr(CreatureEquipmentSchema const& schema)
 	{
-		if (!has_equipment_schema)
+		if (!schema.valid)
 		{
 			return "0 AS mainhand_display_id, 0 AS offhand_display_id, 0 AS ranged_display_id, "
 			       "0 AS mainhand_inventory_type, 0 AS offhand_inventory_type, 0 AS ranged_inventory_type";
 		}
 
-		return "COALESCE(it1.display_id, 0) AS mainhand_display_id, "
-		       "COALESCE(it2.display_id, 0) AS offhand_display_id, "
-		       "COALESCE(it3.display_id, 0) AS ranged_display_id, "
-		       "COALESCE(it1.inventory_type, 0) AS mainhand_inventory_type, "
-		       "COALESCE(it2.inventory_type, 0) AS offhand_inventory_type, "
-		       "COALESCE(it3.inventory_type, 0) AS ranged_inventory_type";
+		std::string const& d = schema.it_display_col;
+		std::string const& iv = schema.it_invtype_col;
+		return "COALESCE(it1." + d + ", 0) AS mainhand_display_id, "
+		       "COALESCE(it2." + d + ", 0) AS offhand_display_id, "
+		       "COALESCE(it3." + d + ", 0) AS ranged_display_id, "
+		       "COALESCE(it1." + iv + ", 0) AS mainhand_inventory_type, "
+		       "COALESCE(it2." + iv + ", 0) AS offhand_inventory_type, "
+		       "COALESCE(it3." + iv + ", 0) AS ranged_inventory_type";
 	}
 
-	std::string creatureEquipmentJoinExpr(bool has_equipment_schema)
+	std::string creatureEquipmentJoinExpr(CreatureEquipmentSchema const& schema)
 	{
-		if (!has_equipment_schema)
+		if (!schema.valid)
 		{
 			return {};
 		}
 
-		return "LEFT JOIN creature_equip_template cet ON cet.entry = ct.equipment_id "
+		return "LEFT JOIN creature_equip_template cet ON cet.entry = ct." + schema.ct_equip_col + " "
 		       "LEFT JOIN item_template it1 ON it1.entry = cet.equipentry1 "
 		       "LEFT JOIN item_template it2 ON it2.entry = cet.equipentry2 "
 		       "LEFT JOIN item_template it3 ON it3.entry = cet.equipentry3 ";
@@ -288,22 +327,38 @@ namespace
 			parts.emplace_back("NULLIF(ca.display_id, 0)");
 		}
 
-		bool const has_template_display_ids = tableHasColumn(connection, "creature_template", "display_id1")
-		                                && tableHasColumn(connection, "creature_template", "display_id2")
-		                                && tableHasColumn(connection, "creature_template", "display_id3")
-		                                && tableHasColumn(connection, "creature_template", "display_id4");
+		// creature_template inline display columns. TrinityCore / some schemas name them
+		// display_id1..4 (underscore); CMaNGOS/mangos name them DisplayId1..4 (NO underscore). Detect
+		// which naming THIS world DB uses so CMaNGOS worlds (e.g. cm_world) resolve creature displays
+		// too -- without this every creature falls through to display_id 0 (verified: cm_world has
+		// valid DisplayId1..4 data but the old snake_case-only check missed it). Gameobjects already
+		// did this via firstColumnExpr; creatures didn't. Turtle (tw_source: display_id1) and
+		// AzerothCore (creature_template_model) paths are unaffected.
+		bool const has_display_id_snake = tableHasColumn(connection, "creature_template", "display_id1")
+		                               && tableHasColumn(connection, "creature_template", "display_id2")
+		                               && tableHasColumn(connection, "creature_template", "display_id3")
+		                               && tableHasColumn(connection, "creature_template", "display_id4");
+		bool const has_display_id_camel = tableHasColumn(connection, "creature_template", "DisplayId1")
+		                               && tableHasColumn(connection, "creature_template", "DisplayId2")
+		                               && tableHasColumn(connection, "creature_template", "DisplayId3")
+		                               && tableHasColumn(connection, "creature_template", "DisplayId4");
+		bool const has_template_display_ids = has_display_id_snake || has_display_id_camel;
 		if (has_template_display_ids)
 		{
-			std::string const display_count = "((ct.display_id1 > 0) + (ct.display_id2 > 0) + (ct.display_id3 > 0) + (ct.display_id4 > 0))";
-			std::string const first_display = "COALESCE(NULLIF(ct.display_id1, 0), NULLIF(ct.display_id2, 0), NULLIF(ct.display_id3, 0), NULLIF(ct.display_id4, 0))";
+			std::string const d1 = has_display_id_snake ? "ct.display_id1" : "ct.DisplayId1";
+			std::string const d2 = has_display_id_snake ? "ct.display_id2" : "ct.DisplayId2";
+			std::string const d3 = has_display_id_snake ? "ct.display_id3" : "ct.DisplayId3";
+			std::string const d4 = has_display_id_snake ? "ct.display_id4" : "ct.DisplayId4";
+			std::string const display_count = "((" + d1 + " > 0) + (" + d2 + " > 0) + (" + d3 + " > 0) + (" + d4 + " > 0))";
+			std::string const first_display = "COALESCE(NULLIF(" + d1 + ", 0), NULLIF(" + d2 + ", 0), NULLIF(" + d3 + ", 0), NULLIF(" + d4 + ", 0))";
 			std::string const second_display = "CASE "
-				"WHEN (ct.display_id1 > 0) + (ct.display_id2 > 0) = 2 THEN ct.display_id2 "
-				"WHEN (ct.display_id1 > 0) + (ct.display_id2 > 0) + (ct.display_id3 > 0) = 2 THEN ct.display_id3 "
-				"WHEN (ct.display_id1 > 0) + (ct.display_id2 > 0) + (ct.display_id3 > 0) + (ct.display_id4 > 0) = 2 THEN ct.display_id4 END";
+				"WHEN (" + d1 + " > 0) + (" + d2 + " > 0) = 2 THEN " + d2 + " "
+				"WHEN (" + d1 + " > 0) + (" + d2 + " > 0) + (" + d3 + " > 0) = 2 THEN " + d3 + " "
+				"WHEN (" + d1 + " > 0) + (" + d2 + " > 0) + (" + d3 + " > 0) + (" + d4 + " > 0) = 2 THEN " + d4 + " END";
 			std::string const third_display = "CASE "
-				"WHEN (ct.display_id1 > 0) + (ct.display_id2 > 0) + (ct.display_id3 > 0) = 3 THEN ct.display_id3 "
-				"WHEN (ct.display_id1 > 0) + (ct.display_id2 > 0) + (ct.display_id3 > 0) + (ct.display_id4 > 0) = 3 THEN ct.display_id4 END";
-			std::string const fourth_display = "CASE WHEN " + display_count + " = 4 THEN ct.display_id4 END";
+				"WHEN (" + d1 + " > 0) + (" + d2 + " > 0) + (" + d3 + " > 0) = 3 THEN " + d3 + " "
+				"WHEN (" + d1 + " > 0) + (" + d2 + " > 0) + (" + d3 + " > 0) + (" + d4 + " > 0) = 3 THEN " + d4 + " END";
+			std::string const fourth_display = "CASE WHEN " + display_count + " = 4 THEN " + d4 + " END";
 
 			std::stringstream template_display_expr;
 			template_display_expr << "CASE WHEN " << display_count << " > 0 THEN CASE 1 + MOD(c.guid, GREATEST(" << display_count << ", 1)) "
@@ -582,7 +637,7 @@ namespace mysql
 		// (creature_template has no scale column there).
 		bool const has_template_model_scale = tableExists(connection.get(), "creature_template_model")
 		                                   && tableHasColumn(connection.get(), "creature_template_model", "DisplayScale");
-		bool const has_equipment_schema = hasCreatureEquipmentSchema(connection.get());
+		auto const equipment_schema = resolveCreatureEquipmentSchema(connection.get());
 		auto display_expr = buildCreatureDisplayExpr(connection.get(), &needs_creature_addon_join, &has_mount_display_col, &needs_template_model_join);
 		auto mount_expr = has_mount_display_col
 			? "COALESCE(CASE WHEN ca.mount_display_id > 0 THEN ca.mount_display_id ELSE 0 END, 0) AS mount_display_id"
@@ -617,6 +672,8 @@ namespace mysql
 		bool const has_template_addon_auras = !has_template_auras
 		                                   && tableExists(connection.get(), "creature_template_addon")
 		                                   && tableHasColumn(connection.get(), "creature_template_addon", "auras");
+		auto const spawn_faction_expr = firstTemplateColumnExpr(connection.get(),
+			{"faction", "faction_A", "faction_a", "factionAlliance", "factionHorde"}, "0");
 		std::string const auras_expr = has_template_auras       ? "COALESCE(ct.auras, '') AS auras"
 		                             : has_template_addon_auras ? "COALESCE(cta.auras, '') AS auras"
 		                             :                            "'' AS auras";
@@ -627,14 +684,15 @@ namespace mysql
 			<< template_scale_expr << ", "
 			<< display_expr << ", "
 			<< mount_expr << ", "
-			<< creatureEquipmentSelectExpr(has_equipment_schema) << ", "
-			<< auras_expr << " "
+			<< creatureEquipmentSelectExpr(equipment_schema) << ", "
+			<< auras_expr << ", "
+			<< "COALESCE(" << spawn_faction_expr << ", 0) AS spawn_faction "
 			<< "FROM creature c "
 			<< "INNER JOIN creature_template ct ON ct.entry = " << creature_entry_col << " "
 			<< (needs_ctm_join ? "LEFT JOIN creature_template_model ctm ON ctm.CreatureID = ct.entry AND ctm.Idx = 0 " : "")
 			<< (needs_creature_addon_join ? "LEFT JOIN creature_addon ca ON ca.guid = c.guid " : "")
 			<< (has_template_addon_auras ? "LEFT JOIN creature_template_addon cta ON cta.entry = ct.entry " : "")
-			<< creatureEquipmentJoinExpr(has_equipment_schema)
+			<< creatureEquipmentJoinExpr(equipment_schema)
 			<< "WHERE c.map = " << mapID << " "
 			<< "ORDER BY ct.name, c.guid";
 
@@ -681,6 +739,7 @@ namespace mysql
 			record.offhand_inventory_type = parseUnsigned(row[15]);
 			record.ranged_inventory_type = parseUnsigned(row[16]);
 			record.auras = parseString(row[17]);
+			record.faction = parseUnsigned(row[18]);
 			records.push_back(record);
 		}
 
@@ -1127,7 +1186,7 @@ namespace mysql
 		bool needs_creature_addon_join = false;
 		bool has_mount_display_col = false;
 		bool has_template_scale_col = tableHasColumn(connection.get(), "creature_template", "scale");
-		bool const has_equipment_schema = hasCreatureEquipmentSchema(connection.get());
+		auto const equipment_schema = resolveCreatureEquipmentSchema(connection.get());
 		auto display_expr = buildCreatureDisplayExpr(connection.get(), &needs_creature_addon_join, &has_mount_display_col);
 		auto mount_expr = has_mount_display_col
 			? "COALESCE(CASE WHEN ca.mount_display_id > 0 THEN ca.mount_display_id ELSE 0 END, 0) AS mount_display_id"
@@ -1146,11 +1205,11 @@ namespace mysql
 			<< template_scale_expr << ", "
 			<< display_expr << ", "
 			<< mount_expr << ", "
-			<< creatureEquipmentSelectExpr(has_equipment_schema) << " "
+			<< creatureEquipmentSelectExpr(equipment_schema) << " "
 			<< "FROM creature c "
 			<< "INNER JOIN creature_template ct ON ct.entry = c.id "
 			<< (needs_creature_addon_join ? "LEFT JOIN creature_addon ca ON ca.guid = c.guid " : "")
-			<< creatureEquipmentJoinExpr(has_equipment_schema)
+			<< creatureEquipmentJoinExpr(equipment_schema)
 			<< "WHERE ct.name LIKE '%" << escaped_search << "%' OR CAST(c.id AS CHAR) = '" << escaped_search << "' "
 			<< "ORDER BY ct.name, c.map, c.guid "
 			<< "LIMIT " << limit;

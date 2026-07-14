@@ -111,6 +111,15 @@ public:
 
   void intersect (math::ray const&, selection_result*, bool do_exterior = true);
 
+  // GAMEOBJECT-owned instances aren't registered with map tiles; skip the tile-visibility gate in
+  // draw() (they are frustum-culled by their gather loop instead).
+  bool skip_tile_culling = false;
+
+  // Per-frame portal visibility of this instance's groups, written by draw() (empty = all visible /
+  // portal culling off). get_visible_doodads reads it in the same frame so portal-culled rooms hide
+  // their doodads too, not just their geometry.
+  std::vector<uint8_t> portal_group_visibility;
+
   void recalcExtents() override;
   void change_nameset(uint16_t name_set);
   void ensureExtents() override;

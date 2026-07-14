@@ -226,6 +226,11 @@ public:
   [[nodiscard]]
   std::uint32_t wmo_area_table_group_id() const { return header.id; }
 
+  // This group's authored MFOG references (MOGP fogs[4]) -- the client selects the scene fog from the
+  // CAMERA group's list, which is how fog colour/distance changes per room (Kara vs Deadmines ship etc).
+  [[nodiscard]]
+  std::uint8_t fog_id(int i) const { return header.fogs[i]; }
+
   // Range into the root WMO's _portal_refs list = this group's portals (for portal-visibility culling).
   [[nodiscard]]
   std::uint16_t portal_start() const { return header.portal_start; }
@@ -408,6 +413,17 @@ public:
   mohd_flags flags;
 
   std::vector<WMOFog> fogs;
+
+  // CLIENT-EXACT fog evaluation for one group at the camera position (wow.exe @0069de20 +
+  // weight @0069e1c0 + lerp @0069efd0; docs/client_re/27). Returns false when this WMO carries
+  // only the default MFOG entry -- the client evaluator bails there and the ZONE fog applies.
+  // Otherwise the result STARTS as fogs[0] (the default entry, NOT the zone fog) and every
+  // candidate from the group's MOGP fog indices (index != 0, !(flags & 1), camera closer than r2)
+  // is lerped over it FARTHEST-first with w = 1 inside r1, linear to 0 at r2 -- so the nearest
+  // fog dominates. fog_start_abs is absolute (WMOFog::init pre-multiplies the authored scaler).
+  bool evaluate_camera_fog(WMOGroup const& group, glm::mat4x4 const& transform,
+                           glm::vec3 const& camera, glm::vec3* color, float* fog_end,
+                           float* fog_start_abs) const;
 
   std::vector<WMODoodadSet> doodadsets;
 

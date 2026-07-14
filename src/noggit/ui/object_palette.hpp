@@ -62,6 +62,7 @@ namespace Noggit
 
             void dragEnterEvent(QDragEnterEvent* event) override;
             void dropEvent(QDropEvent* event) override;
+            void showEvent(QShowEvent* event) override;
 
         signals:
             void selected(std::string);
@@ -77,6 +78,7 @@ namespace Noggit
             MapView* _map_view;
             Noggit::Ui::Tools::PreviewRenderer* _preview_renderer;
             std::shared_ptr<Noggit::Project::NoggitProject> _project;
+            bool _saved_palette_loaded = false;
 
         };
     }

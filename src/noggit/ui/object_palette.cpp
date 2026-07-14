@@ -95,10 +95,6 @@ namespace Noggit
                                                                  this);
       _preview_renderer->setVisible(false);
 
-      // just to initialize context, ugly-ish
-      _preview_renderer->setModelOffscreen("world/wmo/azeroth/buildings/human_farm/farm.wmo");
-      _preview_renderer->renderToPixmap();
-
       connect(_object_list, &QListWidget::itemClicked, this, [=](QListWidgetItem* item)
               {
                 _map_view->getObjectEditor()->copy(item->toolTip().toStdString());
@@ -121,8 +117,20 @@ namespace Noggit
       button_layout->addStretch();
 
       layout->addLayout(button_layout, 0, 1);
+    }
 
-      LoadSavedPalette();
+    void ObjectPalette::showEvent(QShowEvent* event)
+    {
+      widget::showEvent(event);
+
+      // Deferred from the constructor: rendering the saved palette's preview icons there put an
+      // offscreen GL burst (context creation + shader compiles + model uploads + readbacks) on
+      // every map load and intermittently fail-fasted the NVIDIA driver (0xC0000409 in nvoglv64).
+      if (!_saved_palette_loaded)
+      {
+        _saved_palette_loaded = true;
+        LoadSavedPalette();
+      }
     }
 
 

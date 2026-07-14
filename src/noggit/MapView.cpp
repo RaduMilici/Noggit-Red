@@ -3902,9 +3902,13 @@ void MapView::setupViewMenu()
   _draw_wmo.set              (_settings->value("render/wmo",              true ).toBool());
   _draw_terrain.set          (_settings->value("render/terrain",          true ).toBool());
   _draw_water.set            (_settings->value("render/water",            true ).toBool());
+  _draw_clouds.set           (_settings->value("render/draw_clouds",      true ).toBool());
+  _draw_sun.set              (_settings->value("render/draw_sun",         true ).toBool());
+  _draw_moon.set             (_settings->value("render/draw_moon",        true ).toBool());
   _draw_model_animations.set (_settings->value("render/model_animations", true ).toBool());
   _draw_bloom.set            (_settings->value("render/bloom",            true ).toBool());
   _draw_ground_clutter.set   (_settings->value("render/ground_clutter",   true ).toBool());
+  _wdl_horizon_occlusion.set (_settings->value("render/wdl_horizon_occlusion", false).toBool());
   _draw_fog.set              (_settings->value("render/fog",              true ).toBool());
   _draw_vertex_color.set     (_settings->value("render/vertex_color",     true ).toBool());
   _draw_baked_shadows.set    (_settings->value("render/baked_shadows",    true ).toBool());
@@ -3926,9 +3930,36 @@ void MapView::setupViewMenu()
   ADD_TOGGLE (view_menu, "WMO doodads", Qt::Key_F2, _draw_wmo_doodads);
   ADD_TOGGLE (view_menu, "Terrain",     Qt::Key_F3, _draw_terrain);
   ADD_TOGGLE (view_menu, "Water",       Qt::Key_F4, _draw_water);
+  // Clouds/sun/moon render-paths read the SETTINGS each frame (Skies::draw_clouds and the
+  // WorldRender celestial block), so persist on toggle.
+  ADD_TOGGLE_POST (view_menu, "Clouds", Qt::SHIFT | Qt::Key_F5, _draw_clouds,
+                   [=]
+                   {
+                     _settings->setValue("render/draw_clouds", _draw_clouds.get());
+                     _settings->sync();
+                   });
+  ADD_TOGGLE_POST (view_menu, "Sun", Qt::SHIFT | Qt::Key_F6, _draw_sun,
+                   [=]
+                   {
+                     _settings->setValue("render/draw_sun", _draw_sun.get());
+                     _settings->sync();
+                   });
+  ADD_TOGGLE_POST (view_menu, "Moon", Qt::SHIFT | Qt::Key_F7, _draw_moon,
+                   [=]
+                   {
+                     _settings->setValue("render/draw_moon", _draw_moon.get());
+                     _settings->sync();
+                   });
   ADD_TOGGLE (view_menu, "Bloom",       Qt::Key_F5, _draw_bloom);
   ADD_TOGGLE (view_menu, "WMOs",        Qt::Key_F6, _draw_wmo);
   ADD_TOGGLE (view_menu, "Ground clutter", Qt::SHIFT | Qt::Key_G, _draw_ground_clutter);
+  // WorldRender reads render/wdl_horizon_occlusion each frame, so persist on toggle.
+  ADD_TOGGLE_POST (view_menu, "WDL horizon occlusion (perf)", 0, _wdl_horizon_occlusion,
+                   [=]
+                   {
+                     _settings->setValue("render/wdl_horizon_occlusion", _wdl_horizon_occlusion.get());
+                     _settings->sync();
+                   });
 
   ADD_TOGGLE_POST (view_menu, "Lines", Qt::Key_F7, _draw_lines,
                    [=]
@@ -8439,8 +8470,10 @@ void MapView::tick (float dt)
   {
     int const minutes = (static_cast<int>(_world->time) % 2880) / 2;
     bool const is_day = (minutes >= 6 * 60 && minutes < 18 * 60);
-    // World resolves WMOAreaTable.ZoneMusic (dungeons/caves) first, then the AreaTable parent chain.
-    _zone_music_player->update_zone(_world->getZoneMusic(_camera.position), is_day);
+    // World resolves WMOAreaTable first (cities/dungeons/caves -- Ironforge, Caverns of Time), then the
+    // AreaTable parent chain, for BOTH the looping ZoneMusic and the one-shot ZoneIntroMusic.
+    _zone_music_player->update_zone(_world->getZoneMusic(_camera.position),
+                                    _world->getZoneIntroMusic(_camera.position), is_day);
   }
 
   {

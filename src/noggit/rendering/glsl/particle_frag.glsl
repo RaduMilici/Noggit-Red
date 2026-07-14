@@ -7,13 +7,23 @@ in float f_dist;
 
 out vec4 out_color;
 
-// Only the first members are used for fog; std140 prefix matches the shared lighting UBO.
+// Full shared lighting UBO layout (std140) -- the Env slots at the end need every preceding member
+// declared so their offsets match.
 layout (std140) uniform lighting
 {
   vec4 DiffuseColor_FogStart;
   vec4 AmbientColor_FogEnd;
   vec4 FogColor_FogOn;
   vec4 LightDir_FogRate;
+  vec4 OceanColorLight;
+  vec4 OceanColorDark;
+  vec4 RiverColorLight;
+  vec4 RiverColorDark;
+  vec4 PointLightParams;
+  vec4 PointLightPos[16];
+  vec4 PointLightColor[16];
+  vec4 EnvFogColor_On;       // rgb = entity fog colour (camera's fog context), w = 1 when active
+  vec4 EnvFogDist;           // x = start FRACTION of end (can be negative), y = end
 };
 
 uniform sampler2DArray tex;
@@ -51,9 +61,15 @@ void main()
   // the fog colour.
   if (FogColor_FogOn.w != 0.0)
   {
-    float start = AmbientColor_FogEnd.w * DiffuseColor_FogStart.w;
-    float denom = AmbientColor_FogEnd.w - start;
-    float f1 = (f_dist * (-(1.0 / denom))) + ((1.0 / denom) * AmbientColor_FogEnd.w);
+    // ENTITY fog: particles take the camera's fog context (Env slots) when active, zone otherwise.
+    bool use_env = EnvFogColor_On.w > 0.5;
+    vec3 fog_color_p = use_env ? EnvFogColor_On.rgb : FogColor_FogOn.rgb;
+    float fog_end_p = use_env ? EnvFogDist.y : AmbientColor_FogEnd.w;
+    float fog_start_frac_p = use_env ? EnvFogDist.x : DiffuseColor_FogStart.w;
+
+    float start = fog_end_p * fog_start_frac_p;
+    float denom = fog_end_p - start;
+    float f1 = (f_dist * (-(1.0 / denom))) + ((1.0 / denom) * fog_end_p);
     float fogFactor = 1.0 - min(pow(max(f1, 0.0), LightDir_FogRate.w), 1.0);
 
     if (particle_blend == 3 || particle_blend == 4)
@@ -62,7 +78,7 @@ void main()
     }
     else
     {
-      out_color.rgb = mix(out_color.rgb, FogColor_FogOn.rgb, fogFactor);
+      out_color.rgb = mix(out_color.rgb, fog_color_p, fogFactor);
     }
   }
 }

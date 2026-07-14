@@ -90,6 +90,13 @@ public:
   unsigned int uid;
   int frame;
 
+  // Cull-range fade state (client-exact, RE'd from wow.exe 5875: fade-in list in FUN_00614a90,
+  // SWModelFadeout in FUN_00672ef0): the cull test drives a 2000 ms timer; fade-in alpha = t^3,
+  // fade-out alpha = smoothstep((1-t) * a0). Advanced by WorldRender's gather each frame.
+  std::uint8_t _cull_fade_phase = 0; // 0 hidden, 1 fading in, 2 shown, 3 fading out
+  float _cull_fade_ms_ref = 0.f;
+  float _cull_fade_out_a0 = 0.f;
+
 protected:
   SceneObjectTypes _type;
 

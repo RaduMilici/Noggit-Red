@@ -11,6 +11,7 @@
 #include <math/frustum.hpp>
 
 #include <map>
+#include <vector>
 
 class WMO;
 
@@ -44,6 +45,9 @@ namespace Noggit::Rendering
         , display_mode display
         , bool interior_only
         , WorldRender* world_renderer = nullptr // per-room (MOLR) light scoping
+        // Written with this draw's per-group portal visibility (empty = all visible / culling off),
+        // so the caller can filter per-group WMO DOODADS the same way (hidden rooms hide their props).
+        , std::vector<uint8_t>* out_group_visibility = nullptr
     );
 
     bool drawSkybox(glm::mat4x4 const& model_view

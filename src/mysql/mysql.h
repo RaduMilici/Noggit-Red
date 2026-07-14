@@ -28,6 +28,7 @@ namespace mysql
     // Space-separated permanent aura spell ids from creature_template.auras (Turtle/mangos) or
     // creature_template_addon.auras (AzerothCore). Empty when the schema has neither.
     std::string auras;
+    std::uint32_t faction = 0; // creature_template faction (a FactionTemplate.dbc id) -> hostility
     float template_scale = 1.0f;
     float position_x = 0.0f;
     float position_y = 0.0f;

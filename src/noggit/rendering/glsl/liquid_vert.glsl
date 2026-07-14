@@ -58,6 +58,7 @@ flat out vec2 anim_uv;
 flat out int tex_frame;
 flat out uint shadow_chunk_index;
 out vec2 shadow_uv;
+out vec3 world_pos_; // for the water surface specular (sun sheen) in the fragment shader
 
 bool hasSubchunk(uint x, uint z, uint subchunks_first, uint subchunks_second)
 {
@@ -113,5 +114,6 @@ void main()
   mat4 view_rot = model_view;
   view_rot[3].xyz = vec3(0.0);
   vec4 world_pos = (use_transform == 1) ? (transform * final_pos) : final_pos;
+  world_pos_ = world_pos.xyz;
   gl_Position = projection * view_rot * vec4(world_pos.xyz - camera_pos.xyz, 1.0);
 }

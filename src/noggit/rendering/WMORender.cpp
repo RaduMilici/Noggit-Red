@@ -236,8 +236,13 @@ void WMORender::draw(OpenGL::Scoped::use_program& wmo_shader
     , display_mode display
     , bool interior_only
     , WorldRender* world_renderer
+    , std::vector<uint8_t>* out_group_visibility
 )
 {
+  if (out_group_visibility)
+  {
+    out_group_visibility->clear(); // empty = all visible (portal culling off / not computed)
+  }
 
   if (!_wmo->finishedLoading())
   [[unlikely]]
@@ -262,6 +267,11 @@ void WMORender::draw(OpenGL::Scoped::use_program& wmo_shader
     ? portal_visible_groups(_wmo, model_view, projection, transform_matrix, camera)
     : std::vector<uint8_t>();
 
+  if (out_group_visibility && use_portals)
+  {
+    *out_group_visibility = portal_visible;
+  }
+
   for (std::size_t gi = 0; gi < _wmo->groups.size(); ++gi)
   {
     auto& group = _wmo->groups[gi];
@@ -284,8 +294,50 @@ void WMORender::draw(OpenGL::Scoped::use_program& wmo_shader
     visible_groups.push_back(&group);
   }
 
+  // Per-region MFOG (trace: wow_cap_kara_cull_fog, per-draw fog attribution): the client draws WMO
+  // geometry with the group's authored MFOG (start/end/color VERBATIM -- e.g. kara #6DA3C6 83.3/208.3)
+  // IN THE SAME FRAME as terrain keeps the zone fog. There is no global fog switch. The fog fades
+  // toward the zone fog at the volume's outer range (the trace's intermediate blend states). Because
+  // MFOG start distances (83yd in kara) usually exceed room size, interiors show almost no fog in
+  // normal play -- the saturated colour only appears looking through long sightlines (out of bounds).
+  glm::vec3 zone_fog_color(0.0f);
+  float zone_fog_start_frac = 0.25f, zone_fog_end = 500.0f;
+  bool const per_group_fog = world_renderer && draw_fog;
+  if (per_group_fog)
+  {
+    world_renderer->getZoneFog(zone_fog_color, zone_fog_start_frac, zone_fog_end);
+  }
+
   for (auto* group : visible_groups)
   {
+    if (per_group_fog)
+    {
+      glm::vec3 fog_color = zone_fog_color;
+      float fog_start_abs = zone_fog_start_frac * zone_fog_end;
+      float fog_end = zone_fog_end;
+
+      // CLIENT-EXACT rule (wow.exe @0069de20, note 27; replaces the earlier best-sphere heuristic):
+      // a DEFAULT-ONLY WMO (single MFOG entry, e.g. Karazhan's root) keeps the ZONE fog everywhere
+      // -- the trace's dominant state. A WMO with placed fogs blends them (farthest -> nearest,
+      // w = 1 inside r1, linear to 0 at r2, candidates from THIS group's MOGP fog indices) over
+      // the WMO's DEFAULT entry fogs[0] -- NOT over the zone fog.
+      glm::vec3 mf_color;
+      float mf_end = 0.0f, mf_start = 0.0f;
+      if (_wmo->evaluate_camera_fog(*group, transform_matrix, camera, &mf_color, &mf_end, &mf_start))
+      {
+        float const fog_scale = world_renderer->fogDistanceScale();
+        fog_color = mf_color;
+        fog_end = mf_end * fog_scale;
+        fog_start_abs = mf_start * fog_scale;
+      }
+
+      wmo_shader.uniform("use_wmo_fog", 1);
+      wmo_shader.uniform("wmo_fog_color", fog_color);
+      wmo_shader.uniform("wmo_fog_end", fog_end);
+      wmo_shader.uniform("wmo_fog_start",
+                         fog_end > 0.001f ? std::clamp(fog_start_abs / fog_end, -5.0f, 0.99f) : 0.25f);
+    }
+
     if (world_renderer)
     {
       // Per-room lighting (client MOLR semantics): interior groups are lit ONLY by the MOLT lights
@@ -304,6 +356,7 @@ void WMORender::draw(OpenGL::Scoped::use_program& wmo_shader
 
     group->renderer()->draw(wmo_shader
         , frustum
+        , transform_matrix
         , cull_distance
         , camera
         , draw_fog

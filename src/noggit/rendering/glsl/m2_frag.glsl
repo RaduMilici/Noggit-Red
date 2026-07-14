@@ -23,6 +23,8 @@ layout (std140) uniform lighting
     vec4 PointLightParams;     // .x = active point-light count
     vec4 PointLightPos[16];    // xyz = world pos, w = radius
     vec4 PointLightColor[16];  // xyz = colour * intensity
+    vec4 EnvFogColor_On;       // rgb = entity fog colour (camera's fog context), w = 1 when active
+    vec4 EnvFogDist;           // x = start FRACTION of end (can be negative), y = end
 };
 
 // Client point-light model for M2s (RE_notes/15):
@@ -74,21 +76,60 @@ vec3 point_lights(vec3 world_pos, vec3 n)
 
 uniform vec4 mesh_color;
 uniform int blend_mode;
+uniform int water_surface_effect; // 1 = fishing-pool wake geoset: grey out + luminance-alpha (see below)
 
 uniform sampler2DArray tex1;
 uniform sampler2DArray tex2;
 uniform int tex1_index;
 uniform int tex2_index;
+// M2 texture wrap flags (0x1 wrap X, 0x2 wrap Y): an UNSET bit means the texture addresses CLAMP
+// on that axis (trace-verified: 1.12 sets D3DTADDRESS_CLAMP on most in-world M2 draws). Encoded
+// here inverted as a clamp mask (bit0 = clamp U, bit1 = clamp V) so an unset uniform (0) keeps the
+// wrap default for callers that never bind it. Textures share array textures, so clamp-to-edge is
+// emulated by pulling the coordinate half a texel inside the border.
+uniform int tex1_clamp;
+uniform int tex2_clamp;
+
+vec2 cuv1;
+vec2 cuv2;
+
+vec2 clamp_uv(vec2 uv, int clamp_mask, vec2 tex_size)
+{
+  vec2 half_texel = 0.5 / tex_size;
+  if (bool(clamp_mask & 1))
+  {
+    uv.x = clamp(uv.x, half_texel.x, 1.0 - half_texel.x);
+  }
+  if (bool(clamp_mask & 2))
+  {
+    uv.y = clamp(uv.y, half_texel.y, 1.0 - half_texel.y);
+  }
+  return uv;
+}
 
 uniform int unfogged;
 uniform int unlit;
+uniform int detail_doodad; // 1 = ground clutter: grayscale day/night dim, no colour tint
 uniform int masked_additive;
 uniform int creature_bloom; // 1 = creature/character M2: bright body pixels feed the emissive bloom mask
 
 uniform int pixel_shader;
 
+// Per-pixel distance slice (terrain-parity object boundary): fragments beyond the object cull
+// distance are discarded, so a model straddling the boundary loses its far pixels first and
+// slices in/out of view exactly like terrain at the far plane -- no whole-model pops. 0 = off
+// (creatures/near paths keep their own fade).
+uniform float slice_dist;
+
 void main()
 {
+  if (slice_dist > 0.0 && camera_dist > slice_dist)
+  {
+    discard;
+  }
+
+  cuv1 = (tex1_clamp != 0) ? clamp_uv(uv1, tex1_clamp, vec2(textureSize(tex1, 0).xy)) : uv1;
+  cuv2 = (tex2_clamp != 0) ? clamp_uv(uv2, tex2_clamp, vec2(textureSize(tex2, 0).xy)) : uv2;
 
   float alpha_test;
   int fog_mode;
@@ -137,7 +178,23 @@ void main()
 
   vec4 color = vec4(0.0);
 
-  if(mesh_color.a < alpha_test)
+  float grass_coverage = 1.0;
+  if (detail_doodad == 1 && blend_mode == 1)
+  {
+    // ALPHA-TO-COVERAGE for ground-clutter grass. Distant blades cover < 1 pixel; a hard alpha-key
+    // makes each a full-bright green DOT (or nothing), so the field "dissolves into pixels" far
+    // away. Compute the blade's sub-pixel coverage from the mip-softened alpha via its screen-space
+    // derivative and output it as the fragment alpha; with GL_SAMPLE_ALPHA_TO_COVERAGE enabled on
+    // this draw (needs MSAA), a partly-covered blade contributes partial MSAA samples -> it blends
+    // smoothly into the ground instead of dotting. Keeps near grass crisp (coverage saturates to 1).
+    float w = max(fwidth(mesh_color.a), 1e-4);
+    grass_coverage = clamp((mesh_color.a - alpha_test) / w + 0.5, 0.0, 1.0);
+    if (grass_coverage <= 0.003)
+    {
+      discard;
+    }
+  }
+  else if(mesh_color.a < alpha_test)
   {
     discard;
   }
@@ -145,143 +202,143 @@ void main()
   // code from Deamon87 and https://wowdev.wiki/M2/Rendering#Pixel_Shaders
   if (pixel_shader == 0) //Combiners_Opaque
   {
-      vec4 texture1 = texture(tex1, vec3(uv1, tex1_index));
+      vec4 texture1 = texture(tex1, vec3(cuv1, tex1_index));
       color.rgb = texture1.rgb * mesh_color.rgb;
       color.a = mesh_color.a;
   } 
   else if (pixel_shader == 1) // Combiners_Decal
   {
-      vec4 texture1 = texture(tex1, vec3(uv1, tex1_index));
+      vec4 texture1 = texture(tex1, vec3(cuv1, tex1_index));
       color.rgb = mix(mesh_color.rgb, texture1.rgb, mesh_color.a);
       color.a = mesh_color.a;
   } 
   else if (pixel_shader == 2) // Combiners_Add
   {
-      vec4 texture1 = texture(tex1, vec3(uv1, tex1_index));
+      vec4 texture1 = texture(tex1, vec3(cuv1, tex1_index));
       color.rgba = texture1.rgba + mesh_color.rgba;
   } 
   else if (pixel_shader == 3) // Combiners_Mod2x
   {
-      vec4 texture1 = texture(tex1, vec3(uv1, tex1_index));
+      vec4 texture1 = texture(tex1, vec3(cuv1, tex1_index));
       color.rgb = texture1.rgb * mesh_color.rgb * vec3(2.0);
       color.a = texture1.a * mesh_color.a * 2.0;
   } 
   else if (pixel_shader == 4) // Combiners_Fade
   {
-      vec4 texture1 = texture(tex1, vec3(uv1, tex1_index));
+      vec4 texture1 = texture(tex1, vec3(cuv1, tex1_index));
       color.rgb = mix(texture1.rgb, mesh_color.rgb, mesh_color.a);
       color.a = mesh_color.a;
   } 
   else if (pixel_shader == 5) // Combiners_Mod
   {
-      vec4 texture1 = texture(tex1, vec3(uv1, tex1_index));
+      vec4 texture1 = texture(tex1, vec3(cuv1, tex1_index));
       color.rgba = texture1.rgba * mesh_color.rgba;
   } 
   else if (pixel_shader == 6) // Combiners_Opaque_Opaque
   {
-      vec4 texture1 = texture(tex1, vec3(uv1, tex1_index));
-      vec4 texture2 = texture(tex2, vec3(uv2, tex2_index));
+      vec4 texture1 = texture(tex1, vec3(cuv1, tex1_index));
+      vec4 texture2 = texture(tex2, vec3(cuv2, tex2_index));
       color.rgb = texture1.rgb * texture2.rgb * mesh_color.rgb;
       color.a = mesh_color.a;
   } 
   else if (pixel_shader == 7) // Combiners_Opaque_Add
   {
-      vec4 texture1 = texture(tex1, vec3(uv1, tex1_index));
-      vec4 texture2 = texture(tex2, vec3(uv2, tex2_index));
+      vec4 texture1 = texture(tex1, vec3(cuv1, tex1_index));
+      vec4 texture2 = texture(tex2, vec3(cuv2, tex2_index));
       color.rgb = texture2.rgb + texture1.rgb * mesh_color.rgb;
       color.a = mesh_color.a + texture1.a;
   } 
   else if (pixel_shader == 8) // Combiners_Opaque_Mod2x
   {
-      vec4 texture1 = texture(tex1, vec3(uv1, tex1_index));
-      vec4 texture2 = texture(tex2, vec3(uv2, tex2_index));
+      vec4 texture1 = texture(tex1, vec3(cuv1, tex1_index));
+      vec4 texture2 = texture(tex2, vec3(cuv2, tex2_index));
       color.rgb = texture1.rgb * mesh_color.rgb * texture2.rgb * vec3(2.0);
       color.a  = texture2.a * mesh_color.a * 2.0;
   } 
   else if (pixel_shader == 9)  // Combiners_Opaque_Mod2xNA
   {
-      vec4 texture1 = texture(tex1, vec3(uv1, tex1_index));
-      vec4 texture2 = texture(tex2, vec3(uv2, tex2_index));
+      vec4 texture1 = texture(tex1, vec3(cuv1, tex1_index));
+      vec4 texture2 = texture(tex2, vec3(cuv2, tex2_index));
       color.rgb = texture1.rgb * mesh_color.rgb * texture2.rgb * vec3(2.0);
       color.a  = mesh_color.a;
   } 
   else if (pixel_shader == 10) // Combiners_Opaque_AddNA
   {
-      vec4 texture1 = texture(tex1, vec3(uv1, tex1_index));
-      vec4 texture2 = texture(tex2, vec3(uv2, tex2_index));
+      vec4 texture1 = texture(tex1, vec3(cuv1, tex1_index));
+      vec4 texture2 = texture(tex2, vec3(cuv2, tex2_index));
       color.rgb = texture2.rgb + texture1.rgb * mesh_color.rgb;
       color.a = mesh_color.a;
   } 
   else if (pixel_shader == 11) // Combiners_Opaque_Mod
   {
-      vec4 texture1 = texture(tex1, vec3(uv1, tex1_index));
-      vec4 texture2 = texture(tex2, vec3(uv2, tex2_index));
+      vec4 texture1 = texture(tex1, vec3(cuv1, tex1_index));
+      vec4 texture2 = texture(tex2, vec3(cuv2, tex2_index));
       color.rgb = texture1.rgb * texture2.rgb * mesh_color.rgb;
       color.a = texture2.a * mesh_color.a;
   } 
   else if (pixel_shader == 12) // Combiners_Mod_Opaque
   {
-      vec4 texture1 = texture(tex1, vec3(uv1, tex1_index));
-      vec4 texture2 = texture(tex2, vec3(uv2, tex2_index));
+      vec4 texture1 = texture(tex1, vec3(cuv1, tex1_index));
+      vec4 texture2 = texture(tex2, vec3(cuv2, tex2_index));
       color.rgb = texture1.rgb * texture2.rgb * mesh_color.rgb;
       color.a = texture1.a;
   } 
   else if (pixel_shader == 13) // Combiners_Mod_Add
   {
-      vec4 texture1 = texture(tex1, vec3(uv1, tex1_index));
-      vec4 texture2 = texture(tex2, vec3(uv2, tex2_index));
+      vec4 texture1 = texture(tex1, vec3(cuv1, tex1_index));
+      vec4 texture2 = texture(tex2, vec3(cuv2, tex2_index));
       color.rgba = texture2.rgba + texture1.rgba * mesh_color.rgba;
   } 
   else if (pixel_shader == 14) // Combiners_Mod_Mod2x
   {
-      vec4 texture1 = texture(tex1, vec3(uv1, tex1_index));
-      vec4 texture2 = texture(tex2, vec3(uv2, tex2_index));
+      vec4 texture1 = texture(tex1, vec3(cuv1, tex1_index));
+      vec4 texture2 = texture(tex2, vec3(cuv2, tex2_index));
       color.rgba = texture1.rgba * texture2.rgba * mesh_color.rgba * vec4(2.0);
   } 
   else if (pixel_shader == 15) // Combiners_Mod_Mod2xNA
   {
-      vec4 texture1 = texture(tex1, vec3(uv1, tex1_index));
-      vec4 texture2 = texture(tex2, vec3(uv2, tex2_index));
+      vec4 texture1 = texture(tex1, vec3(cuv1, tex1_index));
+      vec4 texture2 = texture(tex2, vec3(cuv2, tex2_index));
       color.rgb = texture1.rgb * texture2.rgb * mesh_color.rgb * vec3(2.0);
       color.a = texture1.a * mesh_color.a;
   } 
   else if (pixel_shader == 16) // Combiners_Mod_AddNA
   {
-      vec4 texture1 = texture(tex1, vec3(uv1, tex1_index));
-      vec4 texture2 = texture(tex2, vec3(uv2, tex2_index));
+      vec4 texture1 = texture(tex1, vec3(cuv1, tex1_index));
+      vec4 texture2 = texture(tex2, vec3(cuv2, tex2_index));
       color.rgb = texture2.rgb + texture1.rgb * mesh_color.rgb;
       color.a = texture1.a * mesh_color.a;
   } 
   else if (pixel_shader == 17) // Combiners_Mod_Mod
   {
-      vec4 texture1 = texture(tex1, vec3(uv1, tex1_index));
-      vec4 texture2 = texture(tex2, vec3(uv2, tex2_index));
+      vec4 texture1 = texture(tex1, vec3(cuv1, tex1_index));
+      vec4 texture2 = texture(tex2, vec3(cuv2, tex2_index));
       color.rgba = texture1.rgba * texture2.rgba * mesh_color.rgba;
   } 
   else if (pixel_shader == 18) // Combiners_Add_Mod
   {
-      vec4 texture1 = texture(tex1, vec3(uv1, tex1_index));
-      vec4 texture2 = texture(tex2, vec3(uv2, tex2_index));
+      vec4 texture1 = texture(tex1, vec3(cuv1, tex1_index));
+      vec4 texture2 = texture(tex2, vec3(cuv2, tex2_index));
       color.rgb = (texture1.rgb + mesh_color.rgb) * texture2.a;
       color.a = (texture1.a + mesh_color.a) * texture2.a;
   } 
   else if (pixel_shader == 19) // Combiners_Mod2x_Mod2x
   {
-      vec4 texture1 = texture(tex1, vec3(uv1, tex1_index));
-      vec4 texture2 = texture(tex2, vec3(uv2, tex2_index));
+      vec4 texture1 = texture(tex1, vec3(cuv1, tex1_index));
+      vec4 texture2 = texture(tex2, vec3(cuv2, tex2_index));
       color.rgba = texture1.rgba * texture2.rgba * mesh_color.rgba * vec4(4.0);
   }
   else if (pixel_shader == 20)  // Combiners_Opaque_Mod2xNA_Alpha
   {
-    vec4 texture1 = texture(tex1, vec3(uv1, tex1_index));
-    vec4 texture2 = texture(tex2, vec3(uv2, tex2_index));
+    vec4 texture1 = texture(tex1, vec3(cuv1, tex1_index));
+    vec4 texture2 = texture(tex2, vec3(cuv2, tex2_index));
     color.rgb = (mesh_color.rgb * texture1.rgb) * mix(texture2.rgb * 2.0, vec3(1.0), texture1.a);
     color.a = mesh_color.a;
   }
   else if (pixel_shader == 21)   //Combiners_Opaque_AddAlpha
   {
-    vec4 texture1 = texture(tex1, vec3(uv1, tex1_index));
-    vec4 texture2 = texture(tex2, vec3(uv2, tex2_index));
+    vec4 texture1 = texture(tex1, vec3(cuv1, tex1_index));
+    vec4 texture2 = texture(tex2, vec3(cuv2, tex2_index));
         if (masked_additive != 0)
         {
             // Keep the original dust mask so low-dust regions stay TRANSPARENT (showing the cave
@@ -307,8 +364,8 @@ void main()
   }
   else if (pixel_shader == 22)   // Combiners_Opaque_AddAlpha_Alpha
   {
-    vec4 texture1 = texture(tex1, vec3(uv1, tex1_index));
-    vec4 texture2 = texture(tex2, vec3(uv2, tex2_index));
+    vec4 texture1 = texture(tex1, vec3(cuv1, tex1_index));
+    vec4 texture2 = texture(tex2, vec3(cuv2, tex2_index));
         if (masked_additive != 0)
         {
             // This batch's 2nd texture is just a *_Mask (Lightray_Dusty_02_Mask) -- WMV ignores it and
@@ -330,6 +387,24 @@ void main()
         }
   }
 
+  // FISHING-POOL WAKE (foam ring / bubbles / sparkles): the effect texture is a near-black field with
+  // bright wisps and no usable alpha. Drawn opaque it bloomed white; alpha-blended it painted a solid
+  // blue veil; additive glowed too bright. Make it read like the murky water it floats on: desaturate
+  // the wisps to grey and use the texel BRIGHTNESS as the alpha (same trick as the dusty-lightray
+  // combiners above) so the dark field goes fully transparent -- the water colour shows straight
+  // through -- and only a faint grey wake remains. It stays lit below, so it warms/cools with the
+  // scene like the surrounding water. The 0.7 lever is the wake opacity (lower = fainter).
+  if (water_surface_effect == 1)
+  {
+    // Luminance (NOT max-channel, which read near-white on the cyan wisps). Map it into a DARK grey
+    // band so the wake reads like the murky water -- never white, never a black hole -- and use it as
+    // the alpha so the near-black texture field goes transparent (water shows through). Lit below, so
+    // it takes the scene's warmth. 0.15 = trough grey, 0.55 = brightest wake, 1.4 = wake opacity lever.
+    float lum = dot(color.rgb, vec3(0.299, 0.587, 0.114));
+    color.rgb = vec3(mix(0.15, 0.55, lum));
+    color.a = clamp(lum * 1.4, 0.0, 1.0);
+  }
+
   if(color.a < alpha_test)
   {
     discard;
@@ -340,7 +415,23 @@ void main()
   vec3 lDiffuse = vec3(0.0, 0.0, 0.0);
   vec3 accumlatedLight = vec3(1.0, 1.0, 1.0);
 
-  if(unlit == 0)
+  if(detail_doodad == 1)
+  {
+      // GROUND CLUTTER: the client bakes the Light-DBC scene colours straight into grass vertices
+      // (D3D lighting OFF in the trace; night verts avg ~(200,132,56) = a dim muted warm, and it
+      // darkens/cools with the scene). So light grass with the SAME colored hemisphere+diffuse as
+      // terrain -- it then matches the ground it grows from at every hour. Grass normals point up,
+      // so use a fixed upward normal for a stable, non-flickery N.L (tufts have no meaningful face).
+      vec3 upN = vec3(0.0, 1.0, 0.0);
+      float nDotL = clamp(dot(upN, -normalize(vec3(LightDir_FogRate.x, LightDir_FogRate.z, -LightDir_FogRate.y))), 0.0, 1.0);
+      vec3 amb = AmbientColor_FogEnd.xyz;
+      vec3 skyC = amb * 1.10000002;
+      vec3 grndC = amb * 0.699999988;
+      currColor = mix(grndC, skyC, 0.5 + 0.5 * nDotL);
+      lDiffuse = DiffuseColor_FogStart.xyz * nDotL;
+      accumlatedLight = vec3(0.0, 0.0, 0.0);
+  }
+  else if(unlit == 0)
   {
       if (v_interior.a > 0.25)
       {
@@ -368,7 +459,15 @@ void main()
       }
       else
       {
-          float nDotL = clamp(dot(normalize(norm), -normalize(vec3(-LightDir_FogRate.x, LightDir_FogRate.z, -LightDir_FogRate.y))), 0.0, 1.0);
+          // OUTDOOR sun lighting -- IDENTICAL PIPELINE to terrain_frag.glsl (same Light-DBC diffuse/
+          // ambient, same ground/sky hemisphere, same N.L), so objects and the ground they sit on
+          // catch the sun from the same compass direction.
+          // FRAME: M2 normals load via fixCoordSystem = (wow.x, wow.z, -wow.y), but terrain (MCNR)
+          // normals are (wow.x, wow.z, +wow.y). Terrain lights with (LightDir.x, LightDir.z,
+          // LightDir.y); to compute the SAME physical wow-space N.L against the M2's negated third
+          // component, the light's third component must be negated too -- else the north-south
+          // half of the sun azimuth is mirrored and objects light from the wrong side vs terrain.
+          float nDotL = clamp(dot(normalize(norm), -normalize(vec3(LightDir_FogRate.x, LightDir_FogRate.z, -LightDir_FogRate.y))), 0.0, 1.0);
 
           vec3 ambientColor = AmbientColor_FogEnd.xyz;
 
@@ -377,6 +476,16 @@ void main()
 
           currColor = mix(groundColor, skyColor, 0.5 + (0.5 * nDotL));
           lDiffuse = DiffuseColor_FogStart.xyz * nDotL + point_lights(m2_world_pos, normalize(norm));
+
+          // Per-OBJECT zone light (trace: wow_cap_timbermaw -- at one instant, different M2s carry the
+          // zone SH scaled by different per-channel tints): the client evaluates the zone light at each
+          // ENTITY's position, not the camera's. v_interior.rgb carries light_at(object)/light_at(camera)
+          // when a==0; (0,0,0) is the legacy no-tint sentinel.
+          if (v_interior.r + v_interior.g + v_interior.b > 0.0)
+          {
+            currColor *= v_interior.rgb;
+            lDiffuse *= v_interior.rgb;
+          }
       }
   }
   else
@@ -405,11 +514,19 @@ void main()
 
   if(FogColor_FogOn.w != 0 && unfogged == 0)
   {
-    float start = AmbientColor_FogEnd.w * DiffuseColor_FogStart.w;
+    // ENTITY fog: the camera's fog context (zone fog blended toward the containing WMO fog volume)
+    // -- client-canon (note 16: inside the inn, M2 fog constants equal the inn MFOG). Terrain keeps
+    // the zone slots; EnvFogColor_On.w == 0 falls back to them.
+    bool use_env = EnvFogColor_On.w > 0.5;
+    vec3 fog_color_m2 = use_env ? EnvFogColor_On.rgb : FogColor_FogOn.rgb;
+    float fog_end_m2 = use_env ? EnvFogDist.y : AmbientColor_FogEnd.w;
+    float fog_start_frac_m2 = use_env ? EnvFogDist.x : DiffuseColor_FogStart.w;
+
+    float start = fog_end_m2 * fog_start_frac_m2;
 
     vec3 fogParams;
-    fogParams.x = -(1.0 / (AmbientColor_FogEnd.w - start));
-    fogParams.y = (1.0 / (AmbientColor_FogEnd.w - start)) * AmbientColor_FogEnd.w;
+    fogParams.x = -(1.0 / (fog_end_m2 - start));
+    fogParams.y = (1.0 / (fog_end_m2 - start)) * fog_end_m2;
     fogParams.z = LightDir_FogRate.w;
 
     float f1 = (camera_dist * fogParams.x) + fogParams.y;
@@ -422,7 +539,7 @@ void main()
     // Additive passes (Add=4, No_Add_Alpha=3) add light, so in fog they must fade to NOTHING (black)
     // rather than toward the fog colour -- otherwise a distant light shaft / glow stays as a bright
     // cutout floating in the haze instead of dissolving into it. Everything else fades to fog colour.
-    vec3 fog_target = (blend_mode == 4 || blend_mode == 3) ? vec3(0.0) : FogColor_FogOn.rgb;
+    vec3 fog_target = (blend_mode == 4 || blend_mode == 3) ? vec3(0.0) : fog_color_m2;
     color.rgb = mix(color.rgb, fog_target, fogFactor);
 
     // Opaque / alpha-key doodads: write the bloom mask into alpha so fog-brightened doodads stop
@@ -497,4 +614,11 @@ void main()
   }
 
   out_color = color;
+
+  // Grass: output the sub-pixel blade coverage as alpha for GL_SAMPLE_ALPHA_TO_COVERAGE (overrides
+  // the bloom-mask alpha above; grass isn't emissive so it never needed to bloom).
+  if (detail_doodad == 1)
+  {
+    out_color.a = grass_coverage;
+  }
 }

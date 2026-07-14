@@ -11,6 +11,7 @@
 #include <array>
 #include <cstdint>
 #include <list>
+#include <deque>
 #include <memory>
 #include <vector>
 
@@ -195,14 +196,13 @@ private:
 };
 
 
-struct RibbonSegment 
+// One ribbon EDGE, client-exact (CRibbonEmitter RE, docs/client_re/25): both vertex positions are
+// BAKED at spawn (the trail does not follow the bone afterwards); gravity displaces them over time
+// and the age drives the U texture coordinate (age/lifetime across the tex slot cell).
+struct RibbonEdge
 {
-  glm::vec3 pos, up, back;
-  float len, len0;
-  RibbonSegment (::glm::vec3 pos_, float len_)
-    : pos (pos_)
-    , len (len_)
-  {}
+  glm::vec3 above, below;
+  float age;
 };
 
 class RibbonEmitter 
@@ -212,23 +212,43 @@ class RibbonEmitter
   Animation::M2Value<glm::vec3> color;
   Animation::M2Value<float, int16_t> opacity;
   Animation::M2Value<float> above, below;
+  // Texture-slot + visibility tracks (client RE, docs/client_re/25): unk1 = int16 slot index into
+  // the s1 x s2 cell grid (SetTexSlot @007b7b70 -> cell UV recompute @007b6f30), unk2 = uint8
+  // visibility (SetVisible @007b7b40: 0 = stop emitting + drop the head; the trail still ages out).
+  Animation::M2Value<int, int16_t> tex_slot_track;
+  Animation::M2Value<int, uint8_t> visibility_track;
 
   Bone *parent;
 
   glm::vec3 pos;
 
   int manim, mtime;
-  int seglen;
-  float length;
+  // Client-exact parameters (CRibbonEmitter::Initialize RE): edges/second emission rate, edge
+  // lifetime in seconds (= trail duration), gravity, and the texture slot grid (rows x cols).
+  float edges_per_sec;
+  float edge_lifetime;
+  float gravity;
+  int tex_rows, tex_cols;
 
   glm::vec3 tpos;
   glm::vec4 tcolor;
   float tabove, tbelow;
 
+  // Emission state: fractional edge accumulator + the previous frame's anchor points for the
+  // client's sub-frame interpolated spawning; last anim timestamp for dt.
+  float _emit_accum = 0.0f;
+  bool _have_prev = false;
+  glm::vec3 _prev_above = glm::vec3(0.f), _prev_below = glm::vec3(0.f);
+  glm::vec3 _cur_above = glm::vec3(0.f), _cur_below = glm::vec3(0.f);
+  int _last_animtime = -1;
+  // Sampled per frame from the tracks above (client defaults: slot 0, visible).
+  int _cur_slot = 0;
+  bool _visible = true;
+
   std::vector<uint16_t> _texture_ids;
   std::vector<uint16_t> _material_ids;
 
-  std::list<RibbonSegment> segs;
+  std::deque<RibbonEdge> edges; // front = newest
 
 public:
   RibbonEmitter(Model*, const BlizzardArchive::ClientFile &f, ModelRibbonEmitterDef const& mta, int *globals

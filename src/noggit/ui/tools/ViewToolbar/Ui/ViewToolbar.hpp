@@ -67,6 +67,13 @@ namespace Noggit
                          const Noggit::Ui::FontNoggit::Icons& icon,
                          ViewToolbar* sec_tool_bar,
                          QVector<QWidgetAction*> sec_action_bar = QVector<QWidgetAction*>());
+      // same, but with an arbitrary QIcon (e.g. FontAwesome glyphs the noggit font lacks)
+      void add_tool_icon(MapView* mapView,
+                         Noggit::BoolToggleProperty* view_state,
+                         const QString& name,
+                         QIcon const& icon,
+                         ViewToolbar* sec_tool_bar,
+                         QVector<QWidgetAction*> sec_action_bar = QVector<QWidgetAction*>());
 
     };
 

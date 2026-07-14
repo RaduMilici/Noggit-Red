@@ -271,6 +271,8 @@ public:
   // ===============================
   std::vector<scoped_blp_texture_reference> _textures;
   std::vector<std::string> _textureFilenames;
+  // ModelTextureDef.flags per texture slot (0x1 wrap X, 0x2 wrap Y; unset bit = clamp on that axis)
+  std::vector<uint32_t> _texture_flags;
   std::map<std::size_t, scoped_blp_texture_reference> _replaceTextures;
   std::vector<int> _specialTextures;
   std::vector<bool> _useReplaceTextures;
@@ -330,6 +332,21 @@ private:
   bool _per_instance_animation;
   bool _uses_classic_layout = false;
   bool _emits_light = false; // has an unlit+additive (emissive glow) material -- see emitsLight()
+public:
+  // Water-surface effect model (fishing-pool "school": foam ring + bubbles + sparkles). Its effect
+  // geosets are authored blend=Opaque in the M2 (verified identical across Turtle/WotLK/converted
+  // copies), so Noggit would draw the flat foam disc as a solid bright quad that z-fights the water.
+  // Flagged at load (path = Tradeskill_FishSchool_*) so prepareDraw promotes the water-EFFECT geosets
+  // (foam/bubble/sparkle textures) to alpha-blend + no depth-write -- translucent, flush on the water,
+  // matching the in-game look -- while the solid debris (crates/barrels/fish) stay opaque.
+  bool _water_surface_effect = false;
+private:
+public:
+  // Ground-clutter detail doodads: the client renders these through a dedicated FULLBRIGHT detail
+  // shader (FUN_006b2b80), ignoring per-material lighting. Left lit, the yellow Westfall atlas
+  // picks up the zone's cyan daytime ambient and reads green. Set on the shared detail models.
+  bool _force_unlit = false;
+private:
   uint32_t _embedded_view_offset = 0;
   bool _logged_layout_summary = false;
   bool _logged_animation_branch = false;

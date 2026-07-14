@@ -76,8 +76,15 @@ namespace Noggit::Rendering
     uint16_t uv_animations[2];
     std::optional<ModelPixelShader> pixel_shader;
 
+    // Fishing-pool water-effect geoset (foam/bubble/sparkle) on a _water_surface_effect model: promote
+    // the authored-Opaque blend to alpha + drop depth-write so it reads translucent and sits flush on
+    // the water instead of z-fighting. Tri-state cache: -1 = not yet resolved, 0 = no, 1 = yes.
+    int _water_effect_translucent = -1;
 
-    bool prepareDraw(OpenGL::Scoped::use_program& m2_shader, Model *m, ModelInstance const* instance, OpenGL::M2RenderState& model_render_state);
+
+    // extra_alpha: distance-fade factor for instanced draws -- multiplies into the instance alpha so
+    // opaque passes promote to alpha-blend and fade out instead of popping at the render distance.
+    bool prepareDraw(OpenGL::Scoped::use_program& m2_shader, Model *m, ModelInstance const* instance, OpenGL::M2RenderState& model_render_state, float extra_alpha = 1.0f);
     void afterDraw();
     bool bindTexture(size_t index, Model* m, ModelInstance const* instance, OpenGL::M2RenderState& model_render_state, OpenGL::Scoped::use_program& m2_shader);
     void initUVTypes(Model* m);
@@ -124,6 +131,8 @@ namespace Noggit::Rendering
         // indoors; (0,0,0,0) = outdoor (default). The shader splits the colour into ambient/diffuse per
         // the client's unit interior lighting (RE_notes/15) instead of the outdoor sun.
         , glm::vec4 const& interior_light = glm::vec4(0.f)
+        // Cull-range fade alpha for this instance (client 2000 ms fade; 1.0 = fully shown).
+        , float dist_fade = 1.0f
     );
 
     void draw (glm::mat4x4 const& model_view
@@ -145,6 +154,9 @@ namespace Noggit::Rendering
         // Per-instance interior light (parallel to `instances`): rgb = sampled MOCV floor colour,
         // a = 1 indoors. Empty = all outdoor. The draw partitions instances by this value into sub-draws.
         , std::vector<glm::vec4> const& instance_interior = {}
+        // Per-instance distance fade 0..1 (parallel to `instances`): alpha ramp over the last stretch
+        // before the render distance so doodads dissolve instead of popping. Empty = no fade (1.0).
+        , std::vector<float> const& instance_fades = {}
     );
 
     void drawParticles(glm::mat4x4 const& model_view

@@ -3,7 +3,25 @@
 #include "WMOGroupRender.hpp"
 #include <noggit/WMO.h>
 
+#include <cstdlib>
+#include <limits>
+
 using namespace Noggit::Rendering;
+
+namespace
+{
+  // Bisect switch for the per-batch (MOBA-style) frustum cull: NOGGIT_NO_MOBA_CULL=1 draws the
+  // merged calls whole, as before.
+  bool moba_cull_disabled()
+  {
+    static bool const disabled = []
+    {
+      char const* v = std::getenv("NOGGIT_NO_MOBA_CULL");
+      return v && *v && *v != '0';
+    }();
+    return disabled;
+  }
+}
 
 WMOGroupRender::WMOGroupRender(WMOGroup* wmo_group)
 : _wmo_group(wmo_group)
@@ -205,6 +223,28 @@ void WMOGroupRender::upload()
 
     draw_call->index_count += batch.index_count;
 
+    // Per-batch cull span (D4): remember this batch's index range + local AABB inside the merged
+    // draw call. The box is computed from the batch's own vertex range -- same data as the authored
+    // MOBA int16 box, but guaranteed to be in VBO space.
+    {
+      WMOBatchSpan& span = draw_call->spans.emplace_back();
+      span.index_start = batch.index_start;
+      span.index_count = batch.index_count;
+      // min > max (the untouched sentinel) marks a span with no vertex data: never culled.
+      span.aabb_min = glm::vec3(std::numeric_limits<float>::max());
+      span.aabb_max = glm::vec3(std::numeric_limits<float>::lowest());
+      if (!_wmo_group->_vertices.empty())
+      {
+        std::size_t const vert_end = std::min(static_cast<std::size_t>(batch.vertex_end),
+                                              _wmo_group->_vertices.size() - 1);
+        for (std::size_t v = batch.vertex_start; v <= vert_end; ++v)
+        {
+          span.aabb_min = glm::min(span.aabb_min, _wmo_group->_vertices[v]);
+          span.aabb_max = glm::max(span.aabb_max, _wmo_group->_vertices[v]);
+        }
+      }
+    }
+
     batch_counter++;
   }
 
@@ -309,7 +349,8 @@ void WMOGroupRender::setupVao(OpenGL::Scoped::use_program& wmo_shader)
 }
 
 void WMOGroupRender::draw(OpenGL::Scoped::use_program& wmo_shader
-    , math::frustum const& // frustum
+    , math::frustum const& frustum
+    , glm::mat4x4 const& transform
     , const float& //cull_distance
     , const glm::vec3& //camera
     , bool // draw_fog
@@ -342,8 +383,68 @@ void WMOGroupRender::draw(OpenGL::Scoped::use_program& wmo_shader
   bool backface_cull = true;
   gl.enable(GL_CULL_FACE);
 
+  // Per-batch frustum cull (D4, client MOBA semantics): inside a merged draw call, test each member
+  // batch's AABB (instance-transformed) and emit only the contiguous runs of visible batches. Runs
+  // stay contiguous because batches only merge when their index ranges are adjacent.
+  bool const cull_spans = !moba_cull_disabled();
+  static std::vector<std::pair<std::uint32_t, std::uint32_t>> visible_runs;
+
+  auto span_visible = [&](WMOBatchSpan const& span)
+  {
+    if (span.aabb_min.x > span.aabb_max.x) // no-vertex-data sentinel
+    {
+      return true;
+    }
+
+    std::array<glm::vec3, 8> const world_corners =
+    {
+      transform * glm::vec4(span.aabb_min.x, span.aabb_min.y, span.aabb_min.z, 1.0f),
+      transform * glm::vec4(span.aabb_min.x, span.aabb_min.y, span.aabb_max.z, 1.0f),
+      transform * glm::vec4(span.aabb_min.x, span.aabb_max.y, span.aabb_min.z, 1.0f),
+      transform * glm::vec4(span.aabb_min.x, span.aabb_max.y, span.aabb_max.z, 1.0f),
+      transform * glm::vec4(span.aabb_max.x, span.aabb_min.y, span.aabb_min.z, 1.0f),
+      transform * glm::vec4(span.aabb_max.x, span.aabb_min.y, span.aabb_max.z, 1.0f),
+      transform * glm::vec4(span.aabb_max.x, span.aabb_max.y, span.aabb_min.z, 1.0f),
+      transform * glm::vec4(span.aabb_max.x, span.aabb_max.y, span.aabb_max.z, 1.0f)
+    };
+
+    return frustum.intersects(world_corners);
+  };
+
   auto issue_draw_call = [&](WMOCombinedDrawCall& draw_call)
   {
+    visible_runs.clear();
+
+    if (!cull_spans || draw_call.spans.empty())
+    {
+      visible_runs.emplace_back(draw_call.index_start, draw_call.index_count);
+    }
+    else
+    {
+      for (auto const& span : draw_call.spans)
+      {
+        if (!span_visible(span))
+        {
+          continue;
+        }
+
+        if (!visible_runs.empty()
+            && visible_runs.back().first + visible_runs.back().second == span.index_start)
+        {
+          visible_runs.back().second += span.index_count;
+        }
+        else
+        {
+          visible_runs.emplace_back(span.index_start, span.index_count);
+        }
+      }
+
+      if (visible_runs.empty())
+      {
+        return; // whole draw call off-screen -- skip the state changes too
+      }
+    }
+
     if (backface_cull != draw_call.backface_cull)
     {
       if (draw_call.backface_cull)
@@ -367,8 +468,17 @@ void WMOGroupRender::draw(OpenGL::Scoped::use_program& wmo_shader
       gl.bindTexture(GL_TEXTURE_2D_ARRAY, draw_call.samplers[i]);
     }
 
-    gl.drawElements (GL_TRIANGLES, draw_call.index_count, GL_UNSIGNED_SHORT, reinterpret_cast<void*>(sizeof(std::uint16_t)*draw_call.index_start));
+    for (auto const& run : visible_runs)
+    {
+      gl.drawElements (GL_TRIANGLES, run.second, GL_UNSIGNED_SHORT, reinterpret_cast<void*>(sizeof(std::uint16_t)*run.first));
+    }
   };
+
+  // Fixed-function fog colour trick (trace-verified: #000000 / #FFFFFF fog states in the client):
+  // additive materials fog toward BLACK and modulate materials toward WHITE so distance fog fades
+  // their contribution instead of tinting it. 0 = normal fog colour.
+  int fog_color_mode = 0;
+  wmo_shader.uniform("fog_color_mode", 0);
 
   // Pass 1: opaque + alpha-key materials (blend modes 0/1) -- depth write on, no GL blend, as before.
   for (auto& draw_call : _draw_calls)
@@ -413,11 +523,25 @@ void WMOGroupRender::draw(OpenGL::Scoped::use_program& wmo_shader
         default: gl.blendFunc(GL_SRC_ALPHA, GL_ONE);                 break; // unknown -> additive
       }
 
+      int const wanted_mode = draw_call.blend_mode == 3 ? 1
+                            : (draw_call.blend_mode == 4 || draw_call.blend_mode == 5) ? 2
+                            : 0;
+      if (wanted_mode != fog_color_mode)
+      {
+        fog_color_mode = wanted_mode;
+        wmo_shader.uniform("fog_color_mode", fog_color_mode);
+      }
+
       issue_draw_call(draw_call);
     }
 
     gl.depthMask(GL_TRUE);
     gl.disable(GL_BLEND);
+
+    if (fog_color_mode != 0)
+    {
+      wmo_shader.uniform("fog_color_mode", 0);
+    }
   }
 
 }
@@ -495,6 +619,23 @@ void WMOGroupRender::initRenderBatches()
       // Self-Illuminated Day/Night: building windows (and similar) emit their own texture colour,
       // ramping up as the outdoor light fades. The shader adds the night-glow emissive term.
       flags |= WMORenderBatchFlags::eWMOBatch_Sidn;
+    }
+
+    if (mat.flags.window)
+    {
+      // F_WINDOW: the client swaps the hardware light to a dedicated window pair around these
+      // batches (wow.exe @006b5190/@006d37e0, note 28) -- flatter, faintly lifted lighting.
+      flags |= WMORenderBatchFlags::eWMOBatch_Window;
+    }
+
+    if (mat.flags.clamp_s)
+    {
+      flags |= WMORenderBatchFlags::eWMOBatch_ClampS;
+    }
+
+    if (mat.flags.clamp_t)
+    {
+      flags |= WMORenderBatchFlags::eWMOBatch_ClampT;
     }
 
     std::uint32_t alpha_test;

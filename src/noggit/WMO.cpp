@@ -945,13 +945,32 @@ void WMOGroup::load()
       WMOLiquidHeader hlq;
       f.read(&hlq, 0x1E);
 
+      // Interior WMO water takes its RGB from the WMO material's baked MOMT.diffColor (client
+      // FUN_006b6420), NOT the zone day/night water light. A group is "outdoor" water only when an
+      // EXTERIOR / exterior-lit MOGP flag is set (& 0x48); otherwise it's indoor. diffColor is a
+      // D3DCOLOR stored BGRA in the file, so the raw bytes land in CArgb as r=Blue, g=Green, b=Red --
+      // the true linear RGB is therefore (b, g, r). Verified against the real Timbermaw WMO: bytes
+      // (46,29,25) -> RGB(25,29,46), the dark blue seen in-game (vs the green Felwood zone water).
+      bool const interior_water = !(header.flags.exterior || header.flags.exterior_lit);
+      bool use_material_color = false;
+      glm::vec3 material_color(0.0f);
+      if (interior_water
+          && hlq.material_id >= 0
+          && static_cast<std::size_t>(hlq.material_id) < wmo->materials.size())
+      {
+        auto const& dc = wmo->materials[hlq.material_id].diffuse_color;
+        material_color = glm::vec3(dc.b, dc.g, dc.r) / 255.0f;
+        use_material_color = true;
+      }
+
       lq = std::make_unique<wmo_liquid> ( &f
           , hlq
-          // , wmo->materials[hlq.material_id] // some models have mat_id = -1, eg "world/wmo/dungeon/md_fishinghole/md_fishingholeice_001.wmo"
           , header.group_liquid
           , (bool)wmo->flags.use_liquid_type_dbc_id
           , (bool)header.flags.ocean
           , fname
+          , use_material_color
+          , material_color
       );
 
       // creating the wmo liquid doesn't move the position
@@ -1562,6 +1581,75 @@ void WMOGroup::setupFog (bool draw_fog, std::function<void (bool)> setup_fog)
   }
 }
 
+bool WMO::evaluate_camera_fog(WMOGroup const& group, glm::mat4x4 const& transform,
+                              glm::vec3 const& camera, glm::vec3* color, float* fog_end,
+                              float* fog_start_abs) const
+{
+  if (fogs.size() <= 1)
+  {
+    return false; // default-only WMO: the client evaluator bails (nFogs == 1) -> zone fog
+  }
+
+  // accumulator starts as the DEFAULT entry fogs[0] (client copies it verbatim before blending)
+  auto const& f0 = fogs[0];
+  glm::vec3 c = glm::vec3(f0.color);
+  float end = f0.fogend;
+  float start = f0.fogstart;
+
+  struct Candidate { float dist; std::uint8_t id; };
+  Candidate cand[4];
+  int n = 0;
+  for (int fi = 0; fi < 4; ++fi)
+  {
+    std::uint8_t const id = group.fog_id(fi);
+    if (id == 0 || id >= fogs.size())
+    {
+      continue; // slot 0 references the default entry -- never a blend candidate
+    }
+    auto const& wf = fogs[id];
+    if (wf.flags & 1)
+    {
+      continue; // client skips flag-1 fogs in the candidate loop
+    }
+    glm::vec3 const fog_world = glm::vec3(transform * glm::vec4(wf.pos, 1.0f));
+    float const d = glm::distance(camera, fog_world);
+    if (d >= wf.r2)
+    {
+      continue;
+    }
+    cand[n++] = {d, id};
+  }
+
+  // NO candidate in range: the per-draw traces (kara/goldshire) show the ZONE fog as the dominant
+  // WMO-geometry state, with MFOG states appearing ONLY around the authored anchors -- the fogs[0]
+  // default base manifests only THROUGH the blend when a placed fog is in range. Applying it
+  // unconditionally painted every multi-fog WMO (and, via the camera fog, all doodads near one)
+  // with heavy fog the live client never shows outside the anchors.
+  if (n == 0)
+  {
+    return false;
+  }
+
+  // farthest -> nearest (the client pops a max-heap), so the NEAREST fog dominates
+  std::sort(cand, cand + n,
+            [](Candidate const& a, Candidate const& b) { return a.dist > b.dist; });
+  for (int i = 0; i < n; ++i)
+  {
+    auto const& wf = fogs[cand[i].id];
+    float const d = std::clamp(cand[i].dist, 0.0f, wf.r2);
+    // client weight @0069e1c0: full inside r1, linear falloff to 0 at r2
+    float const w = d <= wf.r1 ? 1.0f : 1.0f - (d - wf.r1) / (wf.r2 - wf.r1);
+    c = glm::mix(c, glm::vec3(wf.color), w);
+    end = glm::mix(end, wf.fogend, w);
+    start = glm::mix(start, wf.fogstart, w);
+  }
+
+  *color = c;
+  *fog_end = end;
+  *fog_start_abs = start;
+  return true;
+}
+
 void WMOFog::init(BlizzardArchive::ClientFile* f)
 {
   f->read(this, 0x30);
@@ -1571,8 +1659,10 @@ void WMOFog::init(BlizzardArchive::ClientFile* f)
   temp = pos.y;
   pos.y = pos.z;
   pos.z = -temp;
-  fogstart = fogstart * fogend * 1.5f;
-  fogend *= 1.5;
+  // RAW authored distances -- trace-verified in BOTH captures (Kara: client fog 277.8/555.6 == MFOG
+  // entry end=555.6 startMult=0.5 exactly; Goldshire inn: 49.7/199 ~= entry 194.4x0.25). The legacy
+  // x1.5 scaling pushed fog 50% past the authored range and made room fog invisible.
+  fogstart = fogstart * fogend;
 }
 
 void WMOFog::setup()

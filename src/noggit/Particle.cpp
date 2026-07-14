@@ -1711,23 +1711,25 @@ RibbonEmitter::RibbonEmitter(Model* model_
   , opacity (mta.opacity, f, globals)
   , above (mta.above, f, globals)
   , below (mta.below, f, globals)
+  // unk1/unk2 = texture-slot (int16) and visibility (uint8) tracks (client RE note 25)
+  , tex_slot_track (mta.unk1, f, globals)
+  , visibility_track (mta.unk2, f, globals)
   , parent (&model->bones[mta.bone])
   , pos (fixCoordSystem(mta.pos))
-  , seglen (mta.length)
-  , length (mta.res * seglen)
-   // just use the first texture for now; most models I've checked only had one
+  // CLIENT-EXACT field semantics (CRibbonEmitter::Initialize RE, docs/client_re/25):
+  // res = edgesPerSecond, length = edgeLifetime (seconds), Emissionangle = gravity,
+  // s1/s2 = texture slot rows/cols. The old res*length "length in yards" was dimensionally wrong
+  // (BFD too long / CoT too short).
+  , edges_per_sec (std::max(mta.res, 1.0f))
+  , edge_lifetime (std::max(mta.length, 0.05f))
+  , gravity (mta.Emissionangle)
+  , tex_rows (std::max<int>(mta.s1, 1))
+  , tex_cols (std::max<int>(mta.s2, 1))
   , tpos (fixCoordSystem(mta.pos))
-   //! \todo  figure out actual correct way to calculate length
-   // in BFD, res is 60 and len is 0.6, the trails are very short (too long here)
-   // in CoT, res and len are like 10 but the trails are supposed to be much longer (too short here)
   , _context(context)
 {
   _texture_ids = Model::M2Array<uint16_t>(f, mta.ofsTextures, mta.nTextures);
   _material_ids = Model::M2Array<uint16_t>(f, mta.ofsMaterials, mta.nMaterials);
-
-   // create first segment
-  segs.emplace_back(tpos, 0);
-
 }
 
 RibbonEmitter::RibbonEmitter(Model* model_
@@ -1740,19 +1742,22 @@ RibbonEmitter::RibbonEmitter(Model* model_
   , opacity (mta.opacity, f, globals)
   , above (mta.above, f, globals)
   , below (mta.below, f, globals)
+  , tex_slot_track (mta.unk1, f, globals)
+  , visibility_track (mta.unk2, f, globals)
   // Classic effect/creature trails reference a bone index; clamp to a valid bone (mirrors the
   // particle-emitter bone guard) so a stray index can't read past the bones vector and crash.
   , parent (&model->bones[(mta.bone >= 0 && static_cast<std::size_t>(mta.bone) < model->bones.size()) ? mta.bone : 0])
   , pos (fixCoordSystem(mta.pos))
-  , seglen (mta.length)
-  , length (mta.res * seglen)
+  , edges_per_sec (std::max(mta.res, 1.0f))
+  , edge_lifetime (std::max(mta.length, 0.05f))
+  , gravity (mta.Emissionangle)
+  , tex_rows (std::max<int>(mta.s1, 1))
+  , tex_cols (std::max<int>(mta.s2, 1))
   , tpos (fixCoordSystem(mta.pos))
   , _context(context)
 {
   _texture_ids = Model::M2Array<uint16_t>(f, mta.ofsTextures, mta.nTextures);
   _material_ids = Model::M2Array<uint16_t>(f, mta.ofsMaterials, mta.nMaterials);
-
-  segs.emplace_back(tpos, 0);
 }
 
 RibbonEmitter::RibbonEmitter(RibbonEmitter const& other)
@@ -1761,19 +1766,33 @@ RibbonEmitter::RibbonEmitter(RibbonEmitter const& other)
   , opacity(other.opacity)
   , above(other.above)
   , below(other.below)
+  , tex_slot_track(other.tex_slot_track)
+  , visibility_track(other.visibility_track)
   , parent(other.parent)
   , pos(other.pos)
   , manim(other.manim)
   , mtime(other.mtime)
-  , seglen(other.seglen)
-  , length(other.length)
+  , edges_per_sec(other.edges_per_sec)
+  , edge_lifetime(other.edge_lifetime)
+  , gravity(other.gravity)
+  , tex_rows(other.tex_rows)
+  , tex_cols(other.tex_cols)
   , tpos(other.tpos)
   , tcolor(other.tcolor)
   , tabove(other.tabove)
   , tbelow(other.tbelow)
+  , _emit_accum(other._emit_accum)
+  , _have_prev(other._have_prev)
+  , _prev_above(other._prev_above)
+  , _prev_below(other._prev_below)
+  , _cur_above(other._cur_above)
+  , _cur_below(other._cur_below)
+  , _last_animtime(other._last_animtime)
+  , _cur_slot(other._cur_slot)
+  , _visible(other._visible)
   , _texture_ids(other._texture_ids)
   , _material_ids(other._material_ids)
-  , segs(other.segs)
+  , edges(other.edges)
   , _context(other._context)
 {
 
@@ -1785,19 +1804,33 @@ RibbonEmitter::RibbonEmitter(RibbonEmitter&& other)
   , opacity(other.opacity)
   , above(other.above)
   , below(other.below)
+  , tex_slot_track(other.tex_slot_track)
+  , visibility_track(other.visibility_track)
   , parent(other.parent)
   , pos(other.pos)
   , manim(other.manim)
   , mtime(other.mtime)
-  , seglen(other.seglen)
-  , length(other.length)
+  , edges_per_sec(other.edges_per_sec)
+  , edge_lifetime(other.edge_lifetime)
+  , gravity(other.gravity)
+  , tex_rows(other.tex_rows)
+  , tex_cols(other.tex_cols)
   , tpos(other.tpos)
   , tcolor(other.tcolor)
   , tabove(other.tabove)
   , tbelow(other.tbelow)
+  , _emit_accum(other._emit_accum)
+  , _have_prev(other._have_prev)
+  , _prev_above(other._prev_above)
+  , _prev_below(other._prev_below)
+  , _cur_above(other._cur_above)
+  , _cur_below(other._cur_below)
+  , _last_animtime(other._last_animtime)
+  , _cur_slot(other._cur_slot)
+  , _visible(other._visible)
   , _texture_ids(other._texture_ids)
   , _material_ids(other._material_ids)
-  , segs(other.segs)
+  , edges(other.edges)
   , _context(other._context)
 {
 
@@ -1805,54 +1838,98 @@ RibbonEmitter::RibbonEmitter(RibbonEmitter&& other)
 
 void RibbonEmitter::setup(int anim, int time, int animtime)
 {
-  glm::vec3 ntpos = parent->mat * glm::vec4(pos, 1);
-  glm::vec3 ntup = parent->mat * (glm::vec4(pos, 1) + glm::vec4(0, 0, 1, 0));
-  ntup -= ntpos;
-  ntup = glm::normalize(ntup);
-  float dlen = glm::distance(ntpos, tpos);
-
+  // CLIENT-EXACT update (CRibbonEmitter::Update @007b7e60, docs/client_re/25):
+  //   1. expire edges whose age + dt exceeds edgeLifetime
+  //   2. emit dt*edgesPerSecond + accumulator edges, sub-frame interpolated between the previous
+  //      and current anchor points, ages backdated so the trail is continuous at any framerate
+  //   3. age every edge and apply gravity as the exact integral: dh = (2*age + dt) * dt * g
+  // The head edge is virtual: draw() prepends the CURRENT anchors at age 0 every frame.
   manim = anim;
   mtime = time;
 
-  // move first segment
-  RibbonSegment &first = *segs.begin();
-  if (first.len > seglen) {
-    // add new segment
-    first.back = glm::normalize((tpos - ntpos));
-    first.len0 = first.len;
-    RibbonSegment newseg (ntpos, dlen);
-    newseg.up = ntup;
-    segs.push_front(newseg);
+  float dt = 0.0f;
+  if (_last_animtime >= 0 && animtime > _last_animtime)
+  {
+    dt = static_cast<float>(animtime - _last_animtime) * 0.001f;
   }
-  else {
-    first.up = ntup;
-    first.pos = ntpos;
-    first.len += dlen;
-  }
+  _last_animtime = animtime;
+  dt = std::clamp(dt, 0.0f, edge_lifetime);
 
-  // kill stuff from the end TODO: occasional crashes here
-  float l = 0;
-  bool erasemode = false;
-  for (std::list<RibbonSegment>::iterator it = segs.begin(); it != segs.end();) {
-    if (!erasemode) {
-      l += it->len;
-      if (l > length) {
-        it->len = l - length;
-        erasemode = true;
-      }
-    }
-    else {
-      segs.erase(it);
-    }
-    ++it;
-  }
-
-  tpos = ntpos;
   auto col = color.getValue(anim, time, animtime);
-  tcolor = glm::vec4(col.x,col.y,col.z, opacity.getValue(anim, time, animtime));
-
+  tcolor = glm::vec4(col.x, col.y, col.z, opacity.getValue(anim, time, animtime));
   tabove = above.getValue(anim, time, animtime);
   tbelow = below.getValue(anim, time, animtime);
+  // texture slot + visibility tracks, sampled every frame like the client (SetTexSlot only
+  // recomputes on change; ours resolves the cell in draw() so a plain store is equivalent)
+  _cur_slot = tex_slot_track.uses(anim) ? tex_slot_track.getValue(anim, time, animtime) : 0;
+  _visible = visibility_track.uses(anim) ? (visibility_track.getValue(anim, time, animtime) != 0) : true;
+
+  glm::vec3 const ntpos = parent->mat * glm::vec4(pos, 1);
+  glm::vec3 ntup = parent->mat * (glm::vec4(pos, 1) + glm::vec4(0, 0, 1, 0));
+  ntup = safe_normalize_vec3(ntup - ntpos, glm::vec3(0.0f, 1.0f, 0.0f));
+
+  _prev_above = _cur_above;
+  _prev_below = _cur_below;
+  _cur_above = ntpos + ntup * tabove;
+  _cur_below = ntpos - ntup * tbelow;
+  if (!_have_prev)
+  {
+    _prev_above = _cur_above;
+    _prev_below = _cur_below;
+    _have_prev = true;
+  }
+  tpos = ntpos;
+
+  // 1. expire (oldest at the back)
+  while (!edges.empty() && edges.back().age + dt > edge_lifetime)
+  {
+    edges.pop_back();
+  }
+
+  // 2. emit with sub-frame interpolation -- ONLY while the visibility track is on (client Update
+  // gates the emit block on it; expiry/aging below run regardless so the trail ages out).
+  // Hiding also clears the primed-anchor state (client SetVisible(0) clears flag bit 0), so a
+  // re-show does not stretch a quad from the last visible position.
+  if (!_visible)
+  {
+    _have_prev = false;
+  }
+  float const f = _visible ? dt * edges_per_sec + _emit_accum : _emit_accum;
+  if (_visible && f >= 1.0f)
+  {
+    float const inv = 1.0f / (f - _emit_accum);
+    int const n = static_cast<int>(std::floor(f - 1.0f)) + 1;
+    for (int k = 0; k < n; ++k)
+    {
+      float const t = ((1.0f + k) - _emit_accum) * inv; // fraction of the frame's motion
+      RibbonEdge e;
+      e.above = glm::mix(_prev_above, _cur_above, t);
+      e.below = glm::mix(_prev_below, _cur_below, t);
+      e.age = -t * dt; // backdated; the aging step below adds dt -> final (1-t)*dt
+      edges.push_front(e);
+    }
+    _emit_accum = f - std::floor(f);
+  }
+  else if (_visible)
+  {
+    _emit_accum = f;
+  }
+
+  // cap (client: ceil(edgesPerSecond) * edgeLifetime edges)
+  std::size_t const max_edges = static_cast<std::size_t>(std::ceil(edges_per_sec) * edge_lifetime) + 2;
+  while (edges.size() > max_edges)
+  {
+    edges.pop_back();
+  }
+
+  // 3. age + gravity (exact integral of v = g*age over the step)
+  for (auto& e : edges)
+  {
+    float const drop = (e.age + e.age + dt) * dt * gravity;
+    e.above.y -= drop;
+    e.below.y -= drop;
+    e.age += dt;
+  }
 }
 
 void RibbonEmitter::draw( OpenGL::Scoped::use_program& shader
@@ -1860,6 +1937,12 @@ void RibbonEmitter::draw( OpenGL::Scoped::use_program& shader
                         , int instances_count
                         )
 {
+  // hidden (visibility track off): no head quad, so at least two aged edges are needed for a quad
+  if (edges.empty() || (!_visible && edges.size() < 2))
+  {
+    return;
+  }
+
   if (!_uploaded)
   {
     upload();
@@ -1869,19 +1952,18 @@ void RibbonEmitter::draw( OpenGL::Scoped::use_program& shader
   std::vector<glm::vec3> vertices;
   std::vector<glm::vec2> texcoords;
 
-  if (!_texture_ids.empty() && _texture_ids[0] < model->_textures.size())
-  {
-    model->_textures[_texture_ids[0]]->bind();
-    shader.uniform("tex_index", model->_textures[_texture_ids[0]]->array_index());
-  }
-  else
-  {
-    shader.uniform("tex_index", 0);
-  }
-
   gl.enable(GL_BLEND);
-  
   shader.uniform("color", tcolor);
+
+  // Texture slot cell (client SetTexSlot @007b6f30, uvRect=(0,0,1,1)): column = slot % cols along
+  // U (cell 1/s2), row = slot / cols along V (cell 1/s1). U runs base..base+cell with EDGE AGE /
+  // lifetime; all edges use the CURRENT slot base (the client recomputes every edge's U each frame
+  // from it, so a slot change re-textures the whole trail).
+  float const cell_w = 1.0f / static_cast<float>(tex_cols);
+  float const cell_h = 1.0f / static_cast<float>(tex_rows);
+  int const slot = std::clamp(_cur_slot, 0, tex_rows * tex_cols - 1);
+  float const base_u = static_cast<float>(slot % tex_cols) * cell_w;
+  float const base_v = static_cast<float>(slot / tex_cols) * cell_h;
 
   std::uint16_t indice = 0;
   auto add_quad_indices([] (std::vector<std::uint16_t>& indices, std::uint16_t& start)
@@ -1897,30 +1979,32 @@ void RibbonEmitter::draw( OpenGL::Scoped::use_program& shader
     start += 2;
   });
 
-  std::list<RibbonSegment>::iterator it = segs.begin();
-  float l = 0;
-  for (; it != segs.end(); ++it) 
+  // head: the CURRENT anchor points at age 0 (refreshed every frame like the client's head edge);
+  // skipped while the visibility track is off (the client stops refreshing it -- the trail tail
+  // just ages out).
+  if (_visible)
   {
-    float u = l / length;
-
-    texcoords.emplace_back(u, 0);
-    vertices.push_back(it->pos + tabove * it->up);
-    texcoords.emplace_back(u, 1);
-    vertices.push_back(it->pos - tbelow * it->up);
-
-    l += it->len;
-
-    add_quad_indices(indices, indice);
+    texcoords.emplace_back(base_u, base_v);
+    vertices.push_back(_cur_above);
+    texcoords.emplace_back(base_u, base_v + cell_h);
+    vertices.push_back(_cur_below);
   }
 
-  if (segs.size() > 1) 
+  bool first = !_visible; // hidden: the first aged edge takes the head's place (no quad before it)
+  for (auto const& e : edges)
   {
-    // last segment...?
-    --it;
-    texcoords.emplace_back(1, 0);
-    vertices.push_back(it->pos + tabove * it->up + (it->len / it->len0) * it->back);
-    texcoords.emplace_back(1, 1);
-    vertices.push_back(it->pos - tbelow * it->up + (it->len / it->len0) * it->back);
+    float const u = base_u + std::clamp(e.age / edge_lifetime, 0.0f, 1.0f) * cell_w;
+    texcoords.emplace_back(u, base_v);
+    vertices.push_back(e.above);
+    texcoords.emplace_back(u, base_v + cell_h);
+    vertices.push_back(e.below);
+
+    if (first)
+    {
+      first = false;
+      continue;
+    }
+    add_quad_indices(indices, indice);
   }
 
   gl.bufferData<GL_ARRAY_BUFFER, glm::vec3>(_vertices_vbo, vertices, GL_STREAM_DRAW);
@@ -1945,7 +2029,52 @@ void RibbonEmitter::draw( OpenGL::Scoped::use_program& shader
   }
 
   OpenGL::Scoped::buffer_binder<GL_ELEMENT_ARRAY_BUFFER> const indices_binder(_indices_vbo);
-  gl.drawElementsInstanced(GL_TRIANGLES, static_cast<GLsizei>(indices.size()), GL_UNSIGNED_SHORT, nullptr, instances_count);
+
+  // MULTI-PASS like the client (render @007b80c0): the SAME strip is drawn once per
+  // texture/material pair -- texture j with render_flags[material j]'s blend (pairs built in the
+  // create loop pairing textures[j] with materials[j]). Nearly all ribbons have one pair.
+  std::size_t const n_passes = std::max<std::size_t>(_texture_ids.size(), 1);
+  for (std::size_t pass = 0; pass < n_passes; ++pass)
+  {
+    if (pass < _texture_ids.size() && _texture_ids[pass] < model->_textures.size())
+    {
+      model->_textures[_texture_ids[pass]]->bind();
+      shader.uniform("tex_index", model->_textures[_texture_ids[pass]]->array_index());
+    }
+    else
+    {
+      shader.uniform("tex_index", 0);
+    }
+
+    // material for this pass (clamped to the last id if the arrays are uneven); M2 blend -> GL
+    // exactly like ModelRenderPass::prepareDraw. Additive fallback = old behaviour.
+    int blend_mode = 4;
+    if (!_material_ids.empty())
+    {
+      std::uint16_t const mid = _material_ids[std::min(pass, _material_ids.size() - 1)];
+      if (mid < model->_render_flags.size())
+      {
+        blend_mode = model->_render_flags[mid].blend;
+      }
+    }
+    switch (blend_mode)
+    {
+      case 0:
+      case 1:  gl.blendFunc(GL_ONE, GL_ZERO); break;                    // opaque / alpha-key
+      case 2:  gl.blendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA); break; // alpha
+      case 3:  gl.blendFunc(GL_SRC_COLOR, GL_ONE); break;                // no-add-alpha
+      case 4:  gl.blendFunc(GL_SRC_ALPHA, GL_ONE); break;                // additive
+      case 5:  gl.blendFunc(GL_DST_COLOR, GL_ZERO); break;               // modulate
+      case 6:  gl.blendFunc(GL_DST_COLOR, GL_SRC_COLOR); break;          // mod2x
+      default: gl.blendFunc(GL_SRC_ALPHA, GL_ONE); break;
+    }
+    shader.uniform("ribbon_blend", blend_mode);
+
+    gl.drawElementsInstanced(GL_TRIANGLES, static_cast<GLsizei>(indices.size()), GL_UNSIGNED_SHORT, nullptr, instances_count);
+  }
+
+  // restore the pass-wide additive func the ribbon loop in WorldRender expects
+  gl.blendFunc(GL_SRC_ALPHA, GL_ONE);
 }
 
 void RibbonEmitter::upload()

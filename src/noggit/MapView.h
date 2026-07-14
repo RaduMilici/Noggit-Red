@@ -163,8 +163,14 @@ public:
   Noggit::BoolToggleProperty _draw_terrain = {true};
   Noggit::BoolToggleProperty _draw_wmo = {true};
   Noggit::BoolToggleProperty _draw_water = {true};
+  Noggit::BoolToggleProperty _draw_clouds = {true};
+  Noggit::BoolToggleProperty _draw_sun = {true};
+  Noggit::BoolToggleProperty _draw_moon = {true};
   Noggit::BoolToggleProperty _draw_bloom = {true};
   Noggit::BoolToggleProperty _draw_ground_clutter = {true};
+  // Opt-in coarse WDL-horizon occlusion (perf). Default off; WorldRender reads the QSetting each
+  // frame, so the toggle persists on change.
+  Noggit::BoolToggleProperty _wdl_horizon_occlusion = {false};
   Noggit::BoolToggleProperty _draw_wmo_doodads = {true};
   Noggit::BoolToggleProperty _draw_wmo_exterior = { true };
   Noggit::BoolToggleProperty _draw_models = {true};

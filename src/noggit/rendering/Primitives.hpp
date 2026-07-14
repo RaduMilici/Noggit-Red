@@ -195,18 +195,19 @@ namespace Noggit::Rendering::Primitives
              , float radius
              );
 
-    // Terrain-conforming disc: the caller supplies WORLD-space vertices (already draped over the
-    // ground) with matching unit-space local coords (for the radial alpha profile) and triangle
-    // indices. Used for the creature selection circles so they bend with the terrain like the
-    // client's instead of clipping into slopes. Textured with the client's UnitSelectTexture ring,
-    // rotated so its bright edge faces the camera (uv_rotation, radians).
-    void drawWorldSpace(glm::mat4x4 const& mvp
-                       , std::vector<glm::vec3> const& world_vertices
-                       , std::vector<glm::vec2> const& local_coords
-                       , std::vector<std::uint16_t> const& indices
-                       , glm::vec4 const& color
-                       , float uv_rotation
-                       );
+    // SCREEN-SPACE PROJECTED DECAL path (matches the blob shadow): paints the UnitSelectTexture ring
+    // onto the actual terrain/WMO ground under the unit by reconstructing world position from a
+    // pre-captured scene-depth texture -- wraps the existing mesh instead of a draped disc.
+    void drawProjectedDecal(glm::mat4x4 const& mvp
+                           , glm::mat4x4 const& inv_view_projection
+                           , glm::vec2 const& inv_viewport
+                           , GLuint scene_depth_tex
+                           , GLuint empty_vao
+                           , glm::vec3 const& center
+                           , float radius
+                           , glm::vec4 const& color
+                           , float uv_rotation
+                           );
 
     void unload();
 
@@ -222,14 +223,7 @@ namespace Noggit::Rendering::Primitives
     GLuint const& _vertices_vbo = _buffers[0];
     GLuint const& _indices_vbo = _buffers[1];
     std::unique_ptr<OpenGL::program> _program;
-
-    // dynamic buffers for the world-space (terrain-conforming) path
-    OpenGL::Scoped::deferred_upload_vertex_arrays<1> _ws_vao;
-    OpenGL::Scoped::deferred_upload_buffers<3> _ws_buffers;
-    GLuint const& _ws_vertices_vbo = _ws_buffers[0];
-    GLuint const& _ws_locals_vbo = _ws_buffers[1];
-    GLuint const& _ws_indices_vbo = _ws_buffers[2];
-    bool _ws_buffers_are_setup = false;
+    std::unique_ptr<OpenGL::program> _decal_program; // projected-decal path
 
     // The client's selection-circle texture (Textures\UnitSelectTexture.blp), loaded lazily.
     std::unique_ptr<blp_texture> _select_texture;

@@ -146,9 +146,15 @@ namespace OpenGL
     template<std::size_t count>
     deferred_upload_buffers<count>::~deferred_upload_buffers()
     {
-      if (_buffer_generated)
+      // Teardown-safe: a destructor must NEVER let a GL call throw (throwing dtor -> std::terminate,
+      // the "crash on return to menu"). During app/scene teardown (e.g. the BLPRenderer singleton's
+      // atexit destructor) the owning GL context is gone OR a DIFFERENT context is current (Qt's
+      // AA_ShareOpenGLContexts leaves a share context bound) -- so even QOpenGLContext::currentContext()
+      // being non-null isn't enough: gl.deleteBuffers' internal verify throws on a context MISMATCH.
+      // The buffers die with their context anyway, so guard on a current context AND swallow any throw.
+      if (_buffer_generated && QOpenGLContext::currentContext())
       {
-        gl.deleteBuffers (count, _buffers);
+        try { gl.deleteBuffers (count, _buffers); } catch (...) {}
       }
     }
 
@@ -193,9 +199,10 @@ namespace OpenGL
     template<std::size_t count>
     deferred_upload_vertex_arrays<count>::~deferred_upload_vertex_arrays()
     {
-      if (_buffer_generated)
+      // teardown-safe: never let a GL call throw from a destructor (see deferred_upload_buffers dtor).
+      if (_buffer_generated && QOpenGLContext::currentContext())
       {
-        gl.deleteVertexArray (count, _vertex_arrays);
+        try { gl.deleteVertexArray (count, _vertex_arrays); } catch (...) {}
       }
     }
 
@@ -229,9 +236,12 @@ namespace OpenGL
     template<std::size_t count>
     deferred_upload_textures<count>::~deferred_upload_textures()
     {
-      if (_texture_generated)
+      // teardown-safe: never let a GL call throw from a destructor (see deferred_upload_buffers dtor).
+      // The decal's UnitSelectTexture (Circle::_select_texture) is a raw blp_texture destroyed at
+      // process teardown, so its GL delete hits exactly this mismatched/gone-context case.
+      if (_texture_generated && QOpenGLContext::currentContext())
       {
-        gl.deleteTextures(count, _textures);
+        try { gl.deleteTextures(count, _textures); } catch (...) {}
       }
     }
 

@@ -8,6 +8,9 @@
 #define eWMOBatch_Unfogged 0x8u
 #define eWMOBatch_Sidn 0x20u
 #define eWMOBatch_PortalSpill 0x40u
+#define eWMOBatch_ClampS 0x80u
+#define eWMOBatch_ClampT 0x100u
+#define eWMOBatch_Window 0x200u
 
 layout (std140) uniform lighting
 {
@@ -44,6 +47,16 @@ vec3 point_lights(vec3 world_pos, vec3 n)
 uniform vec3 camera;
 uniform sampler2DArray texture_samplers[15];
 uniform vec3 ambient_color;
+// Per-region MFOG (client-canon): WMO geometry fogs with the group's authored MFOG (blended toward
+// the zone fog by the volume falloff on the CPU) while terrain keeps the zone fog in the same frame.
+// use_wmo_fog stays 0 in paths that never set it (previews) -> falls back to the UBO zone fog.
+uniform int use_wmo_fog;
+uniform vec3 wmo_fog_color;
+uniform float wmo_fog_start; // FRACTION of wmo_fog_end (can be negative: mist scaler)
+uniform float wmo_fog_end;
+// Fixed-function fog trick (trace-verified): additive batches fog toward BLACK, modulate toward
+// WHITE, so distance fog fades their contribution out instead of tinting it. 0 normal, 1 black, 2 white.
+uniform int fog_color_mode;
 // 1 when this WMO has exterior groups (an "open" WMO, e.g. a cave mouth). Lets outdoor zone light
 // bleed into its interior groups; 0 for fully enclosed dungeons (keep their dark authored interior).
 uniform int wmo_open;
@@ -133,6 +146,43 @@ vec4 get_tex_color(vec2 tex_coord, uint tex_sampler, int array_index)
   return vec4(0);
 }
 
+vec2 get_tex_size(uint tex_sampler)
+{
+  if (tex_sampler == 0) { return vec2(textureSize(texture_samplers[0], 0).xy); }
+  else if (tex_sampler == 1) { return vec2(textureSize(texture_samplers[1], 0).xy); }
+  else if (tex_sampler == 2) { return vec2(textureSize(texture_samplers[2], 0).xy); }
+  else if (tex_sampler == 3) { return vec2(textureSize(texture_samplers[3], 0).xy); }
+  else if (tex_sampler == 4) { return vec2(textureSize(texture_samplers[4], 0).xy); }
+  else if (tex_sampler == 5) { return vec2(textureSize(texture_samplers[5], 0).xy); }
+  else if (tex_sampler == 6) { return vec2(textureSize(texture_samplers[6], 0).xy); }
+  else if (tex_sampler == 7) { return vec2(textureSize(texture_samplers[7], 0).xy); }
+  else if (tex_sampler == 8) { return vec2(textureSize(texture_samplers[8], 0).xy); }
+  else if (tex_sampler == 9) { return vec2(textureSize(texture_samplers[9], 0).xy); }
+  else if (tex_sampler == 10) { return vec2(textureSize(texture_samplers[10], 0).xy); }
+  else if (tex_sampler == 11) { return vec2(textureSize(texture_samplers[11], 0).xy); }
+  else if (tex_sampler == 12) { return vec2(textureSize(texture_samplers[12], 0).xy); }
+  else if (tex_sampler == 13) { return vec2(textureSize(texture_samplers[13], 0).xy); }
+  else if (tex_sampler == 14) { return vec2(textureSize(texture_samplers[14], 0).xy); }
+  return vec2(1.0);
+}
+
+// MOMT F_CLAMP_S/F_CLAMP_T: the material addresses CLAMP instead of REPEAT on the flagged axis.
+// The textures sit in shared array textures whose GL wrap state must stay REPEAT for everyone
+// else, so clamp-to-edge is emulated by clamping the coordinate half a texel inside the border.
+vec2 clamp_tex_coord(vec2 tex_coord, uint tex_sampler)
+{
+  vec2 half_texel = 0.5 / get_tex_size(tex_sampler);
+  if (bool(flags & eWMOBatch_ClampS))
+  {
+    tex_coord.x = clamp(tex_coord.x, half_texel.x, 1.0 - half_texel.x);
+  }
+  if (bool(flags & eWMOBatch_ClampT))
+  {
+    tex_coord.y = clamp(tex_coord.y, half_texel.y, 1.0 - half_texel.y);
+  }
+  return tex_coord;
+}
+
 vec3 apply_lighting(vec3 material)
 {
   // MOCV = baked per-vertex lighting (interior shadow/light). Already processed Blizzard-style on
@@ -153,10 +203,22 @@ vec3 apply_lighting(vec3 material)
   {
     // Exterior geometry: outdoor sun diffuse (N.L) + outdoor ambient (+ any baked color).
     float nDotL = clamp(dot(normalize(f_normal),
-                            -normalize(vec3(-LightDir_FogRate.x, LightDir_FogRate.z, -LightDir_FogRate.y))),
+                            -normalize(vec3(LightDir_FogRate.x, LightDir_FogRate.z, LightDir_FogRate.y))),
                         0.0, 1.0);
-    light_color = clamp(DiffuseColor_FogStart.xyz * nDotL, 0.0, 1.0)
-                + AmbientColor_FogEnd.xyz
+    vec3 lit_diffuse = DiffuseColor_FogStart.xyz;
+    vec3 lit_ambient = AmbientColor_FogEnd.xyz;
+    if (bool(flags & eWMOBatch_Window))
+    {
+      // F_WINDOW, CLIENT-EXACT (wow.exe @006d37e0 builds the pair, @006b5190 swaps it around the
+      // batch): window materials are lit by diffuse' = ambient' = midpoint(diffuse, ambient), with
+      // the ambient additionally lifted +16/255 (saturating byte add) -- glass reads flat (half the
+      // directional contrast) and faintly luminous. RE note 28.
+      vec3 mid = mix(lit_diffuse, lit_ambient, 0.5);
+      lit_diffuse = mid;
+      lit_ambient = clamp(mid + vec3(16.0 / 255.0), 0.0, 1.0);
+    }
+    light_color = clamp(lit_diffuse * nDotL, 0.0, 1.0)
+                + lit_ambient
                 + vertex_color;
   }
   else
@@ -181,7 +243,7 @@ vec3 apply_lighting(vec3 material)
     {
       float openness = clamp(f_vertex_color.a, 0.0, 1.0);
       float nDotL = clamp(dot(normalize(f_normal),
-                              -normalize(vec3(-LightDir_FogRate.x, LightDir_FogRate.z, -LightDir_FogRate.y))),
+                              -normalize(vec3(LightDir_FogRate.x, LightDir_FogRate.z, LightDir_FogRate.y))),
                           0.0, 1.0);
       vec3 outdoor = clamp(DiffuseColor_FogStart.xyz * nDotL, 0.0, 1.0) + AmbientColor_FogEnd.xyz;
       light_color = mix(light_color, outdoor, openness);
@@ -223,8 +285,17 @@ void main()
   float dist_from_camera = distance(camera, f_position);
   bool fog = FogColor_FogOn.w != 0 && !bool(flags & eWMOBatch_Unfogged);
 
-  vec4 tex = get_tex_color(f_texcoord, tex_array0, int(tex0));
-  vec4 tex_2 = get_tex_color(f_texcoord_2, tex_array1, int(tex1));
+  vec2 tex_coord = f_texcoord;
+  vec2 tex_coord_2 = f_texcoord_2;
+
+  if (bool(flags & (eWMOBatch_ClampS | eWMOBatch_ClampT)))
+  {
+    tex_coord = clamp_tex_coord(tex_coord, tex_array0);
+    tex_coord_2 = clamp_tex_coord(tex_coord_2, tex_array1);
+  }
+
+  vec4 tex = get_tex_color(tex_coord, tex_array0, int(tex0));
+  vec4 tex_2 = get_tex_color(tex_coord_2, tex_array1, int(tex1));
 
   float alpha_test = !bool(alpha_test_mode) ? -1.f : (alpha_test_mode < 2 ? 0.878431372 : 0.003921568);
 
@@ -266,11 +337,23 @@ void main()
   float bloom_mask = 1.0; // bloom eligibility written into alpha; reduced by fog (see below)
   if(fog)
   {
-    float start = AmbientColor_FogEnd.w * DiffuseColor_FogStart.w;
+    float fog_end_eff = (use_wmo_fog == 1) ? wmo_fog_end : AmbientColor_FogEnd.w;
+    float fog_start_frac = (use_wmo_fog == 1) ? wmo_fog_start : DiffuseColor_FogStart.w;
+    vec3 fog_color_eff = (use_wmo_fog == 1) ? wmo_fog_color : FogColor_FogOn.rgb;
+    if (fog_color_mode == 1)
+    {
+      fog_color_eff = vec3(0.0);
+    }
+    else if (fog_color_mode == 2)
+    {
+      fog_color_eff = vec3(1.0);
+    }
+
+    float start = fog_end_eff * fog_start_frac;
 
     vec3 fogParams;
-    fogParams.x = -(1.0 / (AmbientColor_FogEnd.w - start));
-    fogParams.y = (1.0 / (AmbientColor_FogEnd.w - start)) * AmbientColor_FogEnd.w;
+    fogParams.x = -(1.0 / (fog_end_eff - start));
+    fogParams.y = (1.0 / (fog_end_eff - start)) * fog_end_eff;
     fogParams.z = LightDir_FogRate.w;
 
     float f1 = (dist_from_camera * fogParams.x) + fogParams.y;
@@ -280,7 +363,7 @@ void main()
 
     float fogFactor = 1.0 - f4;
 
-    out_color.rgb = mix(out_color.rgb, FogColor_FogOn.rgb, fogFactor);
+    out_color.rgb = mix(out_color.rgb, fog_color_eff, fogFactor);
     bloom_mask = 1.0 - fogFactor; // fog-brightened surfaces opt out of bloom (fully fogged -> 0)
   }
 

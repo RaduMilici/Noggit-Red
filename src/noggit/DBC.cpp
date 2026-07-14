@@ -3,6 +3,7 @@
 #include <noggit/DBC.h>
 #include <noggit/Log.h>
 #include <noggit/Misc.h>
+#include <noggit/project/CurrentProject.hpp>
 #include <blizzard-archive-library/include/ClientData.hpp>
 #include <string>
 
@@ -64,6 +65,30 @@ SpellDurationDB gSpellDurationDB;
 SpellRadiusDB gSpellRadiusDB;
 SpellRangeDB gSpellRangeDB;
 SpellCastTimesDB gSpellCastTimesDB;
+
+namespace
+{
+  // CharSections.dbc reordered the Type (VariationIndex) and Color (ColorIndex) columns to behind the
+  // texture names + flags in WotLK (see DBC.h for the empirically-verified layouts). CLASSIC (Turtle/
+  // Vanilla) keeps the old layout; every other supported client uses the WotLK layout. Guarded on
+  // CurrentProject so a null/unloaded project falls back to the CLASSIC (unchanged) layout.
+  bool charSectionsWotlkLayout()
+  {
+    auto const* project = Noggit::Project::CurrentProject::get();
+    return project && project->projectVersion != Noggit::Project::ProjectVersion::CLASSIC;
+  }
+}
+
+// CreatureDisplayInfoExtra.dbc BakeName column: 20 in WotLK (21-field), 18 in Vanilla/Classic
+// (19-field) -- see DBC.h. Item slots 8..17 didn't move, so only this string column needs gating.
+size_t CreatureDisplayInfoExtraDB::BakedTexture() { return charSectionsWotlkLayout() ? 20 : 18; }
+
+size_t CharacterSectionsDB::VariationIndex() { return charSectionsWotlkLayout() ? 8 : 4; }
+size_t CharacterSectionsDB::ColorIndex()     { return charSectionsWotlkLayout() ? 9 : 5; }
+size_t CharacterSectionsDB::TextureName1()   { return charSectionsWotlkLayout() ? 4 : 6; }
+size_t CharacterSectionsDB::TextureName2()   { return charSectionsWotlkLayout() ? 5 : 7; }
+size_t CharacterSectionsDB::TextureName3()   { return charSectionsWotlkLayout() ? 6 : 8; }
+size_t CharacterSectionsDB::Flags()          { return charSectionsWotlkLayout() ? 7 : 9; }
 
 void OpenDBs(std::shared_ptr<BlizzardArchive::ClientData> clientData)
 {

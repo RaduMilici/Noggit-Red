@@ -11,6 +11,7 @@
 #include <noggit/tool_enums.hpp>
 #include <noggit/rendering/CursorRender.hpp>
 #include <noggit/rendering/LiquidTextureManager.hpp>
+#include <noggit/TextureManager.h>
 #include <noggit/map_horizon.h>
 #include <noggit/Sky.h>
 
@@ -19,6 +20,7 @@
 #include <noggit/ModelInstance.h>
 #include <noggit/InteriorVolume.hpp>
 
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -112,6 +114,19 @@ namespace Noggit::Rendering
                                 glm::mat4x4 const& transform, glm::vec3 const& camera_pos);
     void restoreGlobalPointLights();
 
+    // The zone fog currently in the lighting UBO (always the OUTDOOR values -- per-WMO MFOG is
+    // blended on top by WMORender). start is a FRACTION of end (can be negative: mist scaler).
+    void getZoneFog(glm::vec3& color, float& start_frac, float& end) const
+    {
+      color = glm::vec3(_lighting_ubo_data.FogColor_FogOn);
+      start_frac = _lighting_ubo_data.DiffuseColor_FogStart.w;
+      end = _lighting_ubo_data.AmbientColor_FogEnd.w;
+    }
+
+    // Editor fog-distance multiplier ("fog_distance_scale" setting, default 1.0 = client-authored).
+    // The zone fog in the UBO already has it applied; WMORender applies it to per-group MFOG.
+    float fogDistanceScale() const { return _fog_distance_scale; }
+
   private:
 
     void drawMinimap ( MapTile *tile
@@ -135,11 +150,16 @@ namespace Noggit::Rendering
     // bright-pass -> blur -> composite once the scene has been rendered into the scene target.
     void ensureBloomTargets(int w, int h);
     void renderBloomAndComposite(GLuint target_fbo, int w, int h, glm::vec3 const& camera_pos);
+    // Blit the current depth buffer into _decal_depth_tex for screen-space projected decals (blob
+    // shadows + selection circles). Idempotent per frame (guarded by _decal_depth_ready). Returns
+    // false if it couldn't (no viewport). Call after terrain+WMO+doodads, before creatures.
+    bool snapshotDecalDepth();
 
     World* _world;
     float _cull_distance;         // how far OBJECTS/WMOs/models render (Object Render Distance slider), clamped to terrain
-    float _terrain_cull_distance; // how far TERRAIN/horizon/sky render = view distance (+ fog clamp); drives fog too
+    float _terrain_cull_distance; // how far TERRAIN/horizon/sky render = view distance; fog never affects it
     float _view_distance;
+    float _fog_distance_scale = 1.0f;
 
     // Ground clutter (checklist 14.1): persistent model refs for detail doodads, keyed by path, so
     // the handful of shared grass/pebble M2s stay resident while the camera moves.
@@ -170,7 +190,21 @@ namespace Noggit::Rendering
     bool _bloom_initialized = false;
     int _bloom_w = -1, _bloom_h = -1, _bloom_bw = 0, _bloom_bh = 0;
     GLuint _bloom_vao = 0;
+    std::unique_ptr<OpenGL::program> _sun_program; // sky sun disc
+    std::unique_ptr<OpenGL::program> _sunshaft_program; // screen-space radial sunshaft
+    std::unique_ptr<OpenGL::program> _moon_program; // textured celestial billboard (sun/moon disc + glare)
+    std::unique_ptr<scoped_blp_texture_reference> _moon_texture;       // textures/moon.blp  (White Lady disc)
+    std::unique_ptr<scoped_blp_texture_reference> _moon2_texture;      // textures/moon02.blp (Blue Child disc)
+    std::unique_ptr<scoped_blp_texture_reference> _moon_glare_texture; // textures/moonGlare.blp (white moon halo)
+    std::unique_ptr<scoped_blp_texture_reference> _sun_center_texture; // textures/sunCenter.blp (sun disc)
+    std::unique_ptr<scoped_blp_texture_reference> _sun_glare_texture;  // textures/sunGlare.blp (sun corona/rays)
+    glm::vec2 _sun_screen_uv{0.5f, 0.5f}; // sun projected to screen [0,1], for the sunshaft pass
+    float _sun_shaft_strength = 0.0f;     // view-alignment-faded strength; 0 = sun off-screen/behind
     GLuint _bloom_scene_fbo = 0, _bloom_scene_color = 0, _bloom_scene_depth = 0;
+    // MSAA: the scene renders into multisampled renderbuffers (when render/msaa > 0) and is resolved
+    // into _bloom_scene_color before the bloom chain. 0 = off.
+    GLuint _msaa_fbo = 0, _msaa_color_rb = 0, _msaa_depth_rb = 0;
+    int _msaa_samples = 0;
     GLuint _bloom_fbo[2] = {0, 0};
     GLuint _bloom_tex[2] = {0, 0};
 
@@ -187,20 +221,6 @@ namespace Noggit::Rendering
     Noggit::Rendering::Primitives::Line _line_render;
     Noggit::Rendering::Primitives::Circle _circle_render;
 
-    // Cached terrain-draped selection-disc meshes (creature spawn markers): the disc is tessellated
-    // with per-vertex ground heights so it bends with the terrain like the client's, and rebuilt
-    // only when the spawn moves or its radius changes.
-    struct ConformingDisc
-    {
-      glm::vec3 pos = glm::vec3(0.0f);
-      float radius = 0.0f;
-      std::vector<glm::vec3> vertices;
-      std::vector<glm::vec2> locals;
-      std::vector<std::uint16_t> indices;
-    };
-    std::unordered_map<std::uint32_t, ConformingDisc> _creature_disc_cache;
-    std::unordered_map<std::uint32_t, ConformingDisc> _gameobject_disc_cache;
-
     // Per-object interior lighting: cache of quantized-world-position -> interior light (rgb = WMO room
     // ambient, a = 1 when the position is inside an indoor group; (0,0,0,0) = outdoor). Objects in the
     // same room share a cell, and the value is spatial, so a coarse ~1yd grid key is exact enough. Cleared
@@ -210,6 +230,30 @@ namespace Noggit::Rendering
     // interior tests are then cheap AABB checks against this list.
     std::vector<InteriorVolume> _interior_volumes;
     unsigned _interior_light_epoch = 0;
+    // The client's unit shadow decal texture (Textures\ShadowBlob.blp), lazily acquired on first
+    // blob-shadow draw. 32x32 grayscale oval, drawn modulate (see blob_shadow_frag).
+    std::unique_ptr<scoped_blp_texture_reference> _shadow_blob_texture;
+    // Depth snapshot for screen-space projected decals (blob shadows): the scene depth (terrain +
+    // WMO + doodads, pre-creatures) blitted into a sampleable texture once per frame.
+    GLuint _decal_depth_fbo = 0;
+    GLuint _decal_depth_tex = 0;
+    int _decal_depth_w = -1;
+    int _decal_depth_h = -1;
+    // Cache of faction-template id -> selection-circle hostility color (red/green/yellow), so the
+    // FactionTemplate.dbc isn't walked per spawn per frame.
+    std::unordered_map<std::uint32_t, glm::vec4> _faction_reaction_cache;
+    // Per-frame spawn guid -> cull-fade alpha, so the selection circle fades in lockstep with its
+    // creature (populated in the creature gather, read in the marker pass).
+    std::unordered_map<std::uint32_t, float> _creature_fade_by_guid;
+    bool _decal_depth_ready = false;      // snapshot taken THIS frame (reset at draw start)
+    glm::mat4x4 _decal_inv_vp{1.0f};      // inv(proj*view) captured with the snapshot
+    glm::vec2 _decal_inv_viewport{0.0f};  // 1/viewport
+    // Loaded-WMO-set fingerprint from last volume gather: a change (WMO streamed in/out) triggers an
+    // immediate re-gather + cache flush so freshly loaded rooms light their objects the SAME frame.
+    std::uint64_t _last_wmo_fingerprint = 0;
+    // World-space MFOG entries (rebuilt on the same epoch tick) for the per-frame ENTITY fog: the
+    // camera's fog context written into the lighting UBO Env slots (see types.hpp).
+    std::vector<WmoGroupFogVolume> _env_fog_volumes;
 
     // buffers
     OpenGL::Scoped::deferred_upload_buffers<8> _buffers;

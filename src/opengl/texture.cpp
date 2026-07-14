@@ -4,6 +4,8 @@
 #include <opengl/context.inl>
 #include <opengl/texture.hpp>
 
+#include <QtGui/QOpenGLContext>
+
 #include <utility>
 
 namespace OpenGL
@@ -16,9 +18,13 @@ namespace OpenGL
 
   texture::~texture()
   {
-    if (_id > 0 && _id != -1)
+    // teardown-safe: never let a GL call throw from a destructor -> std::terminate (the "crash on
+    // return to menu"). At process/scene teardown the owning context is gone OR a DIFFERENT context
+    // is current (Qt AA_ShareOpenGLContexts / BLPRenderer's own context), and gl.deleteTextures'
+    // internal verify throws on that mismatch. The texture dies with its context, so guard + swallow.
+    if (_id > 0 && _id != -1 && QOpenGLContext::currentContext())
     {
-      gl.deleteTextures (1, &_id);
+      try { gl.deleteTextures (1, &_id); } catch (...) {}
     }
   }
 
@@ -50,9 +56,11 @@ namespace OpenGL
 
   void texture::unload()
   {
+    // unload() is an explicit call (usually with the context current), but swallow any throw so it
+    // can never std::terminate if invoked during teardown.
     if (_id > 0 && _id != -1)
     {
-      gl.deleteTextures (1, &_id);
+      try { gl.deleteTextures (1, &_id); } catch (...) {}
     }
 
     _id = 0;

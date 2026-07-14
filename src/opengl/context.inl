@@ -5,9 +5,11 @@
 
 #include <opengl/context.hpp>
 #include <noggit/Log.h>
+#include <noggit/errorHandling.h>
 #include <glm/vec2.hpp>
 #include <QtOpenGLExtensions/QOpenGLExtensions>
 #include <QtGui/QOpenGLFunctions>
+#include <QtGui/QOpenGLExtraFunctions>
 #include <util/CurrentFunction.hpp>
 #include <memory>
 
@@ -114,6 +116,17 @@ namespace
         errors += _extra_info();
 #ifndef NOGGIT_DO_NOT_THROW_ON_OPENGL_ERRORS
         LogError << _function << ":" + errors << std::endl;
+        // One-shot caller identification for GL-error hunts (e.g. the map-switch stale-buffer
+        // GL_INVALID_OPERATION spam that precedes the sporadic nvoglv64 crashes): print the callstack
+        // for the first few errors so the log names WHO issued the bad call.
+        {
+          static int s_gl_error_stacks = 0;
+          if (s_gl_error_stacks < 3)
+          {
+            ++s_gl_error_stacks;
+            Noggit::printStacktrace();
+          }
+        }
 #else
         throw std::runtime_error (_function + ":" + errors);
 #endif
@@ -968,6 +981,20 @@ void OpenGL::context::renderbufferStorage (GLenum target, GLenum internalformat,
   verify_context_and_check_for_gl_errors const _ (_current_context, NOGGIT_CURRENT_FUNCTION);
 #endif
   return _current_context->functions()->glRenderbufferStorage (target, internalformat, width, height);
+}
+void OpenGL::context::renderbufferStorageMultisample (GLenum target, GLsizei samples, GLenum internalformat, GLsizei width, GLsizei height)
+{
+#ifndef NOGGIT_DO_NOT_CHECK_FOR_OPENGL_ERRORS
+  verify_context_and_check_for_gl_errors const _ (_current_context, NOGGIT_CURRENT_FUNCTION);
+#endif
+  return _current_context->extraFunctions()->glRenderbufferStorageMultisample (target, samples, internalformat, width, height);
+}
+void OpenGL::context::blitFramebuffer (GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1, GLint dstX0, GLint dstY0, GLint dstX1, GLint dstY1, GLbitfield mask, GLenum filter)
+{
+#ifndef NOGGIT_DO_NOT_CHECK_FOR_OPENGL_ERRORS
+  verify_context_and_check_for_gl_errors const _ (_current_context, NOGGIT_CURRENT_FUNCTION);
+#endif
+  return _current_context->extraFunctions()->glBlitFramebuffer (srcX0, srcY0, srcX1, srcY1, dstX0, dstY0, dstX1, dstY1, mask, filter);
 }
 void OpenGL::context::framebufferRenderbuffer (GLenum target, GLenum attachment, GLenum renderbuffertarget, GLuint renderbuffer)
 {

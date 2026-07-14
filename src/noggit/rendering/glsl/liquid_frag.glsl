@@ -18,6 +18,9 @@ uniform int draw_shadows;
 uniform sampler2DArray shadowmap;
 uniform sampler2DArray texture_samplers[14] ;
 uniform float water_alpha_mult; // dev opacity lever (1 = unchanged)
+uniform vec3 camera;                 // for the water specular view direction
+uniform vec3 sun_spec_color;         // sun-band colour (LightIntBand band 9), same as terrain specular
+uniform int draw_water_specular;     // toggle (render/water_specular)
 
 in float depth_;
 in vec2 tex_coord_;
@@ -28,6 +31,7 @@ flat in vec2 anim_uv;
 flat in int tex_frame;
 flat in uint shadow_chunk_index;
 in vec2 shadow_uv;
+in vec3 world_pos_;
 
 out vec4 out_color;
 
@@ -212,9 +216,58 @@ void main()
               : mix (RiverColorLight, RiverColorDark, color_depth)
               ;
 
-    // Cap water alpha at 0.85: the bloom bright-pass reserves alpha >0.88 for EMISSIVE surfaces (lava
-    // writes 1.0), so deep water must not stray into that range and bloom.
-    out_color = vec4(clamp(texel.rgb + lerp.rgb, 0.0, 1.0), min(max(lerp.a, alpha_depth) * water_alpha_mult, 0.85));
+    // (A4 authored-alpha RESOLVED 2026-07-13: the earlier "too transparent" was the LightParams
+    // OFF-BY-ONE, not zero endpoints -- the classic branch read river_shallow from the glow column
+    // (~0.2). With the off-by-one fixed (Sky.cpp reads cols 5-8) and SkyParam defaulting the alphas to
+    // 0.6 (never 0), the endpoints propagate correctly; consumed for the per-zone water alpha below.)
+    // Water COLOR = the depth-tinted zone ocean/river color (light blue at the coast -> dark blue
+    // deep), MODULATED by the water texture's brightness (its ripple/wave pattern) rather than the
+    // old `texel + color` ADDITIVE -- the ocean texture is greenish, so adding it turned the blue
+    // water teal/washed. Using the texture as a luminance ripple keeps the client's blue hue while
+    // still animating the surface. (Reference: in-game Stormwind harbour = dark-blue deep, lighter-
+    // blue coast, NOT green.)
+    float ripple = dot(texel.rgb, vec3(0.299, 0.587, 0.114));
+    // Base water body = the depth-tinted zone ocean/river colour (lighter coast -> darker deep). The
+    // surface texture is NOT modulated in here -- the client adds it additively (see below), so the
+    // base stays a clean blue/teal and the texture shows up as the bright shine on top.
+    vec3 water_rgb = lerp.rgb;
+
+    // WATER SHINE -- reverse-engineered from wow_cap_westfall_ocean.trace. The 1.12 client draws the
+    // ocean surface ADDITIVELY (SRCBLEND=SRCALPHA, DESTBLEND=ONE) with LIGHTING=FALSE, SPECULARENABLE
+    // =FALSE and NO SetLight/SetMaterial, stage0 COLOROP=MODULATE(texture x per-vertex diffuse). So the
+    // "reflection/sheen" is NOT a hardware specular at all -- it is the water TEXTURE's bright (white/
+    // foam) texels ADDING light. We reproduce that: add sun-coloured light scaled by the texel
+    // brightness so the white parts of the texture SHINE, everywhere as a broad sparkle and much
+    // harder inside the sun-reflection band so the sun-facing water glints.
+    if (draw_water_specular != 0)
+    {
+      // Sun-reflection band, DIRECTION-CORRECTED. to_light lives in the terrain NORMAL frame
+      // (wow.x,wow.z,wow.y); to_view built from positions lives in noggit's POSITION frame
+      // (-wow.y,wow.z,-wow.x). They MUST be in the same frame or the half-vector is ~180 deg off
+      // (glint on the wrong side -- "back to the sun"). Convert to_view position->normal via (-z,y,-x),
+      // EXACTLY like terrain_frag.glsl:301. camera uniform == terrain's (WorldRender 1162 vs 3803).
+      vec3 to_light   = -normalize(vec3(LightDir_FogRate.x, LightDir_FogRate.z, LightDir_FogRate.y));
+      vec3 to_view_ps = normalize(camera - world_pos_);
+      vec3 to_view    = vec3(-to_view_ps.z, to_view_ps.y, -to_view_ps.x);
+      vec3 half_vec   = normalize(to_light + to_view);
+      float sun_sheen = pow(clamp(dot(vec3(0.0, 1.0, 0.0), half_vec), 0.0, 1.0), 8.0);
+
+      // Additive shine: broad term (1.2) so the white texels sparkle over the whole surface, plus a
+      // strong sun-band ramp (3.0) so the reflection glows where the sun actually reflects to the eye.
+      water_rgb += sun_spec_color * ripple * (1.2 + 3.0 * sun_sheen);
+    }
+    water_rgb = clamp(water_rgb, 0.0, 1.0);
+
+    // PER-ZONE AUTHORED TRANSPARENCY (A4, now propagation-verified): each zone's water fades from its
+    // authored SHALLOW alpha at the shore to its DEEP alpha offshore. The endpoints ride the .a channel
+    // of the zone Ocean/River colours (WorldRender packs _skies->{ocean,river}_{shallow,deep}_alpha from
+    // LightParams cols 5-8; SkyParam defaults them to 0.6 so they are never 0). Rivers read more
+    // see-through (~0.5 shallow) than oceans (~0.75); both go opaque (1.0) in deep water. Uses the
+    // STEEPER alpha_depth ramp so only the shallow shore shows the seafloor. water_alpha_mult = dev lever.
+    float shallow_a = (type == 1) ? OceanColorLight.a : RiverColorLight.a;
+    float deep_a    = (type == 1) ? OceanColorDark.a  : RiverColorDark.a;
+    float water_alpha = mix(shallow_a, deep_a, alpha_depth);
+    out_color = vec4(water_rgb, clamp(water_alpha * water_alpha_mult, 0.0, 1.0));
   }
 
   if (FogColor_FogOn.w != 0 && type != 2) // reference applies no fog to lava

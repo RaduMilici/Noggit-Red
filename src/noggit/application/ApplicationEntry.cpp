@@ -429,6 +429,12 @@ int main(int argc, char *argv[])
 
   QApplication::setStyle(QStyleFactory::create("Fusion"));
   QCoreApplication::setAttribute(Qt::AA_EnableHighDpiScaling);
+  // Share GL objects (buffers/textures/shaders) across ALL contexts. The asset-browser preview
+  // renders in its own OFFSCREEN context but draws models whose GL buffers were uploaded in the
+  // main window context; without sharing those objects are invalid in the offscreen context and
+  // the NVIDIA driver __fastfails when the draw is flushed (the asset-browser crash-on-load). Must
+  // be set BEFORE the QApplication is constructed.
+  QCoreApplication::setAttribute(Qt::AA_ShareOpenGLContexts);
   QApplication q_application (argc, argv);
   q_application.setApplicationName ("Noggit");
   q_application.setOrganizationName ("Noggit");

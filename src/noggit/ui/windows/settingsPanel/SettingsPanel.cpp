@@ -156,6 +156,8 @@ namespace Noggit
       // Writes water/transparency (0..1); WorldRender reads it each frame and feeds the
       // liquid shader, so dragging this updates the water immediately for tuning.
       {
+        _perf_layout = new QVBoxLayout(); // owns the runtime-added sliders/toggles -> Performance tab
+
         auto* water_label = new QLabel(this);
         auto* water_slider = new QSlider(Qt::Horizontal, this);
         water_slider->setObjectName("_water_opacity_slider");
@@ -164,8 +166,8 @@ namespace Noggit
         int const init_val = static_cast<int>(_settings->value("water/transparency", 1.0f).toFloat() * 100.f + 0.5f);
         water_slider->setValue(std::clamp(init_val, 0, 100));
         water_label->setText(tr("Water opacity (dev): %1%").arg(water_slider->value()));
-        ui->verticalLayout_7->addWidget(water_label);
-        ui->verticalLayout_7->addWidget(water_slider);
+        _perf_layout->addWidget(water_label);
+        _perf_layout->addWidget(water_slider);
         connect(water_slider, &QSlider::valueChanged, [this, water_label](int v)
                 {
                   water_label->setText(tr("Water opacity (dev): %1%").arg(v));
@@ -189,12 +191,34 @@ namespace Noggit
           _settings->value("object_render_distance", _settings->value("view_distance", 2000.f).toFloat()).toFloat());
         od_slider->setValue(std::clamp(init_od, 200, 2048));
         od_label->setText(tr("Object render distance: %1").arg(od_slider->value()));
-        ui->verticalLayout_7->addWidget(od_label);
-        ui->verticalLayout_7->addWidget(od_slider);
+        _perf_layout->addWidget(od_label);
+        _perf_layout->addWidget(od_slider);
         connect(od_slider, &QSlider::valueChanged, [this, od_label](int v)
                 {
                   od_label->setText(tr("Object render distance: %1").arg(v));
                   _settings->setValue("object_render_distance", static_cast<float>(v));
+                  _settings->sync();
+                });
+      }
+
+      // Fog distance scale (live): multiplies the authored fog start/end distances (zone fog AND WMO
+      // room fog). 1.0 = client-authored distances; >1 pushes the fog band out for editing visibility.
+      // Purely visual -- fog never affects render distance.
+      {
+        auto* fs_label = new QLabel(this);
+        auto* fs_slider = new QSlider(Qt::Horizontal, this);
+        fs_slider->setObjectName("_fog_distance_scale_slider");
+        fs_slider->setMinimum(10);
+        fs_slider->setMaximum(500);
+        int const init_fs = static_cast<int>(_settings->value("fog_distance_scale", 1.0f).toFloat() * 100.f);
+        fs_slider->setValue(std::clamp(init_fs, 10, 500));
+        fs_label->setText(tr("Fog distance scale: %1x").arg(fs_slider->value() / 100.0, 0, 'f', 2));
+        _perf_layout->addWidget(fs_label);
+        _perf_layout->addWidget(fs_slider);
+        connect(fs_slider, &QSlider::valueChanged, [this, fs_label](int v)
+                {
+                  fs_label->setText(tr("Fog distance scale: %1x").arg(v / 100.0, 0, 'f', 2));
+                  _settings->setValue("fog_distance_scale", v / 100.0f);
                   _settings->sync();
                 });
       }
@@ -211,8 +235,8 @@ namespace Noggit
         int const init_lr = _settings->value("loading_radius", 1).toInt();
         lr_slider->setValue(std::clamp(init_lr, 0, 8));
         lr_label->setText(tr("ADT loading radius: %1 (%2x%2 grid)").arg(lr_slider->value()).arg(2 * lr_slider->value() + 1));
-        ui->verticalLayout_7->addWidget(lr_label);
-        ui->verticalLayout_7->addWidget(lr_slider);
+        _perf_layout->addWidget(lr_label);
+        _perf_layout->addWidget(lr_slider);
         connect(lr_slider, &QSlider::valueChanged, [this, lr_label](int v)
                 {
                   lr_label->setText(tr("ADT loading radius: %1 (%2x%2 grid)").arg(v).arg(2 * v + 1));
@@ -233,8 +257,8 @@ namespace Noggit
         int const init_th = _settings->value("async_thread_count", 3).toInt();
         th_slider->setValue(std::clamp(init_th, 1, 16));
         th_label->setText(tr("Loader threads (restart to apply): %1").arg(th_slider->value()));
-        ui->verticalLayout_7->addWidget(th_label);
-        ui->verticalLayout_7->addWidget(th_slider);
+        _perf_layout->addWidget(th_label);
+        _perf_layout->addWidget(th_slider);
         connect(th_slider, &QSlider::valueChanged, [this, th_label](int v)
                 {
                   th_label->setText(tr("Loader threads (restart to apply): %1").arg(v));
@@ -253,8 +277,8 @@ namespace Noggit
         int const init_cd = _settings->value("creature/draw_distance", 500.0f).toFloat();
         cd_slider->setValue(std::clamp(init_cd, 50, 2000));
         cd_label->setText(tr("Creature draw distance: %1").arg(cd_slider->value()));
-        ui->verticalLayout_7->addWidget(cd_label);
-        ui->verticalLayout_7->addWidget(cd_slider);
+        _perf_layout->addWidget(cd_label);
+        _perf_layout->addWidget(cd_slider);
         connect(cd_slider, &QSlider::valueChanged, [this, cd_label](int v)
                 {
                   cd_label->setText(tr("Creature draw distance: %1").arg(v));
@@ -275,8 +299,8 @@ namespace Noggit
         int const init_gc = static_cast<int>(_settings->value("render/ground_clutter_density", 100.0f).toFloat());
         gc_slider->setValue(std::clamp(init_gc, 0, 100));
         gc_label->setText(tr("Ground clutter density: %1%").arg(gc_slider->value()));
-        ui->verticalLayout_7->addWidget(gc_label);
-        ui->verticalLayout_7->addWidget(gc_slider);
+        _perf_layout->addWidget(gc_label);
+        _perf_layout->addWidget(gc_slider);
         connect(gc_slider, &QSlider::valueChanged, [this, gc_label](int v)
                 {
                   gc_label->setText(tr("Ground clutter density: %1%").arg(v));
@@ -295,8 +319,8 @@ namespace Noggit
         int const init_gcd = static_cast<int>(_settings->value("render/ground_clutter_distance", 120.0f).toFloat());
         gcd_slider->setValue(std::clamp(init_gcd, 20, 500));
         gcd_label->setText(tr("Ground clutter distance: %1").arg(gcd_slider->value()));
-        ui->verticalLayout_7->addWidget(gcd_label);
-        ui->verticalLayout_7->addWidget(gcd_slider);
+        _perf_layout->addWidget(gcd_label);
+        _perf_layout->addWidget(gcd_slider);
         connect(gcd_slider, &QSlider::valueChanged, [this, gcd_label](int v)
                 {
                   gcd_label->setText(tr("Ground clutter distance: %1").arg(v));
@@ -312,7 +336,7 @@ namespace Noggit
         auto* wmo_stencil_cb = new QCheckBox(tr("WMO water overlap dedupe (stencil)"), this);
         wmo_stencil_cb->setObjectName("_wmo_water_stencil_checkbox");
         wmo_stencil_cb->setChecked(_settings->value("water/wmo_stencil", true).toBool());
-        ui->verticalLayout_7->addWidget(wmo_stencil_cb);
+        _perf_layout->addWidget(wmo_stencil_cb);
         connect(wmo_stencil_cb, &QCheckBox::toggled, [this](bool checked)
                 {
                   _settings->setValue("water/wmo_stencil", checked);
@@ -327,7 +351,7 @@ namespace Noggit
         auto* portal_cb = new QCheckBox(tr("WMO portal culling (hide unseen interior rooms)"), this);
         portal_cb->setObjectName("_wmo_portal_culling_checkbox");
         portal_cb->setChecked(_settings->value("render/wmo_portal_culling", true).toBool());
-        ui->verticalLayout_7->addWidget(portal_cb);
+        _perf_layout->addWidget(portal_cb);
         connect(portal_cb, &QCheckBox::toggled, [this](bool checked)
                 {
                   _settings->setValue("render/wmo_portal_culling", checked);
@@ -342,7 +366,7 @@ namespace Noggit
         auto* horizon_cb = new QCheckBox(tr("Render distant horizon backdrop"), this);
         horizon_cb->setObjectName("_render_horizon_checkbox");
         horizon_cb->setChecked(_settings->value("render_horizon", true).toBool());
-        ui->verticalLayout_7->addWidget(horizon_cb);
+        _perf_layout->addWidget(horizon_cb);
         connect(horizon_cb, &QCheckBox::toggled, [this](bool checked)
                 {
                   _settings->setValue("render_horizon", checked);
@@ -356,7 +380,7 @@ namespace Noggit
         auto* mclq_cb = new QCheckBox(tr("Save classic MCLQ water (vanilla, alongside MH2O)"), this);
         mclq_cb->setObjectName("_save_classic_mclq_checkbox");
         mclq_cb->setChecked(_settings->value("water/save_classic_mclq", true).toBool());
-        ui->verticalLayout_7->addWidget(mclq_cb);
+        _perf_layout->addWidget(mclq_cb);
         connect(mclq_cb, &QCheckBox::toggled, [this](bool checked)
                 {
                   _settings->setValue("water/save_classic_mclq", checked);
@@ -443,11 +467,44 @@ namespace Noggit
       add_toggle("Vertex color (terrain lighting)",  "render/vertex_color",     true);
       add_toggle("Baked terrain shadows",            "render/baked_shadows",    true);
 
+      // MSAA: applies LIVE -- WorldRender re-reads render/msaa when (re)allocating its scene targets
+      // each frame, so changing this reallocates the multisampled framebuffer on the spot.
+      {
+        auto* msaa = new QComboBox();
+        msaa->addItem("Off", 0);
+        msaa->addItem("2x", 2);
+        msaa->addItem("4x", 4);
+        msaa->addItem("8x", 8);
+        int const cur = _settings->value("render/msaa", 0).toInt();
+        msaa->setCurrentIndex(std::max(0, msaa->findData(cur)));
+        connect(msaa, QOverload<int>::of(&QComboBox::currentIndexChanged), [=](int idx)
+        {
+          _settings->setValue("render/msaa", msaa->itemData(idx).toInt());
+          _settings->sync();
+        });
+        form->addRow(new QLabel("Anti-aliasing (MSAA)"), msaa);
+      }
+
       gLayout->addWidget(toggles);
       gLayout->addStretch(1);
 
       int const idx = ui->tabWidget->indexOf(ui->tab_7); // insert right where Preferences was
       ui->tabWidget->insertTab(idx, graphicsPage, "Graphics");
+
+      // Performance tab: the distance sliders + advanced WMO/water toggles added at runtime. They
+      // used to be appended into the Viewport group and squished the Graphics tab unreadable.
+      if (_perf_layout)
+      {
+        auto* perfPage = new QWidget();
+        auto* pLayout = new QVBoxLayout(perfPage);
+        pLayout->setContentsMargins(4, 4, 4, 4);
+        auto* distGroup = new QGroupBox("Distances && advanced rendering");
+        distGroup->setAlignment(Qt::AlignCenter);
+        distGroup->setLayout(_perf_layout);
+        pLayout->addWidget(distGroup);
+        pLayout->addStretch(1);
+        ui->tabWidget->insertTab(idx + 1, perfPage, "Performance");
+      }
     }
 
     void settings::discard_changes()

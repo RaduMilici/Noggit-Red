@@ -1689,9 +1689,9 @@ namespace
   {
     std::string const suffix = "_" + (value < 10 ? std::string("0") : std::string()) + std::to_string(value) + ".blp";
 
-    for (std::size_t field : {CharacterSectionsDB::TextureName1,
-                              CharacterSectionsDB::TextureName2,
-                              CharacterSectionsDB::TextureName3})
+    for (std::size_t field : {CharacterSectionsDB::TextureName1(),
+                              CharacterSectionsDB::TextureName2(),
+                              CharacterSectionsDB::TextureName3()})
     {
       auto texture = normalize_texture_filename(section.getString(field));
       if (texture.size() >= suffix.size()
@@ -1723,12 +1723,12 @@ namespace
         continue;
       }
 
-      if (section_id && it->getUInt(CharacterSectionsDB::VariationIndex) != *section_id)
+      if (section_id && it->getUInt(CharacterSectionsDB::VariationIndex()) != *section_id)
       {
         continue;
       }
 
-      if (color_id && it->getUInt(CharacterSectionsDB::ColorIndex) != *color_id)
+      if (color_id && it->getUInt(CharacterSectionsDB::ColorIndex()) != *color_id)
       {
         continue;
       }
@@ -1742,9 +1742,9 @@ namespace
       selected.found = true;
       selected_matches_suffix = candidate_matches_suffix;
       selected.textures = {
-        normalize_texture_filename(it->getString(CharacterSectionsDB::TextureName1)),
-        normalize_texture_filename(it->getString(CharacterSectionsDB::TextureName2)),
-        normalize_texture_filename(it->getString(CharacterSectionsDB::TextureName3))
+        normalize_texture_filename(it->getString(CharacterSectionsDB::TextureName1())),
+        normalize_texture_filename(it->getString(CharacterSectionsDB::TextureName2())),
+        normalize_texture_filename(it->getString(CharacterSectionsDB::TextureName3()))
       };
     }
 
@@ -1821,7 +1821,7 @@ namespace
         try
         {
           auto display_extra = gCreatureDisplayInfoExtraDB.getByID(extra_display_id);
-          auto baked_texture = normalize_baked_creature_texture_filename(display_extra.getString(CreatureDisplayInfoExtraDB::BakedTexture));
+          auto baked_texture = normalize_baked_creature_texture_filename(display_extra.getString(CreatureDisplayInfoExtraDB::BakedTexture()));
           auto* client = Noggit::Application::NoggitApplication::instance()->clientData();
           bool const is_character_model = model_dir.rfind("character/", 0) == 0;
           bool const baked_texture_exists = !baked_texture.empty() && client->exists(baked_texture);
@@ -2363,7 +2363,7 @@ namespace
 
           if (!has_explicit_texture_variation)
           {
-            auto baked_texture = normalize_baked_creature_texture_filename(display_extra.getString(CreatureDisplayInfoExtraDB::BakedTexture));
+            auto baked_texture = normalize_baked_creature_texture_filename(display_extra.getString(CreatureDisplayInfoExtraDB::BakedTexture()));
             bool const disable_baked_npc_textures = is_character_model && classic_probe_disable_baked_npc_textures_enabled();
             auto append_character_fallback = [&](std::string texture)
             {
@@ -2860,6 +2860,7 @@ bool World::reloadCreatureSpawns()
     spawn.guid = row.guid;
     spawn.entry = row.entry;
     spawn.display_id = row.display_id;
+    spawn.faction = row.faction;
     spawn.name = row.name;
     spawn.pos = server_to_client_position(row.position_x,
               row.position_y,
@@ -2872,6 +2873,7 @@ bool World::reloadCreatureSpawns()
     // Object scale = creature_template.scale, falling back to CreatureDisplayInfo.scale (D) when 0
     // (server ObjectMgr.cpp:1436). Final render = template_scale * model_scale = (T>0?T:D) * M.
     spawn.template_scale = row.template_scale > 0.0f ? row.template_scale : resolve_creature_display_scale(row.display_id);
+    spawn.mount_display_id = row.mount_display_id;
     spawn.mainhand_display_id = row.mainhand_display_id;
     spawn.offhand_display_id = row.offhand_display_id;
     spawn.ranged_display_id = row.ranged_display_id;
@@ -3220,6 +3222,53 @@ bool World::ensureCreatureSpawnModel(CreatureSpawnOverlay& spawn)
       append_creature_geoset_trace("instance", replacements_line.str());
     }
 
+    // Mount model: mounted NPCs (creature_addon.mount_display_id) ride a mount, resolved like any
+    // creature display. Build it at the spawn's ground position/facing; the rider is re-seated onto
+    // the mount's MountMain attachment (id 0) at draw time (the mount M2 loads async). Mount render
+    // scale = display scale (D) x model scale (M), like a creature with template_scale = 1.
+    if (spawn.mount_display_id != 0 && !spawn.mount_create_failed && !spawn.mount_instance.has_value())
+    {
+      auto const mount_model = resolve_creature_model_path(spawn.mount_display_id);
+      if (mount_model.status == CreatureModelPathStatus::Success)
+      {
+        try
+        {
+          spawn.mount_model_path = mount_model.path;
+          spawn.mount_instance.emplace(BlizzardArchive::Listfile::FileKey(spawn.mount_model_path), _context);
+          spawn.mount_instance->uid = static_cast<unsigned int>(spawn.guid) ^ 0x4D4E5400u; // distinct timeline from the rider
+          spawn.mount_instance->pos = spawn.pos;
+          spawn.mount_instance->dir = glm::vec3(0.0f, spawn.orientation, 0.0f);
+          spawn.mount_instance->scale = std::clamp(
+              resolve_creature_display_scale(spawn.mount_display_id) * resolve_creature_model_scale(spawn.mount_display_id),
+              ModelInstance::min_scale(), ModelInstance::max_scale());
+          spawn.mount_instance->updateTransformMatrix();
+
+          // Apply the mount's creature SKIN textures (CreatureDisplayInfo TextureVariation -> model
+          // texture types), exactly like a non-character creature body. Without this the horse's
+          // variation-filled BODY texture is empty, so the body geoset renders INVISIBLE and only the
+          // model's hardcoded-texture pieces (saddle, bridle) show.
+          for (auto const& ov : resolve_creature_texture_overrides_stable(spawn.mount_display_id))
+          {
+            spawn.mount_instance->setReplaceTexture(ov.first, ov.second);
+          }
+
+          // Rider plays the mounted/sit pose instead of standing: AnimationData.dbc animID 91 = "Mount"
+          // (verified present on the character models). The draw path falls back to Stand(0) for any
+          // race model that lacks it, so this is safe to force unconditionally on mounted riders.
+          spawn.model_instance->setForcedAnimationId(91);
+        }
+        catch (std::exception const&)
+        {
+          spawn.mount_instance.reset();
+          spawn.mount_create_failed = true;
+        }
+      }
+      else
+      {
+        spawn.mount_create_failed = true;
+      }
+    }
+
     return true;
   }
   catch (std::exception const& ex)
@@ -3248,13 +3297,33 @@ bool World::ensureGameObjectSpawnModel(GameObjectSpawnOverlay& spawn)
 
   if (spawn.model_path.ends_with(".wmo"))
   {
-    spawn.model_create_failed = true;
-    LogDebug << "Gameobject WMO overlay skipped: guid=" << spawn.guid
-             << " entry=" << spawn.entry
-             << " display_id=" << spawn.display_id
-             << " path=" << spawn.model_path
-             << std::endl;
-    return false;
+    // WMO-model gameobject (Turtle player housing etc.): build a WMOInstance; the renderer feeds it
+    // into the WMO draw list (walls, doodad sets, liquids all render like a world WMO).
+    if (spawn.wmo_instance.has_value())
+    {
+      return true;
+    }
+    try
+    {
+      BlizzardArchive::Listfile::FileKey const file_key(spawn.model_path);
+      spawn.wmo_instance.emplace(file_key, _context);
+      spawn.wmo_instance->uid = static_cast<unsigned int>(spawn.guid);
+      spawn.wmo_instance->skip_tile_culling = true; // not tile-registered: frustum-only in draw()
+      spawn.wmo_instance->pos = spawn.pos;
+      spawn.wmo_instance->dir = math::degrees::vec3(math::degrees(0)._,
+                                                    math::degrees(spawn.orientation)._,
+                                                    math::degrees(0)._);
+      spawn.wmo_instance->updateTransformMatrix();
+      spawn.wmo_instance->recalcExtents();
+      return true;
+    }
+    catch (std::exception const& ex)
+    {
+      spawn.model_create_failed = true;
+      LogDebug << "Gameobject WMO load failed: guid=" << spawn.guid
+               << " path=" << spawn.model_path << " error=" << ex.what() << std::endl;
+      return false;
+    }
   }
 
   try
@@ -4567,6 +4636,11 @@ unsigned int World::getZoneId(glm::vec3 const& pos)
 
 bool World::getInteriorFog(glm::vec3 const& pos, glm::vec3& out_color, float& out_start, float& out_end)
 {
+  // Client-style per-GROUP fog selection: the scene fog comes from the CAMERA group's authored MFOG
+  // refs (MOGP fogs[4]) -- that's how colour/distance change per room (Kara halls vs Deadmines ship
+  // vs BRM core). The old whole-WMO gate ("only fully enclosed WMOs") disabled fog in every instance
+  // that contains ANY exterior group (Kara/BRM/Deadmines all do) -- visible far ceilings. Now only the
+  // camera GROUP must be interior; open-air groups (city streets) keep the outdoor fog as before.
   auto contains = [](std::pair<glm::vec3, glm::vec3> const& extents, glm::vec3 const& point)
   {
     return point.x >= extents.first.x && point.x <= extents.second.x
@@ -4585,45 +4659,141 @@ bool World::getInteriorFog(glm::vec3 const& pos, glm::vec3& out_color, float& ou
     auto const& wmo_extents = wmo_instance.getExtents();
     if (!contains({wmo_extents[0], wmo_extents[1]}, pos))
     {
+      if (_sticky_fog_uid == wmo_instance.uid)
+      {
+        _sticky_fog_uid = 0; _sticky_fog_id = -1; // truly left the WMO: release the held fog
+      }
+      return; // not even in the loose outer AABB
+    }
+
+    // Smallest containing group wins (nested/overlapping AABBs: the room you're actually in).
+    int best_group = -1;
+    float best_volume = std::numeric_limits<float>::max();
+    for (auto const& [group_index, group_extents] : wmo_instance.getGroupExtents())
+    {
+      if (group_index < 0
+          || group_index >= static_cast<int>(wmo_instance.wmo->groups.size())
+          || !contains(group_extents, pos))
+      {
+        continue;
+      }
+      glm::vec3 const d = group_extents.second - group_extents.first;
+      float const volume = std::abs(d.x * d.y * d.z);
+      if (volume < best_volume)
+      {
+        best_volume = volume;
+        best_group = group_index;
+      }
+    }
+
+    glm::mat4x4 const transform = wmo_instance.transformMatrix();
+    int chosen = -1;
+
+    if (best_group >= 0)
+    {
+      auto const& group = wmo_instance.wmo->groups[best_group];
+      if ((group.is_exterior() || group.is_exterior_lit()) && !mapIndex.hasAGlobalWMO())
+      {
+        if (_sticky_fog_uid == wmo_instance.uid)
+        {
+          _sticky_fog_uid = 0; _sticky_fog_id = -1; // stepped into open air: release
+        }
+        return; // open-air group on a terrain map: keep the outdoor fog
+      }
+
+      // The group's fog refs, in order: pick the first whose sphere contains the camera; the first
+      // valid entry doubles as the fallback (slot 0 is conventionally the default/infinite fog).
+      for (int fi = 0; fi < 4; ++fi)
+      {
+        std::uint8_t const id = group.fog_id(fi);
+        if (id >= wmo_instance.wmo->fogs.size())
+        {
+          continue;
+        }
+        auto const& wf = wmo_instance.wmo->fogs[id];
+        if (wf.fogend <= 1.0f)
+        {
+          continue;
+        }
+        if (chosen < 0)
+        {
+          chosen = id; // fallback: first valid ref
+        }
+        glm::vec3 const fog_world = glm::vec3(transform * glm::vec4(wf.pos, 1.0f));
+        if (glm::distance(pos, fog_world) <= wf.r2)
+        {
+          chosen = id; // inside this fog volume's sphere: it wins
+          break;
+        }
+      }
+    }
+
+    // WMO-ONLY (instance/global-WMO) maps: the camera lives inside the WMO world at all times, so
+    // when no group AABB contains it (flying through atriums / between rooms) the map's MFOG still
+    // applies -- pick from the WHOLE fog list by sphere, else the default entry. Without this the
+    // fog vanished the moment the camera left a room's AABB (patchy/flickering Kara fog).
+    // STICKY fog: no group AABB contains the camera right now (room boxes are gappy -- doorways,
+    // atriums, boundary steps) but we are still inside this WMO's outer AABB and a fog was chosen
+    // here before: keep it. This is what stops the per-step fog popping in Kara.
+    if (chosen < 0 && _sticky_fog_uid == wmo_instance.uid && _sticky_fog_id >= 0
+        && static_cast<std::size_t>(_sticky_fog_id) < wmo_instance.wmo->fogs.size())
+    {
+      chosen = _sticky_fog_id;
+    }
+
+    if (chosen < 0 && mapIndex.hasAGlobalWMO())
+    {
+      int fallback = -1;
+      for (std::size_t id = 0; id < wmo_instance.wmo->fogs.size(); ++id)
+      {
+        auto const& wf = wmo_instance.wmo->fogs[id];
+        if (wf.fogend <= 1.0f)
+        {
+          continue;
+        }
+        if (fallback < 0)
+        {
+          fallback = static_cast<int>(id); // default entry (first valid; slot 0 = map-wide fog)
+        }
+        glm::vec3 const fog_world = glm::vec3(transform * glm::vec4(wf.pos, 1.0f));
+        if (glm::distance(pos, fog_world) <= wf.r2)
+        {
+          chosen = static_cast<int>(id); // sphere containment wins; LAST containing entry wins
+        }
+      }
+      if (chosen < 0)
+      {
+        chosen = fallback;
+      }
+    }
+
+    static bool const s_fog_dbg = std::getenv("NOGGIT_LIGHT_DEBUG") != nullptr;
+    static int s_fog_dbg_tick = 0;
+    if (s_fog_dbg && (++s_fog_dbg_tick % 30) == 0)
+    {
+      LogError << "FOGSEL uid=" << wmo_instance.uid
+               << " bestGroup=" << best_group
+               << (best_group >= 0 ? (" name='" + wmo_instance.wmo->groups[best_group].name + "'") : std::string())
+               << " chosen=" << chosen
+               << " stickyUid=" << _sticky_fog_uid << " stickyId=" << _sticky_fog_id
+               << " nFogs=" << wmo_instance.wmo->fogs.size()
+               << " globalWMO=" << (mapIndex.hasAGlobalWMO() ? 1 : 0)
+               << " groupExtents=" << wmo_instance.getGroupExtents().size()
+               << std::endl;
+    }
+
+    if (chosen < 0)
+    {
       return;
     }
 
-    bool inside_group = false;
-    for (auto const& group_extents : wmo_instance.getGroupExtents())
-    {
-      if (contains(group_extents.second, pos))
-      {
-        inside_group = true;
-        break;
-      }
-    }
-    if (!inside_group)
-    {
-      return;
-    }
-
-    // Only ENCLOSED WMOs (no exterior groups) override the scene fog. An open WMO such as a city
-    // (Stormwind) has exterior groups and must keep the outdoor fog -- otherwise its interior MFOG
-    // floods the whole open city with dense/bright fog (white-out).
-    for (auto const& g : wmo_instance.wmo->groups)
-    {
-      if (g.is_exterior() || g.is_exterior_lit())
-      {
-        return;
-      }
-    }
-
-    for (auto const& wf : wmo_instance.wmo->fogs)
-    {
-      if (wf.fogend > 1.0f)
-      {
-        out_color = glm::vec3(wf.color);
-        out_start = wf.fogstart;
-        out_end = wf.fogend;
-        found = true;
-        return;
-      }
-    }
+    auto const& wf = wmo_instance.wmo->fogs[static_cast<std::size_t>(chosen)];
+    out_color = glm::vec3(wf.color);
+    out_start = wf.fogstart;
+    out_end = wf.fogend;
+    _sticky_fog_uid = wmo_instance.uid;
+    _sticky_fog_id = chosen;
+    found = true;
   }, [&]()
   {
     return found;
@@ -4631,6 +4801,7 @@ bool World::getInteriorFog(glm::vec3 const& pos, glm::vec3& out_color, float& ou
 
   return found;
 }
+
 
 unsigned int World::getWMOAreaID(glm::vec3 const& pos)
 {
@@ -4713,10 +4884,12 @@ unsigned int World::getWMOAreaID(glm::vec3 const& pos)
   return area_id;
 }
 
-unsigned int World::getWMOZoneMusic(glm::vec3 const& pos)
+unsigned int World::getWMOZoneMusic(glm::vec3 const& pos, size_t wmo_field)
 {
-  // Mirrors getWMOAreaID's group resolution, but returns the matched WMOAreaTable row's ZoneMusic
-  // (column 7) -- WMO interiors (dungeons/caves) carry their music here, not in AreaTable.
+  // Mirrors getWMOAreaID's group resolution, but returns the matched WMOAreaTable row's `wmo_field`
+  // column -- WMO interiors (dungeons/caves) carry their music here, not in AreaTable. `wmo_field` is
+  // WMOAreaTableDB::ZoneMusic for the looping zone music, or WMOAreaTableDB::ZoneIntroMusicTable for
+  // the one-shot intro (Ironforge Intro, CoT intro), so both share this identical whole-building logic.
   auto contains = [](std::pair<glm::vec3, glm::vec3> const& extents, glm::vec3 const& point)
   {
     return point.x >= extents.first.x && point.x <= extents.second.x
@@ -4724,7 +4897,7 @@ unsigned int World::getWMOZoneMusic(glm::vec3 const& pos)
         && point.z >= extents.first.z && point.z <= extents.second.z;
   };
 
-  auto find_music = [](std::uint32_t wmo_id, std::uint16_t name_set, int group_id, bool& found) -> unsigned int
+  auto find_music = [wmo_field](std::uint32_t wmo_id, std::uint16_t name_set, int group_id, bool& found) -> unsigned int
   {
     for (DBCFile::Iterator i = gWMOAreaTableDB.begin(); i != gWMOAreaTableDB.end(); ++i)
     {
@@ -4733,7 +4906,7 @@ unsigned int World::getWMOZoneMusic(glm::vec3 const& pos)
           && i->getInt(WMOAreaTableDB::WMOGroupID) == group_id)
       {
         found = true;
-        return i->getUInt(WMOAreaTableDB::ZoneMusic);
+        return i->getUInt(wmo_field);
       }
     }
     found = false;
@@ -4814,7 +4987,7 @@ unsigned int World::getWMOZoneMusic(glm::vec3 const& pos)
       {
         continue;
       }
-      unsigned int const row_music = i->getUInt(WMOAreaTableDB::ZoneMusic);
+      unsigned int const row_music = i->getUInt(wmo_field);
       if (s_wmo_dbg)
       {
         LogError << "ZONEMUSIC   wmoRow wmoId=" << wmo_instance.wmo->WmoId
@@ -4911,31 +5084,87 @@ void World::collect_interior_volumes(std::vector<InteriorVolume>& out)
   });
 }
 
+void World::collect_fog_volumes(std::vector<WmoGroupFogVolume>& out)
+{
+  out.clear();
+  _model_instance_storage.for_each_wmo_instance([&](WMOInstance& wmo_instance)
+  {
+    if (!wmo_instance.finishedLoading() || wmo_instance.wmo->loading_failed())
+    {
+      return;
+    }
+    // default-only WMOs can never override the zone fog (client: nFogs == 1 -> bail), so their
+    // groups need not be searched at all
+    if (wmo_instance.wmo->fogs.size() <= 1)
+    {
+      return;
+    }
+
+    glm::mat4 const transform = wmo_instance.transformMatrix();
+    for (auto const& [group_index, group_extents] : wmo_instance.getGroupExtents())
+    {
+      if (group_index < 0 || group_index >= static_cast<int>(wmo_instance.wmo->groups.size()))
+      {
+        continue;
+      }
+      out.push_back({group_extents.first, group_extents.second, wmo_instance.wmo.get(),
+                     &wmo_instance.wmo->groups[group_index], transform});
+    }
+  });
+}
+
+std::uint64_t World::loaded_wmo_fingerprint()
+{
+  std::uint64_t fp = 1469598103934665603ull; // FNV offset basis
+  _model_instance_storage.for_each_wmo_instance([&](WMOInstance& wmo_instance)
+  {
+    if (wmo_instance.finishedLoading() && !wmo_instance.wmo->loading_failed())
+    {
+      fp = (fp ^ (wmo_instance.uid + 1ull)) * 1099511628211ull;
+    }
+  });
+  return fp;
+}
+
 int World::getZoneMusic(glm::vec3 const& pos)
+{
+  // Looping zone music: WMOAreaTable.ZoneMusic (col 7) then AreaTable.ZoneMusic (col 8).
+  return getZoneMusicField(pos, WMOAreaTableDB::ZoneMusic, AreaDB::ZoneMusic);
+}
+
+int World::getZoneIntroMusic(glm::vec3 const& pos)
+{
+  // One-shot zone INTRO music: WMOAreaTable.IntroSound (col 8) then AreaTable.IntroSound (col 9).
+  // City/instance intros (Ironforge Intro, CoT intro) live here, NOT on ZoneMusic -- this is what the
+  // ZoneMusicPlayer was missing, so they never appeared in the list or played.
+  return getZoneMusicField(pos, WMOAreaTableDB::ZoneIntroMusicTable, AreaDB::ZoneIntroMusicTable);
+}
+
+int World::getZoneMusicField(glm::vec3 const& pos, size_t wmo_field, size_t area_field)
 {
   static bool s_zm_dbg = std::getenv("NOGGIT_LIGHT_DEBUG") != nullptr;
 
-  // 1) WMO interior music (WMOAreaTable.ZoneMusic) -- dungeons/caves (Timbermaw, Wailing Caverns).
+  // 1) WMO interior music (WMOAreaTable) -- dungeons/caves/cities (Ironforge, Timbermaw, Caverns of Time).
   unsigned int wmo_music = 0;
-  try { wmo_music = getWMOZoneMusic(pos); } catch (...) {}
+  try { wmo_music = getWMOZoneMusic(pos, wmo_field); } catch (...) {}
   if (wmo_music > 0)
   {
     if (s_zm_dbg) { LogError << "ZONEMUSIC via WMOAreaTable -> " << wmo_music << std::endl; }
     return static_cast<int>(wmo_music);
   }
 
-  // 2) Area chains: WMO area then terrain area, walking up ParentAreaID for inherited zone music.
+  // 2) Area chains: WMO area then terrain area, walking up ParentAreaID for inherited music.
   auto walk = [&](unsigned int area_id) -> int
   {
     try
     {
-      if (gAreaDB.getFieldCount() <= AreaDB::ZoneMusic) { return 0; }
+      if (gAreaDB.getFieldCount() <= area_field) { return 0; }
       unsigned int a = area_id;
       for (int guard = 0; a != 0 && a != static_cast<unsigned int>(-1) && guard < 16; ++guard)
       {
         if (!gAreaDB.CheckIfIdExists(a)) { break; }
         auto const rec = gAreaDB.getByID(a);
-        int const zm = static_cast<int>(rec.getUInt(AreaDB::ZoneMusic));
+        int const zm = static_cast<int>(rec.getUInt(area_field));
         unsigned int const parent = rec.getUInt(AreaDB::Region);
         if (s_zm_dbg)
         {

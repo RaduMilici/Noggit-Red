@@ -115,6 +115,7 @@ class PreviewRenderer : public Noggit::Ui::Tools::ViewportManager::Viewport
 
     bool _uploaded = false;
     bool _lighting_needs_update = true;
+    bool _preview_trace = false; // NOGGIT_PREVIEW_TRACE=1: flushed step-log for the offscreen crash hunt
 
   };
 
