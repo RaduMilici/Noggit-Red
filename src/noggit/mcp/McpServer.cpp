@@ -192,7 +192,11 @@ namespace Noggit
         | Noggit::ActionFlags::eCHUNKS_WATER
         | Noggit::ActionFlags::eCHUNKS_FLAGS;
 
-      // Edits may mutate textures/tiles -> make this MapView's GL context current first.
+      // Make this MapView's GL context current so gl.* calls in the script (terrain/texture brushes)
+      // execute. KNOWN LIMITATION: models placed via add_m2 do NOT render LIVE in the editor -- an
+      // unresolved GL-upload bug (their buffers fail to bind at draw; identical hand-pasted models
+      // render fine, cause not found across 4 fixes + 3 traces). They ARE written to the map correctly
+      // (query_objects sees them) and appear after SAVE + tile reload. Live in-editor render is open.
       _view->makeCurrent();
       OpenGL::context::scoped_setter const _gl_setter(::gl, _view->context());
 
@@ -230,6 +234,12 @@ namespace Noggit
       }
       // Always close the action, even on error, so we never leave a dangling open action.
       NOGGIT_ACTION_MGR->endAction();
+
+      // Added/removed models are pushed to the per-tile RENDER lists by a background queue that
+      // add_m2/updateTilesModel only ENQUEUE. The world data (what query_objects reads) updates
+      // synchronously, but the viewport won't draw the model until that queue drains -- so drain it
+      // here (the same thing saveTile/saveChanged do) or placements stay invisible until a reload.
+      _view->getWorld()->wait_for_all_tile_updates();
 
       _view->requestRedraw();
       _view->update();
@@ -315,6 +325,7 @@ namespace Noggit
       _view->makeCurrent();
       OpenGL::context::scoped_setter const _gl_setter(::gl, _view->context());
       NOGGIT_ACTION_MGR->undo();
+      _view->getWorld()->wait_for_all_tile_updates();  // drain tile queue so the change renders live
       _view->requestRedraw();
       _view->update();
       return make_ok();
@@ -325,6 +336,7 @@ namespace Noggit
       _view->makeCurrent();
       OpenGL::context::scoped_setter const _gl_setter(::gl, _view->context());
       NOGGIT_ACTION_MGR->redo();
+      _view->getWorld()->wait_for_all_tile_updates();  // drain tile queue so the change renders live
       _view->requestRedraw();
       _view->update();
       return make_ok();
