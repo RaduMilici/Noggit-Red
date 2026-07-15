@@ -7043,7 +7043,7 @@ void MapView::move_camera_with_auto_height (glm::vec3 const& pos)
   _camera_moved_since_last_draw = true;
 }
 
-void MapView::focus_camera_on_target (glm::vec3 const& target)
+void MapView::focus_camera_on_target (glm::vec3 const& target, float dist, float pitch_deg)
 {
   makeCurrent();
   OpenGL::context::scoped_setter const _ (::gl, context());
@@ -7054,10 +7054,13 @@ void MapView::focus_camera_on_target (glm::vec3 const& target)
     _world->mapIndex.loadTile(target)->wait_until_loaded();
   }
 
-  float const dist = 28.0f; // viewing distance from the target (tune)
-  float const k = 0.70710678f; // cos/sin of 45 degrees
+  // Split the viewing distance into horizontal (back) and vertical (up) by the pitch angle, so a
+  // steeper pitch puts the eye higher and looks further down -- needed to frame big builds from above.
+  float const pr = glm::radians(glm::clamp(pitch_deg, 5.0f, 89.0f));
+  float const back = dist * std::cos(pr);
+  float const up   = dist * std::sin(pr);
 
-  // Approach from the current horizontal facing so the jump isn't jarring; back + up at 45 degrees.
+  // Approach from the current horizontal facing so the jump isn't jarring.
   glm::vec3 dir = _camera.direction();
   glm::vec3 horiz (dir.x, 0.0f, dir.z);
   if (glm::length(horiz) < 0.001f)
@@ -7066,7 +7069,7 @@ void MapView::focus_camera_on_target (glm::vec3 const& target)
   }
   horiz = glm::normalize(horiz);
 
-  glm::vec3 const eye = target - horiz * (dist * k) + glm::vec3(0.0f, dist * k, 0.0f);
+  glm::vec3 const eye = target - horiz * back + glm::vec3(0.0f, up, 0.0f);
   _camera.position = eye;
 
   // Aim at the target. direction() = (cos(pitch)*sin(yaw), -sin(pitch), cos(pitch)*cos(yaw)).

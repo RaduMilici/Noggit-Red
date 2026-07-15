@@ -173,6 +173,25 @@ def change_terrain(x: float, y: float, z: float, amount: float,
 
 
 @mcp.tool()
+def blur_terrain(x: float, y: float, z: float, radius: float = 40.0,
+                 remain: float = 0.5, brush_type: int = 2) -> dict:
+    """Smooth/round terrain around a point, live -- softens cliffs and sharp edges toward the local
+    average. `remain` 0..1 is blend strength (higher = stronger smoothing). Run a few passes to melt a
+    hard edge. Great for fixing the cliff sides left by change_terrain's Smooth brush."""
+    return _send({"cmd": "blur_terrain", "x": x, "y": y, "z": z,
+                  "radius": radius, "remain": remain, "brush_type": brush_type})
+
+
+@mcp.tool()
+def flatten_terrain(x: float, z: float, height: float, radius: float = 40.0,
+                    remain: float = 1.0, brush_type: int = 0) -> dict:
+    """Flatten terrain around (x,z) to a level pad at world y=`height`, live. remain=1.0 fully levels it;
+    lower values ease it partway. Use this to make building pads / plazas / roads before placing WMOs."""
+    return _send({"cmd": "flatten_terrain", "x": x, "z": z, "height": height,
+                  "radius": radius, "remain": remain, "brush_type": brush_type})
+
+
+@mcp.tool()
 def paint_texture(x: float, y: float, z: float, texture: str,
                   strength: float = 1.0, radius: float = 15.0,
                   hardness: float = 0.5, pressure: float = 0.9) -> dict:
@@ -194,9 +213,44 @@ def add_water(x: float, y: float, z: float, height: float,
 
 
 @mcp.tool()
-def focus_camera(x: float, y: float, z: float) -> dict:
-    """Aim the user's camera at a world point so they can see what you did / where you're working."""
-    return _send({"cmd": "focus_camera", "x": x, "y": y, "z": z})
+def move_model(uid: int, x: float, y: float, z: float) -> dict:
+    """Move a placed object (by uid, from place_model/query_objects) to a new world position, live.
+    Returns the object's new uid/x/y/z/scale."""
+    return _send({"cmd": "edit_model", "uid": uid, "x": x, "y": y, "z": z})
+
+
+@mcp.tool()
+def rotate_model(uid: int, ry: float, rx: float = None, rz: float = None) -> dict:
+    """Rotate a placed object (by uid) about the vertical axis by ry degrees, live. rx/rz optionally tilt
+    it. Only the axes you pass change; the rest are kept."""
+    cmd = {"cmd": "edit_model", "uid": uid, "ry": ry}
+    if rx is not None:
+        cmd["rx"] = rx
+    if rz is not None:
+        cmd["rz"] = rz
+    return _send(cmd)
+
+
+@mcp.tool()
+def scale_model(uid: int, scale: float) -> dict:
+    """Set the scale of a placed M2 object (by uid), live. 1.0 = default size."""
+    return _send({"cmd": "edit_model", "uid": uid, "scale": scale})
+
+
+@mcp.tool()
+def delete_model(uid: int) -> dict:
+    """Delete a placed object (by uid, from place_model/query_objects) from the map, live. One undo step."""
+    return _send({"cmd": "delete_model", "uid": uid})
+
+
+@mcp.tool()
+def focus_camera(x: float, y: float, z: float,
+                 distance: float = 130.0, pitch: float = 55.0) -> dict:
+    """Frame a world point for the user from HIGH ABOVE, looking down, so they can see your work. `distance`
+    is how far the eye sits from the target (increase for large scenes -- e.g. 250+ for a whole landscape);
+    `pitch` is the look-down angle in degrees (bigger = more top-down)."""
+    return _send({"cmd": "focus_camera", "x": x, "y": y, "z": z,
+                  "distance": distance, "pitch": pitch})
 
 
 @mcp.tool()

@@ -11,6 +11,9 @@
 #include <noggit/Brush.h>
 #include <noggit/TextureManager.h>
 #include <noggit/ContextObject.hpp>
+#include <noggit/SceneObject.hpp>
+#include <noggit/tool_enums.hpp>
+#include <noggit/map_enums.hpp>
 #include <math/trig.hpp>
 #include <noggit/ActionManager.hpp>
 #include <noggit/Action.hpp>
@@ -155,8 +158,12 @@ namespace Noggit
       if (cmd == "place_model")   return cmd_place_model(req);
       if (cmd == "place_wmo")     return cmd_place_wmo(req);
       if (cmd == "change_terrain")return cmd_change_terrain(req);
+      if (cmd == "blur_terrain")  return cmd_blur_terrain(req);
+      if (cmd == "flatten_terrain")return cmd_flatten_terrain(req);
       if (cmd == "paint_texture") return cmd_paint_texture(req);
       if (cmd == "add_water")     return cmd_add_water(req);
+      if (cmd == "edit_model")    return cmd_edit_model(req);
+      if (cmd == "delete_model")  return cmd_delete_model(req);
       if (cmd == "focus_camera")  return cmd_focus_camera(req);
       if (cmd == "query_objects") return cmd_query_objects(req);
       if (cmd == "height_at")     return cmd_height_at(req);
@@ -386,6 +393,70 @@ namespace Noggit
       return make_ok();
     }
 
+    QJsonObject McpServer::cmd_blur_terrain(QJsonObject const& req)
+    {
+      float const x      = static_cast<float>(req.value("x").toDouble());
+      float const y      = static_cast<float>(req.value("y").toDouble());
+      float const z      = static_cast<float>(req.value("z").toDouble());
+      float const remain = static_cast<float>(req.value("remain").toDouble(0.5));  // 0..1 blend strength
+      float const radius = static_cast<float>(req.value("radius").toDouble(40.0));
+      int   const brush  = req.value("brush_type").toInt(2);  // eFlattenType: 0 Flat,1 Linear,2 Smooth
+
+      _view->makeCurrent();
+      OpenGL::context::scoped_setter const _gl(::gl, _view->context());
+      NOGGIT_ACTION_MGR->beginAction(_view, Noggit::ActionFlags::eCHUNKS_TERRAIN);
+      try
+      {
+        // raise+lower both true -> softens the surface toward the local neighbourhood average,
+        // rounding off cliffs and sharp edges left by the Smooth-brush cutoff.
+        _view->getWorld()->blurTerrain(glm::vec3(x, y, z), remain, radius, brush, flatten_mode(true, true));
+      }
+      catch (std::exception const& e)
+      {
+        NOGGIT_ACTION_MGR->endAction();
+        return make_error(QString("blur_terrain: ") + e.what());
+      }
+      NOGGIT_ACTION_MGR->endAction();
+
+      _view->getWorld()->wait_for_all_tile_updates();
+      _view->requestRedraw();
+      _view->update();
+      return make_ok();
+    }
+
+    QJsonObject McpServer::cmd_flatten_terrain(QJsonObject const& req)
+    {
+      float const x       = static_cast<float>(req.value("x").toDouble());
+      float const z       = static_cast<float>(req.value("z").toDouble());
+      float const height  = static_cast<float>(req.value("height").toDouble());  // target y to flatten to
+      float const remain  = static_cast<float>(req.value("remain").toDouble(1.0));// 1 = full flatten
+      float const radius  = static_cast<float>(req.value("radius").toDouble(40.0));
+      int   const brush   = req.value("brush_type").toInt(0);  // eFlattenType: 0 Flat (uniform)
+
+      glm::vec3 const origin(x, height, z);  // origin.y is the flatten target height
+
+      _view->makeCurrent();
+      OpenGL::context::scoped_setter const _gl(::gl, _view->context());
+      NOGGIT_ACTION_MGR->beginAction(_view, Noggit::ActionFlags::eCHUNKS_TERRAIN);
+      try
+      {
+        // angle=orientation=0 -> a level pad at `height`; raise+lower both -> pull terrain to it either way.
+        _view->getWorld()->flattenTerrain(origin, remain, radius, brush, flatten_mode(true, true),
+                                          origin, math::degrees(0.0), math::degrees(0.0));
+      }
+      catch (std::exception const& e)
+      {
+        NOGGIT_ACTION_MGR->endAction();
+        return make_error(QString("flatten_terrain: ") + e.what());
+      }
+      NOGGIT_ACTION_MGR->endAction();
+
+      _view->getWorld()->wait_for_all_tile_updates();
+      _view->requestRedraw();
+      _view->update();
+      return make_ok();
+    }
+
     QJsonObject McpServer::cmd_paint_texture(QJsonObject const& req)
     {
       std::string const texture = req.value("texture").toString().toStdString();
@@ -459,6 +530,96 @@ namespace Noggit
       return make_ok();
     }
 
+    QJsonObject McpServer::cmd_edit_model(QJsonObject const& req)
+    {
+      if (!req.contains("uid"))
+        return make_error("edit_model: missing 'uid'");
+      std::uint32_t const uid = static_cast<std::uint32_t>(req.value("uid").toDouble());
+
+      World* world = _view->getWorld();
+      SceneObject* obj = world->getObjectInstance(uid);
+      if (!obj)
+        return make_error(QString("edit_model: no object with uid %1").arg(uid));
+
+      _view->makeCurrent();
+      OpenGL::context::scoped_setter const _gl(::gl, _view->context());
+      NOGGIT_ACTION_MGR->beginAction(_view, Noggit::ActionFlags::eOBJECTS_TRANSFORMED);
+      try
+      {
+        // Mirror World::set_model_pos: pull the instance out of its old tile, mutate, re-add to the
+        // (possibly new) tile so the render lists follow the object. registerObjectTransformed = undo.
+        world->updateTilesEntry(obj, model_update::remove);
+        NOGGIT_CUR_ACTION->registerObjectTransformed(obj);
+
+        if (req.contains("x") && req.contains("y") && req.contains("z"))
+          obj->pos = glm::vec3(static_cast<float>(req.value("x").toDouble()),
+                               static_cast<float>(req.value("y").toDouble()),
+                               static_cast<float>(req.value("z").toDouble()));
+
+        if (req.contains("rx") || req.contains("ry") || req.contains("rz"))
+          obj->dir = math::degrees::vec3(glm::vec3(
+              static_cast<float>(req.value("rx").toDouble(obj->dir.x)),
+              static_cast<float>(req.value("ry").toDouble(obj->dir.y)),
+              static_cast<float>(req.value("rz").toDouble(obj->dir.z))));
+
+        if (req.contains("scale") && obj->which() == eMODEL)
+          obj->scale = static_cast<float>(req.value("scale").toDouble(obj->scale));
+
+        obj->recalcExtents();
+        world->updateTilesEntry(obj, model_update::add);
+      }
+      catch (std::exception const& e)
+      {
+        NOGGIT_ACTION_MGR->endAction();
+        return make_error(QString("edit_model: ") + e.what());
+      }
+      NOGGIT_ACTION_MGR->endAction();
+
+      world->wait_for_all_tile_updates();
+      _view->requestRedraw();
+      _view->update();
+
+      QJsonObject o = make_ok();
+      o["uid"]   = static_cast<double>(obj->uid);
+      o["x"]     = obj->pos.x;
+      o["y"]     = obj->pos.y;
+      o["z"]     = obj->pos.z;
+      o["scale"] = obj->scale;
+      return o;
+    }
+
+    QJsonObject McpServer::cmd_delete_model(QJsonObject const& req)
+    {
+      if (!req.contains("uid"))
+        return make_error("delete_model: missing 'uid'");
+      std::uint32_t const uid = static_cast<std::uint32_t>(req.value("uid").toDouble());
+
+      World* world = _view->getWorld();
+      if (!world->getObjectInstance(uid))
+        return make_error(QString("delete_model: no object with uid %1").arg(uid));
+
+      _view->makeCurrent();
+      OpenGL::context::scoped_setter const _gl(::gl, _view->context());
+      NOGGIT_ACTION_MGR->beginAction(_view, Noggit::ActionFlags::eOBJECTS_REMOVED);
+      try
+      {
+        // World::deleteInstance -> storage.delete_instance already clears the render tile entry
+        // (updateTilesEntry remove) and registers the removal for undo when an action is active.
+        world->deleteInstance(static_cast<int>(uid));
+      }
+      catch (std::exception const& e)
+      {
+        NOGGIT_ACTION_MGR->endAction();
+        return make_error(QString("delete_model: ") + e.what());
+      }
+      NOGGIT_ACTION_MGR->endAction();
+
+      world->wait_for_all_tile_updates();
+      _view->requestRedraw();
+      _view->update();
+      return make_ok();
+    }
+
     QJsonObject McpServer::cmd_focus_camera(QJsonObject const& req)
     {
       glm::vec3 const target(
@@ -466,8 +627,13 @@ namespace Noggit
         , static_cast<float>(req.value("y").toDouble())
         , static_cast<float>(req.value("z").toDouble()));
 
-      // Reuse the tested framing path (loads the tile, places the eye back+up at ~45 deg, aims).
-      _view->focus_camera_on_target(target);
+      // Default to a HIGH, steep overview so builds are framed from above, not aimed into the dirt.
+      // distance = eye-to-target range; pitch = look-down angle (bigger => higher eye). Scale distance
+      // up for larger scenes.
+      float const distance = static_cast<float>(req.value("distance").toDouble(130.0));
+      float const pitch    = static_cast<float>(req.value("pitch").toDouble(55.0));
+
+      _view->focus_camera_on_target(target, distance, pitch);
       _view->requestRedraw();
       _view->update();
       return make_ok();

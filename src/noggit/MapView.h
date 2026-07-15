@@ -453,7 +453,7 @@ private:
   void move_camera_with_auto_height (glm::vec3 const&);
   // Frame a spawn: place the camera back-and-up at ~45 degrees and aim it AT the target (used when
   // picking a creature/gameobject from the browser list), instead of dropping straight overhead.
-  void focus_camera_on_target (glm::vec3 const&);
+  void focus_camera_on_target (glm::vec3 const&, float dist = 28.0f, float pitch_deg = 45.0f);
 
   void setToolPropertyWidgetVisibility(editing_mode mode);
 
