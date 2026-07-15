@@ -6,6 +6,11 @@
 #include <noggit/SceneObject.hpp>
 #include <noggit/ModelInstance.h>
 #include <noggit/Model.h>
+#include <noggit/WMOInstance.h>
+#include <noggit/WMO.h>
+#include <noggit/Brush.h>
+#include <noggit/TextureManager.h>
+#include <noggit/ContextObject.hpp>
 #include <math/trig.hpp>
 #include <noggit/ActionManager.hpp>
 #include <noggit/Action.hpp>
@@ -148,6 +153,10 @@ namespace Noggit
       if (cmd == "ping")          return cmd_ping(req);
       if (cmd == "run_lua")       return cmd_run_lua(req);
       if (cmd == "place_model")   return cmd_place_model(req);
+      if (cmd == "place_wmo")     return cmd_place_wmo(req);
+      if (cmd == "change_terrain")return cmd_change_terrain(req);
+      if (cmd == "paint_texture") return cmd_paint_texture(req);
+      if (cmd == "add_water")     return cmd_add_water(req);
       if (cmd == "focus_camera")  return cmd_focus_camera(req);
       if (cmd == "query_objects") return cmd_query_objects(req);
       if (cmd == "height_at")     return cmd_height_at(req);
@@ -197,10 +206,9 @@ namespace Noggit
         | Noggit::ActionFlags::eCHUNKS_FLAGS;
 
       // Make this MapView's GL context current so gl.* calls in the script (terrain/texture brushes)
-      // execute. KNOWN LIMITATION: models placed via add_m2 do NOT render LIVE in the editor -- an
-      // unresolved GL-upload bug (their buffers fail to bind at draw; identical hand-pasted models
-      // render fine, cause not found across 4 fixes + 3 traces). They ARE written to the map correctly
-      // (query_objects sees them) and appear after SAVE + tile reload. Live in-editor render is open.
+      // execute. NOTE: models placed via Lua add_m2 still don't render live (add_m2 omits
+      // waitForChildrenLoaded) -- use the dedicated `place_model` command for live M2 placement, which
+      // mirrors the Ctrl+V paste path. run_lua remains the escape hatch for scripted/bulk terrain ops.
       _view->makeCurrent();
       OpenGL::context::scoped_setter const _gl_setter(::gl, _view->context());
 
@@ -300,6 +308,155 @@ namespace Noggit
       if (inst)
         o["uid"] = static_cast<double>(inst->uid);
       return o;
+    }
+
+    QJsonObject McpServer::cmd_place_wmo(QJsonObject const& req)
+    {
+      std::string const path = req.value("path").toString().toStdString();
+      if (path.empty())
+        return make_error("place_wmo: empty 'path'");
+
+      float const x   = static_cast<float>(req.value("x").toDouble());
+      float const y   = static_cast<float>(req.value("y").toDouble());
+      float const z   = static_cast<float>(req.value("z").toDouble());
+      float const rx  = static_cast<float>(req.value("rx").toDouble(0.0));
+      float const ry  = static_cast<float>(req.value("ry").toDouble(0.0));
+      float const rz  = static_cast<float>(req.value("rz").toDouble(0.0));
+
+      // Mirror ObjectEditor::pasteObject's WMO branch exactly so buildings render live.
+      WMOInstance* inst = nullptr;
+      NOGGIT_ACTION_MGR->beginAction(_view, Noggit::ActionFlags::eOBJECTS_ADDED);
+      try
+      {
+        inst = _view->getWorld()->addWMOAndGetInstance(
+            path, glm::vec3(x, y, z),
+            math::degrees::vec3(glm::vec3(rx, ry, rz)));
+        if (inst)
+        {
+          inst->wmo->wait_until_loaded();
+          inst->wmo->waitForChildrenLoaded();
+          inst->recalcExtents();
+        }
+      }
+      catch (std::exception const& e)
+      {
+        NOGGIT_ACTION_MGR->endAction();
+        return make_error(QString("place_wmo: ") + e.what());
+      }
+      NOGGIT_ACTION_MGR->endAction();
+
+      _view->requestRedraw();
+      _view->update();
+
+      QJsonObject o = make_ok();
+      if (inst)
+        o["uid"] = static_cast<double>(inst->uid);
+      return o;
+    }
+
+    QJsonObject McpServer::cmd_change_terrain(QJsonObject const& req)
+    {
+      float const x       = static_cast<float>(req.value("x").toDouble());
+      float const y       = static_cast<float>(req.value("y").toDouble());
+      float const z       = static_cast<float>(req.value("z").toDouble());
+      float const change  = static_cast<float>(req.value("change").toDouble(20.0));   // + raises, - lowers
+      float const radius  = static_cast<float>(req.value("radius").toDouble(40.0));
+      float const inner   = static_cast<float>(req.value("inner_radius").toDouble(0.0));
+      int   const brush   = req.value("brush_type").toInt(2);   // eTerrainType: 2=Smooth, 6=Gaussian
+
+      // Terrain edits are synchronous vertex changes on the GUI thread (registerChunkUpdate ->
+      // re-upload in the next paintGL), so they render live with just context + action + redraw.
+      _view->makeCurrent();
+      OpenGL::context::scoped_setter const _gl(::gl, _view->context());
+      NOGGIT_ACTION_MGR->beginAction(_view, Noggit::ActionFlags::eCHUNKS_TERRAIN);
+      try
+      {
+        _view->getWorld()->changeTerrain(glm::vec3(x, y, z), change, radius, brush, inner);
+      }
+      catch (std::exception const& e)
+      {
+        NOGGIT_ACTION_MGR->endAction();
+        return make_error(QString("change_terrain: ") + e.what());
+      }
+      NOGGIT_ACTION_MGR->endAction();
+
+      _view->getWorld()->wait_for_all_tile_updates();
+      _view->requestRedraw();
+      _view->update();
+      return make_ok();
+    }
+
+    QJsonObject McpServer::cmd_paint_texture(QJsonObject const& req)
+    {
+      std::string const texture = req.value("texture").toString().toStdString();
+      if (texture.empty())
+        return make_error("paint_texture: empty 'texture'");
+
+      float const x        = static_cast<float>(req.value("x").toDouble());
+      float const y        = static_cast<float>(req.value("y").toDouble());
+      float const z        = static_cast<float>(req.value("z").toDouble());
+      float const strength = static_cast<float>(req.value("strength").toDouble(1.0));   // 0..1 coverage
+      float const pressure = static_cast<float>(req.value("pressure").toDouble(0.9));
+      float const hardness = static_cast<float>(req.value("hardness").toDouble(0.5));
+      float const radius   = static_cast<float>(req.value("radius").toDouble(15.0));
+
+      _view->makeCurrent();
+      OpenGL::context::scoped_setter const _gl(::gl, _view->context());
+      NOGGIT_ACTION_MGR->beginAction(_view, Noggit::ActionFlags::eCHUNKS_TEXTURE);
+      try
+      {
+        Brush brush;
+        brush.setHardness(hardness);
+        brush.setRadius(radius);
+        _view->getWorld()->paintTexture(
+            glm::vec3(x, y, z), &brush, strength, pressure,
+            scoped_blp_texture_reference(texture, Noggit::NoggitRenderContext::MAP_VIEW));
+      }
+      catch (std::exception const& e)
+      {
+        NOGGIT_ACTION_MGR->endAction();
+        return make_error(QString("paint_texture: ") + e.what());
+      }
+      NOGGIT_ACTION_MGR->endAction();
+
+      _view->getWorld()->wait_for_all_tile_updates();
+      _view->requestRedraw();
+      _view->update();
+      return make_ok();
+    }
+
+    QJsonObject McpServer::cmd_add_water(QJsonObject const& req)
+    {
+      float const x      = static_cast<float>(req.value("x").toDouble());
+      float const y      = static_cast<float>(req.value("y").toDouble());
+      float const z      = static_cast<float>(req.value("z").toDouble());
+      float const radius = static_cast<float>(req.value("radius").toDouble(40.0));
+      float const height = static_cast<float>(req.value("height").toDouble(y));  // flat water level
+      int   const liquid = req.value("liquid_id").toInt(2);                      // LiquidType.dbc id
+
+      _view->makeCurrent();
+      OpenGL::context::scoped_setter const _gl(::gl, _view->context());
+      NOGGIT_ACTION_MGR->beginAction(_view, Noggit::ActionFlags::eCHUNKS_WATER);
+      try
+      {
+        // add=true, lock+override_height with origin.y=height => flat water plane at `height`
+        // (same recipe as vert::set_water). override_liquid_id=true forces our chosen type.
+        _view->getWorld()->paintLiquid(
+            glm::vec3(x, y, z), radius, liquid, true,
+            math::radians(0.f), math::radians(0.f), true,
+            glm::vec3(0.f, height, 0.f), true, true, 1.0f);
+      }
+      catch (std::exception const& e)
+      {
+        NOGGIT_ACTION_MGR->endAction();
+        return make_error(QString("add_water: ") + e.what());
+      }
+      NOGGIT_ACTION_MGR->endAction();
+
+      _view->getWorld()->wait_for_all_tile_updates();
+      _view->requestRedraw();
+      _view->update();
+      return make_ok();
     }
 
     QJsonObject McpServer::cmd_focus_camera(QJsonObject const& req)

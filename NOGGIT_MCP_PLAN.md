@@ -1,7 +1,16 @@
 # Noggit MCP — AI-Driven Map Authoring
 
-**Status:** DESIGN ONLY — nothing here is implemented yet. This is the layout/roadmap.
-**Date:** 2026-07-13
+**Status:** LIVE. Phases 0–1 complete; Phase 3 well underway (live terrain/texture/water/models). See §9 for per-phase status.
+**Date:** 2026-07-13 (updated 2026-07-14)
+
+### Current status (2026-07-14)
+- ✅ **Phase 0** — in-process TCP bridge (`src/noggit/mcp/McpServer`), `run_lua` on the GUI thread, turn-level undo, `focus_camera`. Committed.
+- ✅ **Phase 1** — Python MCP sidecar (`noggit_mcp_server.py`) + query tools (`query_objects`, `height_at`, `camera_position`, `list_nearby_models`, `list_nearby_textures`). Committed.
+- 🟢 **BREAKTHROUGH** — MCP placements now render **LIVE** (no save/reload). Root cause was the Lua `add_m2` path omitting `waitForChildrenLoaded`; the dedicated `place_model` command mirrors Ctrl+V paste. This unblocked the whole "watch it live" UX.
+- 🟡 **Phase 3** — typed native edit commands landed & verified live: `place_model`, `place_wmo`, `change_terrain` (raise/lower, all falloffs), `paint_texture`, `add_water`. Still TODO: `blur_terrain`, `flatten_terrain`, `set_hole`, `set_area_id`, `move/rotate/scale/delete_model`, `set_vertex_color`.
+- 🟡 **Phase 2** — grounding works via *in-world discovery* (`list_nearby_models`/`list_nearby_textures` harvest valid FileKeys from the loaded map). No curated manifest or thumbnails yet (PreviewRenderer thumbnails disabled — offscreen-render crash).
+- ⏳ **Near-term queue:** aim `focus_camera` from higher up & pitched down (user feedback); `blur_terrain`/`flatten_terrain` for cliff-free hills and building pads; object-editing tools (move/delete); asset palette manifest so we're not limited to what's already painted/placed.
+- ❌ Not started: Phase 4 (mockup ingestion), Phase 5 (heightmap import), Phase 6 (embedded chat panel; procedural scatter/road/river).
 **Inspiration:** Epic's "State of Unreal 2026" (Unreal Fest Chicago) MCP demo — an MCP server inside the
 editor lets an LLM inspect the scene and drive editor tools from a prompt, grounded on starter assets.
 We are building the WoW / Noggit-red equivalent.
@@ -171,17 +180,20 @@ Epic stressed: point the model at existing, working assets. Build a **per-projec
 
 ## 9. Phase plan (revised for the conversational + undo UX)
 
-- **Phase 0 — RPC listener + `run_lua` + turn-level undo.** One C++ endpoint: run Lua on the GUI thread,
-  bracketed in `beginAction`/`endAction`, return stdout/errors. Refresh viewport + `focus_camera`.
-  Vertical slice: chat "place 5 trees here" → trees appear live → `save()` → Ctrl+Z removes them.
-- **Phase 1 — Python MCP sidecar** wrapping Phase 0, driven from Claude Desktop; add core **query tools**
-  (`getObjectsInRange`, `get_ground_height`, `getAreaID`, `get_selection`) so the AI can see between turns.
-- **Phase 2 — Asset catalog + thumbnails + per-project palette** ("use only these assets").
-- **Phase 3 — Full terrain/texture/water/hole/area tools** exposed and tested conversationally.
-- **Phase 4 — Mockup ingestion**: vision → spatial plan → pixel→world coordinate mapping.
-- **Phase 5 — Heightmap import mode** on `importADTHeightmap`, AI decorates on top.
-- **Phase 6 (optional)** — typed native tools for hot paths (undo-clean); higher-level procedural
-  primitives (scatter / road / river) = Noggit's "PCG" analog; embedded in-Noggit chat panel.
+- ✅ **Phase 0 — RPC listener + `run_lua` + turn-level undo.** DONE. In-process TCP bridge, Lua on the
+  GUI thread bracketed in `beginAction`/`endAction`, return channel, viewport refresh + `focus_camera`.
+- ✅ **Phase 1 — Python MCP sidecar** wrapping Phase 0. DONE. Query tools live: `query_objects`,
+  `height_at`, `camera_position`, `list_nearby_models`, `list_nearby_textures`.
+- 🟡 **Phase 2 — Asset catalog + thumbnails + per-project palette.** PARTIAL. In-world discovery works;
+  no curated manifest/thumbnails yet (PreviewRenderer offscreen render crashes → thumbnails disabled).
+- 🟡 **Phase 3 — Full terrain/texture/water/hole/area tools.** IN PROGRESS. Live & verified:
+  `place_model`, `place_wmo`, `change_terrain`, `paint_texture`, `add_water`. TODO: blur/flatten,
+  hole, area-id, move/rotate/scale/delete model, vertex color.
+- ❌ **Phase 4 — Mockup ingestion**: vision → spatial plan → pixel→world coordinate mapping.
+- ❌ **Phase 5 — Heightmap import mode** on `importADTHeightmap`, AI decorates on top.
+- 🟡 **Phase 6 (optional)** — typed native tools for hot paths (undo-clean): STARTED EARLY — the Phase 3
+  commands are already native/typed, not Lua. Remaining: procedural primitives (scatter/road/river),
+  embedded in-Noggit chat panel.
 
 ---
 

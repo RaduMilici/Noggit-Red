@@ -114,6 +114,26 @@ def query_objects(x: float, y: float, z: float, radius: float = 50.0) -> dict:
 
 
 @mcp.tool()
+def list_nearby_textures(radius: float = 80.0) -> dict:
+    """List the distinct terrain texture (.blp) paths already painted on chunks near the camera. This is
+    how you discover VALID texture paths to paint with (e.g. grass/dirt/rock). Returns {"paths":[...]}."""
+    lua = (
+        "local p=camera_pos() local seen={} local out={} local R=%f local s=32.0 "
+        "local dx=-R while dx<=R do local dz=-R while dz<=R do "
+        "local c=get_chunk(vec(p.x+dx,p.y,p.z+dz)) "
+        "if c then local n=c:get_texture_count() for i=0,n-1 do "
+        "local ok,f=pcall(function() return c:get_texture(i) end) "
+        "if ok and f and not seen[f] then seen[f]=true out[#out+1]=f end end end "
+        "dz=dz+s end dx=dx+s end return table.concat(out,'\\n')"
+    ) % radius
+    r = _send({"cmd": "run_lua", "code": lua})
+    if r.get("ok"):
+        paths = [p for p in (r.get("result") or "").split("\n") if p]
+        return {"ok": True, "count": len(paths), "paths": paths}
+    return r
+
+
+@mcp.tool()
 def height_at(x: float, z: float) -> dict:
     """Ground height at a world XZ -> {"ok":true,"height":..}. Use it to sit models on the terrain."""
     return _send({"cmd": "height_at", "x": x, "z": z})
@@ -129,6 +149,48 @@ def place_model(path: str, x: float, y: float, z: float,
     Tip: set y to height_at(x,z).height so it sits on the ground. rotation_degrees spins it about Y."""
     return _send({"cmd": "place_model", "path": path, "x": x, "y": y, "z": z,
                   "scale": scale, "rotation": rotation_degrees})
+
+
+@mcp.tool()
+def place_wmo(path: str, x: float, y: float, z: float,
+              rx: float = 0.0, ry: float = 0.0, rz: float = 0.0) -> dict:
+    """Place a WMO (building/structure -- houses, towers, ruins) at a world coordinate. Renders LIVE.
+    ry rotates about the vertical axis (degrees). Returns the new object's uid."""
+    return _send({"cmd": "place_wmo", "path": path, "x": x, "y": y, "z": z,
+                  "rx": rx, "ry": ry, "rz": rz})
+
+
+@mcp.tool()
+def change_terrain(x: float, y: float, z: float, amount: float,
+                   radius: float = 40.0, brush_type: int = 2,
+                   inner_radius: float = 0.0) -> dict:
+    """Raise (amount>0) or lower (amount<0) the terrain around a world point, live. `radius` is the
+    footprint; `amount` is roughly how many units the center moves. brush_type falloff: 0=Flat, 1=Linear,
+    2=Smooth (default, gentle hills), 6=Gaussian (rounded peaks/mountains). y is ignored (2D footprint).
+    Build hills/mountains by stacking several overlapping calls; use negative amount to carve valleys/lakebeds."""
+    return _send({"cmd": "change_terrain", "x": x, "y": y, "z": z, "change": amount,
+                  "radius": radius, "brush_type": brush_type, "inner_radius": inner_radius})
+
+
+@mcp.tool()
+def paint_texture(x: float, y: float, z: float, texture: str,
+                  strength: float = 1.0, radius: float = 15.0,
+                  hardness: float = 0.5, pressure: float = 0.9) -> dict:
+    """Paint a terrain texture (.blp path from list_nearby_textures) onto the ground around a point, live.
+    strength 0..1 is coverage/opacity, radius the brush size, hardness 0..1 the edge falloff. Layer
+    textures by painting grass as a base then dirt/rock on slopes and paths with smaller radius."""
+    return _send({"cmd": "paint_texture", "x": x, "y": y, "z": z, "texture": texture,
+                  "strength": strength, "radius": radius, "hardness": hardness, "pressure": pressure})
+
+
+@mcp.tool()
+def add_water(x: float, y: float, z: float, height: float,
+              radius: float = 40.0, liquid_id: int = 2) -> dict:
+    """Add a flat body of water around a world point, live. `height` is the water surface level (world y);
+    set it just below the surrounding terrain rim so it reads as a lake/pond. `radius` is the extent.
+    liquid_id is a LiquidType.dbc id (2 = ocean/still water by default)."""
+    return _send({"cmd": "add_water", "x": x, "y": y, "z": z,
+                  "height": height, "radius": radius, "liquid_id": liquid_id})
 
 
 @mcp.tool()
