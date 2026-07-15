@@ -4,6 +4,9 @@
 #include <noggit/MapView.h>
 #include <noggit/World.h>
 #include <noggit/SceneObject.hpp>
+#include <noggit/ModelInstance.h>
+#include <noggit/Model.h>
+#include <math/trig.hpp>
 #include <noggit/ActionManager.hpp>
 #include <noggit/Action.hpp>
 #include <noggit/scripting/scripting_tool.hpp>
@@ -144,6 +147,7 @@ namespace Noggit
 
       if (cmd == "ping")          return cmd_ping(req);
       if (cmd == "run_lua")       return cmd_run_lua(req);
+      if (cmd == "place_model")   return cmd_place_model(req);
       if (cmd == "focus_camera")  return cmd_focus_camera(req);
       if (cmd == "query_objects") return cmd_query_objects(req);
       if (cmd == "height_at")     return cmd_height_at(req);
@@ -249,6 +253,52 @@ namespace Noggit
       QJsonObject o = make_ok();
       if (!result_str.isEmpty())
         o["result"] = result_str;
+      return o;
+    }
+
+    QJsonObject McpServer::cmd_place_model(QJsonObject const& req)
+    {
+      std::string const path = req.value("path").toString().toStdString();
+      if (path.empty())
+        return make_error("place_model: empty 'path'");
+
+      float const x     = static_cast<float>(req.value("x").toDouble());
+      float const y     = static_cast<float>(req.value("y").toDouble());
+      float const z     = static_cast<float>(req.value("z").toDouble());
+      float const scale = static_cast<float>(req.value("scale").toDouble(1.0));
+      float const roty  = static_cast<float>(req.value("rotation").toDouble(0.0));
+
+      // Mirror the interactive Ctrl+V paste (ObjectEditor::pasteObject) EXACTLY -- the path that renders
+      // LIVE. Crucially NO makeCurrent and NO wait_for_all_tile_updates (paste does neither; the frame
+      // timer draws it), plus the full readiness sequence INCLUDING waitForChildrenLoaded, which the Lua
+      // add_m2 omitted -- the one difference that left add_m2 models unbindable at draw until a reload.
+      ModelInstance* inst = nullptr;
+      NOGGIT_ACTION_MGR->beginAction(_view, Noggit::ActionFlags::eOBJECTS_ADDED);
+      try
+      {
+        inst = _view->getWorld()->addM2AndGetInstance(
+            path, glm::vec3(x, y, z), scale,
+            math::degrees::vec3(glm::vec3(0.f, roty, 0.f)), nullptr, false);
+        if (inst)
+        {
+          inst->model->wait_until_loaded();
+          inst->model->waitForChildrenLoaded();
+          inst->recalcExtents();
+        }
+      }
+      catch (std::exception const& e)
+      {
+        NOGGIT_ACTION_MGR->endAction();
+        return make_error(QString("place_model: ") + e.what());
+      }
+      NOGGIT_ACTION_MGR->endAction();
+
+      _view->requestRedraw();
+      _view->update();
+
+      QJsonObject o = make_ok();
+      if (inst)
+        o["uid"] = static_cast<double>(inst->uid);
       return o;
     }
 

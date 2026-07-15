@@ -124,11 +124,11 @@ def height_at(x: float, z: float) -> dict:
 @mcp.tool()
 def place_model(path: str, x: float, y: float, z: float,
                 scale: float = 1.0, rotation_degrees: float = 0.0) -> dict:
-    """Place one M2 doodad (path from list_nearby_models) at a world coordinate. One undo step.
+    """Place one M2 doodad (path from list_nearby_models) at a world coordinate. One undo step, and it
+    renders LIVE (this uses the same code path as Noggit's Ctrl+V paste). Returns the new object's uid.
     Tip: set y to height_at(x,z).height so it sits on the ground. rotation_degrees spins it about Y."""
-    lua = (f"add_m2('{_lua_str(path)}', vec({x},{y},{z}), {scale}, vec(0,{rotation_degrees},0)) "
-           f"return 'placed'")
-    return _send({"cmd": "run_lua", "code": lua})
+    return _send({"cmd": "place_model", "path": path, "x": x, "y": y, "z": z,
+                  "scale": scale, "rotation": rotation_degrees})
 
 
 @mcp.tool()

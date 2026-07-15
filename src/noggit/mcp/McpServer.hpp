@@ -45,6 +45,7 @@ namespace Noggit
 
       QJsonObject cmd_ping         (QJsonObject const& req);
       QJsonObject cmd_run_lua      (QJsonObject const& req);
+      QJsonObject cmd_place_model  (QJsonObject const& req);
       QJsonObject cmd_focus_camera (QJsonObject const& req);
       QJsonObject cmd_query_objects(QJsonObject const& req);
       QJsonObject cmd_height_at    (QJsonObject const& req);
