@@ -51,6 +51,13 @@ uniform mat4 tex_matrix_2;
 uniform bool anim_bones;
 uniform int bone_matrix_count;
 
+// Per-instance bone slices (perf 2026-07-20). 0 = one shared bone set for the whole draw (default: the
+// single-instance path and the normal shared-pose instanced path). >0 = each instance owns its own
+// bone_matrix_count matrices laid out contiguously in bone_matrices, so gl_InstanceID k reads its slice
+// at k*per_instance_bone_stride. Lets billboard doodads (per-instance CPU-baked bones) draw INSTANCED
+// (one drawElementsInstanced per model) instead of one draw per doodad.
+uniform int per_instance_bone_stride;
+
 // code from https://wowdev.wiki/M2/.skin#Environment_mapping
 vec2 sphere_map(vec3 vert, vec3 norm)
 {
@@ -89,7 +96,10 @@ mat4 get_bone_matrix(uint bone_index)
   }
 
   mat4 matrix;
-  int pixel_start = int(bone_index) * 4;
+  // gl_InstanceID is 0 for non-instanced draws; per_instance_bone_stride is 0 for every shared-bone path;
+  // so this offset is a no-op everywhere except the instanced billboard-doodad path.
+  int bone_slot = int(bone_index) + per_instance_bone_stride * gl_InstanceID;
+  int pixel_start = bone_slot * 4;
   matrix[0] = texelFetch(bone_matrices, pixel_start).rgba;
   matrix[1] = texelFetch(bone_matrices, pixel_start + 1).rgba;
   matrix[2] = texelFetch(bone_matrices, pixel_start + 2).rgba;
