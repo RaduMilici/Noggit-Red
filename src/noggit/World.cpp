@@ -5038,11 +5038,25 @@ bool World::camera_is_inside_wmo(glm::vec3 const& pos)
       return; // not even in the loose outer AABB
     }
 
-    // The outer AABB is loose (covers nearby terrain for big city WMOs). Only "inside" if pos falls in
-    // one of the group AABBs -- the same test the ZoneMusic resolver uses to pick the building you stand in.
-    for (auto const& group_extents : wmo_instance.getGroupExtents())
+    // The outer AABB is loose (covers nearby terrain / airspace for big city WMOs). Only "inside" if pos
+    // falls in a GENUINE INTERIOR group's AABB -- indoor and NOT exterior/exterior_lit (the same rule as
+    // collect_interior_volumes, client proxy 0x695960). Exterior building SHELLS (Stormwind's keep/houses)
+    // have loose axis-aligned AABBs that swallow the airspace beside and above them; counting those made
+    // flying near a big city WMO read as "inside", which flipped its sun-lit exterior faces to the dark
+    // interior lighting formula -- the reported all-black WMO-shading regression. Real interior halls
+    // (Ironforge) still count, so the interior-lighting + WMO fog[0] fixes that key off this stay correct.
+    for (auto const& [group_index, group_bounds] : wmo_instance.getGroupExtents())
     {
-      if (contains(group_extents.second, pos))
+      if (group_index < 0 || group_index >= static_cast<int>(wmo_instance.wmo->groups.size()))
+      {
+        continue;
+      }
+      auto const& group = wmo_instance.wmo->groups[group_index];
+      if (!group.is_indoor() || group.is_exterior_lit() || group.is_exterior())
+      {
+        continue; // exterior building shell / exterior-lit group -- its airspace is not "inside"
+      }
+      if (contains(group_bounds, pos))
       {
         inside = true;
         return;

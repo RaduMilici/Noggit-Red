@@ -12,6 +12,7 @@
 #include <QtGui/QOpenGLExtraFunctions>
 #include <util/CurrentFunction.hpp>
 #include <memory>
+#include <cstdlib>
 
 
 namespace
@@ -79,6 +80,18 @@ namespace
     ~verify_context_and_check_for_gl_errors()
     {
       if (inside_gl_begin_end)
+      {
+        return;
+      }
+
+      // PERF A/B MEASUREMENT (2026-07-19): the per-GL-call glGetError() below is a driver round-trip that
+      // can serialize the CPU against the GL driver on EVERY call (thousands/frame) -- the prime suspect for
+      // "CPU+GPU both idle / low fps". Set NOGGIT_GL_NO_ERROR_CHECK=1 to skip it and measure the fps delta.
+      // If the app then CRASHES, the per-call sync was masking a real use-after-free that must be fixed
+      // BEFORE this can be turned off for real (see memory noggit-perf-and-glcheck-crash). This env var is
+      // the measurement lever, NOT the ship fix.
+      static bool const s_no_gl_error_check = std::getenv("NOGGIT_GL_NO_ERROR_CHECK") != nullptr;
+      if (s_no_gl_error_check)
       {
         return;
       }

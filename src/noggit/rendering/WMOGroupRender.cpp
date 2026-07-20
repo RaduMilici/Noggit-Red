@@ -553,13 +553,6 @@ void WMOGroupRender::initRenderBatches()
 
   _render_batches.resize(_wmo_group->_batches.size());
 
-  int interior_batches_start = 0;
-  if (_wmo_group->header.transparency_batches_count > 0)
-  {
-    interior_batches_start =
-      _wmo_group->_batches[_wmo_group->header.transparency_batches_count - 1].vertex_end + 1;
-  }
-
   std::size_t batch_counter = 0;
   for (auto& batch : _wmo_group->_batches)
   {
@@ -570,25 +563,38 @@ void WMOGroupRender::initRenderBatches()
 
     std::uint32_t flags = 0;
 
-    bool const group_exterior_lit =
-      _wmo_group->header.flags.exterior_lit || _wmo_group->header.flags.exterior;
-    bool const has_mocv =
+    // Real per-vertex LIGHTING is MOCV #1 (flag 0x4, has_vertex_color). The mocv2 flag (0x1000000,
+    // use_mocv2_for_texture_blending) is a SECOND vertex-colour chunk whose RGB is 0 and whose ALPHA is
+    // ONLY the two-layer texture-blend factor -- it is NOT lighting. Conflating them made modern WMOs that
+    // carry ONLY a texture-blend mocv (e.g. Ascension's exterior city buildings: exterior 0x8 + mocv2
+    // 0x1000000, NO 0x4) read HasMOCV=true with a black (0,0,0) vertex colour. Gate lighting on 0x4 only;
+    // the blend alpha rides eWMOBatch_HasMOCVBlend so the two-layer blend still works without a lighting MOCV.
+    bool const has_lighting_mocv = _wmo_group->header.flags.has_vertex_color;
+    bool const has_blend_mocv =
       _wmo_group->header.flags.has_vertex_color || _wmo_group->header.flags.use_mocv2_for_texture_blending;
 
-    bool const batch_is_exterior = static_cast<int>(batch.vertex_start) < interior_batches_start;
-
-    // Route ExteriorLit PER BATCH within an exterior-lit group. NOTE: the genuine exterior batches (the
-    // opening-facing reveal/jamb faces) are deliberately NOT sun-lit here -- they face down/sideways with
-    // no direct sun (nDotL=0), so the exterior branch would render them near-black. They are interior
-    // batches lit by their baked warm MOCV instead (Goldshire doorway reveal is authored 255,168,85, which
-    // the un-halved fixup now renders bright). Only fully-exterior no-MOCV groups get the whole-group flag.
-    if (group_exterior_lit && (!has_mocv || batch_is_exterior))
+    // CANON, decompiled (wow.exe FUN_00695960 batch-build + FUN_006a4cc0/FUN_006a4dc0 interior samplers;
+    // RE_notes 17 + LIGHT_FOG_SELECTION_RE.md §9): the interior-vs-exterior lighting choice is PER MOGP
+    // GROUP by `flags & 0x48` (0x8 EXTERIOR | 0x40 EXTERIOR_LIT). A group WITHOUT 0x48 is INTERIOR (baked
+    // MOCV); a group WITH it is EXTERIOR (outdoor sun; MOCV is not the base). That single flag is the ENTIRE
+    // client decision -- there is NO per-batch split, NO transparency-count test, NO MOCV-luma test, and NO
+    // camera inside/outside test anywhere in the client's WMO lighting. noggit's old heuristics
+    // (batch_is_exterior, has_transparency_batches, mocv_peak_luma, the camera_inside_wmo gate) were all
+    // non-canon and each mislit some WMO (Ironforge tunnels lit-from-outside, Stormwind buildings black,
+    // tunnels over-lit, harbor warehouses black). Running the INTERIOR formula on an EXTERIOR group is
+    // exactly what blacked out the harbor warehouses / gundrak_entrance -- the client routes 0x48 groups to
+    // the outdoor sun, so a near-black-MOCV shell is sun-lit, never black. One flag ends the whack-a-mole.
+    if (_wmo_group->header.flags.exterior || _wmo_group->header.flags.exterior_lit)
     {
       flags |= WMORenderBatchFlags::eWMOBatch_ExteriorLit;
     }
-    if (has_mocv)
+    if (has_lighting_mocv)
     {
       flags |= WMORenderBatchFlags::eWMOBatch_HasMOCV;
+    }
+    if (has_blend_mocv)
+    {
+      flags |= WMORenderBatchFlags::eWMOBatch_HasMOCVBlend;
     }
     if (_wmo_group->_has_portal_openness)
     {

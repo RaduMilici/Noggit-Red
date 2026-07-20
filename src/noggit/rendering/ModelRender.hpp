@@ -68,6 +68,10 @@ namespace Noggit::Rendering
     ModelRenderPass(ModelTexUnit const& tex_unit, Model* m);
 
     float ordering_thingy = 0.f;
+    // Model-space submesh sort-centre (classic: geoset.center; wotlk: SkinSection CenterPosition -- both
+    // land in BoundingBox[0], the point the client keys its transparency distance-sort on). Consumed by the
+    // per-frame per-instance back-to-front transparency sort in ModelRender::draw (single-instance overload).
+    glm::vec3 sort_center = glm::vec3(0.f);
     uint16_t index_start = 0, index_count = 0, vertex_start = 0, vertex_end = 0;
     uint16_t geoset_id = 0;
     uint16_t blend_mode = 0;

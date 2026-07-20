@@ -37,7 +37,11 @@ namespace Noggit::Rendering
     // Textures live in shared array textures, so the clamp is emulated in the fragment shader.
     eWMOBatch_ClampS = 0x80,
     eWMOBatch_ClampT = 0x100,
-    eWMOBatch_Window = 0x200 // F_WINDOW: lit by the day-night WINDOW pair (client @006b5190, note 28)
+    eWMOBatch_Window = 0x200, // F_WINDOW: lit by the day-night WINDOW pair (client @006b5190, note 28)
+    // The batch carries a two-layer texture-blend ALPHA in its vertex colour (either a real lighting MOCV's
+    // alpha, or a dedicated texture-blend mocv2 whose RGB is 0). Distinct from HasMOCV, which means the
+    // vertex colour is real per-vertex LIGHTING. A modern WMO can have the blend without the lighting.
+    eWMOBatch_HasMOCVBlend = 0x400
   };
 
   // One member batch of a combined draw call: its (contiguous) index span and its local-space AABB,

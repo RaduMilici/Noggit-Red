@@ -109,6 +109,9 @@ public:
   static void register_raw_texture(std::string const& filename, Noggit::NoggitRenderContext context, int width, int height, std::vector<uint32_t> data);
   static TexArrayParams& get_tex_array(int width, int height, int mip_level, Noggit::NoggitRenderContext context);
   static TexArrayParams& get_tex_array(GLint compression, int width, int height, int mip_level, std::map<int, std::vector<uint8_t>>& comp_data, Noggit::NoggitRenderContext context);
+  // Live-apply the render/anisotropic_filtering setting to every already-uploaded array (models,
+  // particles, tilesets). Needs a current GL context; called from WorldRender::draw on a change.
+  static void reapply_anisotropy();
 
 private:
   friend struct scoped_blp_texture_reference;

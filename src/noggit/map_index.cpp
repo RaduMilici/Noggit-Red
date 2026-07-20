@@ -43,7 +43,7 @@ MapIndex::MapIndex (const std::string &pBasename, int map_id, World* world,
 {
 
   QSettings settings;
-  _unload_interval = settings.value("unload_interval", 5).toInt();
+  _unload_interval = settings.value("unload_interval", 3).toInt();
   _unload_dist = settings.value("unload_dist", 5).toInt();
 
   if (create_empty)

@@ -772,6 +772,64 @@ void Model::calcClassicStaticBones(glm::mat4x4 const& model_view)
     return;
   }
 
+  // One-time: derive each billboard glow/flame CARD's local texture basis (normal/up/right) from its
+  // geometry + UVs -- the same derivation the animated path (calcBones) does. Static classic doodads
+  // (Karazhan chandeliers, sconces, candelabras) carry their candle FLAME as a mesh card on a spherical
+  // (0x8) or cylindrical-lock (0x10/0x20/0x40) billboard bone; without a basis they'd render flat/sideways.
+  if (!_static_bb_bases_computed)
+  {
+    _static_bb_bases_computed = true;
+    for (std::size_t bi = 0; bi < _classic_static_bones.size(); ++bi)
+    {
+      auto& sb = _classic_static_bones[bi];
+      if (!(sb.flags & (0x8u | 0x10u | 0x20u | 0x40u))) continue;
+
+      ModelVertex const* v0 = nullptr; ModelVertex const* v1 = nullptr; ModelVertex const* v2 = nullptr;
+      for (auto const& v : _vertices)
+      {
+        if (v.bones[0] != static_cast<uint8_t>(bi)) continue;
+        if (!v0) { v0 = &v; continue; }
+        if (!v1 && (v.texcoords[0] != v0->texcoords[0])) { v1 = &v; continue; }
+        if (v1 && !v2)
+        {
+          glm::vec2 const d1 = v1->texcoords[0] - v0->texcoords[0];
+          glm::vec2 const d2 = v.texcoords[0] - v0->texcoords[0];
+          if (std::abs(d1.x * d2.y - d2.x * d1.y) > 1e-8f) { v2 = &v; break; }
+        }
+      }
+      if (!v0 || !v1 || !v2) continue;
+
+      // _vertices are already fixCoordSystem'd once at load -- do NOT re-apply here (see the calcBones note):
+      // a double fixCoordSystem tips the derived basis ~90deg and rendered directional flame cards sideways.
+      glm::vec3 const p0 = v0->position;
+      glm::vec3 const e1 = v1->position - p0;
+      glm::vec3 const e2 = v2->position - p0;
+      glm::vec2 const duv1 = v1->texcoords[0] - v0->texcoords[0];
+      glm::vec2 const duv2 = v2->texcoords[0] - v0->texcoords[0];
+      float const det = duv1.x * duv2.y - duv2.x * duv1.y;
+      if (std::abs(det) < 1e-8f) continue;
+      float const r = 1.0f / det;
+      glm::vec3 const tangent   = (e1 * duv2.y - e2 * duv1.y) * r;
+      glm::vec3 const bitangent = (e2 * duv1.x - e1 * duv2.x) * r;
+      glm::vec3 normal = glm::cross(e1, e2);
+      if (glm::length(normal) < 1e-8f || glm::length(bitangent) < 1e-8f) continue;
+      normal = glm::normalize(normal);
+      glm::vec3 up = -bitangent;                       // texture V grows downward -> screen-up = -V
+      up = up - normal * glm::dot(up, normal);
+      if (glm::length(up) < 1e-8f) continue;
+      up = glm::normalize(up);
+      glm::vec3 right = glm::normalize(glm::cross(up, normal));
+      if (glm::dot(right, tangent) < 0.0f) right = -right;
+
+      sb.bb_local_normal = normal; sb.bb_local_up = up; sb.bb_local_right = right; sb.basis_ok = true;
+    }
+  }
+
+  // Camera basis expressed in this doodad's MODEL space = the ROWS of the (full model->view) 3x3.
+  glm::vec3 const camRight = glm::normalize(glm::vec3(model_view[0][0], model_view[1][0], model_view[2][0]));
+  glm::vec3 const camUp    = glm::normalize(glm::vec3(model_view[0][1], model_view[1][1], model_view[2][1]));
+  glm::vec3 const camFwd   = glm::normalize(glm::vec3(model_view[0][2], model_view[1][2], model_view[2][2]));
+
   for (std::size_t i = 0; i < _classic_static_bones.size(); ++i)
   {
     auto const& bone = _classic_static_bones[i];
@@ -780,6 +838,50 @@ void Model::calcClassicStaticBones(glm::mat4x4 const& model_view)
     if (bone.parent >= 0 && static_cast<std::size_t>(bone.parent) < i)
     {
       matrix = bone_matrices[static_cast<std::size_t>(bone.parent)] * matrix;
+    }
+
+    // Billboard the flame/glow CARD so it faces the camera instead of rendering in its flat bind pose
+    // (Karazhan chandelier candle flames = CANDLEFLAMEORANGE cards on billboard bones, were sideways). Same
+    // card-basis math as Bone::calcMatrix's billboard branch, applied to the static hierarchy matrix.
+    bool const spherical = (bone.flags & 0x8u) != 0;
+    bool const cylindrical = (bone.flags & (0x10u | 0x20u | 0x40u)) != 0;
+    if (bone.basis_ok && (spherical || cylindrical))
+    {
+      glm::mat3 const local(bone.bb_local_normal, bone.bb_local_right, bone.bb_local_up);
+      glm::mat3 bb3(1.0f);
+      bool apply = true;
+      if (spherical)
+      {
+        // Per-card upright fix (see Bone::calcMatrix's billboard branch): keep the derived up if it points
+        // world-up, else re-fixCoordSystem the basis to swing a texture-rotated (horizontal) up vertical.
+        bool const refix = std::abs(bone.bb_local_up.y) < std::abs(bone.bb_local_right.y);
+        glm::mat3 const local_sph(refix ? fixCoordSystem(bone.bb_local_normal) : bone.bb_local_normal,
+                                  refix ? fixCoordSystem(bone.bb_local_right)  : bone.bb_local_right,
+                                  refix ? fixCoordSystem(bone.bb_local_up)     : bone.bb_local_up);
+        glm::mat3 const cam(camFwd, camRight, camUp);
+        bb3 = cam * glm::transpose(local_sph);
+      }
+      else // cylindrical lock-Z -> render authored REST pose (static), matching in-game
+      {
+        // Chains (LavaPots) + candle threads use lock-Z; in-game they read static, and any billboard swung
+        // the multi-quad mesh to face the camera. User-confirmed rest pose matches in-game. Don't billboard.
+        // (flame cards are SPHERICAL and handled by the branch above, so this doesn't affect them.)
+        apply = false;
+      }
+      if (apply)
+      {
+        glm::vec4 const world_pivot = matrix * glm::vec4(bone.pivot, 1.0f);
+        glm::vec3 const bone_scale(glm::length(glm::vec3(matrix[0])),
+                                   glm::length(glm::vec3(matrix[1])),
+                                   glm::length(glm::vec3(matrix[2])));
+        glm::mat4x4 bb(1.0f);
+        bb[0] = glm::vec4(bb3[0] * bone_scale.x, 0.0f);
+        bb[1] = glm::vec4(bb3[1] * bone_scale.y, 0.0f);
+        bb[2] = glm::vec4(bb3[2] * bone_scale.z, 0.0f);
+        glm::vec4 const rotated_pivot = bb * glm::vec4(bone.pivot, 1.0f);
+        bb[3] = glm::vec4(glm::vec3(world_pivot) - glm::vec3(rotated_pivot), 1.0f);
+        matrix = bb;
+      }
     }
 
     bone_matrices[i] = matrix;
@@ -2198,9 +2300,15 @@ void Model::calcBones(glm::mat4x4 const& model_view
       }
       if (!v0 || !v1 || !v2) continue;
 
-      glm::vec3 const p0 = fixCoordSystem(v0->position);
-      glm::vec3 const p1 = fixCoordSystem(v1->position);
-      glm::vec3 const p2 = fixCoordSystem(v2->position);
+      // _vertices positions are ALREADY fixCoordSystem'd once at load (initCommon:
+      // "v.position = fixCoordSystem(v.position)"). Re-applying it here double-transformed the card basis
+      // (an extra fixCoordSystem rotation), tipping bb_local_up from vertical (0,1,0) to (0,0,-1) -- a ~90deg
+      // roll. That was invisible on symmetric glow halos (Anomalus) but rendered the DIRECTIONAL Karazhan
+      // candle flames sideways. Use the already-fixed positions directly so the basis lives in the same
+      // (single-fixed) model space as the bone matrix `mat` used below in calcMatrix.
+      glm::vec3 const p0 = v0->position;
+      glm::vec3 const p1 = v1->position;
+      glm::vec3 const p2 = v2->position;
       glm::vec3 const e1 = p1 - p0;
       glm::vec3 const e2 = p2 - p0;
       glm::vec2 const duv1 = v1->texcoords[0] - v0->texcoords[0];
@@ -3027,7 +3135,17 @@ void Bone::calcMatrix(glm::mat4x4 const& model_view
     // Map the card's OWN texture basis to the screen: local normal -> view axis, texture-right -> screen
     // right, texture-up -> screen up. bb = Camera * transpose(Local) since the local basis is orthonormal.
     glm::mat3 const cam(camFwd, camRight, camUp);                                   // columns
-    glm::mat3 const local(bb_local_normal, bb_local_right, bb_local_up);            // columns
+    // Both the chandelier flame and Anomalus's energy glow are SPHERICAL billboards, yet they need
+    // OPPOSITE basis conventions -- so any single global choice makes one upright and the other sideways
+    // (the whack-a-mole). Cause: the card "up" is derived from texture-V, but Anomalus's glow authors the
+    // texture rotated 90deg (V horizontal / U vertical) while the chandelier's is upright (V vertical).
+    // Decide per-card from the geometry: if the derived up already points world-up (chandelier) keep it;
+    // if it came out horizontal (Anomalus) re-apply fixCoordSystem, a det-+1 rotation that swings that
+    // horizontal up back to vertical -- i.e. each card gets the exact basis it was confirmed upright with.
+    bool const refix = std::abs(bb_local_up.y) < std::abs(bb_local_right.y);
+    glm::mat3 const local(refix ? fixCoordSystem(bb_local_normal) : bb_local_normal,
+                          refix ? fixCoordSystem(bb_local_right)  : bb_local_right,
+                          refix ? fixCoordSystem(bb_local_up)     : bb_local_up);   // columns
     glm::mat3 const bb3 = cam * glm::transpose(local);
 
     // PRESERVE the animated bone SCALE: `mat` (about to be replaced) carries the hierarchy's scale --
@@ -3050,39 +3168,15 @@ void Bone::calcMatrix(glm::mat4x4 const& model_view
         || flags.cylindrical_billboard_lock_y
         || flags.cylindrical_billboard_lock_z)
   {
-    // Cylindrical billboard: keep the LOCKED axis fixed and rotate the card around it so its normal faces
-    // the camera as much as possible. 1.12 torches/candles/lampposts/sconces are all lock-Z: the flame card
-    // stays UPRIGHT (up axis kept) and only spins horizontally toward the viewer -- so it no longer tips
-    // toward the camera at steep pitch the way a spherical billboard would. The locked axis is the card's
-    // own up (the flame's vertical edge, derived above), transformed by the hierarchy, so a tilted placement
-    // tilts its flame with it. (Only lock-Z exists in the data; X/Y fall through this same up-lock.)
-    glm::vec3 const U = glm::normalize(glm::mat3(mat) * bb_local_up); // locked axis in model space
-    glm::vec4 const world_pivot = mat * glm::vec4(pivot, 1.0f);
-    glm::vec3 const camFwd = glm::normalize(glm::vec3(model_view[0][2], model_view[1][2], model_view[2][2]));
-
-    glm::vec3 N = camFwd - U * glm::dot(camFwd, U); // project camera-forward onto the plane perp to U
-    float const nlen = glm::length(N);
-    if (nlen > 1e-4f) // degenerate when the camera looks straight along the lock axis -> keep the hierarchy pose
-    {
-      N /= nlen;
-      glm::vec3 const R = glm::normalize(glm::cross(U, N));
-      glm::mat3 const target(N, R, U);                                   // columns: normal, right, up
-      glm::mat3 const local(bb_local_normal, bb_local_right, bb_local_up);
-      glm::mat3 const bb3 = target * glm::transpose(local);
-
-      // Preserve the animated bone scale (candle-flame pulse) -- same as the spherical path above.
-      glm::vec3 const bone_scale(glm::length(glm::vec3(mat[0])),
-                                 glm::length(glm::vec3(mat[1])),
-                                 glm::length(glm::vec3(mat[2])));
-
-      glm::mat4x4 bb(1.0f);
-      bb[0] = glm::vec4(bb3[0] * bone_scale.x, 0.0f);
-      bb[1] = glm::vec4(bb3[1] * bone_scale.y, 0.0f);
-      bb[2] = glm::vec4(bb3[2] * bone_scale.z, 0.0f);
-      glm::vec4 const rotated_pivot = bb * glm::vec4(pivot, 1.0f);
-      bb[3] = glm::vec4(glm::vec3(world_pivot) - glm::vec3(rotated_pivot), 1.0f);
-      mat = bb;
-    }
+    // Cylindrical lock-Z geometry in 1.12 is thin VERTICAL structural mesh -- the LavaPots forge CHAINS
+    // (MELTINGPOTCHAIN) and candle threads -- NOT flames (flames are SPHERICAL 0x8, handled above; noggit's
+    // old comment claiming torches/candles are lock-Z was wrong). In-game these read as STATIC: the client's
+    // cylindrical spin around vertical is imperceptible on them, whereas ANY noggit billboard -- the old
+    // flame-card-basis remap OR a clean bone-axis spin -- visibly swung the multi-quad chain to face the
+    // camera (reported: forge chains "rotate and change orientation"). User-confirmed that rendering them in
+    // their authored REST pose matches in-game exactly. So do not billboard cylindrical-lock bones; `mat`
+    // already holds the rest pose here.
+    (void)model_view;
   }
 
   // transform matrix for normal vectors ... ??

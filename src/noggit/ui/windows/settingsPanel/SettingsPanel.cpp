@@ -146,6 +146,33 @@ namespace Noggit
               }
       );
 
+      // Time-of-day globe skin (Appearance tab): which Warcraft-3 race frame the top-centre time globe
+      // wears. Applied live -- the globe re-reads theme/race about once a second.
+      {
+        auto* globeBox = new QGroupBox("Time-of-day globe", ui->tab_6);
+        globeBox->setAlignment(Qt::AlignCenter);
+        auto* gv = new QVBoxLayout(globeBox);
+        auto* row = new QHBoxLayout();
+        row->addStretch(1);
+        row->addWidget(new QLabel("Skin"));
+        auto* race = new QComboBox();
+        race->addItem("Human", "human");
+        race->addItem("Orc", "orc");
+        race->addItem("Night Elf", "nightelf");
+        race->addItem("Undead", "undead");
+        race->setMinimumWidth(200);
+        race->setCurrentIndex(std::max(0, race->findData(_settings->value("theme/race", "nightelf").toString())));
+        connect(race, QOverload<int>::of(&QComboBox::currentIndexChanged), [this, race](int idx)
+        {
+          _settings->setValue("theme/race", race->itemData(idx).toString());
+          _settings->sync();
+        });
+        row->addWidget(race);
+        row->addStretch(1);
+        gv->addLayout(row);
+        ui->verticalLayout_23->addWidget(globeBox);
+      }
+
       connect(ui->_fps_limit_slider, &QSlider::valueChanged, [&](int value)
               {
                   ui->_fps_limit_current_label->setText(
@@ -188,7 +215,7 @@ namespace Noggit
         od_slider->setMinimum(200);
         od_slider->setMaximum(2048);
         int const init_od = static_cast<int>(
-          _settings->value("object_render_distance", _settings->value("view_distance", 2000.f).toFloat()).toFloat());
+          _settings->value("object_render_distance", 925.0f).toFloat());
         od_slider->setValue(std::clamp(init_od, 200, 2048));
         od_label->setText(tr("Object render distance: %1").arg(od_slider->value()));
         _perf_layout->addWidget(od_label);
@@ -210,7 +237,7 @@ namespace Noggit
         fs_slider->setObjectName("_fog_distance_scale_slider");
         fs_slider->setMinimum(10);
         fs_slider->setMaximum(500);
-        int const init_fs = static_cast<int>(_settings->value("fog_distance_scale", 1.0f).toFloat() * 100.f);
+        int const init_fs = static_cast<int>(_settings->value("fog_distance_scale", 2.0f).toFloat() * 100.f);
         fs_slider->setValue(std::clamp(init_fs, 10, 500));
         fs_label->setText(tr("Fog distance scale: %1x").arg(fs_slider->value() / 100.0, 0, 'f', 2));
         _perf_layout->addWidget(fs_label);
@@ -254,7 +281,7 @@ namespace Noggit
         th_slider->setObjectName("_async_thread_count_slider");
         th_slider->setMinimum(1);
         th_slider->setMaximum(16);
-        int const init_th = _settings->value("async_thread_count", 3).toInt();
+        int const init_th = _settings->value("async_thread_count", 8).toInt();
         th_slider->setValue(std::clamp(init_th, 1, 16));
         th_label->setText(tr("Loader threads (restart to apply): %1").arg(th_slider->value()));
         _perf_layout->addWidget(th_label);
@@ -316,7 +343,7 @@ namespace Noggit
         gcd_slider->setObjectName("_ground_clutter_distance_slider");
         gcd_slider->setMinimum(20);
         gcd_slider->setMaximum(500);
-        int const init_gcd = static_cast<int>(_settings->value("render/ground_clutter_distance", 120.0f).toFloat());
+        int const init_gcd = static_cast<int>(_settings->value("render/ground_clutter_distance", 160.0f).toFloat());
         gcd_slider->setValue(std::clamp(init_gcd, 20, 500));
         gcd_label->setText(tr("Ground clutter distance: %1").arg(gcd_slider->value()));
         _perf_layout->addWidget(gcd_label);
@@ -350,7 +377,7 @@ namespace Noggit
       {
         auto* portal_cb = new QCheckBox(tr("WMO portal culling (hide unseen interior rooms)"), this);
         portal_cb->setObjectName("_wmo_portal_culling_checkbox");
-        portal_cb->setChecked(_settings->value("render/wmo_portal_culling", true).toBool());
+        portal_cb->setChecked(_settings->value("render/wmo_portal_culling", false).toBool());
         _perf_layout->addWidget(portal_cb);
         connect(portal_cb, &QCheckBox::toggled, [this](bool checked)
                 {
@@ -365,7 +392,7 @@ namespace Noggit
       {
         auto* horizon_cb = new QCheckBox(tr("Render distant horizon backdrop"), this);
         horizon_cb->setObjectName("_render_horizon_checkbox");
-        horizon_cb->setChecked(_settings->value("render_horizon", true).toBool());
+        horizon_cb->setChecked(_settings->value("render_horizon", false).toBool());
         _perf_layout->addWidget(horizon_cb);
         connect(horizon_cb, &QCheckBox::toggled, [this](bool checked)
                 {
@@ -475,7 +502,7 @@ namespace Noggit
         msaa->addItem("2x", 2);
         msaa->addItem("4x", 4);
         msaa->addItem("8x", 8);
-        int const cur = _settings->value("render/msaa", 0).toInt();
+        int const cur = _settings->value("render/msaa", 8).toInt();
         msaa->setCurrentIndex(std::max(0, msaa->findData(cur)));
         connect(msaa, QOverload<int>::of(&QComboBox::currentIndexChanged), [=](int idx)
         {
@@ -483,6 +510,27 @@ namespace Noggit
           _settings->sync();
         });
         form->addRow(new QLabel("Anti-aliasing (MSAA)"), msaa);
+      }
+
+      // Anisotropic filtering: applies LIVE -- WorldRender::draw re-applies the level to every loaded
+      // texture array (models, particles, tilesets, liquids) when this changes, so no restart. The
+      // 1.12 client ran little/no AF; the modern 16x default over-sharpens oblique/distant textures
+      // ("everything pops / looks crispy"). Lower this to soften toward the client look. Off = 1x.
+      {
+        auto* af = new QComboBox();
+        af->addItem("Off", 1);
+        af->addItem("2x", 2);
+        af->addItem("4x", 4);
+        af->addItem("8x", 8);
+        af->addItem("16x", 16);
+        int const cur = _settings->value("render/anisotropic_filtering", 16).toInt();
+        af->setCurrentIndex(std::max(0, af->findData(cur)));
+        connect(af, QOverload<int>::of(&QComboBox::currentIndexChanged), [=](int idx)
+        {
+          _settings->setValue("render/anisotropic_filtering", af->itemData(idx).toInt());
+          _settings->sync();
+        });
+        form->addRow(new QLabel("Anisotropic filtering"), af);
       }
 
       gLayout->addWidget(toggles);
@@ -517,8 +565,8 @@ namespace Noggit
 
       ui->importPathField->setText(_settings->value("project/import_file", "import.txt").toString());
       ui->wmvLogPathField->setText(_settings->value("project/wmv_log_file").toString());
-      ui->viewDistanceField->setValue(_settings->value("view_distance", 2000.f).toFloat());
-      ui->farZField->setValue(_settings->value("farZ", 2048.f).toFloat());
+      ui->viewDistanceField->setValue(_settings->value("view_distance", 900.f).toFloat());
+      ui->farZField->setValue(_settings->value("farZ", 900.f).toFloat());
       ui->_undock_tool_properties->setChecked(
           _settings->value("undock_tool_properties/enabled", true).toBool());
       ui->_undock_small_texture_palette->setChecked(
@@ -527,7 +575,7 @@ namespace Noggit
       ui->_anti_aliasing_cb->setChecked(_settings->value("anti_aliasing", false).toBool());
       ui->_fullscreen_cb->setChecked(_settings->value("fullscreen", false).toBool());
       ui->_adt_unload_dist->setValue(_settings->value("unload_dist", 5).toInt());
-      ui->_adt_unload_check_interval->setValue(_settings->value("unload_interval", 5).toInt());
+      ui->_adt_unload_check_interval->setValue(_settings->value("unload_interval", 3).toInt());
       ui->_uid_cb->setChecked(_settings->value("uid_startup_check", true).toBool());
       ui->_systemWindowFrame->setChecked(_settings->value("systemWindowFrame", true).toBool());
       ui->_nativeMenubar->setChecked(_settings->value("nativeMenubar", true).toBool());

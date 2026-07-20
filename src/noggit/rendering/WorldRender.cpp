@@ -11,19 +11,23 @@
 #include <external/PNG2BLP/Png2Blp.h>
 #include <noggit/DBC.h>
 #include <noggit/project/CurrentProject.hpp>
+#include <noggit/frame_profiler.hpp>
 
 #include <QDir>
 #include <QBuffer>
 #include <QtCore/QElapsedTimer>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdlib>
 #include <fstream>
 #include <map>
 #include <set>
 #include <sstream>
+#include <thread>
 #include <utility>
+#include <vector>
 
 using namespace Noggit::Rendering;
 
@@ -639,7 +643,7 @@ WorldRender::WorldRender(World* world)
 : BaseRender()
 , _world(world)
 , _liquid_texture_manager(world->_context)
-, _view_distance(world->_settings->value("view_distance", 2000.f).toFloat())
+, _view_distance(world->_settings->value("view_distance", 900.f).toFloat())
 , _cull_distance(0.f)
 , _terrain_cull_distance(0.f)
 {
@@ -689,6 +693,21 @@ void WorldRender::draw (glm::mat4x4 const& model_view
 {
 
   ZoneScoped;
+  noggit::perf::Scoped _prof_world(noggit::perf::Phase::WorldDraw);
+
+  // Anisotropic filtering (Settings -> Anisotropic filtering) applies LIVE. Unlike MSAA (a per-frame
+  // framebuffer realloc), AF is a per-texture parameter set at upload, so a change means re-applying
+  // it to every loaded array. Polling the setting each frame is cheap (Qt caches it); the re-apply
+  // pass only runs on an actual change.
+  {
+    float const af = QSettings().value("render/anisotropic_filtering", 16.0f).toFloat();
+    if (af != _last_anisotropy)
+    {
+      _last_anisotropy = af;
+      TextureManager::reapply_anisotropy();
+      _liquid_texture_manager.reapply_anisotropy();
+    }
+  }
 
   glm::mat4x4 const mvp(projection * model_view);
   math::frustum const frustum (mvp);
@@ -722,6 +741,18 @@ void WorldRender::draw (glm::mat4x4 const& model_view
     updateLightingUniformBlock(draw_fog, camera_pos);
   else
     updateLightingUniformBlockMinimap(minimap_render_settings);
+
+  // Cache "camera inside a WMO" for this frame -- the WMO shader (camera_inside_wmo uniform) uses it to
+  // light exterior-lit / portal-spill faces from the WMO's own interior context instead of the outdoor map
+  // light when viewed from inside. Ironforge's building fronts + gryphon tunnels were getting Dun Morogh
+  // daylight because no Light.dbc row sits inside a city WMO. Guarded like the sibling camera_is_* calls,
+  // which can throw while a tile streams in.
+  _camera_inside_wmo = false;
+  if (!minimap_render)
+  {
+    try { _camera_inside_wmo = _world->camera_is_inside_wmo(camera_pos); }
+    catch (...) { _camera_inside_wmo = false; }
+  }
 
   // Bloom: render the whole 3D scene into an offscreen colour target first, so afterwards we can pull
   // out the bright areas, blur them and add them back (the glow/bleed of bright sky openings, light
@@ -1109,7 +1140,7 @@ void WorldRender::draw (glm::mat4x4 const& model_view
   //   * object_render_distance ("Object render distance" slider) -> objects/WMOs/models only.
   // Fog is deliberately tied to the RENDER distance, not the object distance, so dragging the object
   // slider never moves the fog wall (that coupling was the reported bug).
-  _view_distance = _world->_settings->value("view_distance", 2000.f).toFloat();
+  _view_distance = _world->_settings->value("view_distance", 900.f).toFloat();
   // Fog does NOT drive render distance (user rule: "fog is fog -- it adds the fog band, nothing
   // else"). The old min(fog_end, view_distance) clamp was tolerable while fog ends were inflated by
   // the /20 divisor, but with authored /36 distances (kara: 361yd) it visibly ate doodads/terrain.
@@ -1118,18 +1149,18 @@ void WorldRender::draw (glm::mat4x4 const& model_view
   _terrain_cull_distance = _view_distance;
   // Editor lever: scales the authored fog start/end distances (zone + WMO room fog), default 1.0 =
   // client-authored. Applied in updateLightingUniformBlock and WMORender's per-group fog.
-  _fog_distance_scale = _world->_settings->value("fog_distance_scale", 1.0f).toFloat();
+  _fog_distance_scale = _world->_settings->value("fog_distance_scale", 2.0f).toFloat();
   // Object render distance: its own slider, defaulting to the view distance (so first run / unset =
   // old behaviour). Clamped to the terrain distance -- objects past the terrain/fog horizon would just
   // float in the void, so there's no point drawing them further than the world itself renders.
   float const object_render_distance =
-    _world->_settings->value("object_render_distance", _view_distance).toFloat();
+    _world->_settings->value("object_render_distance", 925.0f).toFloat();
   _cull_distance = std::min(_terrain_cull_distance, object_render_distance);
   _decal_depth_ready = false; // fresh depth snapshot needed this frame (shadows + selection circles)
 
   // Draw verylowres heightmap (distant horizon backdrop). Toggleable live via Settings
   // ("render_horizon", default on) so it can be disabled to stop fog rendering distant mesh.
-  bool const draw_horizon = _world->_settings->value("render_horizon", true).toBool();
+  bool const draw_horizon = _world->_settings->value("render_horizon", false).toBool();
   if (!_world->mapIndex.hasAGlobalWMO() && draw_fog && draw_terrain && draw_horizon)
   {
     ZoneScopedN("World::draw() : Draw horizon");
@@ -1153,6 +1184,7 @@ void WorldRender::draw (glm::mat4x4 const& model_view
     }
 
     ZoneScopedN("World::draw() : Draw terrain");
+    noggit::perf::Scoped _prof_terrain(noggit::perf::Phase::Terrain);
 
     gl.disable(GL_BLEND);
 
@@ -1316,11 +1348,12 @@ void WorldRender::draw (glm::mat4x4 const& model_view
   std::vector<CreatureSpawnInstanceDraw> creature_spawn_instances_to_draw;
   // WMO doodads needing PER-INSTANCE animation (billboarded glow cards, global-seq flicker): drawn
   // individually so each copy animates with its own transform, like the client's per-doodad CM2Models.
-  // Stored BY VALUE (a ModelInstance copy whose scoped model reference keeps the Model alive): holding
-  // pointers into a WMOInstance's doodad storage across frame sections dangles if any WMO streams out /
-  // its doodad set is rebuilt mid-frame -- the by-value transform lists of the instanced bucket never
-  // had that hazard, so neither do we.
-  std::vector<ModelInstance> per_instance_wmo_doodads;
+  // Per-frame list of NON-OWNING pointers into _pi_doodad_cache (a persistent member map). The OWNING
+  // ModelInstance copy lives in that cache -- its scoped model reference keeps the Model alive, so these
+  // pointers can't dangle even if a WMO streams out (the cache is flushed on the WMO-set fingerprint
+  // change before it's repopulated). The expensive by-value copy is thus paid ONCE per placement, not
+  // once per frame (see _pi_doodad_cache + the add_per_instance helper below).
+  std::vector<ModelInstance*> per_instance_wmo_doodads;
   std::vector<WMOInstance*> wmos_to_draw;
 
   // Interior lighting for objects (creatures/gameobjects/doodads): if a spawn stands inside a WMO indoor
@@ -1339,6 +1372,15 @@ void WorldRender::draw (glm::mat4x4 const& model_view
   std::uint64_t const wmo_fingerprint = _world->loaded_wmo_fingerprint();
   if ((_interior_light_epoch++ % 60u) == 0u || wmo_fingerprint != _last_wmo_fingerprint)
   {
+    // Invalidate the per-instance WMO-doodad copy cache ONLY on a genuine WMO-set change (load/unload/
+    // move/rotate/doodadset edit -> fingerprint delta), NOT on the 60-frame interior-light epoch: the
+    // cached copies are the expensive part, so a periodic wipe would re-incur ~25ms once a second. This
+    // guard is evaluated BEFORE _last_wmo_fingerprint is updated on the next line. (The enclosing `if`
+    // also fires on the epoch tick; that path leaves _pi_doodad_cache untouched.)
+    if (wmo_fingerprint != _last_wmo_fingerprint)
+    {
+      _pi_doodad_cache.clear();
+    }
     _last_wmo_fingerprint = wmo_fingerprint;
     _interior_light_cache.clear();
     if (!s_no_interior_object_light)
@@ -1380,6 +1422,11 @@ void WorldRender::draw (glm::mat4x4 const& model_view
                                 + glm::vec3(_lighting_ubo_data.AmbientColor_FogEnd);
   int const zone_tint_time = static_cast<int>(_world->time);
 
+  // GAP B (checklist 8.7): NOGGIT_NO_INTERIOR_SPILL=1 forces the interior encoding to a flat 0.5 (no
+  // doorway spill) -> byte-identical to the pre-GAP-B behaviour, for A/B. Static local -> the lambda
+  // reads it without capturing.
+  static bool const s_no_interior_spill = std::getenv("NOGGIT_NO_INTERIOR_SPILL") != nullptr;
+
   auto interior_light_at = [this, &camera_pos, cam_light_sum, zone_tint_time](glm::vec3 const& pos) -> glm::vec4
   {
     std::int64_t const kx = static_cast<std::int64_t>(std::floor(pos.x));
@@ -1400,9 +1447,14 @@ void WorldRender::draw (glm::mat4x4 const& model_view
       {
         glm::vec3 const local = glm::vec3(v.inv_transform * glm::vec4(pos, 1.f));
         glm::vec3 sample;
-        if (v.wmo->groups[v.group_index].sample_ground_color(local, &sample))
+        float spill = 0.f;
+        if (v.wmo->groups[v.group_index].sample_ground_color(local, &sample, &spill))
         {
-          light = glm::vec4(sample, 1.f);
+          // GAP B (checklist 8.7): encode the doorway spill in a. a in [0.5,1.0]: 0.5 = deep interior
+          // (spill 0, > 0.25 -> interior, m2 shader mix is a no-op = byte-identical), ramping to 1.0 at
+          // an opening where the m2 shader lerps the room light toward the outdoor day/night light.
+          float const enc = s_no_interior_spill ? 0.5f : (0.5f + 0.5f * glm::clamp(spill, 0.f, 1.f));
+          light = glm::vec4(sample, enc);
           break;
         }
         // no floor under the point in this group -> try other overlapping volumes; if none hit,
@@ -1820,6 +1872,7 @@ void WorldRender::draw (glm::mat4x4 const& model_view
     }
 
     ZoneScopedN("World::draw() : Draw WMOs");
+    noggit::perf::Scoped _prof_wmo(noggit::perf::Phase::WMO);
     {
       OpenGL::Scoped::use_program wmo_program{*_wmo_program.get()};
 
@@ -2016,6 +2069,7 @@ void WorldRender::draw (glm::mat4x4 const& model_view
     }
 
     ZoneScopedN("World::draw() : Draw M2s");
+    noggit::perf::Scoped _prof_m2(noggit::perf::Phase::M2);
 
     if (draw_model_animations)
     {
@@ -2035,42 +2089,246 @@ void WorldRender::draw (glm::mat4x4 const& model_view
       }
 
       ZoneScopedN("World::draw() : Inject visible WMO doodads");
-      for (auto* wmo_instance : wmos_to_draw)
+
+      // Parallelized WMO-doodad gather (was ~35ms single-threaded per frame in Ironforge). Behaviour is
+      // IDENTICAL to the old serial loop -- same instances routed the same way, same order after the merge.
+      //
+      // The split is per DOODAD, not per WMO: a single huge interior (e.g. Ironforge) is ONE WMOInstance
+      // with thousands of doodads, so per-WMO tasking would hand it a single task = zero parallelism --
+      // exactly the case we most need to accelerate. Phase A flattens every surviving doodad (in WMO order)
+      // into one vector that Phase B slices into equal contiguous ranges.
+      //
+      // CRITICAL PERF INVARIANT: the parallel phase must be LOCK-FREE and ALLOC-LIGHT. Copying a
+      // ModelInstance (the per-instance `push_back(*doodad)`) bumps the ModelManager + TextureManager
+      // refcounts through AsyncObjectMultimap's shared std::mutex; doing that on N worker threads over
+      // Ironforge's thousands of animated braziers formed a lock convoy on that one mutex + hammered the
+      // heap allocator -> 150-275ms (far WORSE than serial). So the workers only COLLECT raw doodad
+      // pointers (per-instance) and Model*+matrix (instanced) into their own buffers -- zero refcount, zero
+      // mutex, zero shared state. The mutex-guarded ModelInstance copy is DEFERRED to the serial merge,
+      // where it runs single-threaded with no contention (byte-identical to the original serial code).
+
+      // NOGGIT_SERIAL_GATHER=1 -> run the ORIGINAL fully-serial gather at this exact spot (A/B baseline,
+      // for measuring serial vs parallel). NOGGIT_NO_PIDOODAD=1 -> disable per-instance routing entirely
+      // (doodads all instanced, glow static -- the stable fallback).
+      static bool const s_serial_gather = std::getenv("NOGGIT_SERIAL_GATHER") != nullptr;
+      static bool const s_no_pidoodad = std::getenv("NOGGIT_NO_PIDOODAD") != nullptr;
+
+      // Per-doodad classify, shared by EVERY path (serial baseline, serial gate, parallel) so they can
+      // never diverge. Thread-safety when invoked from a worker:
+      //   * ensureExtents()/recalcExtents(): writes ONLY this doodad's own members (extents, size_cat,
+      //     _need_recalc_extents). Each doodad appears exactly once in `flat` and each flat index belongs
+      //     to exactly one worker range, so no two threads ever touch the same doodad. recalcExtents only
+      //     READS the shared Model (header box + load flags), never writes it, and for a
+      //     wmo_doodad_instance its updateTransformMatrix() override is a no-op -> _transform_mat untouched.
+      //   * finishedLoading() is an atomic load; loading_failed() / _per_instance_animation /
+      //     transformMatrix() / model.get() are reads of Model state fully published before the model's
+      //     `finished` atomic is set (every such read is gated behind finishedLoading()). Same guarantee
+      //     the old serial code relied on.
+      //   * the sinks (add_instanced / add_per_instance) write ONLY the caller's own buffers. The PARALLEL
+      //     sinks push a raw pointer / Model*+matrix -- NO ModelInstance copy, NO refcount, NO mutex.
+      auto classify_doodad = [&](wmo_doodad_instance* doodad, auto&& add_instanced, auto&& add_per_instance)
       {
-        auto doodads = wmo_instance->get_visible_doodads(frustum, _cull_distance, camera_pos, draw_hidden_models, display);
-        for (auto* doodad : doodads)
+        doodad->ensureExtents();
+        if (!doodad->model->finishedLoading() || doodad->model->loading_failed())
         {
-          if (!doodad)
+          return;
+        }
+
+        if (!s_no_pidoodad && doodad->model->_per_instance_animation)
+        {
+          // NOT registered in model_with_particles: their particles use the creature-style per-copy state
+          // swap (mesh pass + own particle loop) -- feeding them to the placement loop too would
+          // double-advance the same state (the previous AV/freeze).
+          add_per_instance(doodad);
+        }
+        else
+        {
+          add_instanced(doodad->model.get(), doodad->transformMatrix());
+        }
+      };
+
+      // Direct-to-container sink for the instanced side (main thread, no contention). Shared by every
+      // serial path (baseline, <256 gate) via classify_doodad.
+      auto add_instanced_direct = [&](Model* m, glm::mat4x4 const& mat)
+      {
+        models_to_draw[m].push_back(mat);
+        models_to_draw_fades[m].push_back(1.0f); // WMO doodads cull with their group
+      };
+      // Per-instance sink shared by ALL THREE gather paths (parallel Phase-C merge, the <256 serial gate,
+      // and the NOGGIT_SERIAL_GATHER baseline). It resolves the doodad to its persistent cache entry,
+      // copying the ModelInstance ONCE per placement (on first sighting) -- that one-time copy is the only
+      // place the mutex-guarded ModelManager/TextureManager refcount bump happens now, and it runs on the
+      // main thread (serial), so no lock convoy. Every subsequent frame is a pure map lookup + push of a
+      // stable pointer into the cache. Called only serially (never from the parallel Phase B workers).
+      auto add_per_instance = [&](wmo_doodad_instance* d)
+      {
+        std::uint64_t const key = wmo_doodad_placement_key(d->get_pos());
+        auto it = _pi_doodad_cache.find(key);
+        if (it == _pi_doodad_cache.end())
+        {
+          it = _pi_doodad_cache.emplace(key, *d).first; // ONE-TIME by-value copy (refcount bump) here
+        }
+        per_instance_wmo_doodads.push_back(&it->second); // non-owning pointer into the stable cache node
+      };
+
+      if (s_serial_gather)
+      {
+        // A/B BASELINE: the original fully-serial gather -- get_visible_doodads + inline classify straight
+        // into the real containers, no flat vector, no threads. get_visible_doodads + suppress must be
+        // serial (see below); here the whole gather is serial.
+        for (auto* wmo_instance : wmos_to_draw)
+        {
+          auto doodads = wmo_instance->get_visible_doodads(frustum, _cull_distance, camera_pos, draw_hidden_models, display);
+          for (auto* doodad : doodads)
           {
-            continue;
+            if (!doodad)
+            {
+              continue;
+            }
+
+            if (!minimap_render && should_suppress_legacy_creature_instance(_world, *doodad, _legacy_suppress_index))
+            {
+              continue;
+            }
+
+            classify_doodad(doodad, add_instanced_direct, add_per_instance);
+          }
+        }
+      }
+      else
+      {
+        // PHASE A (SERIAL, this thread): call get_visible_doodads for every WMO and pre-filter the results
+        // into a single flat, WMO-ordered vector. get_visible_doodads MUST stay serial -- it lazily mutates
+        // WMO state (change_doodadset when _need_doodadset_update, plus per-doodad update_transform_matrix_wmo
+        // when need_matrix_update). should_suppress_legacy_creature_instance ALSO must stay serial: it mutates
+        // two function-local static std::set<> (logged_suppressions / logged_legacy_candidates) via insert()
+        // for debug-log dedup, so calling it concurrently would race on those sets. We drop null + suppressed
+        // doodads HERE (identical to the old null/suppress `continue`s), leaving Phase B nothing unsafe.
+        std::vector<wmo_doodad_instance*> flat;
+        {
+          // GatherCull = Phase A wall-time (get_visible_doodads cull + null/legacy-suppress filter + flat
+          // build). Explicit braces so this Scoped covers ONLY Phase A -- it must NOT bleed into the
+          // parallel Phase B or the Phase-C merge. Timed for the parallel path AND the <256 serial gate
+          // (both build `flat`); in the s_serial_gather baseline above, cull is fused with classify in one
+          // pass so GatherCull reads 0 there (that mode is the baseline; we profile the parallel split).
+          noggit::perf::Scoped _prof_cull(noggit::perf::Phase::GatherCull);
+          for (auto* wmo_instance : wmos_to_draw)
+          {
+            auto doodads = wmo_instance->get_visible_doodads(frustum, _cull_distance, camera_pos, draw_hidden_models, display);
+            flat.reserve(flat.size() + doodads.size());
+            for (auto* doodad : doodads)
+            {
+              if (!doodad)
+              {
+                continue;
+              }
+
+              if (!minimap_render && should_suppress_legacy_creature_instance(_world, *doodad, _legacy_suppress_index))
+              {
+                continue;
+              }
+
+              flat.push_back(doodad);
+            }
+          }
+        }
+
+        std::size_t const flat_count = flat.size();
+        constexpr std::size_t parallel_threshold = 256; // below this, threads cost more than they save
+        constexpr std::size_t doodads_per_worker = 128; // >= this many doodads per worker so we never over-thread
+
+        if (flat_count < parallel_threshold)
+        {
+          // SERIAL GATE: on light frames a handful of doodads isn't worth the thread-spawn overhead (it
+          // would regress them). Classify inline, straight into the real containers, skip the threads.
+          for (auto* doodad : flat)
+          {
+            classify_doodad(doodad, add_instanced_direct, add_per_instance);
+          }
+        }
+        else
+        {
+          // PHASE B (PARALLEL, LOCK-FREE): slice [0, flat_count) into N contiguous ascending ranges of
+          // ~doodads_per_worker each. Worker k fills ONLY results[k] with raw pointers / Model*+matrix --
+          // no ModelInstance copy, no refcount, no mutex, no shared mutable state. STATIC contiguous ranges
+          // (not a work-stealing counter) guarantee chunk k precedes chunk k+1 in the merge -> deterministic
+          // serial-identical order.
+          struct GatherLocal
+          {
+            std::vector<std::pair<Model*, glm::mat4x4>> instanced;
+            std::vector<wmo_doodad_instance*> per_instance_ptrs; // POINTERS -- the copy is deferred to merge
+          };
+
+          unsigned int hw = std::thread::hardware_concurrency();
+          if (hw == 0)
+          {
+            hw = 4;
+          }
+          std::size_t const N = std::min<std::size_t>(hw, std::max<std::size_t>(1, flat_count / doodads_per_worker));
+
+          std::vector<GatherLocal> results(N);
+          std::size_t const base = flat_count / N;
+          std::size_t const rem = flat_count % N;
+
+          auto run_range = [&](std::size_t k)
+          {
+            std::size_t const lo = k * base + std::min<std::size_t>(k, rem);
+            std::size_t const hi = lo + base + (k < rem ? 1 : 0);
+            GatherLocal& out = results[k];
+            std::size_t const range_size = hi - lo;
+            // Reserve the (upper-bound) range size up front so the fill loop never reallocs -> cuts
+            // allocator churn on the worker threads. A doodad goes to exactly one of the two, so this
+            // slightly over-reserves; the waste is trivial and bounded.
+            out.instanced.reserve(range_size);
+            out.per_instance_ptrs.reserve(range_size);
+            // Phase B stays LOCK-FREE: collect raw pointers / Model*+matrix into this worker's own
+            // thread-local buffers only. The mutex-guarded ModelInstance copy is deferred to the serial
+            // Phase-C merge (via the block-scope add_per_instance cache helper).
+            auto collect_instanced = [&](Model* m, glm::mat4x4 const& mat) { out.instanced.emplace_back(m, mat); };
+            auto collect_per_instance = [&](wmo_doodad_instance* d) { out.per_instance_ptrs.push_back(d); };
+            for (std::size_t i = lo; i < hi; ++i)
+            {
+              classify_doodad(flat[i], collect_instanced, collect_per_instance);
+            }
+          };
+
+          std::vector<std::thread> workers;
+          workers.reserve(N - 1);
+          for (std::size_t k = 1; k < N; ++k)
+          {
+            workers.emplace_back(run_range, k);
+          }
+          run_range(0); // the main thread processes chunk 0
+          for (auto& w : workers)
+          {
+            w.join();
           }
 
-          if (!minimap_render && should_suppress_legacy_creature_instance(_world, *doodad, _legacy_suppress_index))
+          // PHASE C (SERIAL MERGE, this thread): append each chunk's results in ascending index order.
+          // `flat` is WMO-ordered and the chunks are contiguous ascending ranges, so this reproduces the
+          // exact push order of the old serial loop. instanced -> models_to_draw and per_instance ->
+          // per_instance_wmo_doodads are disjoint containers, so emitting all of a chunk's instanced
+          // entries before its per-instance ones does not perturb either container's internal order.
+          // The mutex-guarded ModelInstance copy (`*p`) happens HERE, serially on the main thread with
+          // zero contention -> byte-for-byte identical to the original serial version.
           {
-            continue;
-          }
-
-          doodad->ensureExtents();
-          if (!doodad->model->finishedLoading() || doodad->model->loading_failed())
-          {
-            continue;
-          }
-
-          // Bisect switches: NOGGIT_NO_PIDOODAD=1 disables the per-instance routing entirely (doodads
-          // all instanced, glow static -- the stable fallback); NOGGIT_NO_PIDOODAD_PARTICLES=1 keeps
-          // billboards but skips their particle loop (isolates mesh vs particle side on a crash).
-          static bool const s_no_pidoodad = std::getenv("NOGGIT_NO_PIDOODAD") != nullptr;
-          if (!s_no_pidoodad && doodad->model->_per_instance_animation)
-          {
-            // NOT registered in model_with_particles: their particles use the creature-style
-            // per-copy state swap (mesh pass + own particle loop) -- feeding them to the placement
-            // loop too would double-advance the same state (the previous AV/freeze).
-            per_instance_wmo_doodads.push_back(*doodad); // BY VALUE -- see declaration
-          }
-          else
-          {
-            models_to_draw[doodad->model.get()].push_back(doodad->transformMatrix());
-            models_to_draw_fades[doodad->model.get()].push_back(1.0f); // WMO doodads cull with their group
+            // GatherMerge = Phase C wall-time: the serial merge (instanced -> models_to_draw + the
+            // mutex-guarded per_instance_wmo_doodads copies). Explicit braces so this Scoped covers ONLY
+            // the merge -- never the parallel Phase B above it. (In the s_serial_gather baseline and the
+            // <256 gate the copy happens inline during their single pass, so GatherMerge reads 0 there.)
+            noggit::perf::Scoped _prof_merge(noggit::perf::Phase::GatherMerge);
+            for (auto& out : results)
+            {
+              for (auto& entry : out.instanced)
+              {
+                models_to_draw[entry.first].push_back(entry.second);
+                models_to_draw_fades[entry.first].push_back(1.0f); // WMO doodads cull with their group
+              }
+              for (auto* p : out.per_instance_ptrs)
+              {
+                add_per_instance(p); // cache lookup (copy only on first sighting) -- serial, no convoy
+              }
+            }
           }
         }
       }
@@ -2372,7 +2630,7 @@ void WorldRender::draw (glm::mat4x4 const& model_view
       // so the slider takes effect without a restart.
       QSettings clutter_settings;
       float const clutter_density = std::clamp(clutter_settings.value("render/ground_clutter_density", 100.0f).toFloat(), 0.0f, 100.0f) / 100.0f;
-      float const clutter_dist = clutter_settings.value("render/ground_clutter_distance", 200.0f).toFloat();
+      float const clutter_dist = clutter_settings.value("render/ground_clutter_distance", 160.0f).toFloat();
 
       auto dist2 = [](glm::vec3 const& a, glm::vec3 const& b)
       {
@@ -2686,21 +2944,21 @@ void WorldRender::draw (glm::mat4x4 const& model_view
               }
             }
 
-            // INDOOR doodads/gameobjects: deliberate deviation from the client (which feeds them the
-            // unmodified exterior sun -- noon-bright, sun-shaded cellar barrels; RE_notes/15 section
-            // 4+11). Per user requirement they get the baked MOCV floor colour as FLAT EVEN room light
-            // (shader mode a=0.5): no time-of-day, no directional shading -- matching the live client's
-            // even dark-all-around barrel look at night, at every hour. Candle MOLT points still apply.
-            // Outdoor instances get (0,0,0,0) -> normal sun path.
+            // INDOOR doodads/gameobjects: the baked MOCV floor colour as FLAT EVEN room light deep inside
+            // (matching the live client's even dark-all-around barrel look; RE_notes/15 section 4+11),
+            // now with GAP B (checklist 8.7) doorway spill: interior_light_at encodes the baked MOCV floor
+            // ALPHA in the a channel (a in [0.5,1.0]) and the m2 shader lerps the room light toward the
+            // outdoor day/night light by it, so props near a portal/window catch the outdoor colour
+            // (client FUN_0069e4c0). Deep interior (alpha 0 -> a 0.5) is unchanged. Candle MOLT points
+            // still apply. Outdoor instances get (0,0,0,0) -> normal sun path.
             std::vector<glm::vec4> bucket_interior;
             bucket_interior.reserve(pair.second.size());
             for (auto const& tr : pair.second)
             {
-              glm::vec4 const in_light = interior_light_at(glm::vec3(tr[3]));
-              // indoors -> flat room-light mode (a=0.5); outdoors -> pass through (a=0, rgb may carry
-              // the per-object zone tint)
-              bucket_interior.push_back(in_light.a > 0.f ? glm::vec4(glm::vec3(in_light), 0.5f)
-                                                         : in_light);
+              // Pass the spill-encoded interior light straight through: indoors carries a in [0.5,1.0]
+              // (its a MUST survive or the doorway spill is discarded), outdoors carries a==0 (+ zone
+              // tint rgb). No a=0.5 override here anymore.
+              bucket_interior.push_back(interior_light_at(glm::vec3(tr[3])));
             }
             // Per-instance cull-fade alphas gathered in lockstep with the transforms (defensive pad
             // with 1.0 if a push site missed the parallel vector).
@@ -2713,7 +2971,9 @@ void WorldRender::draw (glm::mat4x4 const& model_view
             m2_shader.uniform("slice_dist",
                               (s_no_dist_fade || go_bucket_models.count(pair.first)) ? 0.0f : _cull_distance);
 
-            pair.first->renderer()->draw( model_view
+            {
+              noggit::perf::Scoped _prof_submit(noggit::perf::Phase::SubmitInst);
+              pair.first->renderer()->draw( model_view
                 , pair.second
                 , m2_shader
                 , model_render_state
@@ -2728,7 +2988,8 @@ void WorldRender::draw (glm::mat4x4 const& model_view
                 , /*representative*/ nullptr
                 , bucket_interior
                 , bucket_fades
-            );
+              );
+            }
             _world->_n_rendered_objects += pair.second.size();
 
             // Collect particle/ribbon models regardless of the animation toggle: when off we still
@@ -2781,10 +3042,13 @@ void WorldRender::draw (glm::mat4x4 const& model_view
           }
           std::vector<float>& creature_fades = creature_instanced_fades[entry.first];
           creature_fades.resize(transforms.size(), 1.0f);
-          m->renderer()->draw(model_view, transforms, m2_shader, model_render_state, frustum,
-                              _cull_distance, camera_pos, _world->model_animtime, draw_models_with_box,
-                              model_boxes_to_draw, display, /*no_cull*/ false, rep, creature_interior,
-                              creature_fades);
+          {
+            noggit::perf::Scoped _prof_cre2(noggit::perf::Phase::M2Creatures);
+            m->renderer()->draw(model_view, transforms, m2_shader, model_render_state, frustum,
+                                _cull_distance, camera_pos, _world->model_animtime, draw_models_with_box,
+                                model_boxes_to_draw, display, /*no_cull*/ false, rep, creature_interior,
+                                creature_fades);
+          }
           _world->_n_rendered_objects += transforms.size();
         }
 
@@ -2818,8 +3082,10 @@ void WorldRender::draw (glm::mat4x4 const& model_view
           doodad_shader.uniform("pixel_shader", 0);
 
           std::unordered_set<std::uint64_t> seen_doodad_keys;
-          for (ModelInstance& doodad : per_instance_wmo_doodads)
+          for (ModelInstance* _dptr : per_instance_wmo_doodads)
           {
+            if (!_dptr) { continue; } // defensive: cache pointers are never null in practice
+            ModelInstance& doodad = *_dptr;
             Model* pmodel = doodad.model.get();
             if (!pmodel || !pmodel->finishedLoading() || pmodel->loading_failed()
                 || (!draw_hidden_models && pmodel->is_hidden()))
@@ -2835,19 +3101,22 @@ void WorldRender::draw (glm::mat4x4 const& model_view
             {
               pmodel->animcalc = false;
             }
-            pmodel->renderer()->draw(model_view
-              , doodad
-              , doodad_shader
-              , doodad_render_state
-              , frustum
-              , _cull_distance
-              , camera_pos
-              , static_cast<int>(_world->model_animtime)
-              , display
-              , /*no_cull*/ false
-              , /*bloom_mask_only*/ false
-              , interior_light_at(doodad.get_pos())
-            );
+            {
+              noggit::perf::Scoped _prof_submit2(noggit::perf::Phase::SubmitIndiv);
+              pmodel->renderer()->draw(model_view
+                , doodad
+                , doodad_shader
+                , doodad_render_state
+                , frustum
+                , _cull_distance
+                , camera_pos
+                , static_cast<int>(_world->model_animtime)
+                , display
+                , /*no_cull*/ false
+                , /*bloom_mask_only*/ false
+                , interior_light_at(doodad.get_pos())
+              );
+            }
             ++_world->_n_rendered_objects;
 
             if (draw_model_animations && !pmodel->_particles.empty())
@@ -2911,6 +3180,8 @@ void WorldRender::draw (glm::mat4x4 const& model_view
 
     if (!creature_spawn_instances_to_draw.empty())
     {
+      // Times the whole near/individual creature-draw region (shadow blobs + mesh + attachments).
+      noggit::perf::Scoped _prof_cre(noggit::perf::Phase::M2Creatures);
       // Transparency ordering: draw OPAQUE creatures first, then TRANSLUCENT ones back-to-front. A
       // translucent creature (Anomalus, ghosts) blends against whatever colour is already in the
       // framebuffer, and it lays a depth prepass -- so an opaque creature standing BEHIND it must be
@@ -3835,6 +4106,7 @@ void WorldRender::draw (glm::mat4x4 const& model_view
     }
 
     ZoneScopedN("World::draw() : Draw water");
+    noggit::perf::Scoped _prof_water(noggit::perf::Phase::Water);
 
     // draw the water on both sides
     OpenGL::Scoped::bool_setter<GL_CULL_FACE, GL_FALSE> const cull;
@@ -3951,6 +4223,7 @@ void WorldRender::draw (glm::mat4x4 const& model_view
   // Drawn even when animations are off -> particles freeze in place (not advanced) instead of vanishing.
   if (!model_with_particles.empty() || !creature_spawn_instances_to_draw.empty())
   {
+    noggit::perf::Scoped _prof_part(noggit::perf::Phase::M2Particles);
     OpenGL::Scoped::bool_setter<GL_CULL_FACE, GL_FALSE> const cull;
     OpenGL::Scoped::bool_setter<GL_DEPTH_TEST, GL_TRUE> const depth_test;
     OpenGL::Scoped::depth_mask_setter<GL_FALSE> const depth_mask;
@@ -4087,12 +4360,14 @@ void WorldRender::draw (glm::mat4x4 const& model_view
     {
       static bool const s_no_pidoodad_particles = std::getenv("NOGGIT_NO_PIDOODAD_PARTICLES") != nullptr;
       std::unordered_set<std::uint64_t> seen_doodad_keys;
-      for (ModelInstance& doodad : per_instance_wmo_doodads)
+      for (ModelInstance* _dptr : per_instance_wmo_doodads)
       {
         if (s_no_pidoodad_particles)
         {
           break;
         }
+        if (!_dptr) { continue; } // defensive: cache pointers are never null in practice
+        ModelInstance& doodad = *_dptr;
         Model* pmodel = doodad.model.get();
         if (!pmodel || !pmodel->finishedLoading() || pmodel->loading_failed()
             || (!draw_hidden_models && pmodel->is_hidden())
@@ -4132,6 +4407,7 @@ void WorldRender::draw (glm::mat4x4 const& model_view
 
   if (!model_with_particles.empty()) // ribbons too: drawn frozen when animations are off
   {
+    noggit::perf::Scoped _prof_part2(noggit::perf::Phase::M2Particles);
     OpenGL::Scoped::bool_setter<GL_CULL_FACE, GL_FALSE> const cull;
     OpenGL::Scoped::depth_mask_setter<GL_FALSE> const depth_mask;
 
@@ -4332,6 +4608,7 @@ void WorldRender::draw (glm::mat4x4 const& model_view
   // composite (scene + bloom) back onto the framebuffer that was bound when we entered (Qt's).
   if (do_bloom)
   {
+    noggit::perf::Scoped _prof_post(noggit::perf::Phase::Post);
     renderBloomAndComposite(static_cast<GLuint>(bloom_prev_fbo), bloom_vp[2], bloom_vp[3], camera_pos);
   }
 }
@@ -4421,7 +4698,7 @@ void WorldRender::ensureBloomTargets(int w, int h)
 
   // MSAA sample count (Settings -> Render features): 0/2/4/8, clamped to the driver max. Read every
   // call so a settings change reallocates live.
-  int msaa = QSettings().value("render/msaa", 0).toInt();
+  int msaa = QSettings().value("render/msaa", 8).toInt();
   if (msaa != 0 && msaa != 2 && msaa != 4 && msaa != 8) { msaa = 0; }
   if (msaa > 0)
   {
@@ -4499,15 +4776,18 @@ void WorldRender::renderBloomAndComposite(GLuint target_fbo, int w, int h, glm::
     gl.bindFramebuffer(GL_DRAW_FRAMEBUFFER, _bloom_scene_fbo);
     gl.blitFramebuffer(0, 0, _bloom_w, _bloom_h, 0, 0, _bloom_w, _bloom_h, GL_COLOR_BUFFER_BIT, GL_NEAREST);
   }
-  // CANON FFXGlow strength for this frame. The 1.12 client applies a full-screen additive glow whose
-  // weight = the per-zone LightParams.glow (0..1, `Skies::glow()` = the same interpolated value the
-  // client reads), floored at 84/255 = 0.329. (RE'd from wow.exe FFXEffects.cpp -- see
-  // full_data/RE_notes/13_ffx_fullscreen_glow.md.) The client's *no-floor* case is narrow
-  // (area-param==15, i.e. specific fully-enclosed dungeon instances), NOT every WMO interior -- fake
-  // outdoor caverns like Timbermaw Hold (bright sky-ceiling dome) still take the floor and bloom. So we
-  // apply the floor everywhere rather than guessing which WMOs are the enclosed set.
+  // CANON FFXGlow strength: the 1.12 client's full-screen additive glow weight = the per-zone glow FIELD
+  // (LightParams field 4, 0..1; `Skies::glow()` reads it now -- NOT LightFloatBand band 3, which is cloud
+  // density). RE'd from wow.exe FFXEffects.cpp (FUN_006cb020): the per-zone glow is packed into the
+  // glow-quad's vertex ALPHA and gates the composite. A SEPARATE RGB scene-glow is floored at
+  // 84/255=0.329 outdoors, but that is a DIFFERENT channel and does not gate the per-zone bloom -- so we
+  // drive the bloom by the per-zone glow with NO floor. Zones authoring glow 0 (Dun Morogh day 406/34)
+  // get NO full-screen bloom, matching in-game (user-confirmed: the 0.329 floor still over-bloomed
+  // Steelgrill's fog). Bloomy zones author their own glow (Kara 0.6, default day 0.65, night 1.0) and
+  // keep it. (Emissive lava/unlit surfaces still bloom via the bright-pass alpha mask in zones whose
+  // glow > 0; a glow-0 zone matches the client, which likewise runs no FFXGlow there.)
   float const zone_glow = skies() ? std::clamp(skies()->glow(), 0.0f, 1.0f) : 0.0f;
-  float const glow_strength = std::max(zone_glow, 0.329f);
+  float const glow_strength = zone_glow; // NO floor -- per-zone glow (the composite-alpha weight) gates it
 
   static bool const s_glow_dbg = std::getenv("NOGGIT_LIGHT_DEBUG") != nullptr;
   if (s_glow_dbg)
@@ -4871,43 +5151,27 @@ void WorldRender::updateMVPUniformBlock(const glm::mat4x4& model_view, const glm
 void WorldRender::updateLightingUniformBlock(bool draw_fog, glm::vec3 const& camera_pos)
 {
   ZoneScoped;
+  noggit::perf::Scoped _prof_lc(noggit::perf::Phase::LightCollect);
 
   int daytime = static_cast<int>(_world->time) % 2880;
 
-  int area_light_id = 0;
-  unsigned int wmo_area_id = static_cast<unsigned int>(-1);
-  unsigned int terrain_area_id = static_cast<unsigned int>(-1);
-  unsigned int area_id = static_cast<unsigned int>(-1);
-  try
-  {
-    wmo_area_id = _world->getWMOAreaID(camera_pos);
-    terrain_area_id = _world->getAreaID(camera_pos);
-    area_id = wmo_area_id;
-    if (area_id == static_cast<unsigned int>(-1))
-    {
-      area_id = terrain_area_id;
-    }
-
-    if (area_id != static_cast<unsigned int>(-1)
-        && gAreaDB.getFieldCount() > AreaDB::LightId
-        && gAreaDB.CheckIfIdExists(area_id))
-    {
-      area_light_id = gAreaDB.getByID(area_id).getInt(AreaDB::LightId);
-    }
-  }
-  catch (...)
-  {
-    area_light_id = 0;
-  }
-
-  _skies->setAreaLightId(area_light_id);
+  // Zone light selection is the CLIENT-FAITHFUL Light.dbc position + distance-falloff blend
+  // (Skies::findSkyWeights) -- spatial and continuous. We deliberately do NOT apply the AreaTable.dbc
+  // area->light override (field 35 `LightId`): that column exists ONLY in the 3.3.5a 36-field
+  // AreaTable; the 1.12 Turtle DBC has 25 fields and no such field, so 1.12 has no per-area light at
+  // all. Applying it hard-snapped the zone light/fog to weight=1 the instant the camera crossed a
+  // sub-area boundary, a WMO edge (indoor<->outdoor), or a terrain hole (getAreaID -> -1 dropped the
+  // override) -- the "fog + lighting shoots up when I move a little" jump. The smooth position blend is
+  // the whole story in 1.12, so force the override off. (getWMOAreaID/getAreaID were read ONLY to feed
+  // this override; dropping them also removes their per-frame chunk-walk cost.)
+  _skies->setAreaLightId(0);
   // Underwater: switch to the underwater LightParams set (CLEAR_WATER) so the fog colour/density and
   // ambient match the in-game submerged look (cool, dense fog); above water use CLEAR. Both colorFor
   // and floatParamFor read the active param, so this swaps tint and fog together. If a light doesn't
   // define the underwater param, active_sky_param falls back to defaults -- harmless.
-  // GUARDED: camera_is_underwater walks the chunk + its liquid layers, which (like getAreaID /
-  // getWMOAreaID above) can throw while a tile is mid-load/unload. The sibling calls are wrapped in a
-  // try/catch for exactly this reason; this one was not -> an uncaught exception here crashed the
+  // GUARDED: camera_is_underwater walks the chunk + its liquid layers, which can throw while a tile is
+  // mid-load/unload (the same hazard as any per-frame chunk query). Wrapped in a try/catch for that
+  // reason; this one was not -> an uncaught exception here crashed the
   // editor intermittently (any map, any time the camera sits over loading liquid). Default to "not
   // underwater" on failure.
   bool underwater = false;
@@ -4938,6 +5202,14 @@ void WorldRender::updateLightingUniformBlock(bool draw_fog, glm::vec3 const& cam
     fog_start = 0.25f;
     fog_end = 500.0f;
   }
+  // The fog START fraction is CLIENT-CANON and is NOT clamped -- a negative start is authored and correct.
+  // Dun Morogh's Steelgrill's Depot light id=22 authors start=-0.3, distance=15000. apitrace of the 1.12
+  // client at that exact spot (wow_cap_streelgrill.trace) records D3DRS_FOGSTART=-125.0, D3DRS_FOGEND=416.67
+  // -- i.e. the client runs the negative start verbatim (start = -0.3 * 416.67 = -125.0 EXACTLY), putting
+  // ~23% fog on the camera plane. That "overblown fog in your face" is the real in-game look; the client
+  // jumps to it whenever this underground zone light becomes nearest-dominant (the trace shows both regimes:
+  // -125/416.67 overblown and 0/1200 clear). An earlier std::max(0,fog_start) clamp here forced the start to
+  // 0 and made noggit SOFTER than the client -- removed so noggit is bit-exact to the traced client fog.
   // Editor fog-distance scale (Settings, default 1.0 = client-authored). fog_start is a fraction of
   // fog_end, so scaling the end stretches the whole band uniformly.
   fog_end *= _fog_distance_scale;
@@ -4955,6 +5227,25 @@ void WorldRender::updateLightingUniformBlock(bool draw_fog, glm::vec3 const& cam
   // farclip 2098 -> fogEnd 1250 (Elwynn's authored value). fog_start is a FRACTION of fog_end, so the
   // start scales with the clamp automatically (0.25 * 777 = 194.25, matching the trace).
   fog_end = std::min(fog_end, _view_distance);
+
+  // TRACE (NOGGIT_LIGHT_DEBUG): the FINAL zone-fog state fed to the render, logged so overblown-fog spots
+  // can be diagnosed straight from log.txt. Pairs with the Sky.cpp ZONEFOG line (weighted-light list).
+  {
+    static bool const s_ff_dbg = std::getenv("NOGGIT_LIGHT_DEBUG") != nullptr;
+    static int s_ff_tick = 0;
+    if (s_ff_dbg && draw_fog && (++s_ff_tick % 30) == 0)
+    {
+      LogError << "FOGFINAL pos=(" << camera_pos.x << "," << camera_pos.y << "," << camera_pos.z << ")"
+               << " raw_end(/36)=" << _skies->fog_distance_end()
+               << " scale=" << _fog_distance_scale
+               << " view_dist=" << _view_distance
+               << " -> FOG_END=" << fog_end
+               << " fog_start_abs=" << (fog_start * fog_end)
+               << " fog_color=(" << fog_color.x << "," << fog_color.y << "," << fog_color.z << ")"
+               << " inside_wmo=" << (_camera_inside_wmo ? 1 : 0)
+               << std::endl;
+    }
+  }
 
   // (An earlier temporal fog lerp lived here; the per-draw trace showed the client's fog transitions
   // are SPATIAL -- Light.dbc falloff radii for the zone fog, MFOG sphere falloff for WMO fog -- both
@@ -5004,7 +5295,8 @@ void WorldRender::updateLightingUniformBlock(bool draw_fog, glm::vec3 const& cam
       float mf_end = 0.0f, mf_start = 0.0f;
       if (cam_group
           && cam_group->wmo->evaluate_camera_fog(*cam_group->group, cam_group->transform,
-                                                 camera_pos, &mf_color, &mf_end, &mf_start))
+                                                 camera_pos, /*camera_inside_wmo=*/ true,
+                                                 &mf_color, &mf_end, &mf_start))
       {
         env_w = 1.0f;
         env_color = mf_color;
@@ -5025,6 +5317,25 @@ void WorldRender::updateLightingUniformBlock(bool draw_fog, glm::vec3 const& cam
 
   if (capture_lighting_trace_enabled())
   {
+    // Area IDs are diagnostic-only now (the area->light override is disabled above); resolve them here so
+    // the trace still reports them -- and the per-frame chunk-walk cost is only paid while tracing.
+    unsigned int wmo_area_id = static_cast<unsigned int>(-1);
+    unsigned int terrain_area_id = static_cast<unsigned int>(-1);
+    unsigned int area_id = static_cast<unsigned int>(-1);
+    int area_light_id = 0;
+    try
+    {
+      wmo_area_id = _world->getWMOAreaID(camera_pos);
+      terrain_area_id = _world->getAreaID(camera_pos);
+      area_id = (wmo_area_id != static_cast<unsigned int>(-1)) ? wmo_area_id : terrain_area_id;
+      if (area_id != static_cast<unsigned int>(-1)
+          && gAreaDB.getFieldCount() > AreaDB::LightId && gAreaDB.CheckIfIdExists(area_id))
+      {
+        area_light_id = gAreaDB.getByID(area_id).getInt(AreaDB::LightId); // would-be override (NOT applied)
+      }
+    }
+    catch (...) {}
+
     std::ofstream trace("I:\\Twow-local\\server_dev\\noggit_captures\\lighting_trace.txt", std::ios::app);
     trace << "pos=(" << camera_pos.x << "," << camera_pos.y << "," << camera_pos.z << ")"
           << " time=" << daytime

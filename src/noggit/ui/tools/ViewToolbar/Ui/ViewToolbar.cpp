@@ -292,54 +292,9 @@ ViewToolbar::ViewToolbar(MapView *mapView, ViewToolbar *tb)
     addWidget(tile_view_btn);
     */
 
-    // Time-of-day control: a clock button that drops down a slider to scrub the in-game time and see
-    // the lighting/fog change live (daytime is recomputed from World::time every frame).
-    auto time_btn = new QPushButton(this);
-    time_btn->setIcon(FontNoggitIcon{ FontNoggit::TIME_NORMAL });
-    time_btn->setToolTip("Time of day");
-    addWidget(time_btn);
-
-    auto time_popup = new QWidget(this);
-    time_popup->setMinimumWidth(260);
-    auto time_layout = new QVBoxLayout(time_popup);
-    auto time_label = new QLabel("12:00", time_popup);
-    time_label->setAlignment(Qt::AlignCenter);
-    auto time_slider = new WrapAroundSlider(Qt::Horizontal, time_popup);
-    time_slider->setMinimum(0);
-    time_slider->setMaximum(1439); // minutes in a day (0:00 .. 23:59)
-    time_layout->addWidget(time_label);
-    time_layout->addWidget(time_slider);
-    time_popup->setVisible(false);
-
-    auto fmt_time = [](int minutes)
-    {
-        return QString("%1:%2").arg(minutes / 60, 2, 10, QChar('0')).arg(minutes % 60, 2, 10, QChar('0'));
-    };
-
-    connect(time_slider, &QSlider::valueChanged, [mapView, time_label, fmt_time](int minutes)
-        {
-            // World::time runs 0..2880 (half-minutes); minutes = (time % 2880) / 2, so time = minutes * 2.
-            mapView->getWorld()->time = static_cast<float>(minutes * 2);
-            time_label->setText(fmt_time(minutes));
-            mapView->update(); // request a redraw so the lighting change shows immediately
-        });
-
-    connect(time_btn, &QPushButton::clicked,
-        [this, time_btn, time_popup, time_slider, time_label, mapView, fmt_time]()
-        {
-            // Sync the slider to the world's current time whenever the popup opens.
-            int minutes = (static_cast<int>(mapView->getWorld()->time) % 2880) / 2;
-            {
-                QSignalBlocker const block(time_slider);
-                time_slider->setValue(minutes);
-            }
-            time_label->setText(fmt_time(minutes));
-
-            QPoint new_pos = mapToGlobal(QPoint(time_btn->pos().x(), time_btn->pos().y() + 30));
-            time_popup->setGeometry(new_pos.x(), new_pos.y(), time_popup->width(), time_popup->height());
-            time_popup->setWindowFlags(Qt::Popup);
-            time_popup->show();
-        });
+    // Time-of-day control moved to the Warcraft-3 time-of-day globe (Noggit::Ui::TimeGlobeWidget),
+    // floated at the top-centre of the viewport by MapView. Click it to scrub World::time; it shows the
+    // day/night cycle + the 8-stud loading bar. The old clock button + slider that lived here are gone.
 
     // Zone music controls: a dropdown showing the current zone's playlist (click a song to play it,
     // the playing track is highlighted) plus a volume slider. The Zone-music toggle button above

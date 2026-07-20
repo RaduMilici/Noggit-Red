@@ -11,6 +11,9 @@
 #define eWMOBatch_ClampS 0x80u
 #define eWMOBatch_ClampT 0x100u
 #define eWMOBatch_Window 0x200u
+// The vertex-colour ALPHA is a valid two-layer texture-blend factor (either from a real lighting MOCV or a
+// dedicated texture-blend mocv2 whose RGB is 0). Set independently of HasMOCV, which gates LIGHTING.
+#define eWMOBatch_HasMOCVBlend 0x400u
 
 layout (std140) uniform lighting
 {
@@ -60,6 +63,14 @@ uniform int fog_color_mode;
 // 1 when this WMO has exterior groups (an "open" WMO, e.g. a cave mouth). Lets outdoor zone light
 // bleed into its interior groups; 0 for fully enclosed dungeons (keep their dark authored interior).
 uniform int wmo_open;
+// 1 while the camera is INSIDE a WMO this frame (set from WorldRender::cameraInsideWmo). An exterior-lit or
+// portal-spill face of an enclosed city WMO -- Ironforge's building fronts, the tiny gryphon flight tunnels
+// -- must NOT be lit by the outdoor map light when viewed from inside: there is no Light.dbc row positioned
+// inside a city WMO, so the outdoor fallback floods those faces with bright Dun Morogh daylight (the reported
+// bug -- faces that should be dark "look lit from outside"). While inside, route them to the interior formula
+// (MOHD ambient + baked MOCV) so they match the surrounding interior. Viewed from OUTSIDE they keep outdoor
+// lighting. This ONLY changes the exterior-lit / portal-spill faces; the plain interior look is untouched.
+uniform int camera_inside_wmo;
 // Debug: 1 = output the raw fixed-up MOCV vertex colour (magenta where a batch has NO MOCV flag), so we
 // can see whether the black doorway-reveal faces actually carry the warm baked colour or lose it.
 uniform int debug_mocv;
@@ -201,7 +212,12 @@ vec3 apply_lighting(vec3 material)
   }
   else if (bool(flags & eWMOBatch_ExteriorLit))
   {
-    // Exterior geometry: outdoor sun diffuse (N.L) + outdoor ambient (+ any baked color).
+    // CANON (wow.exe FUN_006a7300 exterior branch; LIGHT_FOG_SELECTION_RE.md §9.4): exterior/exterior_lit
+    // groups (MOGP flags & 0x48) take the OUTDOOR directional light -- diffuse*max(0,N.L) + ambient -- PER
+    // GROUP, with NO camera test. Exterior faces seen from INSIDE Ironforge are dark for free because the
+    // zone selection picks the dim Ironforge-interior Light.dbc zone (ID 72/73, param 77 #98461d) at that
+    // eye -- not from any camera gate. (If they stay bright, the bug is noggit's zone selection wrongly
+    // holding the bright surface ID=16 (#546f84) inside IF -- a light-selection fix, not a shader one.)
     float nDotL = clamp(dot(normalize(f_normal),
                             -normalize(vec3(LightDir_FogRate.x, LightDir_FogRate.z, LightDir_FogRate.y))),
                         0.0, 1.0);
@@ -217,9 +233,14 @@ vec3 apply_lighting(vec3 material)
       lit_diffuse = mid;
       lit_ambient = clamp(mid + vec3(16.0 / 255.0), 0.0, 1.0);
     }
+    // CANON (RE_notes/17 §1b, apitrace): exterior / exterior_lit batches are drawn with MATERIAL
+    // diffuse/ambient = WHITE and DIFFUSE/AMBIENTMATERIALSOURCE=MATERIAL, so the vertex colour (MOCV) is
+    // IGNORED for lighting (those batches carry a white placeholder MOCV). Exterior faces = pure outdoor
+    // sun, tex * saturate(ambient + diffuse*N.L), exactly like terrain -- NO baked-colour add. (noggit's
+    // old `+ vertex_color` stacked the buildings' baked colour ON TOP of the sun, which is why Stormwind
+    // read too bright and warm vs in-game.)
     light_color = clamp(lit_diffuse * nDotL, 0.0, 1.0)
-                + lit_ambient
-                + vertex_color;
+                + lit_ambient;
   }
   else
   {
@@ -239,15 +260,12 @@ vec3 apply_lighting(vec3 material)
     vec3 interior_ambient = all(greaterThan(ambient_color, vec3(0.95))) ? vec3(0.04) : ambient_color;
     light_color = interior_ambient + vertex_color;
 
-    if (bool(flags & eWMOBatch_PortalSpill))
-    {
-      float openness = clamp(f_vertex_color.a, 0.0, 1.0);
-      float nDotL = clamp(dot(normalize(f_normal),
-                              -normalize(vec3(LightDir_FogRate.x, LightDir_FogRate.z, LightDir_FogRate.y))),
-                          0.0, 1.0);
-      vec3 outdoor = clamp(DiffuseColor_FogStart.xyz * nDotL, 0.0, 1.0) + AmbientColor_FogEnd.xyz;
-      light_color = mix(light_color, outdoor, openness);
-    }
+    // NO outdoor colour-lerp for WMO faces. CANON (LIGHT_FOG_SELECTION_RE.md §9.5): in the client's interior
+    // lighting (FUN_006a7300), the MOCV-alpha / near-opening (0x800) term only tilts the light DIRECTION
+    // toward the sun -- it NEVER lerps the face COLOUR toward the outdoor light. The colour-lerp toward
+    // CWorldLight (FUN_0069e4c0 / FUN_006a8410) is for placed DOODADS that SAMPLE the WMO light, not the
+    // WMO's own geometry. noggit's old PortalSpill mix() toward the bright Dun Morogh light was exactly what
+    // lit Ironforge's windows/doorways blue-white -- removed. Interior WMO faces are baked MOCV, full stop.
   }
 
   light_color += point_lights(f_position, normalize(f_normal));
@@ -281,6 +299,17 @@ void main()
     out_color = vec4(vec3(o), 1.0);
     return;
   }
+  if (debug_mocv == 3) // BRANCH visualiser: which lighting path does each WMO face take? (dimmed = camera outside)
+  {
+    vec3 c;
+    if (bool(flags & eWMOBatch_Unlit))                                      c = vec3(1.0, 1.0, 1.0); // WHITE  = unlit/fullbright
+    else if (bool(flags & eWMOBatch_ExteriorLit) && camera_inside_wmo == 0) c = vec3(1.0, 0.0, 0.0); // RED    = ExteriorLit outdoor branch (the bug when inside)
+    else if (bool(flags & eWMOBatch_ExteriorLit))                          c = vec3(1.0, 0.5, 0.0); // ORANGE = ExteriorLit face but INSIDE -> now routed to interior (fixed)
+    else if (bool(flags & eWMOBatch_PortalSpill))                          c = vec3(0.0, 0.4, 1.0); // BLUE   = interior + portal spill
+    else                                                                   c = vec3(0.0, 1.0, 0.0); // GREEN  = plain interior (ambient + MOCV)
+    out_color = vec4(c * (camera_inside_wmo != 0 ? 1.0 : 0.5), 1.0);
+    return;
+  }
 
   float dist_from_camera = distance(camera, f_position);
   bool fog = FogColor_FogOn.w != 0 && !bool(flags & eWMOBatch_Unfogged);
@@ -312,6 +341,11 @@ void main()
     vertex_color = f_vertex_color;
   }
 
+  // Two-layer (shader 6) blend factor rides the vertex-colour ALPHA. That alpha is valid whenever ANY
+  // vertex-colour chunk was uploaded -- including modern WMOs that carry ONLY a texture-blend mocv2 (RGB=0)
+  // and are therefore NOT flagged HasMOCV for lighting. Gate the blend on its own flag so those groups
+  // still blend their two layers instead of collapsing to layer 1; default 1.0 = pure layer 1.
+  float blend_alpha = bool(flags & eWMOBatch_HasMOCVBlend) ? f_vertex_color.a : 1.0;
 
   // see: https://github.com/Deamon87/WebWowViewerCpp/blob/master/wowViewerLib/src/glsl/wmoShader.glsl
   if(shader == 3) // Env
@@ -327,7 +361,7 @@ void main()
   else if(shader == 6) // TwoLayerDiffuse
   {
     vec3 layer2 = mix(tex.rgb, tex_2.rgb, tex_2.a);
-    out_color = vec4(apply_lighting(mix(layer2, tex.rgb, vertex_color.a)), 1.);
+    out_color = vec4(apply_lighting(mix(layer2, tex.rgb, blend_alpha)), 1.);
   }
   else // default shader, used for shader 0,1,2,4 (Diffuse, Specular, Metal, Opaque)
   {

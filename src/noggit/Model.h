@@ -327,7 +327,14 @@ private:
     std::uint32_t flags = 0;
     int parent = -1;
     glm::vec3 pivot = {};
+    // Billboard glow/flame card texture basis (derived once from this card's geometry+UVs, like the
+    // animated path's bb_local_*). basis_ok = a non-degenerate card was found for this billboard bone.
+    bool basis_ok = false;
+    glm::vec3 bb_local_normal = glm::vec3(1, 0, 0);
+    glm::vec3 bb_local_up     = glm::vec3(0, 0, 1);
+    glm::vec3 bb_local_right  = glm::vec3(0, 1, 0);
   };
+  bool _static_bb_bases_computed = false;
 
   bool _per_instance_animation;
   bool _uses_classic_layout = false;

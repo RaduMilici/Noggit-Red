@@ -26,24 +26,23 @@ namespace
   // oblique/distant tilesets and model textures were blurrier than in-game. EXT_texture_filter_
   // anisotropic is core-adjacent and universally supported; constants defined locally since the
   // GL headers in use predate them. Level from QSettings render/anisotropic_filtering (default 16),
-  // clamped to the hardware max; <= 1 disables. Cached once (samplers are created early and often).
+  // clamped to the hardware max; <= 1 disables. Re-read every call so the Settings slider applies
+  // live -- TextureManager::reapply_anisotropy() re-runs it over every loaded array on a change.
   constexpr GLenum GL_TEXTURE_MAX_ANISOTROPY_LOCAL = 0x84FE;
   constexpr GLenum GL_MAX_TEXTURE_MAX_ANISOTROPY_LOCAL = 0x84FF;
 
   float anisotropy_level()
   {
-    static float const level = []
+    // hw_max is a hardware constant -> query it once (the first call happens during array creation,
+    // with a live GL context). The requested level is re-read from QSettings every call.
+    static float const hw_max = []
     {
-      float requested = QSettings().value("render/anisotropic_filtering", 16.0f).toFloat();
-      GLfloat hw_max = 1.0f;
-      gl.getFloatv(GL_MAX_TEXTURE_MAX_ANISOTROPY_LOCAL, &hw_max);
-      if (!(hw_max >= 1.0f)) // extension absent or query failed
-      {
-        hw_max = 1.0f;
-      }
-      return std::clamp(requested, 1.0f, hw_max);
+      GLfloat m = 1.0f;
+      gl.getFloatv(GL_MAX_TEXTURE_MAX_ANISOTROPY_LOCAL, &m);
+      return (m >= 1.0f) ? m : 1.0f; // extension absent or query failed -> no AF
     }();
-    return level;
+    float const requested = QSettings().value("render/anisotropic_filtering", 16.0f).toFloat();
+    return std::clamp(requested, 1.0f, hw_max);
   }
 
   void apply_anisotropy(GLenum target)
@@ -142,6 +141,28 @@ void TextureManager::unload_all(Noggit::NoggitRenderContext context)
   for (auto& pair : arrays_for_context)
   {
     gl.deleteTextures(static_cast<GLuint>(pair.second.arrays.size()), pair.second.arrays.data());
+  }
+}
+
+void TextureManager::reapply_anisotropy()
+{
+  // Live re-apply of the anisotropic-filtering level (Settings -> Anisotropic filtering) to every
+  // already-uploaded texture array: models, particles and tilesets all live in _tex_arrays. AF is
+  // otherwise set once at array creation, so without this a change wouldn't take effect until the
+  // texture reloaded. Must run with a current GL context (called from WorldRender::draw). The level
+  // is always set explicitly, including 1 (= off), so lowering the setting actually clears a
+  // previously-set higher value on each array.
+  float const level = std::max(1.0f, anisotropy_level());
+  for (auto& arrays_for_context : _tex_arrays)
+  {
+    for (auto& pair : arrays_for_context)
+    {
+      for (GLuint array : pair.second.arrays)
+      {
+        gl.bindTexture(GL_TEXTURE_2D_ARRAY, array);
+        gl.texParameterf(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAX_ANISOTROPY_LOCAL, level);
+      }
+    }
   }
 }
 
@@ -500,6 +521,19 @@ void blp_texture::loadFromUncompressedData(BLPHeader const* lHeader, char const*
             {
               alpha = (*a & (1 << cnt++)) ? 0xff : 0;
               if (cnt == 8)
+              {
+                cnt = 0;
+                a++;
+              }
+            }
+            else if (alphabits == 4)
+            {
+              // 4-bit alpha (BLP2 alphaSize=4): two 4-bit alphas packed per byte, low nibble = even pixel;
+              // expand the nibble to 8-bit (v<<4|v). Hits exactly ONE Turtle asset
+              // (Character\Tauren\Male\TAURENMALESKIN00_20_EXTRA), which without this branch rendered opaque. (7.3)
+              int const nib = (*a >> (4 * cnt)) & 0x0F;
+              alpha = (nib << 4) | nib;
+              if (++cnt == 2)
               {
                 cnt = 0;
                 a++;

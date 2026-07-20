@@ -14,7 +14,8 @@ in uvec4 bones_indices;
   uniform mat4 transform;
 #endif
 
-// Interior light for this draw: rgb = WMO room ambient, a = 1 when the object is indoors. A uniform in
+// Interior light for this draw: rgb = WMO room ambient; a in [0.5,1.0] indoors (carries GAP B doorway
+// spill = baked MOCV floor alpha), 0 outdoors. A uniform in
 // BOTH variants -- the instanced path partitions its instances by interior value into per-value sub-draws
 // so one uniform covers each sub-batch (avoids a per-instance attribute + shared-VAO location fragility).
 uniform vec4 instance_interior;
@@ -32,7 +33,7 @@ out vec2 uv2;
 out float camera_dist;
 out vec3 norm;
 out vec3 m2_world_pos;
-flat out vec4 v_interior;        // rgb = interior room ambient, a = 1 when the object is indoors
+flat out vec4 v_interior;        // rgb = interior room ambient; a in [0.5,1.0] indoors (carries GAP B doorway spill), 0 outdoors
 
 layout (std140) uniform matrices
 {

@@ -4,6 +4,7 @@
 #include <noggit/Model.h>
 #include <noggit/ModelInstance.h>
 #include <noggit/Log.h>
+#include <noggit/frame_profiler.hpp>
 #include <external/tracy/Tracy.hpp>
 #include <math/bounding_box.hpp>
 #include <noggit/Misc.h>
@@ -367,7 +368,10 @@ void ModelRender::draw(glm::mat4x4 const& model_view
     // billboarding with only the view matrix left the Purple_Glow card rotated by the spawn's heading.
     // calcMatrix uses model_view ONLY for the billboard basis, so this affects nothing else. This is a
     // single-instance draw (creature spawns re-animate per draw), so per-instance billboards are correct.
-    _model->animate(model_view * instance.transformMatrix(), anim_id, animtime);
+    {
+      noggit::perf::Scoped _prof_anim(noggit::perf::Phase::AnimateCPU);
+      _model->animate(model_view * instance.transformMatrix(), anim_id, animtime);
+    }
     _model->animcalc = true;
   }
 
@@ -492,12 +496,86 @@ void ModelRender::draw(glm::mat4x4 const& model_view
     gl.colorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
   }
 
-  for (ModelRenderPass& p : _render_passes)
+  // CANON per-frame transparency sort (WoW.exe 5875 -- CM2Scene draw FUN_00707680 builds+buckets+sorts the
+  // batches; transparent-bucket comparator FUN_0070ae10; RE'd 2026-07-18, [[twmoa-m2-transparency-sort]]):
+  // the client re-sorts a model's TRANSPARENT batches EVERY FRAME back-to-front by the batch sort-centre's
+  // SQUARED CAMERA DISTANCE (comparator primary key), with priorityPlane only a #3 tiebreaker; the opaque /
+  // alpha-key depth-writers draw first in their own state-sorted bucket. noggit's static _render_passes sort
+  // (ModelRenderPass::operator<) is priorityPlane-primary and view-independent -- right for opaque, but it
+  // stacks a model's alpha-blended layers in a fixed order that reads wrong from angles where depth != the
+  // authored priority. So per THIS instance THIS frame: draw depth-writers (blend<=1) first in static order,
+  // then the transparent batches, grouped by blend (the client buckets transparent by render category --
+  // exact criterion not fully traced, blend_mode is the proxy) and back-to-front within each group. Only the
+  // single-instance path (creatures / individually-drawn doodads); the instanced doodad overload keeps the
+  // static order for the instancing perf win, and additive blends commute, so only multi-alpha-blend models
+  // actually change. Gated to >=2 transparent batches, so the overwhelmingly common 0/1-transparent model
+  // keeps its exact prior order.
   {
-    if (p.prepareDraw(m2_shader, _model, &instance, model_render_state, dist_fade))
+    static thread_local std::vector<std::size_t> draw_order;
+    draw_order.clear();
+
+    std::size_t transparent_pass_count = 0;
+    for (ModelRenderPass const& p : _render_passes)
     {
-      gl.drawElements(GL_TRIANGLES, p.index_count, GL_UNSIGNED_SHORT, reinterpret_cast<void*>(p.index_start * sizeof(GLushort)));
-      p.afterDraw();
+      if (p.blend_mode > 1)
+      {
+        ++transparent_pass_count;
+      }
+    }
+
+    // depth-writers first (and, in the fast <2-transparent case, EVERY pass in exact static order)
+    for (std::size_t i = 0; i < _render_passes.size(); ++i)
+    {
+      if (transparent_pass_count < 2 || _render_passes[i].blend_mode <= 1)
+      {
+        draw_order.push_back(i);
+      }
+    }
+
+    if (transparent_pass_count >= 2)
+    {
+      std::size_t const transparent_begin = draw_order.size();
+      for (std::size_t i = 0; i < _render_passes.size(); ++i)
+      {
+        if (_render_passes[i].blend_mode > 1)
+        {
+          draw_order.push_back(i);
+        }
+      }
+
+      glm::mat4x4 const inst_mat = instance.transformMatrix();
+      auto const dist2 = [&](std::size_t idx)
+      {
+        glm::vec3 const world = glm::vec3(inst_mat * glm::vec4(_render_passes[idx].sort_center, 1.0f));
+        glm::vec3 const to_cam = camera - world;
+        return glm::dot(to_cam, to_cam);
+      };
+
+      std::stable_sort(draw_order.begin() + transparent_begin, draw_order.end(),
+        [&](std::size_t a, std::size_t b)
+        {
+          if (_render_passes[a].blend_mode != _render_passes[b].blend_mode)
+          {
+            return _render_passes[a].blend_mode < _render_passes[b].blend_mode; // keep the blend/category grouping
+          }
+          float const da = dist2(a);
+          float const db = dist2(b);
+          if (da != db)
+          {
+            return da > db; // back-to-front -- the client's primary transparent key
+          }
+          return _render_passes[a].priority_plane < _render_passes[b].priority_plane; // priorityPlane tiebreaker
+        });
+    }
+
+    for (std::size_t idx : draw_order)
+    {
+      ModelRenderPass& p = _render_passes[idx];
+      if (p.prepareDraw(m2_shader, _model, &instance, model_render_state, dist_fade))
+      {
+        gl.drawElements(GL_TRIANGLES, p.index_count, GL_UNSIGNED_SHORT, reinterpret_cast<void*>(p.index_start * sizeof(GLushort)));
+        p.afterDraw();
+      }
     }
   }
 
@@ -1424,6 +1502,9 @@ void ModelRender::initRenderPasses(ModelView const* view, ModelTexUnit const* te
 
     ModelRenderPass pass(tex_unit[j], _model);
     pass.ordering_thingy = model_geosets[geoset].BoundingBox[0].x;
+    // Full submesh sort-centre for the per-frame transparency sort: BoundingBox[0] is the client's per-batch
+    // sort point (classic geoset.center, wotlk SkinSection CenterPosition), so this matches WoW.exe's key.
+    pass.sort_center = model_geosets[geoset].BoundingBox[0];
     pass.geoset_id = model_geosets[geoset].id;
 
     pass.index_start = model_geosets[geoset].istart;
@@ -1521,18 +1602,21 @@ void ModelRender::updateBoneMatrices()
 
   {
     OpenGL::Scoped::buffer_binder<GL_TEXTURE_BUFFER> const binder (_bone_matrices_buffer);
-    if (upload_size != _bone_matrices_buffer_size)
+    // Orphan-on-upload (perf 2026-07-20). The per-instance doodad/creature path re-uploads this SHARED
+    // per-model bone buffer once per instance and immediately draws from it. A plain bufferSubData then
+    // BLOCKS the next instance's upload on the GPU still reading the previous draw's bones -- the "both
+    // CPU+GPU idle" SubmitIndiv stall (~27ms in dense billboard scenes). Respecifying the whole store
+    // with bufferData(STREAM_DRAW) tells the driver to discard the old contents, so it hands back fresh
+    // storage instead of waiting. Bones are byte-identical; only the stall is removed. texBuffer is
+    // re-associated each upload because respecifying the store can otherwise leave the buffer texture
+    // reading stale storage on some drivers.
+    _bone_matrices_buffer_size = upload_size;
+    gl.bufferData(GL_TEXTURE_BUFFER, upload_size, _model->bone_matrices.data(), GL_STREAM_DRAW);
+    if (_bone_matrices_buf_tex)
     {
-      _bone_matrices_buffer_size = upload_size;
-      gl.bufferData(GL_TEXTURE_BUFFER, _bone_matrices_buffer_size, nullptr, GL_STREAM_DRAW);
-      if (_bone_matrices_buf_tex)
-      {
-        gl.bindTexture(GL_TEXTURE_BUFFER, _bone_matrices_buf_tex);
-        gl.texBuffer(GL_TEXTURE_BUFFER, GL_RGBA32F, _bone_matrices_buffer);
-      }
+      gl.bindTexture(GL_TEXTURE_BUFFER, _bone_matrices_buf_tex);
+      gl.texBuffer(GL_TEXTURE_BUFFER, GL_RGBA32F, _bone_matrices_buffer);
     }
-
-    gl.bufferSubData(GL_TEXTURE_BUFFER, 0, upload_size, _model->bone_matrices.data());
   }
 
   if (capture_debug_enabled()
@@ -1667,8 +1751,14 @@ bool ModelRenderPass::prepareDraw(OpenGL::Scoped::use_program& m2_shader, Model 
   // TRACE-VERIFIED (RE_notes/20): a pass whose animated opacity evaluates to ~0 is NOT drawn by the
   // client (alphatest >= 1/255 kills it). E.g. Anomalus's MANAMISTBASE shell is DEATH-ONLY
   // (ModelColor alpha = 0 in every idle anim) -- drawing it at idle painted a dim lit layer over his
-  // bright body. Skip such passes outright.
-  if (mesh_color.w < (1.0f / 255.0f))
+  // bright body. Skip such passes outright -- but ONLY for creature/character models, which is the case
+  // this was written for. World GameObject force-field / portal WALLS (RazorfenForceField, ZulGurub
+  // Forcefield, InstancePortal, Summon_Ritual, ...) are ADDITIVE submeshes whose authored transparency
+  // legitimately fades to 0 in their "open"/gone GameObject state; nuking the whole panel over one
+  // frame's animated alpha collapsed the barrier to just its particle ring (the "tiny" regression, added
+  // in 7c43c6a0). For an ADDITIVE pass alpha~=0 already contributes ~=0 under premultiplied ONE/ONE, so
+  // NOT skipping world passes is visually free.
+  if (mesh_color.w < (1.0f / 255.0f) && is_classic_creature_or_character_model(m))
   {
     return false;
   }

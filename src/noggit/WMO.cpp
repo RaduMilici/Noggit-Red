@@ -1108,12 +1108,30 @@ void WMOGroup::load()
   if (header.flags.indoor && !header.flags.exterior && !header.flags.exterior_lit
       && header.flags.has_vertex_color && _vertex_colors.size() >= _vertices.size())
   {
+    // CANON (LIGHT_FOG_SELECTION_RE.md §9.3): the client's interior MOCV CARRIES the MOHD ambient, so an
+    // M2/gameobject sampling a dark floor is floored to the room ambient and NEVER samples pure (0,0,0)
+    // (FUN_006a77e0 can't lift a 0 -> that would render solid black). noggit's fix_vertex_color_alpha
+    // SUBTRACTS the ambient (the WMO face shader adds it back); the CPU ground sample must add it back too,
+    // or a MOCV<=ambient vertex reads (0,0,0) and the gameobject renders black (Ironforge dark-floor props;
+    // IF MOHD ambient = (5,5,14)/255). So store _ground_colors = the floor's LIT colour = eff_ambient +
+    // fixed MOCV, exactly the interior FACE branch. (Near-white MOHD ambient = the "MOCV already carries
+    // full light" sentinel -> 0.04 floor, matching the shader's interior_ambient guard.)
+    glm::vec3 const mohd_amb = glm::vec3(wmo->ambient_light_color);
+    bool const neutral_amb = mohd_amb.x > 0.95f && mohd_amb.y > 0.95f && mohd_amb.z > 0.95f;
+    glm::vec3 const eff_amb = neutral_amb ? glm::vec3(0.04f) : mohd_amb;
     _ground_colors.resize(_vertices.size());
+    // GAP B (checklist 8.7): store the PRISTINE baked MOCV floor alpha per vertex [0..255] alongside the
+    // rgb, so sample_ground_color() can drive the doorway day/night spill. Sourced from the pristine
+    // capture (colorFromInt), NOT _vertex_colors[i].w (already clobbered by fix/portal above). alpha 0
+    // for verts with no MOCV.
+    _ground_alphas.resize(_vertices.size());
     for (std::size_t i = 0; i < _vertices.size(); ++i)
     {
-      _ground_colors[i] = glm::u8vec3(static_cast<std::uint8_t>(glm::clamp(_vertex_colors[i].x, 0.f, 1.f) * 255.f)
-                                    , static_cast<std::uint8_t>(glm::clamp(_vertex_colors[i].y, 0.f, 1.f) * 255.f)
-                                    , static_cast<std::uint8_t>(glm::clamp(_vertex_colors[i].z, 0.f, 1.f) * 255.f));
+      _ground_colors[i] = glm::u8vec3(static_cast<std::uint8_t>(glm::clamp(eff_amb.x + _vertex_colors[i].x, 0.f, 1.f) * 255.f)
+                                    , static_cast<std::uint8_t>(glm::clamp(eff_amb.y + _vertex_colors[i].y, 0.f, 1.f) * 255.f)
+                                    , static_cast<std::uint8_t>(glm::clamp(eff_amb.z + _vertex_colors[i].z, 0.f, 1.f) * 255.f));
+      float const pa = (i < _mocv_pristine_alpha.size()) ? _mocv_pristine_alpha[i] : 0.f;
+      _ground_alphas[i] = static_cast<std::uint8_t>(glm::clamp(pa, 0.f, 1.f) * 255.f + 0.5f);
     }
   }
 
@@ -1121,7 +1139,7 @@ void WMOGroup::load()
   _renderer.initRenderBatches();
 }
 
-bool WMOGroup::sample_ground_color(glm::vec3 const& local_pos, glm::vec3* out) const
+bool WMOGroup::sample_ground_color(glm::vec3 const& local_pos, glm::vec3* out, float* out_alpha) const
 {
   // Client CWorldEntity::SampleGroundColor (wow.exe 0x69E4C0 -> 0x6B9A50, RE_notes/15): ray from
   // entity+1.0 down 12.0 units, barycentric-interpolate the hit face's MOCV. Group verts are stored in
@@ -1175,6 +1193,15 @@ bool WMOGroup::sample_ground_color(glm::vec3 const& local_pos, glm::vec3* out) c
     glm::vec3 const cb = glm::vec3(_ground_colors[ib]) / 255.f;
     glm::vec3 const cc = glm::vec3(_ground_colors[ic]) / 255.f;
     *out = ca * w0 + cb * w1 + cc * w2;
+    // GAP B (checklist 8.7): same barycentric weights interpolate the pristine baked floor alpha [0..1]
+    // for the doorway day/night spill. Bounds-guarded like the rgb path (ia/ib/ic already < _vertices).
+    if (out_alpha && !_ground_alphas.empty()
+        && ia < _ground_alphas.size() && ib < _ground_alphas.size() && ic < _ground_alphas.size())
+    {
+      *out_alpha = (static_cast<float>(_ground_alphas[ia]) * w0
+                  + static_cast<float>(_ground_alphas[ib]) * w1
+                  + static_cast<float>(_ground_alphas[ic]) * w2) / 255.f;
+    }
     best_y = y;
     found = true;
   }
@@ -1193,9 +1220,14 @@ void WMOGroup::load_mocv(BlizzardArchive::ClientFile& f, uint32_t size)
   // bytes -- the rest of our pipeline evidently compensates around the legacy fix. Back to the
   // approved formula; atten_trans_verts stays parked below for a future retry.
   _vertex_colors.resize(count);
+  // GAP B (checklist 8.7): capture the PRISTINE baked MOCV alpha now, before fix_vertex_color_alpha
+  // (sets .w=1) or compute_portal_openness (sets .w=portal-fade) overwrite _vertex_colors[i].w below.
+  // The _ground_alphas build at the end of load() sources the doorway-spill exposure from this.
+  _mocv_pristine_alpha.resize(count);
   for (std::size_t i(0); i < count; ++i)
   {
     _vertex_colors[i] = colorFromInt(colors[i]);
+    _mocv_pristine_alpha[i] = _vertex_colors[i].w;
   }
 
   if (wmo->flags.do_not_fix_vertex_color_alpha)
@@ -1582,8 +1614,8 @@ void WMOGroup::setupFog (bool draw_fog, std::function<void (bool)> setup_fog)
 }
 
 bool WMO::evaluate_camera_fog(WMOGroup const& group, glm::mat4x4 const& transform,
-                              glm::vec3 const& camera, glm::vec3* color, float* fog_end,
-                              float* fog_start_abs) const
+                              glm::vec3 const& camera, bool camera_inside_wmo, glm::vec3* color,
+                              float* fog_end, float* fog_start_abs) const
 {
   if (fogs.size() <= 1)
   {
@@ -1627,7 +1659,22 @@ bool WMO::evaluate_camera_fog(WMOGroup const& group, glm::mat4x4 const& transfor
   // with heavy fog the live client never shows outside the anchors.
   if (n == 0)
   {
-    return false;
+    // No placed fog sphere in range. If the camera is OUTSIDE this WMO (we're drawing its exterior from
+    // the map), keep the ZONE fog -- don't paint the outside with the interior default (that was the old
+    // fogs[0] regression that fogged Karazhan doodads/rooms). But when the camera is INSIDE a multi-fog
+    // WMO, the client uses the DEFAULT entry fog[0] as the base EVERYWHERE (RE @0069de20: placed fogs
+    // blend OVER fog[0]; with none in range the result IS fog[0]), NOT the zone fog. Ironforge: fog[0]
+    // end 805.6 / start 201.4 = clear-then-fog interior, vs the Dun Morogh zone light's start ~1.4yd
+    // (fog from the camera plane) that hazed the whole Great Forge. Karazhan's root has NO MFOG (fogs<=1,
+    // handled by the early-out above), so this never touches it.
+    if (!camera_inside_wmo)
+    {
+      return false;
+    }
+    *color = c;      // c/end/start were seeded to fog[0] above
+    *fog_end = end;
+    *fog_start_abs = start;
+    return true;
   }
 
   // farthest -> nearest (the client pops a max-heap), so the NEAREST fog dominates

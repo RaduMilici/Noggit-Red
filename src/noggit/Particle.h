@@ -32,6 +32,9 @@ struct Particle {
   float size, life, maxlife;
   unsigned int tile;
   glm::vec4 color;
+  // Stable per-particle index (the client's memory-slot index). Drives the twinkle noise-table phase
+  // and the alternating spin sign (client uses slot parity when emitter flag 0x8000 is set).
+  unsigned int slot = 0;
 };
 
 typedef std::list<Particle> ParticleList;
@@ -89,6 +92,32 @@ class ParticleSystem
   // this closed loop of points; the emission position advances around it at _spin rev/sec. Empty = not a
   // spline emitter. Points are stored in Noggit render space (fixCoordSystem applied), emitter-local.
   std::vector<glm::vec3> _spline_points;
+
+  // Client-exact per-particle motion params (RE'd from CParticleEmitter2, 1.12 build 5875).
+  // WIND (§4): a young-only acceleration -- while a particle's age < _wind_time, vel += _wind * dt.
+  // _wind is the authored windVector in Noggit render space (fixCoordSystem). Wind-blown dust/snow/embers.
+  glm::vec3 _wind = glm::vec3(0.0f);
+  float _wind_time = 0.0f;
+  // TWINKLE (§5): sprite shimmer. Per particle per frame the client samples a shared 128-entry random
+  // noise table at idx=(floor(twinkleSpeed*age)+slot)&0x7f -> t; culls the sprite when twinklePercent<t,
+  // and scales size by lerp(scaleMin,scaleMax,t). 1.0/1.0 min==max and speed 0 percent>=1 = inert.
+  float _twinkle_speed = 0.0f;
+  float _twinkle_percent = 1.0f;
+  float _twinkle_scale_min = 1.0f;
+  float _twinkle_scale_max = 1.0f;
+  // SPIN sign (§2): when emitter flag 0x8000 is set the client alternates the sprite spin direction by
+  // particle slot parity (its "random" sign). Base angle = _spin * age is unchanged.
+  bool _spin_alternate = false;
+  // Running spawn counter -> each new particle's stable slot (see Particle::slot).
+  unsigned int _spawn_seq = 0;
+
+  // TAIL streak (type/ParticleType 1=Tail, 2=Both, client FUN_007b2a50 tail branch): each particle is
+  // drawn as a motion streak of _tail_length * (screen-projected velocity) trailing behind it, billboarded
+  // about the velocity axis, width = particle size. _tail_clamp_age (emitter flag 0x400) clamps the streak
+  // to the particle's age so a fresh particle's tail grows in rather than popping to full length.
+  float _tail_length = 0.0f;
+  bool _tail_clamp_age = false;
+
   glm::vec3 pos;
   uint16_t _texture_id;
   ParticleList particles;

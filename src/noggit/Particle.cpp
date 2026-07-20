@@ -34,6 +34,26 @@ namespace
   bool classic_effect_debug_enabled();
   float sane_classic_particle_size(float value, float fallback);
 
+  // Client twinkle noise table (CParticleEmitter2 §5): the 1.12 client fills DAT_00cf58f0 once at load
+  // with 128 uniform-random floats in [0,1) and every twinkling sprite indexes it by
+  // (floor(twinkleSpeed*age)+slot)&0x7f. The exact values are irrelevant (they're just white noise);
+  // we build a stable deterministic table (fixed-seed LCG) so the shimmer is identical run to run.
+  std::array<float, 128> const& twinkle_noise_table()
+  {
+    static std::array<float, 128> const table = []
+    {
+      std::array<float, 128> t{};
+      std::uint32_t s = 0x1234567u;
+      for (float& v : t)
+      {
+        s = s * 1664525u + 1013904223u;
+        v = static_cast<float>(s >> 8) * (1.0f / 16777216.0f); // [0,1)
+      }
+      return t;
+    }();
+    return table;
+  }
+
   bool particle_range_fits(BlizzardArchive::ClientFile const& file,
                            std::uint32_t offset,
                            std::uint32_t count,
@@ -129,10 +149,10 @@ namespace
                             color.red / 255.0f,
                             color.alpha / 255.0f);
 
-      float const burst_multiplier = std::isfinite(params.burstMultiplier) && params.burstMultiplier > 0.001f
-        ? params.burstMultiplier
-        : 1.0f;
-      float const size = params.scalesValues[i] * burst_multiplier;
+      // Client size ramp = scalesValues DIRECTLY (CParticleEmitter2 render fill FUN_007b2a50); burstMultiplier
+      // is NOT applied to size in 1.12 (nor to spawn count -- 14.5% of Turtle emitters author burst=0.0 yet
+      // emit). Dropping the x burst removes a minor non-client size artifact on the 1.1% authoring burst!=1. (12.15)
+      float const size = params.scalesValues[i];
       if (std::isfinite(size) && size > 0.0f && size < 100.0f)
       {
         sizes[i] = sane_classic_particle_size(size, sizes[i]);
@@ -362,8 +382,12 @@ ParticleSystem::ParticleSystem(Model* model_
   , pos(fixCoordSystem(mta.pos))
   , _texture_id(mta.texture)
   , blend(mta.blend)
-  , order(0)
-  , type(0)
+  // ParticleType (file 0x2c) IS the Head/Tail selector: 0=Head, 1=Tail, 2=Both (RE'd from the client
+  // M2 loader FUN_0070ebd0). The classic ctor used to hardcode type(0), forcing every classic particle
+  // to render as a Head billboard -- so Tail emitters (e.g. a core hound's dripping drool) never
+  // stretched. The wotlk ctor already read mta.ParticleType; match it here.
+  , order(mta.ParticleType > 0 ? -1 : 0)
+  , type(mta.ParticleType)
   , manim(0)
   , mtime(0)
   , manimtime(0)
@@ -381,6 +405,23 @@ ParticleSystem::ParticleSystem(Model* model_
   // Emitter spin: for a spline emitter (M2 EmitterType 3) this is how fast the emission point travels
   // along the spline. classic models carry it in params.spin; WotLK params don't.
   _spin = std::isfinite(mta.p.spin) ? mta.p.spin : 0.f;
+
+  // Wind / twinkle / spin-sign (client-exact, CParticleEmitter2 RE). Guard non-finite authored floats.
+  auto const sane = [](float v, float fb) { return std::isfinite(v) ? v : fb; };
+  _wind = fixCoordSystem(glm::vec3(sane(mta.p.windVector.x, 0.f),
+                                   sane(mta.p.windVector.y, 0.f),
+                                   sane(mta.p.windVector.z, 0.f)));
+  _wind_time = std::max(0.0f, sane(mta.p.windTime, 0.f));
+  _twinkle_speed = sane(mta.p.twinkleSpeed, 0.f);
+  _twinkle_percent = sane(mta.p.twinklePercent, 1.f);
+  _twinkle_scale_min = sane(mta.p.twinkleScaleMin, 1.f);
+  _twinkle_scale_max = sane(mta.p.twinkleScaleMax, 1.f);
+  _spin_alternate = (mta.flags & 0x8000) != 0;
+
+  // Tail streak (Head/Tail=1/2): tailLength (file 0x17c) = streak length as a fraction of velocity.
+  // Emitter flag 0x400 = clamp the tail to the particle's age (young particles have a short growing tail).
+  _tail_length = std::max(0.0f, sane(mta.p.tailLength, 0.f));
+  _tail_clamp_age = (mta.flags & 0x400) != 0;
 
   // Spline path (the MC flamecircle's ring etc.). The emitter stores nSplinePoints vec3s at
   // ofsSplinePoints; particles emit along this loop instead of from the bone origin. Read & convert to
@@ -452,21 +493,19 @@ ParticleSystem::ParticleSystem(Model* model_
   // stacking additively into small bright yellow licks. The floor made ours bigger AND dimmer -- the
   // opposite. Authored data passes through untouched now.
 
-  // Large-area, alpha-blended ambient dust/fog (e.g. the Timbermaw furbolg dust: emission area ~8-12u,
-  // ~270 motes) fills a big volume with many overlapping semi-transparent particles. In the editor's
-  // brighter, un-fogged scene that overlap reads as near-opaque, unlike the dark in-game cave where the
-  // same motes are subtle. Scale the opacity of big-area alpha-blend emitters down so the cumulative
-  // density matches the in-game subtlety. Data-driven (emission area + alpha blend), not a per-model
-  // hack -- localized effects (torches, small dust/steam) have small areas and keep their full alpha.
+  // Editor vs in-game: the editor's brighter, un-fogged scene makes overlapping alpha-blended smoke/
+  // dust read as near-opaque and crisp, where in the dark, foggy game the same particles are soft and
+  // see-through. Scale alpha-blend opacity down so it reads translucent like in-game. Large-area
+  // ambient fog (Timbermaw dust ~8-12u) overlaps hardest -> strongest cut; smaller volumetric smoke
+  // (energy-elemental feet mist etc.) still gets a meaningful cut so it stops looking too clear/solid.
+  // Additive fire/glow (blend 3/4) is left alone. Data-driven (blend + emission area), not a per-model hack.
   if (blend == 2)
   {
     float const area = std::max(areal.getValue(0, 0, 0), areaw.getValue(0, 0, 0));
-    if (std::isfinite(area) && area > 5.0f)
+    float const soften = (std::isfinite(area) && area > 5.0f) ? 0.2f : 0.5f;
+    for (glm::vec4& ramp_color : colors)
     {
-      for (glm::vec4& ramp_color : colors)
-      {
-        ramp_color.a *= 0.2f;
-      }
+      ramp_color.a *= soften;
     }
   }
 
@@ -502,6 +541,16 @@ ParticleSystem::ParticleSystem(ParticleSystem const& other)
   , slowdown(other.slowdown)
   , _spin(other._spin)
   , _spline_points(other._spline_points)
+  , _wind(other._wind)
+  , _wind_time(other._wind_time)
+  , _twinkle_speed(other._twinkle_speed)
+  , _twinkle_percent(other._twinkle_percent)
+  , _twinkle_scale_min(other._twinkle_scale_min)
+  , _twinkle_scale_max(other._twinkle_scale_max)
+  , _spin_alternate(other._spin_alternate)
+  , _spawn_seq(other._spawn_seq)
+  , _tail_length(other._tail_length)
+  , _tail_clamp_age(other._tail_clamp_age)
   , pos(other.pos)
   , _texture_id(other._texture_id)
   , particles(other.particles)
@@ -552,6 +601,16 @@ ParticleSystem::ParticleSystem(ParticleSystem&& other)
   , slowdown(other.slowdown)
   , _spin(other._spin)
   , _spline_points(other._spline_points)
+  , _wind(other._wind)
+  , _wind_time(other._wind_time)
+  , _twinkle_speed(other._twinkle_speed)
+  , _twinkle_percent(other._twinkle_percent)
+  , _twinkle_scale_min(other._twinkle_scale_min)
+  , _twinkle_scale_max(other._twinkle_scale_max)
+  , _spin_alternate(other._spin_alternate)
+  , _spawn_seq(other._spawn_seq)
+  , _tail_length(other._tail_length)
+  , _tail_clamp_age(other._tail_clamp_age)
   , pos(other.pos)
   , _texture_id(other._texture_id)
   , particles(other.particles)
@@ -592,12 +651,18 @@ void ParticleSystem::initTile(glm::vec2 *tc, int num)
   a.y = y * (1.0f / rows);
   b.y = (y + 1) * (1.0f / rows);
 
-  otc[0] = a;
-  otc[2] = b;
-  otc[1].x = b.x;
-  otc[1].y = a.y;
-  otc[3].x = a.x;
-  otc[3].y = b.y;
+  // Flip V so the tile's TOP row (min v) lands on the +up screen corners. The 1.12 client draws every
+  // FFP particle sprite with the texture's top at the screen top (trace-verified on the Karazhan candle
+  // flame-lick 4x4 flipbook, RE_notes/18: min-v -> screen TOP, min-u -> screen LEFT, no rotation). Noggit
+  // uploads DXT mip data verbatim (GL v=0 = the BLP's top row, same as D3D's convention) but this quad
+  // previously mapped the tile's MAX v to the +up corners, drawing every billboard sprite UPSIDE-DOWN.
+  // Invisible on the radially-symmetric + spinning smoke/glow sprites (their fixed orientation is masked),
+  // but the fixed, upright, non-spinning candle flames rendered inverted -- the "sideways" chandelier
+  // flames. Emitting min-v at the top corners makes all sprites match the client.
+  otc[0].x = a.x; otc[0].y = b.y; // screen bottom-left  <- tile bottom (max v)
+  otc[1].x = b.x; otc[1].y = b.y; // screen bottom-right <- tile bottom (max v)
+  otc[2].x = b.x; otc[2].y = a.y; // screen top-right    <- tile top    (min v)
+  otc[3].x = a.x; otc[3].y = a.y; // screen top-left     <- tile top    (min v)
 
   for (int i = 0; i<4; ++i) {
     tc[(i + 4 - order) & 3] = otc[i];
@@ -758,14 +823,19 @@ void ParticleSystem::update(float dt)
           {
             ++part_dbg_count;
             glm::vec3 const bone_pos(parent->mat[3][0], parent->mat[3][1], parent->mat[3][2]);
-            LogDebug << "[PARTDBG] tex=" << _texture_id << " type=" << emitter_type
+            LogError << "[PARTDBG-SPAWN] tex=" << _texture_id << " emitterType=" << emitter_type
+                     << " bone=" << _bone_index << " ridesParent=" << (ridesParent() ? 1 : 0)
                      << " emitterLocalPos=(" << pos.x << "," << pos.y << "," << pos.z << ")"
                      << " boneWorldPos=(" << bone_pos.x << "," << bone_pos.y << "," << bone_pos.z << ")"
                      << " spawnPos=(" << p.pos.x << "," << p.pos.y << "," << p.pos.z << ")"
+                     << " spawnRadiusFromEmitter=" << glm::length(glm::vec3(p.pos.x - pos.x, 0.0f, p.pos.z - pos.z))
                      << " dir=(" << p.dir.x << "," << p.dir.y << "," << p.dir.z << ")"
                      << " speed=" << glm::length(p.speed)
                      << std::endl;
           }
+
+          // Stable per-particle slot (client memory-slot index): drives twinkle phase + spin-sign parity.
+          p.slot = (_spawn_seq++) & 0x7fu;
 
           // sanity check:
           //if (particles.size() < MAX_PARTICLES) // No need to check this every loop iteration. Already checked above.
@@ -782,18 +852,26 @@ void ParticleSystem::update(float dt)
     Particle &p = *it;
     p.speed += p.down * grav * dt - p.dir * deaccel * dt;
 
+    // Wind (client CParticleEmitter2 §4): a YOUNG-ONLY acceleration -- while the particle's age is below
+    // windTime the wind vector is added to velocity each step, so the drift ramps up to windVector*windTime
+    // then freezes. Added to velocity (not position) so it integrates + is damped by drag like any force.
+    if (_wind_time > 0.0f && p.life < _wind_time)
+    {
+      p.speed += _wind * dt;
+    }
+
     if (slowdown>0) {
       mspeed = expf(-1.0f * slowdown * p.life);
     }
     else if (slowdown < 0.0f) {
-      // Negative authored drag = DECELERATION in the live 1.12 client. Verified by apitrace capture of
-      // the Anomalus feet smoke (MANAMISTBASE, drag=-0.1): the particles rise bright from the feet then
-      // visibly slow and fade to ~8% opacity at the top of their travel (measured alpha 183->20 over the
-      // last ~1.3 units of rise). WMV/Noggit's original `slowdown>0` gate dropped negative drag entirely,
-      // so the smoke never decelerated -> rose too fast and stayed at full opacity at the top. exp(drag*
-      // life) (drag<0 -> decay) reproduces the client's measured speed falloff (exp(-0.1*life) matched the
-      // deceleration: ~4.0 units risen in the first 70% of life, only ~1.3 more in the last 30%).
-      mspeed = expf(slowdown * p.life);
+      // NEGATIVE authored drag = ANTI-drag: the particle ACCELERATES exponentially over its life -- it gets
+      // progressively faster and looks "SUCKED IN" toward the model at the end. User-observed on the live
+      // 1.12 client for the Anomalus feet mist (drag=-0.1): the particles converge on his body and speed up
+      // exponentially into it just before they fade -- start-to-finish the travel speed is NOT constant, it
+      // ramps up hard at the end. exp(-slowdown*life) = exp(+|drag|*life) grows past 1 (same formula the
+      // positive branch uses, just the anti-drag sign). The old code used exp(slowdown*life) (a DECAY), which
+      // decelerated negative-drag particles, so ours drifted and slowed at the end instead of being sucked in.
+      mspeed = expf(-slowdown * p.life);
     }
     else {
       mspeed = 1.0f;
@@ -849,6 +927,60 @@ void ParticleSystem::update(float dt)
     else
     {
       ++it;
+    }
+  }
+
+  // [PARTDBG-TRAVEL] Anomalus FEET SMOKE (the sphere emitter) cloud snapshot -- lets us diff noggit's ACTUAL
+  // particle travel against the client trace instead of a sim. Trace ground truth (world yd): particles are
+  // born from rest on a wide ~8-yd-radius ring at his feet, converge inward to ~2.5 yd while rising ~4.1 yd,
+  // ~39 alive, size(edge) 0.42->3.27, alpha ~140->184->11. Positions here are bone-local (rideParent), so
+  // world ~= model * 3.5 (Anomalus display scale 3.5). Set NOGGIT_CLASSIC_EFFECT_DEBUG=1 and stand near him.
+  if (classic_effect_debug_enabled() && !particles.empty()
+      && model && model->file_key().hasFilepath()
+      && model->file_key().filepath().find("anomalus") != std::string::npos)
+  {
+    static int travel_frame = 0;
+    static int travel_logs = 0;
+    if ((travel_frame++ % 15) == 0 && travel_logs < 64)
+    {
+      ++travel_logs;
+      float rise_min = 1e9f, rise_max = -1e9f, rise_sum = 0.0f;
+      float rad_min = 1e9f, rad_max = -1e9f, rad_sum = 0.0f;
+      float size_min = 1e9f, size_max = -1e9f, a_min = 1e9f, a_max = -1e9f, life_max = 0.0f;
+      // Mean rise + mean vertical SPEED per life-quartile -> the acceleration SHAPE. If the plume speeds up
+      // toward the end, both the rise-gaps AND vy should GROW across quartiles (q0<q1<q2<q3). Flat vy = it
+      // rises at a constant rate (no speed-up); shrinking vy = it decelerates.
+      float qrise[4] = {0.f, 0.f, 0.f, 0.f}, qvy[4] = {0.f, 0.f, 0.f, 0.f};
+      int   qn[4] = {0, 0, 0, 0};
+      for (auto const& q : particles)
+      {
+        float const rise = q.pos.y - q.origin.y;
+        float const rad = glm::length(glm::vec3(q.pos.x - pos.x, 0.0f, q.pos.z - pos.z));
+        rise_min = std::min(rise_min, rise); rise_max = std::max(rise_max, rise); rise_sum += rise;
+        rad_min = std::min(rad_min, rad); rad_max = std::max(rad_max, rad); rad_sum += rad;
+        size_min = std::min(size_min, q.size); size_max = std::max(size_max, q.size);
+        a_min = std::min(a_min, q.color.a); a_max = std::max(a_max, q.color.a);
+        life_max = std::max(life_max, q.life);
+        float const rl = (q.maxlife > 0.001f) ? (q.life / q.maxlife) : 0.0f;
+        int const b = std::min(3, std::max(0, static_cast<int>(rl * 4.0f)));
+        qrise[b] += rise; qvy[b] += q.speed.y; qn[b] += 1;   // q.speed.y = current vertical velocity
+      }
+      float const n = static_cast<float>(particles.size());
+      auto qr = [&](int b) { return qn[b] > 0 ? qrise[b] / qn[b] : 0.0f; };
+      auto qv = [&](int b) { return qn[b] > 0 ? qvy[b] / qn[b] : 0.0f; };
+      LogError << "[PARTDBG-TRAVEL] anomalus emitter tex=" << _texture_id << " bone=" << _bone_index
+               << " etype=" << emitter_type << " blend=" << blend << " n=" << static_cast<int>(n)
+               << " grav=" << grav << " lifeMax=" << life_max
+               << " | rise model(min/mean/max)=" << rise_min << "/" << (rise_sum / n) << "/" << rise_max
+               << " -> world.max=" << (rise_max * 3.5f) << " (trace ~4.1)"
+               << " | rise/quartile=" << qr(0) << "/" << qr(1) << "/" << qr(2) << "/" << qr(3)
+               << " | vy/quartile=" << qv(0) << "/" << qv(1) << "/" << qv(2) << "/" << qv(3)
+               << " (grow=speeds up at end)"
+               << " | radius model(min/mean/max)=" << rad_min << "/" << (rad_sum / n) << "/" << rad_max
+               << " -> world(min/max)=" << (rad_min * 3.5f) << "/" << (rad_max * 3.5f) << " (trace 2.5->8)"
+               << " | size(min/max)=" << size_min << "/" << size_max << " edge.world=" << (size_max * 2.0f)
+               << " | alpha(min/max)=" << a_min << "/" << a_max
+               << std::endl;
     }
   }
 
@@ -1034,7 +1166,8 @@ void ParticleSystem::draw( glm::mat4x4 const& model_view
 
   std::uint16_t indice = 0;
 
-  if (billboard)
+  // Tail (type 1/2) is billboarded about the velocity axis -> it also needs the view right/up vectors.
+  if (billboard || type == 1 || type == 2)
   {
     vRight = glm::normalize(glm::vec3(model_view[0]));
     vUp = glm::normalize(glm::vec3(model_view[1]));
@@ -1081,13 +1214,18 @@ void ParticleSystem::draw( glm::mat4x4 const& model_view
     // - doesn't seem to be any different from 0 -_-
     // regular particles
 
-    if (billboard)
+    if (billboard || type == 2)
     {
       // Per-particle quad rotation: authored params.spin (radians/sec) rotates the billboard around
       // its center over the particle's life -- positive = counterclockwise on screen (e.g. the arcane
       // elementals' feet smoke, spin=2.0). Spline emitters keep _spin as their emission-path travel
       // speed instead (the MC flamecircle), so no quad rotation for those.
       bool const quad_spin = (_spin != 0.0f) && _spline_points.empty();
+      // Twinkle (client render-time §5): only do the work when the emitter authors it.
+      // Active only when it actually does something: cull (percent<1) or size shimmer (min!=max).
+      // twinkleSpeed alone (percent=1, min==max, e.g. Anomalus feet smoke) is inert -> skip the work.
+      bool const twinkle_active = (_twinkle_percent < 1.0f) || (_twinkle_scale_min != _twinkle_scale_max);
+      std::array<float, 128> const& twinkle_tbl = twinkle_noise_table();
 
       for (ParticleList::iterator it = particles.begin(); it != particles.end(); ++it)
       {
@@ -1096,17 +1234,38 @@ void ParticleSystem::draw( glm::mat4x4 const& model_view
           break;
         }
 
-        const float size = classic ? sane_classic_particle_size(it->size, 1.0f) : it->size;// / 2;
+        float size = classic ? sane_classic_particle_size(it->size, 1.0f) : it->size;// / 2;
         if (!std::isfinite(size) || !finite_vec3(it->pos) || !finite_vec4(it->color))
         {
           continue;
+        }
+
+        // Twinkle: sample the shared noise table at this particle's advancing phase; the client CULLS
+        // the sprite this frame when twinklePercent < t (the blink-out) and shimmers the size by
+        // lerp(scaleMin,scaleMax,t). idx = (floor(twinkleSpeed*age)+slot) & 0x7f.
+        if (twinkle_active)
+        {
+          float const phase = std::min(std::max(_twinkle_speed * it->life, 0.0f), 255.0f);
+          int const idx = (static_cast<int>(phase) + static_cast<int>(it->slot)) & 0x7f;
+          float const t = twinkle_tbl[idx];
+          if (_twinkle_percent < 1.0f && _twinkle_percent < t)
+          {
+            continue; // blinked out this frame
+          }
+          if (_twinkle_scale_min != _twinkle_scale_max)
+          {
+            size *= _twinkle_scale_min + t * (_twinkle_scale_max - _twinkle_scale_min);
+          }
         }
 
         glm::vec3 quad_right = vRight;
         glm::vec3 quad_up = vUp;
         if (quad_spin)
         {
-          float const ang = _spin * it->life;
+          // Alternating spin direction when emitter flag 0x8000 is set (the client's per-slot "random"
+          // sign); without the flag every sprite spins the same way (angle = spin * age).
+          float const sign = (_spin_alternate && (it->slot & 1u)) ? -1.0f : 1.0f;
+          float const ang = sign * _spin * it->life;
           float const c = std::cos(ang);
           float const s = std::sin(ang);
           quad_right = vRight * c + vUp * s;
@@ -1138,19 +1297,40 @@ void ParticleSystem::draw( glm::mat4x4 const& model_view
         add_quad_indices(indices, indice);
       }
     }
-    else 
+    else
     {
-      for (ParticleList::iterator it = particles.begin(); it != particles.end(); ++it) 
+      // Active only when it actually does something: cull (percent<1) or size shimmer (min!=max).
+      // twinkleSpeed alone (percent=1, min==max, e.g. Anomalus feet smoke) is inert -> skip the work.
+      bool const twinkle_active = (_twinkle_percent < 1.0f) || (_twinkle_scale_min != _twinkle_scale_max);
+      std::array<float, 128> const& twinkle_tbl = twinkle_noise_table();
+
+      for (ParticleList::iterator it = particles.begin(); it != particles.end(); ++it)
       {
         if (tiles.size() - 1 < it->tile) // Alfred, 2009.08.07, error prevent
         {
           break;
         }
 
-        const float size = classic ? sane_classic_particle_size(it->size, 1.0f) : it->size;
+        float size = classic ? sane_classic_particle_size(it->size, 1.0f) : it->size;
         if (!std::isfinite(size) || !finite_vec3(it->pos) || !finite_vec4(it->color))
         {
           continue;
+        }
+
+        // Twinkle (see billboard branch): cull + size shimmer from the shared noise table.
+        if (twinkle_active)
+        {
+          float const phase = std::min(std::max(_twinkle_speed * it->life, 0.0f), 255.0f);
+          int const idx = (static_cast<int>(phase) + static_cast<int>(it->slot)) & 0x7f;
+          float const t = twinkle_tbl[idx];
+          if (_twinkle_percent < 1.0f && _twinkle_percent < t)
+          {
+            continue;
+          }
+          if (_twinkle_scale_min != _twinkle_scale_max)
+          {
+            size *= _twinkle_scale_min + t * (_twinkle_scale_max - _twinkle_scale_min);
+          }
         }
 
         glm::vec3 const ppos = ride_pos(it->pos);
@@ -1175,50 +1355,63 @@ void ParticleSystem::draw( glm::mat4x4 const& model_view
       }
     }
   }  
-  else if (type == 1) 
-  { // Sphere particles
-    // particles from origin to position
-    /*
-    bv0 = mbb * glm::vec3(0,-1.0f,0);
-    bv1 = mbb * glm::vec3(0,+1.0f,0);
-
-
-    bv0 = mbb * glm::vec3(-1.0f,0,0);
-    bv1 = mbb * glm::vec3(1.0f,0,0);
-    */
-
-    for (ParticleList::iterator it = particles.begin(); it != particles.end(); ++it) 
+  if (type == 1 || type == 2)
+  { // TAIL particles (ParticleType 1=Tail, 2=Both). Client-exact (RE'd from wow.exe render fill
+    // FUN_007b2a50 tail branch @0x7b3041): each live particle is a MOTION STREAK of tailLength * the
+    // velocity, extending BEHIND the particle (along -velocity), billboarded about the velocity axis
+    // with width = the particle size. The old path drew a spawn-origin->position ribbon (grew to the
+    // full fall length + fixed model-space width) which is why drool never stretched right. Uses the
+    // billboard OFFSET path (position = streak ends in model space so the streak follows the velocity
+    // under any instance transform; offset = the view-aligned width so it stays screen-facing).
+    float const min_stretch_sq = 0.000771605f; // client short-streak->head fallback threshold @0x80c744
+    for (ParticleList::iterator it = particles.begin(); it != particles.end(); ++it)
     {
       if (tiles.size() - 1 < it->tile) // Alfred, 2009.08.07, error prevent
       {
         break;
       }
 
-      const float size = classic ? sane_classic_particle_size(it->size, 1.0f) : it->size;
-      if (!std::isfinite(size) || !finite_vec3(it->pos) || !finite_vec3(it->origin) || !finite_vec4(it->color))
+      float const size = classic ? sane_classic_particle_size(it->size, 1.0f) : it->size;
+      if (!std::isfinite(size) || !finite_vec3(it->pos) || !finite_vec3(it->speed) || !finite_vec4(it->color))
       {
         continue;
       }
 
-      glm::vec3 const ppos = ride_pos(it->pos);
-      glm::vec3 const porigin = ride_pos(it->origin);
+      // Streak length = tailLength, clamped to the particle's age when the emitter opts in (flag 0x400)
+      // so a just-spawned drip has a short tail that grows to full length instead of popping.
+      float len = _tail_length;
+      if (_tail_clamp_age && it->life < len) { len = it->life; }
 
-      texcoords.push_back(tiles[it->tile].tc[0]);
-      vertices.push_back(ppos + bv0 * size);
-      colors_data.push_back(it->color);
+      glm::vec3 const vel = ride_rot * it->speed;   // sim-space velocity (ride_rot = identity outdoors)
+      glm::vec3 const streak = -len * vel;          // trails BEHIND the motion
+      glm::vec3 const head = ride_pos(it->pos);
+      glm::vec3 const tail = head + streak;
 
-      texcoords.push_back(tiles[it->tile].tc[1]);
-      vertices.push_back(ppos + bv1 * size);
-      colors_data.push_back(it->color);
+      // Project the streak onto the screen (view) plane; width is perpendicular to it, magnitude = size.
+      float const sx = glm::dot(streak, vRight);
+      float const sy = glm::dot(streak, vUp);
+      float const len_xy_sq = sx * sx + sy * sy;
 
-      texcoords.push_back(tiles[it->tile].tc[2]);
-      vertices.push_back(porigin + bv1 * size);
-      colors_data.push_back(it->color);
+      if (len_xy_sq < min_stretch_sq)
+      {
+        // Streak too short on screen -> plain head billboard (client fallback), size square at the head.
+        texcoords.push_back(tiles[it->tile].tc[0]); vertices.push_back(head); offsets.push_back(-(vRight + vUp) * size); colors_data.push_back(it->color);
+        texcoords.push_back(tiles[it->tile].tc[1]); vertices.push_back(head); offsets.push_back(( vRight - vUp) * size); colors_data.push_back(it->color);
+        texcoords.push_back(tiles[it->tile].tc[2]); vertices.push_back(head); offsets.push_back(( vRight + vUp) * size); colors_data.push_back(it->color);
+        texcoords.push_back(tiles[it->tile].tc[3]); vertices.push_back(head); offsets.push_back(-(vRight - vUp) * size); colors_data.push_back(it->color);
+        add_quad_indices(indices, indice);
+        continue;
+      }
 
-      texcoords.push_back(tiles[it->tile].tc[3]);
-      vertices.push_back(porigin + bv0 * size);
-      colors_data.push_back(it->color);
+      // Perpendicular to the on-screen streak, |perp| = size, view-aligned (added as a billboard offset).
+      glm::vec3 const perp = (size / std::sqrt(len_xy_sq)) * (-sy * vRight + sx * vUp);
 
+      // 4 corners around the quad: head+perp, head-perp, tail-perp, tail+perp. UVs map the tile square
+      // onto the streak (head edge tc0-tc1, tail edge tc3-tc2), so the texture stretches along the tail.
+      texcoords.push_back(tiles[it->tile].tc[0]); vertices.push_back(head); offsets.push_back( perp); colors_data.push_back(it->color);
+      texcoords.push_back(tiles[it->tile].tc[1]); vertices.push_back(head); offsets.push_back(-perp); colors_data.push_back(it->color);
+      texcoords.push_back(tiles[it->tile].tc[2]); vertices.push_back(tail); offsets.push_back(-perp); colors_data.push_back(it->color);
+      texcoords.push_back(tiles[it->tile].tc[3]); vertices.push_back(tail); offsets.push_back( perp); colors_data.push_back(it->color);
       add_quad_indices(indices, indice);
     }
   }
@@ -1297,7 +1490,11 @@ void ParticleSystem::draw( glm::mat4x4 const& model_view
   }
 
   shader.uniform("alpha_test", alpha_test);
-  shader.uniform("billboard", (int)billboard);
+  // Tail particles (type 1/2) are built with the billboard OFFSET path (streak ends in `position` + a
+  // view-aligned width in `offset`), so they need billboard=1 and the offset buffer bound even when the
+  // emitter's own billboard flag is clear.
+  bool const use_offsets = billboard || type == 1 || type == 2;
+  shader.uniform("billboard", use_offsets ? 1 : 0);
   shader.uniform("particle_blend", static_cast<int>(blend)); // for blend-aware fog in the shader
   // Emitter flag 0x8 = particle SIZE scales with the model's scale. Trace-verified on Anomalus
   // (creature_template.scale 5): his aura flare (flags 0x29) draws at authored size x5 in the live
@@ -1311,7 +1508,7 @@ void ParticleSystem::draw( glm::mat4x4 const& model_view
     shader.attrib("position", 3, GL_FLOAT, GL_FALSE, 0, 0);
     shader.attrib_divisor("position", 0);
   }
-  if(billboard)
+  if(use_offsets)
   {
     gl.bufferData<GL_ARRAY_BUFFER, glm::vec3>(_offsets_vbo, offsets, GL_STREAM_DRAW);
 
@@ -1481,49 +1678,15 @@ Particle PlaneParticleEmitter::newParticle(ParticleSystem* sys, int anim, int ti
     p.down = glm::vec3(0, -1.0f, 0);
     p.speed = p.dir * spd * (1.0f + misc::randfloat(-var, var));
   }
-  else if (sys->flags == 1041) { // Trans Halo
-    p.pos = sys->parent->mat * (glm::vec4(sys->pos, 1) + glm::vec4(misc::randfloat(-l, l), 0, misc::randfloat(-w, w), 0));
-
-    const float t = misc::randfloat(0.0f, 2.0f * glm::pi<float>());
-
-    p.pos = glm::vec3(0.0f, sys->pos.y + 0.15f, sys->pos.z) + glm::vec3(cos(t) / 8, 0.0f, sin(t) / 8); // Need to manually correct for the halo - why?
-
-    // var isn't being used, which is set to 1.0f,  whats the importance of this?
-    // why does this set of values differ from other particles
-
-    glm::vec3 dir(0.0f, 1.0f, 0.0f);
-    p.dir = dir;
-
-    p.speed = safe_normalize_vec3(dir, glm::vec3(0.0f, 1.0f, 0.0f)) * spd * misc::randfloat(0, var);
-  }
-  else if (sys->flags == 25 && sys->parent->parent<1) { // Weapon Flame
-    // flags 25 contains bit 0x10 (ride parent) -> spawn local so draw()'s bone transform applies once.
-    p.pos = (sys->ridesParent() ? glm::vec3(0.0f) : sys->parent->pivot)
-          + (sys->pos + glm::vec3(misc::randfloat(-l, l), misc::randfloat(-l, l), misc::randfloat(-w, w)));
-    glm::vec3 dir = mrot * glm::vec4(0.0f, 1.0f, 0.0f,0.0f);
-    p.dir = safe_normalize_vec3(dir, glm::vec3(0.0f, 1.0f, 0.0f));
-    //glm::vec3 dir = sys->model->bones[sys->parent->parent].mrot * sys->parent->mrot * glm::vec3(0.0f, 1.0f, 0.0f);
-    //p.speed = dir.normalize() * spd;
-
-  }
-  else if (sys->flags == 25 && sys->parent->parent > 0) { // Weapon with built-in Flame (Avenger lightsaber!)
-    // flags 25 contains bit 0x10 (ride parent) -> spawn local so draw()'s bone transform applies once.
-    p.pos = sys->ridesParent()
-          ? sys->pos + glm::vec3(misc::randfloat(-l, l), misc::randfloat(-l, l), misc::randfloat(-w, w))
-          : glm::vec3(sys->parent->mat * (glm::vec4(sys->pos, 1) + glm::vec4(misc::randfloat(-l, l), misc::randfloat(-l, l), misc::randfloat(-w, w), 0)));
-    glm::vec3 dir = glm::vec4(sys->parent->mat[1][0], sys->parent->mat[1][1], sys->parent->mat [1][2],0.0f) + glm::vec4(0.0f, 1.0f, 0.0f,0.0f);
-    p.dir = safe_normalize_vec3(dir, glm::vec3(0.0f, 1.0f, 0.0f));
-    p.speed = p.dir * spd * misc::randfloat(0, var * 2);
-
-  }
-  else if (sys->flags == 17 && sys->parent->parent<1) { // Weapon Glow
-    // flags 17 contains bit 0x10 (ride parent) -> spawn local so draw()'s bone transform applies once.
-    p.pos = (sys->ridesParent() ? glm::vec3(0.0f) : sys->parent->pivot)
-          + (sys->pos + glm::vec3(misc::randfloat(-l, l), misc::randfloat(-l, l), misc::randfloat(-w, w)));
-    glm::vec3 dir = mrot * glm::vec4(0, 1, 0,0);
-    p.dir = safe_normalize_vec3(dir, glm::vec3(0.0f, 1.0f, 0.0f));
-
-  }
+  // (12.14, 2026-07-19) REMOVED the WMV whole-word magic-number branches -- Trans Halo (flags==1041),
+  // Weapon Flame (==25, x2), Weapon Glow (==17). RE_notes/12 (decompiled CParticleEmitter2): the 1.12
+  // client copies the emitter flags VERBATIM and runs ONE general plane CreateParticle (FUN_007b8890) for
+  // every plane emitter -- there is NO per-model flag dispatch. These were WoW-Model-Viewer per-model
+  // approximations that (a) fell to generic behavior on any near-miss flag combo and (b) diverged from the
+  // client (the halo even carried a "manually correct - why?" fudge). Every plane emitter now takes the
+  // client-faithful general path below; the sphere magic-numbers (Faith-Halo 57/313) were removed the same
+  // way for the portal fix. Individual flag BITS are still honored where they matter (0x10 ride-parent,
+  // 0x400 tail-clamp, 0x8000 spin-sign). VERIFY in-game: flaming/glowing weapons + halo/aura rings.
   else {
     // CLIENT-FAITHFUL plane emission (RE'd from 1.12 CParticleEmitter2 plane CreateParticle,
     // FUN_007b8890): spawn on the authored rect -- model X in +-areaLength/2 (w), model Y in

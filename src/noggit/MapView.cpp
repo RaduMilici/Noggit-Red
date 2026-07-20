@@ -34,8 +34,12 @@
 #include <noggit/ui/texture_palette_small.hpp>
 #include <noggit/ui/MinimapCreator.hpp>
 #include <noggit/project/CurrentProject.hpp>
+#include <noggit/frame_profiler.hpp>
 #include <opengl/scoped.hpp>
 #include <noggit/ui/tools/ViewToolbar/Ui/ViewToolbar.hpp>
+#include <noggit/ui/tools/TimeGlobe/TimeGlobeWidget.hpp>
+#include <QtWidgets/QAction>
+#include <QtWidgets/QToolBar>
 #include <noggit/ui/tools/AssetBrowser/Ui/AssetBrowser.hpp>
 #include <noggit/ui/tools/AssetBrowser/ModelView.hpp>
 #include <noggit/ui/tools/PresetEditor/Ui/PresetEditor.hpp>
@@ -3090,6 +3094,75 @@ void MapView::setupToolbars()
 
   top_toolbar_layout->addWidget( _view_toolbar);
   sec_toolbar_layout->addWidget( _secondary_toolbar);
+
+  // WC3-style time-of-day globe: its own widget, NEVER inside a button layout (so it can't stretch the
+  // toolbars to its height). The icon strip is split into a left half (_view_toolbar) and a right half
+  // (right_toolbar); the globe sits between them and all three are laid out as siblings, vertically
+  // centred, so the button strips keep their normal small height and only the globe is tall.
+  _time_globe = new Noggit::Ui::TimeGlobeWidget(this);
+  _time_globe->setFixedSize(_time_globe->sizeHint());
+
+  auto* right_toolbar = new QToolBar(_overlay_widget);
+  right_toolbar->setMovable(false);
+  right_toolbar->setContextMenuPolicy(Qt::PreventContextMenu);
+  right_toolbar->setIconSize(_view_toolbar->iconSize());
+  right_toolbar->setStyleSheet(_view_toolbar->styleSheet());
+  right_toolbar->setSizePolicy(QSizePolicy::Maximum, QSizePolicy::Maximum);
+  right_toolbar->setContentsMargins(0, 0, 0, 0);
+  // no padding between the button strips and the globe
+  _view_toolbar->setContentsMargins(0, 0, 0, 0);
+  top_toolbar_layout->setContentsMargins(0, 0, 0, 0);
+  {
+    auto const acts = _view_toolbar->actions();
+    int const half = (static_cast<int>(acts.size()) + 1) / 2;
+    for (int i = half; i < acts.size(); ++i)
+    {
+      QAction* const a = acts.at(i);
+      _view_toolbar->removeAction(a);
+      right_toolbar->addAction(a);
+    }
+  }
+  // Hover tool-options (secondaryToolbarHolder, shown via getSecondaryToolBar()) stay in the row BELOW the
+  // globe so they never shove it when they pop up on hover.
+  _viewport_overlay_ui->horizontalLayout_4->removeWidget(_viewport_overlay_ui->secondaryToolbarHolder);
+  if (auto* below = _viewport_overlay_ui->horizontalLayout_8)
+    below->insertWidget(0, _viewport_overlay_ui->secondaryToolbarHolder, 0, Qt::AlignTop);
+
+  // The MODE secondary tools (Patrol paths / Creature info in creature mode; flatten & texture options in
+  // the terrain modes -> getLeftSecondaryToolbar()) live in leftSecondaryToolbarHolder, which the .ui put
+  // in the SECOND row. The tall time globe -- added to the row ABOVE it -- pushed that whole second row
+  // down, so the panel rendered well below the icon strip. Lift the holder INTO the globe's row at the FAR
+  // LEFT, TOP-aligned, so it sits at the same Y as the icons again (it is hidden except in the modes that
+  // populate it). A zero-width spacer on the far right, whose width tracks the holder (see eventFilter),
+  // keeps the centred globe block at the true viewport centre when the holder appears -- nothing shoves
+  // the globe.
+  if (auto* below = _viewport_overlay_ui->horizontalLayout_8)
+    below->removeWidget(_viewport_overlay_ui->leftSecondaryToolbarHolder);
+
+  _globe_balance_spacer = new QWidget(_overlay_widget);
+  _globe_balance_spacer->setFixedWidth(0);
+  _globe_balance_spacer->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Preferred);
+  _viewport_overlay_ui->leftSecondaryToolbarHolder->installEventFilter(this);
+
+  if (auto* row = _viewport_overlay_ui->horizontalLayout_4)
+  {
+    // drop the trailing .ui spacer
+    for (int i = row->count() - 1; i >= 0; --i)
+    {
+      if (row->itemAt(i)->spacerItem()) { delete row->takeAt(i); break; }
+    }
+    // Row order: [leftSecondary][stretch] main | globe | right-toolbar [stretch][balance-spacer]. Spacing 0
+    // so the button strips butt up against the globe; top-aligned so only the tall globe hangs down.
+    row->setSpacing(0);
+    row->insertWidget(1, right_toolbar, 0, Qt::AlignTop);
+    row->insertWidget(1, _time_globe, 0, Qt::AlignTop);
+    row->insertStretch(0, 1);
+    row->addStretch(1);
+    row->addWidget(_globe_balance_spacer, 0, Qt::AlignTop);
+    row->insertWidget(0, _viewport_overlay_ui->leftSecondaryToolbarHolder, 0, Qt::AlignTop);
+    row->setAlignment(_viewport_overlay_ui->upperToolbarHolder, Qt::AlignTop);
+    row->setAlignment(_viewport_overlay_ui->leftSecondaryToolbarHolder, Qt::AlignTop);
+  }
 }
 
 void MapView::setupKeybindingsGui()
@@ -7496,6 +7569,20 @@ void MapView::paintGL()
 
   gl.clear (GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
+  {
+    // [perf] frame-to-frame total + throttled per-phase report (NOGGIT_FRAME_PROFILE=1). No-op when off.
+    static std::chrono::steady_clock::time_point s_prof_last;
+    static bool s_prof_have = false;
+    auto& _prof = noggit::perf::FrameProfiler::get();
+    auto const _prof_now = std::chrono::steady_clock::now();
+    if (s_prof_have)
+      _prof.add(noggit::perf::Phase::Frame,
+                std::chrono::duration<double, std::milli>(_prof_now - s_prof_last).count());
+    s_prof_last = _prof_now;
+    s_prof_have = true;
+    _prof.end_frame();
+  }
+
   if (!saving_minimap)
   {
     lock = true;
@@ -8464,12 +8551,13 @@ void MapView::tick (float dt)
   _status_area->setText
     (QString::fromStdString (gAreaDB.getAreaName (current_area_id)));
 
-  // Drive zone music from the current area + time of day (day ~ 6:00..18:00). Only while enabled (the
-  // dropdown checkbox), so nothing music-related (incl. the QtMultimedia backend) runs when off.
+  // Drive zone music from the current area only. Only while enabled (the dropdown checkbox), so nothing
+  // music-related (incl. the QtMultimedia backend) runs when off.
   if (_zone_music_player && _zone_music_player->enabled())
   {
-    int const minutes = (static_cast<int>(_world->time) % 2880) / 2;
-    bool const is_day = (minutes >= 6 * 60 && minutes < 18 * 60);
+    // Music deliberately does NOT follow the day/night cycle -- it used to swap tracks at every dawn/dusk
+    // as time advanced. Always request the zone's DAY music so it stays put regardless of time of day.
+    bool const is_day = true;
     // World resolves WMOAreaTable first (cities/dungeons/caves -- Ironforge, Caverns of Time), then the
     // AreaTable parent chain, for BOTH the looping ZoneMusic and the one-shot ZoneIntroMusic.
     _zone_music_player->update_zone(_world->getZoneMusic(_camera.position),
@@ -8751,7 +8839,7 @@ glm::mat4x4 MapView::model_view() const
 
 glm::mat4x4 MapView::projection() const
 {
-  float far_z = _settings->value("farZ", 2048).toFloat();
+  float far_z = _settings->value("farZ", 900).toFloat();
 
   if (_display_mode == display_mode::in_2D)
   {
@@ -8847,6 +8935,7 @@ void MapView::draw_map()
     && !(_world->has_selection()
     || _locked_cursor_mode.get()))
   {
+    noggit::perf::Scoped _prof_sel(noggit::perf::Phase::Selection);
     doSelection(true);
   }
 
@@ -8984,6 +9073,35 @@ bool MapView::event(QEvent* e)
     }
   }
   return QOpenGLWidget::event(e);
+}
+
+bool MapView::eventFilter(QObject* obj, QEvent* e)
+{
+  // Keep the centred time globe from being shoved when the left secondary toolbar (patrol paths /
+  // creature info, terrain-mode options) appears at the far left of the globe's row: mirror its width
+  // into a spacer on the far right so the globe block stays centred on the true viewport centre.
+  if (_globe_balance_spacer && _viewport_overlay_ui
+      && obj == _viewport_overlay_ui->leftSecondaryToolbarHolder)
+  {
+    switch (e->type())
+    {
+      case QEvent::Resize:
+      case QEvent::Show:
+      case QEvent::Hide:
+      {
+        auto* holder = _viewport_overlay_ui->leftSecondaryToolbarHolder;
+        int const w = holder->isVisible() ? std::max(holder->width(), holder->sizeHint().width()) : 0;
+        if (_globe_balance_spacer->width() != w)
+        {
+          _globe_balance_spacer->setFixedWidth(w);
+        }
+        break;
+      }
+      default:
+        break;
+    }
+  }
+  return QOpenGLWidget::eventFilter(obj, e);
 }
 
 void MapView::keyPressEvent (QKeyEvent *event)

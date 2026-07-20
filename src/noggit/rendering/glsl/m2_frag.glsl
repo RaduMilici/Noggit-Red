@@ -6,7 +6,7 @@ in vec2 uv2;
 in float camera_dist;
 in vec3 norm;
 in vec3 m2_world_pos;
-flat in vec4 v_interior;        // rgb = interior room ambient, a = 1 when the object is indoors
+flat in vec4 v_interior;        // rgb = interior room ambient; a in [0.5,1.0] indoors (carries GAP B doorway spill), 0 outdoors
 
 out vec4 out_color;
 
@@ -435,16 +435,16 @@ void main()
   {
       if (v_interior.a > 0.25)
       {
-          // Interior lighting from the baked MOCV floor colour C (raycast-sampled under the object).
-          // Two modes, encoded in v_interior.a:
-          //   a = 1.0  UNIT (creature/NPC) -- the client's formula (RE_notes/15 @0x69E4C0/0x6A77E0):
-          //            ambient = C capped to max-channel 96/255, diffuse = C boosted to >= 168/255
-          //            with N.L along the client's FIXED interior light direction.
-          //   a = 0.5  DOODAD -- deliberate deviation from the client (which sunlights indoor doodads
-          //            and made cellar barrels noon-bright / sun-shaded): flat EVEN room light = C,
-          //            no directional term, no time-of-day. Matches the live client's even dark-all-
-          //            around barrel look; candle MOLT points supply the local warmth.
-          // The outdoor sun and MOHD ambient play no part in either mode.
+          // Interior lighting from the baked MOCV floor colour C (raycast-sampled under the object):
+          // ambient = C capped to max-channel 96/255, diffuse = C boosted to >= 168/255 with N.L along
+          // the client's FIXED interior light direction (client formula, RE_notes/15 @0x69E4C0/0x6A77E0).
+          // v_interior.a in [0.5,1.0] carries the GAP B (checklist 8.7) DOORWAY SPILL = the baked MOCV
+          // floor ALPHA sampled under the object: 0.5 = deep interior (no change), 1.0 = at a portal/
+          // window. Below, the interior light is lerped toward the OUTDOOR day/night light by that spill
+          // (client FUN_0069e4c0 @0x69e4c0 / LIGHT_FOG_SELECTION_RE.md 9.3: interior = mix(interior,
+          // outdoor, mocv_alpha/255)); spill 0 is a no-op mix, so deep interiors are byte-identical. Any
+          // a > 0.25 is "interior" (the exact magnitude only encodes spill). The outdoor sun and MOHD
+          // ambient otherwise play no part.
           // MEASURED from wow_cap_upstairs.trace (RE_notes/16): every in-world M2 -- NPC and doodad
           // alike -- decodes to ambient(C capped) + ONE warm directional(C boosted) along the fixed
           // interior vector, and ZERO point lights reach any M2 (c17-c27 all zero all frames). The
@@ -454,6 +454,11 @@ void main()
           vec3 interior_ambient = C * min(1.0, 0.376471 / max(mc, 0.003922)); // cap 96/255
           vec3 interior_diffuse = C * max(1.0, 0.658824 / max(mc, 0.003922)); // boost 168/255
           vec3 L = normalize(vec3(0.30822, 0.9, -0.30822)); // to-light, noggit y-up
+          // GAP B doorway spill: lerp the interior light toward the outdoor day/night light by the baked
+          // MOCV floor alpha (v_interior.a in [0.5,1.0] -> spill in [0,1]). spill 0 => mix is a no-op.
+          float spill = clamp((v_interior.a - 0.5) * 2.0, 0.0, 1.0);
+          interior_ambient = mix(interior_ambient, AmbientColor_FogEnd.xyz, spill);
+          interior_diffuse = mix(interior_diffuse, DiffuseColor_FogStart.xyz, spill);
           currColor = interior_ambient;
           lDiffuse = interior_diffuse * clamp(dot(normalize(norm), L), 0.0, 1.0);
       }

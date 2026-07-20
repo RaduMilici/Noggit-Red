@@ -251,7 +251,9 @@ public:
   // barycentric-interpolates the retained MOCV rgb of the face into *out (0..1). Returns false when this
   // group keeps no ground colours (non-indoor / no MOCV) or no floor is under the point. This colour is
   // the ENTIRE base light of a unit standing indoors (MOHD ambient and the sun play no part).
-  bool sample_ground_color(glm::vec3 const& local_pos, glm::vec3* out) const;
+  // out_alpha (optional): the face's PRISTINE baked MOCV floor ALPHA barycentric-interpolated into [0..1]
+  // (GAP B / checklist 8.7 doorway spill) -- ~0 deep inside a room, ramping to 1 near a portal/window.
+  bool sample_ground_color(glm::vec3 const& local_pos, glm::vec3* out, float* out_alpha = nullptr) const;
 
 private:
   void load_mocv(BlizzardArchive::ClientFile& f, uint32_t size);
@@ -294,6 +296,16 @@ private:
   // Compact MOCV rgb copy (post atten_trans_verts), INDOOR groups only: the renderer clears
   // _vertex_colors on GPU upload, but sample_ground_color() needs the baked floor colours on the CPU.
   std::vector<glm::u8vec3> _ground_colors;
+  // Parallel to _ground_colors (same size / vertex indexing, INDOOR groups only): the PRISTINE baked
+  // MOCV floor ALPHA per vertex [0..255] (GAP B / checklist 8.7 doorway spill). ~0 deep interior,
+  // ramping to 255 near a portal/window. sample_ground_color() barycentric-interpolates it for the
+  // doorway day/night spill. Sourced from _mocv_pristine_alpha (below), NOT from the .w that
+  // fix_vertex_color_alpha / compute_portal_openness overwrite.
+  std::vector<std::uint8_t> _ground_alphas;
+  // Transient (load-time bridge): the pristine MOCV alpha straight from colorFromInt [0..1], captured in
+  // load_mocv BEFORE fix_vertex_color_alpha (.w=1) / compute_portal_openness (.w=portal-fade) clobber it,
+  // so the _ground_alphas build (end of load()) can read the true baked floor exposure.
+  std::vector<float> _mocv_pristine_alpha;
 
   std::optional<std::vector<wmo_bsp_node>> _bsp_tree_nodes;
   std::optional<std::vector<uint16_t>> _bsp_indices;
@@ -422,8 +434,8 @@ public:
   // is lerped over it FARTHEST-first with w = 1 inside r1, linear to 0 at r2 -- so the nearest
   // fog dominates. fog_start_abs is absolute (WMOFog::init pre-multiplies the authored scaler).
   bool evaluate_camera_fog(WMOGroup const& group, glm::mat4x4 const& transform,
-                           glm::vec3 const& camera, glm::vec3* color, float* fog_end,
-                           float* fog_start_abs) const;
+                           glm::vec3 const& camera, bool camera_inside_wmo, glm::vec3* color,
+                           float* fog_end, float* fog_start_abs) const;
 
   std::vector<WMODoodadSet> doodadsets;
 

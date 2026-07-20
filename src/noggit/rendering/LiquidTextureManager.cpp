@@ -298,3 +298,22 @@ void LiquidTextureManager::unload()
   _texture_frames_map.clear();
   _uploaded = false;
 }
+
+void LiquidTextureManager::reapply_anisotropy()
+{
+  // Mirror of TextureManager::reapply_anisotropy for the liquid arrays (water/lava/slime), which
+  // carry their own arrays in _texture_frames_map. Level is set explicitly (incl. 1 = off) so a
+  // lowered setting clears a previously-set higher value. Needs a current GL context.
+  GLfloat hw_max = 1.0f;
+  gl.getFloatv(0x84FF /*GL_MAX_TEXTURE_MAX_ANISOTROPY_EXT*/, &hw_max);
+  float const requested = QSettings().value("render/anisotropic_filtering", 16.0f).toFloat();
+  float const level = std::max(1.0f, std::clamp(requested, 1.0f, hw_max >= 1.0f ? hw_max : 1.0f));
+  for (auto& pair : _texture_frames_map)
+  {
+    GLuint const array = std::get<0>(pair.second);
+    if (!array)
+      continue;
+    gl.bindTexture(GL_TEXTURE_2D_ARRAY, array);
+    gl.texParameterf(GL_TEXTURE_2D_ARRAY, 0x84FE /*GL_TEXTURE_MAX_ANISOTROPY_EXT*/, level);
+  }
+}

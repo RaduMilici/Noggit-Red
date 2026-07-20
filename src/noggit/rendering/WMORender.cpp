@@ -52,7 +52,7 @@ namespace
     static bool value = true;
     if (!timer.isValid() || timer.elapsed() > 500)
     {
-      value = QSettings().value("render/wmo_portal_culling", true).toBool();
+      value = QSettings().value("render/wmo_portal_culling", false).toBool();
       timer.restart();
     }
     return value;
@@ -252,6 +252,21 @@ void WMORender::draw(OpenGL::Scoped::use_program& wmo_shader
 
   wmo_shader.uniform("ambient_color",glm::vec3(_wmo->ambient_light_color));
 
+  // While the camera is inside a WMO, its exterior-lit + portal-spill faces are lit from THIS WMO's own
+  // interior context (MOHD ambient + baked MOCV), not the outdoor map light -- there is no Light.dbc row
+  // positioned inside a city WMO, so the outdoor fallback was flooding Ironforge's building fronts and the
+  // gryphon-flight tunnels with Dun Morogh daylight. Viewed from outside (in the world) they keep outdoor
+  // lighting. world_renderer is null in the asset-preview, where the camera is never "inside" a WMO.
+  wmo_shader.uniform("camera_inside_wmo",
+      (world_renderer && world_renderer->cameraInsideWmo()) ? 1 : 0);
+
+  // Diagnostic: NOGGIT_WMO_DEBUG_MOCV=3 colour-codes each WMO face by its lighting branch (WHITE=unlit,
+  // RED=ExteriorLit-outdoor, ORANGE=ExteriorLit-but-inside(fixed), BLUE=portal-spill, GREEN=plain interior;
+  // dimmed when the camera is NOT detected inside the WMO). =1 shows raw MOCV (magenta=no MOCV). 0/unset off.
+  static int const s_debug_mocv =
+      std::getenv("NOGGIT_WMO_DEBUG_MOCV") ? std::atoi(std::getenv("NOGGIT_WMO_DEBUG_MOCV")) : 0;
+  wmo_shader.uniform("debug_mocv", s_debug_mocv);
+
   // (Removed the "wmo_open" outdoor-spill heuristic: it lifted EVERY interior group toward the outdoor
   // ambient whenever the WMO had any exterior group, flooding big mixed WMOs like Ironforge with Dun
   // Morogh daylight. The shader now lights interiors the canonical way -- MOHD ambient + baked MOCV.)
@@ -323,13 +338,30 @@ void WMORender::draw(OpenGL::Scoped::use_program& wmo_shader
       // the WMO's DEFAULT entry fogs[0] -- NOT over the zone fog.
       glm::vec3 mf_color;
       float mf_end = 0.0f, mf_start = 0.0f;
-      if (_wmo->evaluate_camera_fog(*group, transform_matrix, camera, &mf_color, &mf_end, &mf_start))
+      bool const mfog_applied = _wmo->evaluate_camera_fog(*group, transform_matrix, camera,
+                                                          world_renderer->cameraInsideWmo(), &mf_color, &mf_end, &mf_start);
+      if (mfog_applied)
       {
         float const fog_scale = world_renderer->fogDistanceScale();
         fog_color = mf_color;
         fog_end = mf_end * fog_scale;
         fog_start_abs = mf_start * fog_scale;
       }
+      // DIAGNOSTIC (NOGGIT_LIGHT_DEBUG): is the WMO-geometry fog coming from an MFOG sphere override
+      // (mfog=1) or the zone fog (mfog=0)? Logs the resulting FOG_END vs the zone fog end, throttled.
+      {
+        static bool const s_wmf_dbg = std::getenv("NOGGIT_LIGHT_DEBUG") != nullptr;
+        static int s_wmf_tick = 0;
+        if (s_wmf_dbg && (++s_wmf_tick % 240) == 0)
+          LogError << "WMOFOG mfog=" << (mfog_applied ? 1 : 0) << " FOG_END=" << fog_end
+                   << " start_abs=" << fog_start_abs << " zone_end=" << zone_fog_end << std::endl;
+      }
+      // No MFOG sphere in range -> ZONE fog (the default set above), per client RE docs 22/27: WMO geometry
+      // is drawn with the zone fog as its dominant state, and a fog sphere applies ONLY while the camera is
+      // inside it. There is deliberately NO fogs[0] fallback -- an earlier one (and my re-added Ironforge
+      // "fix") painted whole rooms / outdoor doodads near big WMOs (Karazhan Malchezaar) with the anchor/
+      // default fog the live client never shows. Ironforge "interior too near" + Icecrown "too foggy" are
+      // ZONE-fog problems (light-zone selection / fog-end), fixed in the lighting path, not here.
 
       wmo_shader.uniform("use_wmo_fog", 1);
       wmo_shader.uniform("wmo_fog_color", fog_color);

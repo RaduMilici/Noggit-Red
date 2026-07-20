@@ -68,6 +68,7 @@ namespace Noggit
 
   namespace Ui
   {
+    class TimeGlobeWidget;
     class ZoneMusicPlayer;
     class CreatureInfoPanel;
   }
@@ -264,6 +265,8 @@ private:
   Noggit::Ui::Tools::ViewToolbar::Ui::ViewToolbar* _view_toolbar;
   Noggit::Ui::Tools::ViewToolbar::Ui::ViewToolbar* _secondary_toolbar;
   Noggit::Ui::Tools::ViewToolbar::Ui::ViewToolbar* _left_sec_toolbar;
+  Noggit::Ui::TimeGlobeWidget* _time_globe = nullptr; // WC3 time-of-day globe, floated top-centre
+  QWidget* _globe_balance_spacer = nullptr; // far-right spacer tracking leftSecondaryToolbarHolder width to keep the globe centred
 
   void save(save_mode mode);
 
@@ -595,6 +598,7 @@ private:
   bool _mod_x_down = false;
 
   bool event(QEvent* e) override;
+  bool eventFilter(QObject* obj, QEvent* e) override;
 
   unsigned _mmap_async_index = 0;
   unsigned _mmap_render_index = 0;

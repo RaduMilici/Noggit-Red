@@ -34,6 +34,8 @@ namespace Noggit::Rendering
 
     void upload();
     void unload();
+    // Live-apply the render/anisotropic_filtering setting to the already-uploaded liquid arrays.
+    void reapply_anisotropy();
 
     tsl::robin_map<unsigned, std::tuple<GLuint, glm::vec2, int, unsigned>> const& getTextureFrames() { return _texture_frames_map; };
 

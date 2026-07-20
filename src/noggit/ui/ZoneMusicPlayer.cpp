@@ -276,7 +276,7 @@ namespace Noggit::Ui
     _intro_min_delay_ms = 0;
 
     std::string zone_name = "-";
-    int sound_entry_id = 0;
+    int day_sound_id = 0, night_sound_id = 0;
 
     try
     {
@@ -284,7 +284,10 @@ namespace Noggit::Ui
       {
         auto const zm = gZoneMusicDB.getByID(_current_zone_music_id);
         zone_name = zm.getString(ZoneMusicDB::Name);
-        sound_entry_id = static_cast<int>(zm.getUInt(_is_day ? ZoneMusicDB::DayMusic : ZoneMusicDB::NightMusic));
+        // Play ALL of the zone's music -- BOTH the Day and Night SoundEntries -- so night tracks show in
+        // the list and enter the random rotation too (no day/night segregation, per request).
+        day_sound_id = static_cast<int>(zm.getUInt(ZoneMusicDB::DayMusic));
+        night_sound_id = static_cast<int>(zm.getUInt(ZoneMusicDB::NightMusic));
         _silence_min_ms = static_cast<int>(zm.getUInt(_is_day ? ZoneMusicDB::SilenceIntervalMinDay
                                                               : ZoneMusicDB::SilenceIntervalMinNight));
         _silence_max_ms = static_cast<int>(zm.getUInt(_is_day ? ZoneMusicDB::SilenceIntervalMaxDay
@@ -293,7 +296,7 @@ namespace Noggit::Ui
     }
     catch (...)
     {
-      sound_entry_id = 0;
+      day_sound_id = night_sound_id = 0;
     }
 
     // Add every non-empty file of a SoundEntries row to the playlist, each carrying its OWN directory
@@ -319,8 +322,10 @@ namespace Noggit::Ui
       catch (...) {}
     };
 
-    // 1) Looping zone music (ZoneMusic.dbc day/night SoundEntries).
-    add_sound_entry(sound_entry_id, "");
+    // 1) Looping zone music: BOTH the Day and Night SoundEntries (deduped when a zone reuses the same set
+    //    for day and night), so every song for the zone plays and appears in the list.
+    add_sound_entry(day_sound_id, "");
+    if (night_sound_id != day_sound_id) { add_sound_entry(night_sound_id, ""); }
 
     // 2) Zone INTRO music (ZoneIntroMusicTable -> SoundEntries): city/instance intros such as
     //    "IronForge Intro.mp3" and "cot_intro.mp3" live on IntroSound, not ZoneMusic -- this is what
@@ -365,6 +370,13 @@ namespace Noggit::Ui
     if (pool.empty())
     {
       return;
+    }
+    // Don't replay the track that just finished back-to-back. Only drop it when there's an alternative,
+    // so a zone with a single looping track still plays.
+    if (pool.size() > 1 && _now_playing >= 0)
+    {
+      pool.erase(std::remove(pool.begin(), pool.end(), _now_playing), pool.end());
+      if (pool.empty()) { return; }
     }
     std::uniform_int_distribution<int> dist(0, static_cast<int>(pool.size()) - 1);
     play_index(pool[dist(_rng)]);

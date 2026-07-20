@@ -176,14 +176,17 @@ namespace
 
     param->set_highlight_sky(light_params.field_count > 1 && light_params.word(row, 1) != 0);
 
-    bool const classic_light_params = light_params.field_count == 9;
     // The classic 9-field LightParams.dbc is the SAME layout as modern for fields 0-8 (verified vs
     // the Turtle DBC: f5/6 = water shallow/deep, f7/8 = ocean shallow/deep; only the trailing
-    // `flags` field 9 is absent). The old classic branch was OFF BY ONE -> ocean_shallow read
-    // waterDeepAlpha (1.0 = OPAQUE shore) and every water alpha was shifted down a column. Use the
-    // real columns for BOTH. Glow stays special: 1.12 sources it from LightFloatBand band 3 (field 3
-    // is zeroed in the data), so keep the trace-verified workaround below rather than field 4.
-    std::size_t const glow_field = classic_light_params ? 3 : LightParamsDB::glow;
+    // `flags` field 9 is absent). The old classic branch was OFF BY ONE on the float fields ->
+    // ocean_shallow read waterDeepAlpha (opaque shore) AND glow read field 3 (cloudTypeID, always 0),
+    // which was then "rescued" by substituting LightFloatBand band 3 -- but band 3 is CLOUD DENSITY
+    // (the cloud-coverage input, wow.exe FUN_006d0970), NOT glow. glow is field 4 and is NOT zeroed:
+    // LightParams.dbc field 4 (float) = 0.6 for Karazhan 386 (== the measured 0.600 FFXGlow composite,
+    // wow_cap_kara), 0.65 for the map-0 default day 12, 0.0 for Dun Morogh's Steelgrill's 406. Reading
+    // cloud density (0.95 at overcast Steelgrill's) as the FFXGlow strength was the fog over-bloom bug
+    // -- use field 4, floored to 0.329 outdoors in the render (client FFXEffects.cpp FUN_006cb020).
+    std::size_t const glow_field = LightParamsDB::glow;
     std::size_t const river_shallow_field = LightParamsDB::water_shallow_alpha;
     std::size_t const river_deep_field = LightParamsDB::water_deep_alpha;
     std::size_t const ocean_shallow_field = LightParamsDB::ocean_shallow_alpha;
@@ -191,13 +194,6 @@ namespace
 
     if (light_params.field_count > glow_field)
       param->set_glow(light_params.number(row, glow_field));
-    // VANILLA data fix (trace-measured, wow_cap_kara / wow_cap_upstairs): 1.12 stores glow as
-    // LightFloatBand band 3, NOT LightParams field 3 (which Turtle zeroes everywhere). Param 386
-    // band 3 = 0.70; spatially blended by the sky weights this yields the client's measured
-    // composite weights (inn 0.647, Karazhan 0.600). Without this every zone fell to the 0.329
-    // floor and interiors like Kara lost their bloom (Anomalus's bright parts).
-    if (classic_light_params && !param->floatParams[3].empty())
-      param->set_glow(param->floatParams[3].front().value);
     if (light_params.field_count > river_shallow_field)
       param->set_river_shallow_alpha(light_params.number(row, river_shallow_field));
     if (light_params.field_count > river_deep_field)
@@ -438,10 +434,10 @@ SkyParam::SkyParam(int paramId, Noggit::NoggitRenderContext context)
     {
         DBCFile::Record light_param = gLightParamsDB.getByID(paramId);
         int skybox_id = light_param.getInt(LightParamsDB::skybox);
-        bool const classic_light_params = gLightParamsDB.getFieldCount() == 9;
-        // See the raw-DBC path above: the classic 9-field layout matches modern for fields 0-8, so
-        // the old off-by-one made ocean_shallow read waterDeepAlpha (opaque shore). Use real columns.
-        std::size_t const glow_field = classic_light_params ? 3 : LightParamsDB::glow;
+        // See the raw-DBC path above: the classic 9-field layout matches modern for fields 0-8, so the
+        // old off-by-one made ocean_shallow read waterDeepAlpha AND glow read field 3 (cloudTypeID) then
+        // substitute cloud-density band 3 (the over-bloom bug). Use real columns -- glow is field 4.
+        std::size_t const glow_field = LightParamsDB::glow;
         std::size_t const river_shallow_field = LightParamsDB::water_shallow_alpha;
         std::size_t const river_deep_field = LightParamsDB::water_deep_alpha;
         std::size_t const ocean_shallow_field = LightParamsDB::ocean_shallow_alpha;
@@ -449,10 +445,6 @@ SkyParam::SkyParam(int paramId, Noggit::NoggitRenderContext context)
 
         _highlight_sky = light_param.getInt(LightParamsDB::highlightSky);
         _glow = light_param.getFloat(glow_field);
-        // VANILLA: glow = LightFloatBand band 3 (LightParams field 3 is zeroed in 1.12 data) --
-        // see the matching fix in the raw-DBC path above.
-        if (classic_light_params && !floatParams[3].empty())
-          _glow = floatParams[3].front().value;
         _river_shallow_alpha = light_param.getFloat(river_shallow_field);
         _river_deep_alpha = light_param.getFloat(river_deep_field);
         _ocean_shallow_alpha = light_param.getFloat(ocean_shallow_field);
@@ -1165,6 +1157,42 @@ void Skies::update_sky_colors(glm::vec3 pos, int time)
   // straight linear ramp between fog start and end. (Was a 1.0-1.6 exponent tuned by eye, which read as
   // too-dense fog vs. the client.) fog_start/end distances are computed render-side (see WorldRender:
   // fog_end = min(fog_distance_end, view_distance); fog_start stays the DBC fraction of fog_end).
+  // DIAGNOSTIC (NOGGIT_LIGHT_DEBUG): dump the zone-light fog selection so overblown-fog spots can be pinned.
+  {
+    static bool const s_zf_dbg = std::getenv("NOGGIT_LIGHT_DEBUG") != nullptr;
+    static int s_zf_tick = 0;
+    if (s_zf_dbg && (++s_zf_tick % 30) == 0)
+    {
+      int weighted = 0;
+      for (auto const& s : skies) if (s.weight > 0.f) ++weighted;
+      LogError << "ZONEFOG pos=(" << pos.x << "," << pos.y << "," << pos.z << ")"
+               << " default=" << (default_sky ? std::to_string(default_sky->Id) : std::string("NULL"))
+               << " fog_distance=" << _fog_distance << " fog_end=" << fog_distance_end()
+               << " weightedSkies=" << weighted << std::endl;
+      for (auto const& s : skies)
+      {
+        if (s.weight <= 0.f) continue;
+        LogError << "  sky id=" << s.Id << " w=" << s.weight
+                 << " fogDist=" << s.floatParamFor(0, time)
+                 << " pos=(" << s.pos.x << "," << s.pos.y << "," << s.pos.z << ")"
+                 << " r1=" << s.r1 << " r2=" << s.r2 << std::endl;
+      }
+    }
+  }
+
+  // GUARD (overblown-fog fix): a bad/short-fog positioned light -- or the no-default fallback that wipes
+  // colours to white and _fog_distance to 0 -- can collapse the blended zone fog distance to ~0, which fogs
+  // the ENTIRE view to the (often white) sky colour. That is the "overblown fog" at Steelgrill's Depot and
+  // over half of Icecrown. A zone (outdoor) fog under ~50yd is essentially always that failure (real short
+  // fog lives in WMO MFOG, not the zone band), so fall back to the default light's authored fog distance
+  // (or a sane 500yd) rather than whiting out. Root cause of WHICH light is bad is logged above.
+  if (_fog_distance < 1800.f)
+  {
+    _fog_distance = (default_sky && default_sky->floatParamFor(0, time) >= 1800.f)
+                      ? default_sky->floatParamFor(0, time)
+                      : 18000.f;
+  }
+
   _fog_rate = 1.0f;
 
   _last_pos = pos;
@@ -1882,13 +1910,17 @@ void OutdoorLightStats::interpolate(OutdoorLightStats *a, OutdoorLightStats *b, 
   float progressDayAndNight = r / DayNight_SecondsPerDay;
 
   // SCENE LIGHT direction -- CLIENT-CANON (wow.exe 5875 FUN_006d3a10 key tables): the 1.12 scene
-  // light does NOT follow the visible sun disc. It oscillates gently between polar 110 deg
-  // (2.2165682) and 127 deg (1.9198623... swapped naming aside, the exact values below) at a
-  // FIXED azimuth of 225 deg (pi*1.25) -- i.e. light always arrives from the sun's compass
-  // bearing (45 deg) at a 20-37 deg incidence, day and night. The visible sun disc rides its own
-  // keyframed path (WorldRender) that shares this azimuth, so disc and lighting always agree.
+  // light does NOT follow the visible sun disc; it oscillates gently between polar 110 deg
+  // (2.2165682) and 127 deg (1.9198623) at a FIXED azimuth, day and night.
+  // AZIMUTH FIX (2026-07-18): the visible sun disc's celestial_dir (WorldRender) maps wow azimuth ->
+  // render bearing with a +180 flip (a = theta_wow + pi), matching the position-frame direction map
+  // (wx,wy,wz)->(-wy,wz,-wx). But the scene-light shaders reorder dayDir WITHOUT that flip
+  // (to_light = -normalize(dayDir.x, dayDir.z, dayDir.y)). With thetaValue = 225 the lit side came out
+  // 180 deg OPPOSITE the sun disc (reported: "scene lit 180 from where the sun is in the sky").
+  // thetaValue = pi/4 (45 deg) makes to_light render on the SAME bearing as the disc (render-SW /
+  // wow-45 sun), so the lit side of terrain, WMO and M2 geometry faces the visible sun.
   float phiValue = 0;
-  const float thetaValue = 3.926991f;
+  const float thetaValue = 0.7853982f; // pi/4 == 45 deg (was 3.926991 = 225 deg, which lit 180 backwards)
   const float phiTable[4] =
     {
       2.2165682f,

@@ -52,6 +52,10 @@ namespace Noggit::Rendering
     void upload() override;
     void unload() override;
 
+    // True while the camera is inside a WMO this frame (cached in draw()). Read by WMORender to route WMO
+    // exterior-lit / portal-spill faces to the WMO's interior context instead of the outdoor map light.
+    bool cameraInsideWmo() const { return _camera_inside_wmo; }
+
     void draw (glm::mat4x4 const& model_view
         , glm::mat4x4 const& projection
         , glm::vec3 const& cursor_pos
@@ -205,6 +209,9 @@ namespace Noggit::Rendering
     // into _bloom_scene_color before the bloom chain. 0 = off.
     GLuint _msaa_fbo = 0, _msaa_color_rb = 0, _msaa_depth_rb = 0;
     int _msaa_samples = 0;
+    // Live-apply guard for render/anisotropic_filtering: draw() re-applies AF to every loaded texture
+    // array (via TextureManager + liquid manager) only when this changes. -1 forces apply on frame 1.
+    float _last_anisotropy = -1.0f;
     GLuint _bloom_fbo[2] = {0, 0};
     GLuint _bloom_tex[2] = {0, 0};
 
@@ -251,6 +258,17 @@ namespace Noggit::Rendering
     // Loaded-WMO-set fingerprint from last volume gather: a change (WMO streamed in/out) triggers an
     // immediate re-gather + cache flush so freshly loaded rooms light their objects the SAME frame.
     std::uint64_t _last_wmo_fingerprint = 0;
+    // Placement-keyed cache of the OWNING ModelInstance copies for per-instance-animated WMO doodads
+    // (billboarded glow cards / global-seq flicker). The by-value copy bumps the ModelManager +
+    // TextureManager refcounts through a shared mutex, so it is EXPENSIVE (~25ms/frame of GatherMerge in
+    // dense interiors like Ironforge). Copying once per placement and reusing across frames removes that
+    // per-frame cost. std::unordered_map is NODE-BASED, so element addresses are STABLE across insert /
+    // rehash -- per_instance_wmo_doodads holds bare pointers INTO this map and they stay valid for the
+    // whole frame (we only ever emplace, never erase, mid-frame). The owning copy keeps its Model alive
+    // (async-unload-safe -- the same safety the old by-value list bought). Cleared ONLY when the loaded-
+    // WMO fingerprint changes (load/unload/move/rotate/doodadset edit) -- never on the interior-light
+    // 60-frame epoch -- so it persists across pure camera panning. Render-thread only (no races).
+    std::unordered_map<std::uint64_t, ModelInstance> _pi_doodad_cache;
     // World-space MFOG entries (rebuilt on the same epoch tick) for the per-frame ENTITY fog: the
     // camera's fog context written into the lighting UBO Env slots (see types.hpp).
     std::vector<WmoGroupFogVolume> _env_fog_volumes;
@@ -270,6 +288,7 @@ namespace Noggit::Rendering
     OpenGL::MVPUniformBlock _mvp_ubo_data;
     OpenGL::LightingUniformBlock _lighting_ubo_data;
     bool _point_lights_scoped = false; // true while the UBO carries a WMO group's MOLR set
+    bool _camera_inside_wmo = false;   // cached per frame; drives the WMO shader's camera_inside_wmo uniform
     OpenGL::TerrainParamsUniformBlock _terrain_params_ubo_data;
 
 
