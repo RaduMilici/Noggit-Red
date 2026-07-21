@@ -161,7 +161,12 @@ void main()
   uv1 = get_texture_uv(tex_unit_lookup_1, vertex.xyz, camera_norm, tex_matrix_1);
   uv2 = get_texture_uv(tex_unit_lookup_2, vertex.xyz, camera_norm, tex_matrix_2);
 
-  camera_dist = -vertex.z;
+  // Fog distance = TRUE Euclidean distance to the camera (view space is a rigid transform, so
+  // length(view_pos) == world distance). Every other shader -- terrain, WMO, liquid, wmo_liquid,
+  // particle -- fogs by distance(camera, world_pos); M2 alone used -vertex.z (view DEPTH), which is
+  // shorter off-axis, so doodads/creatures fogged by a different amount than the ground and "stuck
+  // out" of the fog. Matching Euclidean puts M2 objects on the identical fog ramp as the terrain.
+  camera_dist = length(vertex.xyz);
   v_interior = instance_interior;
   gl_Position = projection * vertex;
 }

@@ -1617,6 +1617,17 @@ bool WMO::evaluate_camera_fog(WMOGroup const& group, glm::mat4x4 const& transfor
                               glm::vec3 const& camera, bool camera_inside_wmo, glm::vec3* color,
                               float* fog_end, float* fog_start_abs) const
 {
+  // CAMERA-GROUP GATE (client FUN_0069de20 param_3 + the FUN_006be250 floor walk): the WMO camera fog
+  // applies ONLY while the camera stands over an INTERIOR group's floor. camera_inside_wmo is now the
+  // geometric floor test (World::camera_is_inside_wmo -- a ray-down onto indoor WMO geometry), NOT a loose
+  // AABB, so an open-air tower (Karazhan's Malchezaar) resolves FALSE -> zone fog (gray), and a real
+  // enclosed interior (Ironforge's Great Forge) resolves TRUE -> the WMO's own fog. This one geometric
+  // rule ends the Ironforge<->Malchezaar flip-flop -- no fog[0] guessing; the floor decides.
+  if (!camera_inside_wmo)
+  {
+    return false;
+  }
+
   if (fogs.size() <= 1)
   {
     return false; // default-only WMO: the client evaluator bails (nFogs == 1) -> zone fog
@@ -1659,19 +1670,11 @@ bool WMO::evaluate_camera_fog(WMOGroup const& group, glm::mat4x4 const& transfor
   // with heavy fog the live client never shows outside the anchors.
   if (n == 0)
   {
-    // No placed fog sphere in range. If the camera is OUTSIDE this WMO (we're drawing its exterior from
-    // the map), keep the ZONE fog -- don't paint the outside with the interior default (that was the old
-    // fogs[0] regression that fogged Karazhan doodads/rooms). But when the camera is INSIDE a multi-fog
-    // WMO, the client uses the DEFAULT entry fog[0] as the base EVERYWHERE (RE @0069de20: placed fogs
-    // blend OVER fog[0]; with none in range the result IS fog[0]), NOT the zone fog. Ironforge: fog[0]
-    // end 805.6 / start 201.4 = clear-then-fog interior, vs the Dun Morogh zone light's start ~1.4yd
-    // (fog from the camera plane) that hazed the whole Great Forge. Karazhan's root has NO MFOG (fogs<=1,
-    // handled by the early-out above), so this never touches it.
-    if (!camera_inside_wmo)
-    {
-      return false;
-    }
-    *color = c;      // c/end/start were seeded to fog[0] above
+    // Camera is over an interior floor (gated true above) but no placed fog sphere is in range -> the WMO's
+    // DEFAULT fog[0] as the base (RE @0069de20). Ironforge's Great Forge needs this long interior fog (end
+    // 805.6), not the short outdoor zone fog. Malchezaar can't reach here: its open tower resolves
+    // camera_inside_wmo == false and already returned the zone fog at the top.
+    *color = c;
     *fog_end = end;
     *fog_start_abs = start;
     return true;

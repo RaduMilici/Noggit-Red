@@ -5038,13 +5038,6 @@ bool World::camera_is_inside_wmo(glm::vec3 const& pos)
       return; // not even in the loose outer AABB
     }
 
-    // The outer AABB is loose (covers nearby terrain / airspace for big city WMOs). Only "inside" if pos
-    // falls in a GENUINE INTERIOR group's AABB -- indoor and NOT exterior/exterior_lit (the same rule as
-    // collect_interior_volumes, client proxy 0x695960). Exterior building SHELLS (Stormwind's keep/houses)
-    // have loose axis-aligned AABBs that swallow the airspace beside and above them; counting those made
-    // flying near a big city WMO read as "inside", which flipped its sun-lit exterior faces to the dark
-    // interior lighting formula -- the reported all-black WMO-shading regression. Real interior halls
-    // (Ironforge) still count, so the interior-lighting + WMO fog[0] fixes that key off this stay correct.
     for (auto const& [group_index, group_bounds] : wmo_instance.getGroupExtents())
     {
       if (group_index < 0 || group_index >= static_cast<int>(wmo_instance.wmo->groups.size()))
@@ -5065,6 +5058,53 @@ bool World::camera_is_inside_wmo(glm::vec3 const& pos)
   }, [&]() { return inside; });
 
   return inside;
+}
+
+// The map's authored WMO fog (MOFG spheres) is real content -- render it WHERE it is placed. Starting from
+// the incoming ZONE fog (color + absolute end/start in yards), blend every WMO fog sphere the camera is
+// INSIDE (dist < r2) over it, farthest -> nearest, weight = 1 inside r1 falling linearly to 0 at r2 (RE
+// docs 22/27, wow.exe @0069e1c0). Sphere end/start are scaled by the editor fog-distance scale to match the
+// zone fog's units. The caller writes the result to the MAIN fog UBO, so EVERY draw -- terrain, doodads,
+// AND WMO geometry (via getZoneFog) -- reads the SAME fog: no per-region split, and the authored blue shows
+// exactly where its spheres are (Karazhan) fading to the zone fog outside them.
+void World::collect_camera_fog(glm::vec3 const& camera, float scale,
+                               glm::vec3& color, float& end, float& start_abs)
+{
+  struct Cand { float d, r1, r2; glm::vec3 color; float end, start; };
+  std::vector<Cand> cands;
+  _model_instance_storage.for_each_wmo_instance([&](WMOInstance& wmo_instance)
+  {
+    if (!wmo_instance.finishedLoading() || wmo_instance.wmo->loading_failed()
+        || wmo_instance.wmo->fogs.size() <= 1)
+    {
+      return; // default-only WMO carries no placed fog
+    }
+    glm::mat4x4 const transform = wmo_instance.transformMatrix();
+    for (std::size_t i = 1; i < wmo_instance.wmo->fogs.size(); ++i) // slot 0 = default entry, skipped
+    {
+      auto const& wf = wmo_instance.wmo->fogs[i];
+      if ((wf.flags & 1u) != 0u || wf.r2 <= 0.f)
+      {
+        continue;
+      }
+      glm::vec3 const world_pos = glm::vec3(transform * glm::vec4(wf.pos, 1.0f));
+      float const d = glm::distance(camera, world_pos);
+      if (d < wf.r2)
+      {
+        cands.push_back({d, wf.r1, wf.r2, glm::vec3(wf.color), wf.fogend * scale, wf.fogstart * scale});
+      }
+    }
+  });
+
+  std::sort(cands.begin(), cands.end(), [](Cand const& a, Cand const& b) { return a.d > b.d; });
+  for (auto const& c : cands)
+  {
+    float const w = (c.d <= c.r1) ? 1.0f
+                  : (c.r2 > c.r1 ? (c.r2 - c.d) / (c.r2 - c.r1) : 0.0f);
+    color = glm::mix(color, c.color, w);
+    end = glm::mix(end, c.end, w);
+    start_abs = glm::mix(start_abs, c.start, w);
+  }
 }
 
 void World::collect_interior_volumes(std::vector<InteriorVolume>& out)

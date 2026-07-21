@@ -338,7 +338,18 @@ void WMORender::draw(OpenGL::Scoped::use_program& wmo_shader
       // the WMO's DEFAULT entry fogs[0] -- NOT over the zone fog.
       glm::vec3 mf_color;
       float mf_end = 0.0f, mf_start = 0.0f;
-      bool const mfog_applied = _wmo->evaluate_camera_fog(*group, transform_matrix, camera,
+      // WMO camera-fog DEFAULT-OFF (2026-07-20): route WMO geometry to the ZONE fog (the default set above)
+      // so EVERY draw -- WMO walls/floor, terrain, doodads -- reads the SAME fog with nothing per-region to
+      // mismatch. noggit can't reproduce the client's portal/BSP camera-group walk (wow.exe FUN_006be250 ->
+      // FUN_006b92b0); every AABB/floor proxy re-blued Karazhan's open Malchezaar tower (its own indoor
+      // floor sits under the camera) while leaving doodads on zone fog -> the terrain-blue/doodads-gray
+      // split. The authored MFOG is fog-free up close (start ~83yd) and shows only over long sightlines, so
+      // the zone fog is visually close AND consistent. Interiors that genuinely need their own fog
+      // (Ironforge) get it from their dim interior Light.dbc ZONE (RE §9.5) -- the SAME source the terrain
+      // reads. NOGGIT_WMO_FOG=1 re-enables the per-group MFOG (only worth it with real portal resolution).
+      static bool const s_wmo_mfog = std::getenv("NOGGIT_WMO_FOG") != nullptr;
+      bool const mfog_applied = s_wmo_mfog
+                             && _wmo->evaluate_camera_fog(*group, transform_matrix, camera,
                                                           world_renderer->cameraInsideWmo(), &mf_color, &mf_end, &mf_start);
       if (mfog_applied)
       {

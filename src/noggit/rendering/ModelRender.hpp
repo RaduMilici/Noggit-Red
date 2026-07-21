@@ -161,6 +161,11 @@ namespace Noggit::Rendering
         // Per-instance distance fade 0..1 (parallel to `instances`): alpha ramp over the last stretch
         // before the render distance so doodads dissolve instead of popping. Empty = no fade (1.0).
         , std::vector<float> const& instance_fades = {}
+        // Per-instance bone matrices (perf 2026-07-20): instances.size() * bone_matrix_count matrices,
+        // instance i's slice at [i*count, (i+1)*count). Each billboard doodad's own CPU-baked bones so
+        // they draw INSTANCED (one drawElementsInstanced per interior group) instead of one draw each.
+        // Non-empty => per-instance bone slices + skip the single shared animate(). Empty = unchanged.
+        , std::vector<glm::mat4x4> const& per_instance_bones = {}
     );
 
     void drawParticles(glm::mat4x4 const& model_view

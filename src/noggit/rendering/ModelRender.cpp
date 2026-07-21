@@ -640,10 +640,17 @@ void ModelRender::draw(glm::mat4x4 const& model_view
     , ModelInstance const* representative
     , std::vector<glm::vec4> const& instance_interior
     , std::vector<float> const& instance_fades
+    , std::vector<glm::mat4x4> const& per_instance_bones
 )
 {
   ZoneScopedN(NOGGIT_CURRENT_FUNCTION);
   bool const skip_mesh_passes = is_classic_effect_shell_model(_model);
+  // Per-instance bone slices (perf 2026-07-20): non-empty => each instance owns bone_matrices.size()
+  // matrices in per_instance_bones (slice i at [i*count,(i+1)*count)), so billboard doodads draw
+  // INSTANCED (one call per interior group) instead of one draw per doodad. Skips the single shared
+  // animate() (the caller pre-animated each instance into this buffer) and strides the bone reads.
+  bool const pib = !per_instance_bones.empty();
+  int const pib_bone_count = pib ? static_cast<int>(_model->bone_matrices.size()) : 0;
 
   {
     ZoneScopedN("Model::draw() : uploads")
@@ -672,6 +679,18 @@ void ModelRender::draw(glm::mat4x4 const& model_view
     {
       setupVAO(m2_shader);
     }
+    else
+    {
+      // The VAO may have been first set up under the NON-instanced m2 program (the minimap render and the
+      // individual per-instance-doodad / creature paths all bind _m2_program, where "transform" is a UNIFORM,
+      // so setupVAO's attrib("transform") no-ops). An instanced draw on that VAO then reads a garbage
+      // per-instance transform => inverted / misplaced meshes (the instanced billboard-doodad regression in
+      // e.g. Timbermaw). Re-assert the divisor-1 transform attribute under THIS (instanced) program; it's a
+      // harmless no-op for VAOs already set up instanced (the models_to_draw tree/prop buckets).
+      OpenGL::Scoped::vao_binder const _v(_vao);
+      OpenGL::Scoped::buffer_binder<GL_ARRAY_BUFFER> const _tb(_transform_buffer);
+      m2_shader.attrib("transform", 0, 1);
+    }
 
     if (capture_debug_enabled())
     {
@@ -689,7 +708,9 @@ void ModelRender::draw(glm::mat4x4 const& model_view
   {
     ZoneScopedN("Model::draw() : drawing")
 
-    if (_model->animated && (!_model->animcalc || _model->_per_instance_animation))
+    // pib: the caller already animated each instance (per-instance billboards) into per_instance_bones,
+    // so skip the single shared animate() that would otherwise stomp one pose over all instances.
+    if (!pib && _model->animated && (!_model->animcalc || _model->_per_instance_animation))
     {
       if (capture_debug_enabled())
       {
@@ -743,7 +764,7 @@ void ModelRender::draw(glm::mat4x4 const& model_view
     // (~31 ms per step of the 2 s fade -- imperceptible; the old 1/16 stepped visibly on fading
     // GAMEOBJECTS next to smoothly-fading individual creatures). Group count stays bounded: only
     // instances actually mid-fade split off extra sub-draws.
-    struct InteriorGroup { glm::vec4 interior; float fade; std::vector<glm::mat4x4> transforms; };
+    struct InteriorGroup { glm::vec4 interior; float fade; std::vector<glm::mat4x4> transforms; std::vector<glm::mat4x4> bones; };
     std::vector<InteriorGroup> interior_groups;
     for (std::size_t i = 0; i < instances.size(); ++i)
     {
@@ -765,8 +786,20 @@ void ModelRender::draw(glm::mat4x4 const& model_view
       {
         if (cand.interior == inter && cand.fade == fade) { grp = &cand; break; }
       }
-      if (!grp) { interior_groups.push_back({inter, fade, {}}); grp = &interior_groups.back(); }
+      if (!grp) { interior_groups.push_back({inter, fade, {}, {}}); grp = &interior_groups.back(); }
       grp->transforms.push_back(instances[i]);
+      if (pib && pib_bone_count > 0)
+      {
+        // Gather THIS instance's bone slice into the group (parallel to transforms) so the group's bones
+        // are laid out group-local -> gl_InstanceID indexes them directly (no base offset needed).
+        auto const s = static_cast<std::size_t>(i) * static_cast<std::size_t>(pib_bone_count);
+        if (s + pib_bone_count <= per_instance_bones.size())
+        {
+          grp->bones.insert(grp->bones.end(),
+                            per_instance_bones.begin() + s,
+                            per_instance_bones.begin() + s + pib_bone_count);
+        }
+      }
     }
 
     // NOGGIT_FADE_DEBUG=1: report per-model fade group makeup (find models whose fades never move)
@@ -799,18 +832,30 @@ void ModelRender::draw(glm::mat4x4 const& model_view
 
     // Guard as above: never bind an empty bone-matrix texture buffer (NVIDIA __fastfail -- the
     // asset-browser preview barrel crash).
-    if (_model->animBones && _bone_matrices_buf_tex != 0 && _bone_matrices_buffer_size > 0
+    if (pib)
+    {
+      // Per-instance bone slices: the actual bones are uploaded per interior group below (group-local).
+      // Here just declare the mode -- bones ON, per-instance count, and stride = count so instance k in
+      // a group reads its slice at k*count. (The stride uniforms are set on EVERY path so a prior pib
+      // draw never leaks its stride into the normal shared-bone instanced draws.)
+      m2_shader.uniform("anim_bones", pib_bone_count > 0);
+      m2_shader.uniform("bone_matrix_count", pib_bone_count);
+      m2_shader.uniform("per_instance_bone_stride", pib_bone_count);
+    }
+    else if (_model->animBones && _bone_matrices_buf_tex != 0 && _bone_matrices_buffer_size > 0
         && !_model->bone_matrices.empty())
     {
       gl.activeTexture(GL_TEXTURE0);
       gl.bindTexture(GL_TEXTURE_BUFFER, _bone_matrices_buf_tex);
       m2_shader.uniform("anim_bones", true);
       m2_shader.uniform("bone_matrix_count", static_cast<int>(_model->bone_matrices.size()));
+      m2_shader.uniform("per_instance_bone_stride", 0);
     }
     else
     {
       m2_shader.uniform("anim_bones", false);
       m2_shader.uniform("bone_matrix_count", 0);
+      m2_shader.uniform("per_instance_bone_stride", 0);
     }
 
     OpenGL::Scoped::buffer_binder<GL_ELEMENT_ARRAY_BUFFER> indices_binder(_indices_buffer);
@@ -831,6 +876,16 @@ void ModelRender::draw(glm::mat4x4 const& model_view
         // GL 3.3), then set the room light this whole group shares.
         OpenGL::Scoped::buffer_binder<GL_ARRAY_BUFFER> const transform_binder (_transform_buffer);
         gl.bufferData(GL_ARRAY_BUFFER, group.transforms.size() * sizeof(::glm::mat4x4), group.transforms.data(), GL_DYNAMIC_DRAW);
+      }
+      if (pib && pib_bone_count > 0 && _bone_matrices_buf_tex != 0 && !group.bones.empty())
+      {
+        // Upload THIS group's bones group-local (slice 0 = the group's first instance) so gl_InstanceID
+        // indexes the slice directly, matching the group-local transform upload above.
+        OpenGL::Scoped::buffer_binder<GL_TEXTURE_BUFFER> const bone_binder (_bone_matrices_buffer);
+        gl.bufferData(GL_TEXTURE_BUFFER, group.bones.size() * sizeof(::glm::mat4x4), group.bones.data(), GL_STREAM_DRAW);
+        gl.activeTexture(GL_TEXTURE0);
+        gl.bindTexture(GL_TEXTURE_BUFFER, _bone_matrices_buf_tex);
+        gl.texBuffer(GL_TEXTURE_BUFFER, GL_RGBA32F, _bone_matrices_buffer);
       }
       m2_shader.uniform("instance_interior", group.interior);
 

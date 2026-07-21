@@ -3062,7 +3062,12 @@ void WorldRender::draw (glm::mat4x4 const& model_view
         // in the instanced program "transform" is a vertex ATTRIBUTE (4 slots, divisor 1), and calling
         // the non-instanced draw under it left the VAO/attrib state inconsistent, which the NVIDIA
         // driver eventually faulted on in a later (particle) draw. Own program scope, like creatures.
-        if (!per_instance_wmo_doodads.empty())
+        // INSTANCED-DOODAD toggle (perf 2026-07-20): DEFAULT = original per-doodad path (correct). The
+        // instanced path (block after this) is OPT-IN via NOGGIT_INSTANCED_DOODADS=1. Transform-attribute bug
+        // fixed, but a remaining "black mesh slices" bug on some glow/lightray doodads (opaque-black instead of
+        // additive) is still under debug -- so the instanced path is NOT default until that's resolved.
+        static bool const s_inst_doodads = std::getenv("NOGGIT_INSTANCED_DOODADS") != nullptr;
+        if (!per_instance_wmo_doodads.empty() && !s_inst_doodads)
         {
           OpenGL::Scoped::use_program doodad_shader {*_m2_program.get()};
 
@@ -3131,6 +3136,103 @@ void WorldRender::draw (glm::mat4x4 const& model_view
               pmodel->updateParticleSystems(pdt);
               pmodel->swapInstanceEmitterState(key);
             }
+          }
+        }
+
+        // INSTANCED billboard-doodad path (perf 2026-07-20): default ON (disable with
+        // NOGGIT_NO_INSTANCED_DOODADS). Batches each model's billboard doodads into ONE instanced draw per
+        // interior group instead of one draw per doodad. Each doodad's billboard bones are animated serially
+        // (per-instance, into a big bone buffer) exactly as the individual path did; the instanced m2 program
+        // reads them via gl_InstanceID*per_instance_bone_stride. The per-copy particle sim is advanced per
+        // doodad here too, so the particle DRAW pass below renders each flame's own state.
+        if (!per_instance_wmo_doodads.empty() && s_inst_doodads)
+        {
+          OpenGL::Scoped::use_program m2_shader {*_m2_instanced_program.get()};
+
+          OpenGL::M2RenderState doodad_render_state;
+          doodad_render_state.tex_arrays = {0, 0};
+          doodad_render_state.tex_indices = {0, 0};
+          doodad_render_state.tex_unit_lookups = {0, 0};
+          gl.blendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+          gl.disable(GL_BLEND);
+          gl.depthMask(GL_TRUE);
+          gl.enable(GL_CULL_FACE);
+          m2_shader.uniform("blend_mode", 0);
+          m2_shader.uniform("unfogged", static_cast<int>(doodad_render_state.unfogged));
+          m2_shader.uniform("unlit",  static_cast<int>(doodad_render_state.unlit));
+          m2_shader.uniform("tex_unit_lookup_1", 0);
+          m2_shader.uniform("tex_unit_lookup_2", 0);
+          m2_shader.uniform("pixel_shader", 0);
+
+          // Group visible (deduped-by-placement) doodads by model.
+          std::unordered_map<Model*, std::vector<ModelInstance*>> pib_by_model;
+          {
+            std::unordered_set<std::uint64_t> seen_doodad_keys;
+            for (ModelInstance* _dptr : per_instance_wmo_doodads)
+            {
+              if (!_dptr) { continue; }
+              ModelInstance& doodad = *_dptr;
+              Model* pmodel = doodad.model.get();
+              if (!pmodel || !pmodel->finishedLoading() || pmodel->loading_failed()
+                  || (!draw_hidden_models && pmodel->is_hidden()))
+              {
+                continue;
+              }
+              std::uint64_t const key = wmo_doodad_placement_key(doodad.get_pos());
+              if (!seen_doodad_keys.insert(key).second) { continue; }
+              pib_by_model[pmodel].push_back(_dptr);
+            }
+          }
+
+          std::unordered_map<Model*, std::size_t> pib_boxes; // unused (all_boxes = false)
+          for (auto& model_group : pib_by_model)
+          {
+            Model* const pmodel = model_group.first;
+            auto const& group_doodads = model_group.second;
+            std::size_t const bc = pmodel->bone_matrices.size();
+            bool const has_bones = pmodel->animBones && bc > 0;
+
+            std::vector<glm::mat4x4> transforms; transforms.reserve(group_doodads.size());
+            std::vector<glm::vec4> interiors;    interiors.reserve(group_doodads.size());
+            std::vector<glm::mat4x4> big_bones;
+            if (has_bones) { big_bones.reserve(group_doodads.size() * bc); }
+
+            noggit::perf::Scoped _prof_submit2(noggit::perf::Phase::SubmitIndiv);
+            for (ModelInstance* _dptr : group_doodads)
+            {
+              ModelInstance& doodad = *_dptr;
+              std::uint64_t const key = wmo_doodad_placement_key(doodad.get_pos());
+              if (has_bones)
+              {
+                // Animate THIS instance's billboard bones (serial; writes shared Model bone state) then
+                // snapshot into the big buffer -- mirrors the individual path's per-doodad animate.
+                if (draw_model_animations) { pmodel->animcalc = false; }
+                pmodel->animate(model_view * doodad.transformMatrix(), 0, static_cast<int>(_world->model_animtime));
+                big_bones.insert(big_bones.end(), pmodel->bone_matrices.begin(), pmodel->bone_matrices.end());
+              }
+              transforms.push_back(doodad.transformMatrix());
+              interiors.push_back(interior_light_at(doodad.get_pos()));
+              ++_world->_n_rendered_objects;
+
+              if (draw_model_animations && !pmodel->_particles.empty())
+              {
+                pmodel->swapInstanceEmitterState(key);
+                float pdt = _world->models_emitter_dt();
+                while (pdt > 0.1f) { pmodel->updateParticleSystems(0.1f); pdt -= 0.1f; }
+                pmodel->updateParticleSystems(pdt);
+                pmodel->swapInstanceEmitterState(key);
+              }
+            }
+
+            if (transforms.empty()) { continue; }
+            std::vector<float> const fades(transforms.size(), 1.0f);
+            std::vector<glm::mat4x4> const no_bones;
+            // has_bones -> per-instance bone slices (pib path). Else -> empty => draw()'s shared animate
+            // (static / texanim-only doodads are correctly shared across instances).
+            pmodel->renderer()->draw(model_view, transforms, m2_shader, doodad_render_state, frustum,
+                _cull_distance, camera_pos, static_cast<int>(_world->model_animtime), false, pib_boxes,
+                display, /*no_cull*/ false, /*representative*/ nullptr, interiors, fades,
+                has_bones ? big_bones : no_bones);
           }
         }
 
@@ -5228,6 +5330,26 @@ void WorldRender::updateLightingUniformBlock(bool draw_fog, glm::vec3 const& cam
   // start scales with the clamp automatically (0.25 * 777 = 194.25, matching the trace).
   fog_end = std::min(fog_end, _view_distance);
 
+  // CAMERA FOG: the map's authored WMO fog (MOFG spheres) is real content -- render it WHERE it's placed.
+  // Blend any fog sphere the camera is inside over the zone fog (in absolute yards), then feed the result to
+  // the MAIN fog below so EVERY draw -- terrain, doodads AND WMO geometry (via getZoneFog) -- reads the SAME
+  // fog. Outside all spheres this is exactly the zone fog; inside one it fades to the sphere's colour /
+  // distance (Karazhan's authored blue), fog-free up close via the authored start. This replaces the old
+  // per-WMO-geometry-only MFOG (which mismatched terrain/doodads); NOGGIT_NO_WMO_FOG=1 = pure zone fog.
+  {
+    static bool const s_no_wmo_fog = std::getenv("NOGGIT_NO_WMO_FOG") != nullptr;
+    if (!s_no_wmo_fog && draw_fog)
+    {
+      glm::vec3 cam_color = fog_color;
+      float cam_end = fog_end;
+      float cam_start_abs = fog_start * fog_end;
+      _world->collect_camera_fog(camera_pos, _fog_distance_scale, cam_color, cam_end, cam_start_abs);
+      fog_color = cam_color;
+      fog_end = std::min(cam_end, _view_distance);
+      fog_start = (fog_end > 0.001f) ? (cam_start_abs / fog_end) : fog_start;
+    }
+  }
+
   // TRACE (NOGGIT_LIGHT_DEBUG): the FINAL zone-fog state fed to the render, logged so overblown-fog spots
   // can be diagnosed straight from log.txt. Pairs with the Sky.cpp ZONEFOG line (weighted-light list).
   {
@@ -5260,13 +5382,22 @@ void WorldRender::updateLightingUniformBlock(bool draw_fog, glm::vec3 const& cam
   // the Env UBO slots read by the M2/particle/ribbon/WMO-liquid shaders; terrain keeps zone fog.
   // NOGGIT_NO_M2_ENV_FOG=1 disables (entities then always use the zone fog, the old behaviour).
   {
-    static bool const s_no_env_fog = std::getenv("NOGGIT_NO_M2_ENV_FOG") != nullptr;
+    // Entity/camera MFOG is OPT-IN (default OFF). It resolves the camera's WMO group by the SMALLEST
+    // containing group AABB (World::collect_fog_volumes) -- a loose box that extends well outside the
+    // WMO's real geometry, so it over-applies a WMO's placed MFOG spheres to nearby doodads. Per the
+    // MFOG RE (docs/client_re/27, wow.exe @0069de20): "the live client never shows" that heavy blue fog
+    // near the Tower of Karazhan -- it uses the ZONE fog there. Karazhan's open Malchezaar tower doodads
+    // were taking the WMO's cyan/purple fog spheres (env_w flipping 0<->1 = the intensity "spike") while
+    // the terrain kept the zone fog -> doodads-blue/terrain-gray split. Default OFF => doodads use the
+    // SAME zone fog as the terrain (consistent + client-correct). Re-enable via NOGGIT_M2_ENV_FOG=1 only
+    // once a precise portal-based group resolution replaces the leaky AABB test.
+    static bool const s_env_fog_on = std::getenv("NOGGIT_M2_ENV_FOG") != nullptr;
     float env_w = 0.0f;
     glm::vec3 env_color = fog_color;
     float env_end = fog_end;
     float env_start_abs = fog_start * fog_end;
 
-    if (!s_no_env_fog && draw_fog)
+    if (s_env_fog_on && draw_fog)
     {
       // CLIENT-EXACT (wow.exe @0069de20, note 27): the camera fog comes from the GROUP the camera
       // is standing in (smallest containing group AABB approximates the client's portal-resolved
@@ -5302,6 +5433,24 @@ void WorldRender::updateLightingUniformBlock(bool draw_fog, glm::vec3 const& cam
         env_color = mf_color;
         env_end = std::min(mf_end * _fog_distance_scale, _view_distance);
         env_start_abs = mf_start * _fog_distance_scale;
+      }
+
+      // DIAGNOSTIC (NOGGIT_LIGHT_DEBUG): the ENTITY fog fed to M2/doodads. env_w=1 => doodads use this
+      // instead of the zone fog (terrain always uses the zone fog). grp_ext/grp_extlit = the camera
+      // group's MOGP 0x8/0x40 flags: an exterior group must resolve env_w=0 (zone fog) so doodads match
+      // the ground -- the Malchezaar-tower doodads-blue-terrain-gray split.
+      {
+        static bool const s_env_dbg = std::getenv("NOGGIT_LIGHT_DEBUG") != nullptr;
+        static int s_env_tick = 0;
+        if (s_env_dbg && (++s_env_tick % 30) == 0)
+        {
+          LogError << "ENVFOG env_w=" << env_w
+                   << " cam_group=" << (cam_group ? 1 : 0)
+                   << " grp_ext=" << (cam_group ? (cam_group->group->is_exterior() ? 1 : 0) : -1)
+                   << " grp_extlit=" << (cam_group ? (cam_group->group->is_exterior_lit() ? 1 : 0) : -1)
+                   << " env_color=(" << env_color.x << "," << env_color.y << "," << env_color.z << ")"
+                   << " env_end=" << env_end << std::endl;
+        }
       }
     }
 

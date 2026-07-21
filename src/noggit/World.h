@@ -253,6 +253,10 @@ public:
   // dungeon interior, not merely inside its loose outer AABB). Used to drop the client's outdoor
   // FFXGlow floor when indoors (see renderBloomAndComposite).
   bool camera_is_inside_wmo(glm::vec3 const& pos);
+  // Blend the map's authored WMO fog spheres (MOFG) the camera is inside over the given ZONE fog, so the
+  // one camera fog can be written to the MAIN UBO for terrain, doodads AND WMO geometry alike. color +
+  // absolute end/start in/out (start = the pre-multiplied absolute distance); scale = fog-distance scale.
+  void collect_camera_fog(glm::vec3 const& camera, float scale, glm::vec3& color, float& end, float& start_abs);
   // Sticky interior-fog state (see getInteriorFog): once a WMO fog is chosen it HOLDS while the camera
   // stays inside that instance's outer AABB -- room-AABB containment alone is gappy (Kara: one step and
   // the fog dropped). Cleared on leaving the WMO or entering an exterior group.
