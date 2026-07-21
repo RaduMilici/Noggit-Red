@@ -196,10 +196,54 @@ def paint_texture(x: float, y: float, z: float, texture: str,
                   strength: float = 1.0, radius: float = 15.0,
                   hardness: float = 0.5, pressure: float = 0.9) -> dict:
     """Paint a terrain texture (.blp path from list_nearby_textures) onto the ground around a point, live.
-    strength 0..1 is coverage/opacity, radius the brush size, hardness 0..1 the edge falloff. Layer
-    textures by painting grass as a base then dirt/rock on slopes and paths with smaller radius."""
+    strength 0..1 is target opacity (1.0 = fully replace, ~0.5 = half-blend with what's under it), radius
+    the brush size, hardness 0..1 the edge falloff (low = soft/feathered edge for blending). Layer textures
+    by painting grass as a base then rock/dirt on slopes/paths on top. NOTE: a chunk holds max 4 textures.
+    Accents need a high strength (>=0.7) to actually show over the base grass; low hardness blends the edge."""
+    # Engine alpha target is 0..255; expose an intuitive 0..1 coverage and scale it here.
+    alpha = max(0.0, min(1.0, strength)) * 255.0
     return _send({"cmd": "paint_texture", "x": x, "y": y, "z": z, "texture": texture,
-                  "strength": strength, "radius": radius, "hardness": hardness, "pressure": pressure})
+                  "strength": alpha, "radius": radius, "hardness": hardness, "pressure": pressure})
+
+
+@mcp.tool()
+def import_heightmap(path: str, x: float, z: float, multiplier: float,
+                     mode: int = 0, tiled_edges: bool = False) -> dict:
+    """Set the terrain of the whole ADT tile at (x,z) from a grayscale heightmap PNG, live. Each pixel's
+    brightness maps to height: white(255)=`multiplier` yards, black(0)=0. mode 0=Set(absolute),1=Add,
+    2=Subtract,3=Multiply. This produces a perfectly SMOOTH surface (no brush-stacking waves) and precise
+    shape -- generate the PNG (257x257) with real math (smooth hills, fractal noise) then import it."""
+    return _send({"cmd": "import_heightmap", "path": path, "x": x, "z": z,
+                  "multiplier": multiplier, "mode": mode, "tiled_edges": tiled_edges}, timeout=300.0)
+
+
+@mcp.tool()
+def import_heightmap_raw(path: str, x: float, z: float, n: int = 257) -> dict:
+    """Import terrain heights at FULL FLOAT precision from a raw float32 file (n x n, row-major; row->worldZ,
+    col->worldX across the ADT tile at (x,z)). Unlike import_heightmap's 8-bit PNG, this has NO quantization
+    -> flat ground stays flat and slopes are correct, so grass paints and there's no rock checkerboard. Write
+    the file in Python with `arr.astype('<f4').tofile(path)` (arr shape (n,n), heights in yards)."""
+    return _send({"cmd": "import_heightmap_raw", "path": path, "x": x, "z": z, "n": n}, timeout=180.0)
+
+
+@mcp.tool()
+def clear_textures(x: float, z: float) -> dict:
+    """Erase ALL painted textures on the whole ADT tile at (x,z), live -- a clean slate before autotexture."""
+    return _send({"cmd": "clear_textures", "x": x, "z": z}, timeout=120.0)
+
+
+@mcp.tool()
+def autotexture(x: float, z: float, base: str, grass: str, rock: str, sand: str = "",
+                radius: float = 400.0, slope_flat: float = 0.93, slope_steep: float = 0.66,
+                water_level: float = -1e9, shore_height: float = 2.5, noise: float = 0.04) -> dict:
+    """Texture terrain the way the DEVS do (learned from real MCAL data), live: a biome BASE layer (dirt for
+    forests, snow for snowy zones -- NOT grass), then `grass` painted ON TOP where it's flat and `rock` on the
+    steep faces, as SMOOTH slope-driven alpha (feathered, no checkerboard). `base` shows on the medium slopes.
+    slope_flat = normal-up above which grass appears (1=flat); slope_steep = normal-up below which rock appears.
+    `sand` textures river/lake beds+shores below water_level. Do clear_textures first."""
+    return _send({"cmd": "autotexture", "x": x, "z": z, "base": base, "grass": grass, "rock": rock,
+                  "sand": sand, "radius": radius, "slope_flat": slope_flat, "slope_steep": slope_steep,
+                  "water_level": water_level, "shore_height": shore_height, "noise": noise}, timeout=300.0)
 
 
 @mcp.tool()

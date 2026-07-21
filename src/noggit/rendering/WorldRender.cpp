@@ -723,6 +723,18 @@ void WorldRender::draw (glm::mat4x4 const& model_view
   else
     updateLightingUniformBlockMinimap(minimap_render_settings);
 
+  // Cache "camera inside a WMO" for this frame -- the WMO shader (camera_inside_wmo uniform) uses it to
+  // light exterior-lit / portal-spill faces from the WMO's own interior ambient instead of the outdoor map
+  // light when viewed from inside. Ironforge's building fronts were getting Dun Morogh daylight because no
+  // Light.dbc row is positioned inside a city WMO, so the outdoor fallback applies. Guarded like the
+  // sibling camera_is_* calls, which can throw while a tile streams in.
+  _camera_inside_wmo = false;
+  if (!minimap_render)
+  {
+    try { _camera_inside_wmo = _world->camera_is_inside_wmo(camera_pos); }
+    catch (...) { _camera_inside_wmo = false; }
+  }
+
   // Bloom: render the whole 3D scene into an offscreen colour target first, so afterwards we can pull
   // out the bright areas, blur them and add them back (the glow/bleed of bright sky openings, light
   // shafts, additive glows). Only for the main 3D viewport -- never the minimap or 2D mode.
@@ -4534,12 +4546,17 @@ void WorldRender::renderBloomAndComposite(GLuint target_fbo, int w, int h, glm::
     // Canon full-screen glow weight (see above): scene*glow is added to the bright buffer, so the blur +
     // composite yield final = scene + blur(scene)*glow, exactly the client's additive FFXGlow.
     p.uniform("glow", glow_strength);
+    // Box4 downsample spread (client PS 4039): the full-res scene texel size.
+    p.uniform("scene_texel", glm::vec2(1.f / static_cast<float>(_bloom_w), 1.f / static_cast<float>(_bloom_h)));
     gl.drawArraysInstanced(GL_TRIANGLES, 0, 3, 1);
   }
 
-  // 2) separable gaussian blur, ping-ponging between the two half-res targets
+  // 2) separable blur, ping-ponging between the two quarter-res targets. The client FFXGlow does a
+  // SINGLE 4-tap [1/8,3/8,3/8,1/8] pass per axis (wow_cap_bloom trace, pixel shader 4124), so 2 passes
+  // total (1 horizontal + 1 vertical). The old 6-pass 9-tap radius-4 gaussian spread the glow ~10x
+  // wider than the client and over-bloomed bright zones (snow smeared the halo across the frame).
   bool horizontal = true;
-  int const passes = 6; // 3 H/V pairs -- tighter blur so bloom doesn't smear across the terrain
+  int const passes = 2;
   for (int i = 0; i < passes; ++i)
   {
     int const src = horizontal ? 0 : 1;

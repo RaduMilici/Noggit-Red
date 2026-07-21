@@ -252,6 +252,27 @@ void WMORender::draw(OpenGL::Scoped::use_program& wmo_shader
 
   wmo_shader.uniform("ambient_color",glm::vec3(_wmo->ambient_light_color));
 
+  // While the camera is inside a WMO, its exterior-lit + portal-spill faces are lit by THIS WMO's MOHD
+  // ambient (the interior branch), not the outdoor map light -- there is no Light.dbc row positioned inside
+  // a city WMO, so the outdoor fallback was flooding Ironforge's building fronts with Dun Morogh daylight.
+  // Viewed from outside (in the world) they keep their outdoor lighting. world_renderer is null in previews.
+  wmo_shader.uniform("camera_inside_wmo",
+      (world_renderer && world_renderer->cameraInsideWmo()) ? 1 : 0);
+
+  // Verbatim MOCV: interior surface = tex x MOCV (client-exact, dark-baked faces stay dark). Must agree
+  // with the load-time MOCV processing in WMO.cpp, which reads the same env once. NOGGIT_WMO_VERBATIM_MOCV=0
+  // restores the legacy subtract-and-add ambient formula.
+  static int const s_verbatim_mocv =
+      (std::getenv("NOGGIT_WMO_VERBATIM_MOCV") && std::string(std::getenv("NOGGIT_WMO_VERBATIM_MOCV")) == "0") ? 0 : 1;
+  wmo_shader.uniform("wmo_verbatim_mocv", s_verbatim_mocv);
+
+  // Diagnostic: NOGGIT_WMO_DEBUG_MOCV=3 colour-codes each WMO face by its lighting branch (white=unlit,
+  // RED=ExteriorLit-outdoor, GREEN=verbatim+MOCV, BLUE=verbatim+no-MOCV, YELLOW=legacy); dimmed when the
+  // camera is NOT detected inside the WMO. =1 shows MOCV (magenta=no MOCV). 0/unset = normal render.
+  static int const s_debug_mocv = std::getenv("NOGGIT_WMO_DEBUG_MOCV") ? std::atoi(std::getenv("NOGGIT_WMO_DEBUG_MOCV")) : 0;
+  (void)s_debug_mocv;
+  wmo_shader.uniform("debug_mocv", 3); // TEMP: FORCE branch visualiser to prove the shader is actually running
+
   // (Removed the "wmo_open" outdoor-spill heuristic: it lifted EVERY interior group toward the outdoor
   // ambient whenever the WMO had any exterior group, flooding big mixed WMOs like Ironforge with Dun
   // Morogh daylight. The shader now lights interiors the canonical way -- MOHD ambient + baked MOCV.)

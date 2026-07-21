@@ -16,18 +16,32 @@ uniform float threshold;
 // this, with NO luminance threshold -- bright pixels bloom purely because additive blending saturates
 // them. (RE'd from wow.exe FFXEffects.cpp, see RE_notes/13_ffx_fullscreen_glow.md.)
 uniform float glow;
+// Full-res scene texel size (1/scene_w, 1/scene_h): the Box4 downsample spread. Set per-frame so a
+// resolution change reallocates live.
+uniform vec2 scene_texel;
 
 void main()
 {
-  // MEASURED (wow_cap_upstairs.trace, RE_notes/16): the client has NO bright pass and NO emissive
-  // mask -- blur input = plain downsampled scene, composite = scene + zoneGlow * blur^2.
-  // DELIBERATE DEVIATION (user, Anomalus A/B 2026-07-08): energy-creature UNLIT passes still stamp
-  // the reserved emissive alpha (>0.88); boost those texels into the blur input so bright energy
-  // bodies bloom hot like the live client's saturated core. Ordinary lit surfaces (a <= 0.85) are
-  // untouched -- for them this remains the measured passthrough.
-  vec4 s = texture(scene, uv);
-  float emissive = smoothstep(0.88, 0.97, clamp(s.a, 0.0, 1.0));
-  out_color = vec4(s.rgb * (1.0 + 0.25 * emissive), 1.0); // 0.25: dialed by A/B (2x too hot, 1.5x still too much)
+  // Client FFXGlow DOWNSAMPLE = Box4 (wow_cap_bloom trace, pixel shader 4039 / 335a 13033:
+  // `def c0, 0.25` -> 4 taps averaged 0.25 each). We render this into the quarter-res blur input, so
+  // the 4 taps sit at the four quadrant centres (+/-1 full-res texel) of the 4x4 source block -- each
+  // bilinear tap covers a 2x2 quadrant, the four together cover the whole 4x4 with no overlap. A proper
+  // box downsample (vs the old single bilinear tap) matters now that the blur is tight: a single tap
+  // 4x-downsampling aliased bright thin features, which the old wide 6-pass blur used to hide.
+  vec2 o = scene_texel;
+  vec4 s0 = texture(scene, uv + vec2(-1.0, -1.0) * o);
+  vec4 s1 = texture(scene, uv + vec2( 1.0, -1.0) * o);
+  vec4 s2 = texture(scene, uv + vec2(-1.0,  1.0) * o);
+  vec4 s3 = texture(scene, uv + vec2( 1.0,  1.0) * o);
+  vec3 rgb = (s0.rgb + s1.rgb + s2.rgb + s3.rgb) * 0.25;
+
+  // DELIBERATE DEVIATION (user, Anomalus A/B 2026-07-08): energy-creature UNLIT passes stamp the
+  // reserved emissive alpha (>0.88); boost those texels into the blur input so bright energy bodies
+  // bloom hot like the live client's saturated core. Take the brightest emissive across the 4 taps so a
+  // thin hot core survives the downsample. Ordinary lit surfaces (a <= 0.85) are untouched.
+  float a = max(max(s0.a, s1.a), max(s2.a, s3.a));
+  float emissive = smoothstep(0.88, 0.97, clamp(a, 0.0, 1.0));
+  out_color = vec4(rgb * (1.0 + 0.25 * emissive), 1.0); // 0.25: dialed by A/B (2x too hot, 1.5x still too much)
 }
 
 void main_old_masked()

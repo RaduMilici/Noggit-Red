@@ -1214,7 +1214,32 @@ void WMOGroup::load_mocv(BlizzardArchive::ClientFile& f, uint32_t size)
   }
   else
   {
-    fix_vertex_color_alpha();
+    // VERBATIM MOCV (1.12-client-exact, trace-proven: wow_cap_ironforge_interior). The 1.12 client draws
+    // WMO geometry with D3DRS_LIGHTING=FALSE, ambient 0, and NO lights enabled -> the surface is simply
+    // texture x MOCV (the raw baked per-vertex colour). It applies NO FixColorVertexAlpha. So dark-baked
+    // faces (Ironforge's gryphon tunnels) stay BLACK. The old fix_vertex_color_alpha() subtracted the MOHD
+    // ambient and CLAMPED to [0,1] (WMO.cpp clamp), and the shader added the ambient back -> every dark
+    // face floored to the ambient and lit up (the reported bug). Keep the raw MOCV rgb; only set the
+    // trans/exterior alpha the way the do_not_fix path does. NOGGIT_WMO_VERBATIM_MOCV=0 restores the old
+    // subtract-and-add formula for A/B.
+    static bool const s_verbatim_mocv = !(std::getenv("NOGGIT_WMO_VERBATIM_MOCV")
+                                          && std::string(std::getenv("NOGGIT_WMO_VERBATIM_MOCV")) == "0");
+    if (s_verbatim_mocv)
+    {
+      int interior_batchs_start = 0;
+      if (header.transparency_batches_count > 0)
+      {
+        interior_batchs_start = _batches[header.transparency_batches_count - 1].vertex_end + 1;
+      }
+      for (int n = interior_batchs_start; n < static_cast<int>(_vertex_colors.size()); ++n)
+      {
+        _vertex_colors[n].w = header.flags.exterior ? 1.f : 0.f;
+      }
+    }
+    else
+    {
+      fix_vertex_color_alpha();
+    }
   }
 
   compute_portal_openness();

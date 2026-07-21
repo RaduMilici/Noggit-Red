@@ -51,6 +51,10 @@ namespace Noggit
       QJsonObject cmd_blur_terrain (QJsonObject const& req);
       QJsonObject cmd_flatten_terrain(QJsonObject const& req);
       QJsonObject cmd_paint_texture(QJsonObject const& req);
+      QJsonObject cmd_import_heightmap(QJsonObject const& req);
+      QJsonObject cmd_import_heightmap_raw(QJsonObject const& req);
+      QJsonObject cmd_clear_textures(QJsonObject const& req);
+      QJsonObject cmd_autotexture  (QJsonObject const& req);
       QJsonObject cmd_add_water    (QJsonObject const& req);
       QJsonObject cmd_edit_model   (QJsonObject const& req);
       QJsonObject cmd_delete_model (QJsonObject const& req);

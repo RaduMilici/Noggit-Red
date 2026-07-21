@@ -12,9 +12,14 @@
 #include <noggit/TextureManager.h>
 #include <noggit/ContextObject.hpp>
 #include <noggit/SceneObject.hpp>
+#include <noggit/MapChunk.h>
 #include <noggit/tool_enums.hpp>
 #include <noggit/map_enums.hpp>
 #include <math/trig.hpp>
+
+#include <QImage>
+#include <QFile>
+#include <set>
 #include <noggit/ActionManager.hpp>
 #include <noggit/Action.hpp>
 #include <noggit/scripting/scripting_tool.hpp>
@@ -37,6 +42,8 @@
 
 #include <exception>
 #include <string>
+#include <algorithm>
+#include <cmath>
 
 namespace Noggit
 {
@@ -161,6 +168,10 @@ namespace Noggit
       if (cmd == "blur_terrain")  return cmd_blur_terrain(req);
       if (cmd == "flatten_terrain")return cmd_flatten_terrain(req);
       if (cmd == "paint_texture") return cmd_paint_texture(req);
+      if (cmd == "import_heightmap") return cmd_import_heightmap(req);
+      if (cmd == "import_heightmap_raw") return cmd_import_heightmap_raw(req);
+      if (cmd == "clear_textures") return cmd_clear_textures(req);
+      if (cmd == "autotexture")   return cmd_autotexture(req);
       if (cmd == "add_water")     return cmd_add_water(req);
       if (cmd == "edit_model")    return cmd_edit_model(req);
       if (cmd == "delete_model")  return cmd_delete_model(req);
@@ -494,6 +505,235 @@ namespace Noggit
       _view->requestRedraw();
       _view->update();
       return make_ok();
+    }
+
+    QJsonObject McpServer::cmd_import_heightmap(QJsonObject const& req)
+    {
+      QString const path = req.value("path").toString();
+      if (path.isEmpty())
+        return make_error("import_heightmap: empty 'path'");
+
+      float const x          = static_cast<float>(req.value("x").toDouble());
+      float const z          = static_cast<float>(req.value("z").toDouble());
+      float const multiplier = static_cast<float>(req.value("multiplier").toDouble(100.0)); // white px height
+      unsigned const mode    = static_cast<unsigned>(req.value("mode").toInt(0));            // 0 Set,1 Add,...
+      bool const tiled       = req.value("tiled_edges").toBool(false);
+
+      QImage img;
+      if (!img.load(path))
+        return make_error("import_heightmap: failed to load image '" + path + "'");
+
+      glm::vec3 const pos(x, 0.f, z);
+      _view->makeCurrent();
+      OpenGL::context::scoped_setter const _gl(::gl, _view->context());
+      NOGGIT_ACTION_MGR->beginAction(_view, Noggit::ActionFlags::eCHUNKS_TERRAIN);
+      try
+      {
+        // Sets each vertex height = (pixel_gray/255) * multiplier over the whole ADT tile at pos: a
+        // smooth heightfield with no brush-stacking waves. Then a zero-delta changeTerrain over the tile
+        // forces normal recalculation (importADTHeightmap only flags VERTEX) so shading is correct.
+        _view->getWorld()->importADTHeightmap(pos, img, multiplier, mode, tiled);
+        _view->getWorld()->changeTerrain(pos, 0.0f, 800.0f, eTerrainType_Smooth, 0.0f);
+      }
+      catch (std::exception const& e)
+      {
+        NOGGIT_ACTION_MGR->endAction();
+        return make_error(QString("import_heightmap: ") + e.what());
+      }
+      NOGGIT_ACTION_MGR->endAction();
+
+      _view->getWorld()->wait_for_all_tile_updates();
+      _view->requestRedraw();
+      _view->update();
+      return make_ok();
+    }
+
+    QJsonObject McpServer::cmd_import_heightmap_raw(QJsonObject const& req)
+    {
+      // Import terrain heights at FULL FLOAT precision from a raw float32 array (NxN, row-major, row->worldZ,
+      // col->worldX across the tile). Avoids the 8-bit PNG quantization that stair-steps flat ground and
+      // wrecks the slopes (which locked grass out and made the rock checkerboard). Sets vertex heights
+      // directly + recomputes real normals per chunk.
+      QString const path = req.value("path").toString();
+      if (path.isEmpty()) return make_error("import_heightmap_raw: empty 'path'");
+      float const x  = static_cast<float>(req.value("x").toDouble());
+      float const z  = static_cast<float>(req.value("z").toDouble());
+      int   const NN = req.value("n").toInt(257);
+
+      QFile file(path);
+      if (!file.open(QIODevice::ReadOnly))
+        return make_error("import_heightmap_raw: cannot open '" + path + "'");
+      QByteArray const bytes = file.readAll();
+      if (bytes.size() < static_cast<int>(NN) * NN * static_cast<int>(sizeof(float)))
+        return make_error("import_heightmap_raw: file too small for a " + QString::number(NN) + "^2 float grid");
+      const float* arr = reinterpret_cast<const float*>(bytes.constData());
+
+      float const TILE = 533.33333f, CHUNK = TILE / 16.0f;
+      float const xmin = std::floor(x / TILE) * TILE, zmin = std::floor(z / TILE) * TILE;
+      glm::vec3 const pos(x, 0.f, z);
+
+      World* world = _view->getWorld();
+      _view->makeCurrent();
+      OpenGL::context::scoped_setter const _gl(::gl, _view->context());
+      NOGGIT_ACTION_MGR->beginAction(_view, Noggit::ActionFlags::eCHUNKS_TERRAIN);
+      int set_chunks = 0;
+      try
+      {
+        for (int l = 0; l < 16; ++l)
+          for (int k = 0; k < 16; ++k)
+          {
+            MapChunk* c = world->getChunkAt(glm::vec3(xmin + (k + 0.5f) * CHUNK, 0.f, zmin + (l + 0.5f) * CHUNK));
+            if (!c) continue;
+            NOGGIT_CUR_ACTION->registerChunkTerrainChange(c);
+            for (int i = 0; i < mapbufsize; ++i)
+            {
+              glm::vec3& v = c->mVertices[i];
+              float const fc = (v.x - xmin) / TILE * (NN - 1);
+              float const fr = (v.z - zmin) / TILE * (NN - 1);
+              int const c0 = std::min(std::max(static_cast<int>(fc), 0), NN - 2);
+              int const r0 = std::min(std::max(static_cast<int>(fr), 0), NN - 2);
+              float const tc = fc - c0, tr = fr - r0;
+              float const h00 = arr[r0*NN + c0],     h01 = arr[r0*NN + c0 + 1];
+              float const h10 = arr[(r0+1)*NN + c0], h11 = arr[(r0+1)*NN + c0 + 1];
+              v.y = h00*(1-tc)*(1-tr) + h01*tc*(1-tr) + h10*(1-tc)*tr + h11*tc*tr;
+            }
+            c->registerChunkUpdate(ChunkUpdateFlags::VERTEX | ChunkUpdateFlags::NORMALS);
+            world->recalc_norms(c);
+            ++set_chunks;
+          }
+      }
+      catch (std::exception const& e)
+      {
+        NOGGIT_ACTION_MGR->endAction();
+        return make_error(QString("import_heightmap_raw: ") + e.what());
+      }
+      NOGGIT_ACTION_MGR->endAction();
+
+      world->wait_for_all_tile_updates();
+      _view->requestRedraw();
+      _view->update();
+      QJsonObject o = make_ok();
+      o["chunks"] = set_chunks;
+      return o;
+    }
+
+    QJsonObject McpServer::cmd_clear_textures(QJsonObject const& req)
+    {
+      float const x = static_cast<float>(req.value("x").toDouble());
+      float const z = static_cast<float>(req.value("z").toDouble());
+      glm::vec3 const pos(x, 0.f, z);
+
+      _view->makeCurrent();
+      OpenGL::context::scoped_setter const _gl(::gl, _view->context());
+      NOGGIT_ACTION_MGR->beginAction(_view, Noggit::ActionFlags::eCHUNKS_TEXTURE);
+      try
+      {
+        _view->getWorld()->clearTextures(pos);  // erases all texture layers on the whole tile at pos
+      }
+      catch (std::exception const& e)
+      {
+        NOGGIT_ACTION_MGR->endAction();
+        return make_error(QString("clear_textures: ") + e.what());
+      }
+      NOGGIT_ACTION_MGR->endAction();
+
+      _view->getWorld()->wait_for_all_tile_updates();
+      _view->requestRedraw();
+      _view->update();
+      return make_ok();
+    }
+
+    QJsonObject McpServer::cmd_autotexture(QJsonObject const& req)
+    {
+      // DEV-LEARNED model: a biome BASE layer (dirt/snow, NOT grass), then GRASS on flat + ROCK on steep
+      // as SMOOTH per-vertex alpha weights that follow slope. Smooth weights (not hard dabs) = no checkerboard.
+      std::string base  = req.value("base").toString().toStdString();   // ground base (dirt/snow per biome)
+      std::string const grass = req.value("grass").toString().toStdString();  // flat overlay
+      std::string const rock  = req.value("rock").toString().toStdString();   // steep overlay
+      std::string       sand  = req.value("sand").toString().toStdString();   // water bed/shore
+      if (base.empty()) base = req.value("dirt").toString().toStdString();     // back-compat
+      if (base.empty()) base = grass;
+      if (base.empty()) return make_error("autotexture: need a 'base' texture");
+      if (sand.empty()) sand = base;
+
+      float const x      = static_cast<float>(req.value("x").toDouble());
+      float const z      = static_cast<float>(req.value("z").toDouble());
+      float const radius = static_cast<float>(req.value("radius").toDouble(300.0));
+      // normal-up (1=flat): grass fades in above t_flat, rock fades in below t_steep; base shows between.
+      float const t_flat  = static_cast<float>(req.value("slope_flat").toDouble(0.93));
+      float const t_steep = static_cast<float>(req.value("slope_steep").toDouble(0.66));
+      float const water_level = static_cast<float>(req.value("water_level").toDouble(-1e9));
+      float const shore  = static_cast<float>(req.value("shore_height").toDouble(2.5));
+      float const nz     = static_cast<float>(req.value("noise").toDouble(0.04));
+
+      auto h1 = [](float a, float b){ float s = std::sin(a*12.9898f + b*78.233f)*43758.55f; return s - std::floor(s); };
+      auto sstep = [](float a, float b, float xx){ float t = (xx-a)/(b-a); t = t<0?0:(t>1?1:t); return t*t*(3.f-2.f*t); };
+
+      World* world = _view->getWorld();
+      _view->makeCurrent();
+      OpenGL::context::scoped_setter const _gl(::gl, _view->context());
+
+      std::set<MapChunk*> chunks;
+      for (float dx = -radius; dx <= radius; dx += 16.0f)
+        for (float dz = -radius; dz <= radius; dz += 16.0f)
+          if (MapChunk* c = world->getChunkAt(glm::vec3(x + dx, 0.f, z + dz)))
+            chunks.insert(c);
+
+      int painted_accents = 0;
+      NOGGIT_ACTION_MGR->beginAction(_view, Noggit::ActionFlags::eCHUNKS_TEXTURE);
+      try
+      {
+        Brush bb; bb.setHardness(1.0f); bb.setRadius(60.0f);   // uniform BASE layer
+        Brush acc; acc.setHardness(0.5f); acc.setRadius(16.0f); // wider -> can stride verts (fewer paint calls)
+
+        for (MapChunk* c : chunks)
+        {
+          world->paintTexture(c->vcenter, &bb, 255.0f, 1.0f,
+              scoped_blp_texture_reference(base, Noggit::NoggitRenderContext::MAP_VIEW));
+
+          for (int i = 0; i < mapbufsize; i += 2)   // stride 2 (radius 16 still overlaps) -> ~half the paints
+          {
+            glm::vec3 const v = c->mVertices[i];
+            float ny = c->mNormals[i].y;
+            int lo = (i >= 1) ? i - 1 : i, hi = (i + 1 < mapbufsize) ? i + 1 : i;
+            ny = (ny + c->mNormals[lo].y + c->mNormals[hi].y) / 3.0f;      // smoothed slope
+            float const nyj = ny + (h1(v.x, v.z) - 0.5f) * nz;            // tiny organic jitter
+
+            // WATER: sand bed + smooth shoreline
+            if (water_level > -1e8f && v.y <= water_level + shore)
+            {
+              float wsand = (v.y <= water_level + 0.4f) ? 1.0f : (1.0f - (v.y - water_level) / std::max(0.1f, shore));
+              world->paintTexture(v, &acc, 255.0f * std::min(1.0f, std::max(0.0f, wsand)), 0.85f,
+                  scoped_blp_texture_reference(sand, Noggit::NoggitRenderContext::MAP_VIEW));
+              ++painted_accents; continue;
+            }
+            // SMOOTH slope-driven overlays (weights vary gradually -> feathered blend, like the devs)
+            float const wf = grass.empty() ? 0.f : sstep(t_flat - 0.07f, t_flat + 0.03f, nyj);      // grass on flat
+            float const wr = rock.empty()  ? 0.f : sstep(t_steep + 0.11f, t_steep - 0.05f, nyj);    // rock on steep
+            if (wf > 0.03f)
+            { world->paintTexture(v, &acc, 255.0f * wf, 0.85f,
+                scoped_blp_texture_reference(grass, Noggit::NoggitRenderContext::MAP_VIEW)); ++painted_accents; }
+            if (wr > 0.03f)
+            { world->paintTexture(v, &acc, 255.0f * wr, 0.85f,
+                scoped_blp_texture_reference(rock, Noggit::NoggitRenderContext::MAP_VIEW)); ++painted_accents; }
+          }
+        }
+      }
+      catch (std::exception const& e)
+      {
+        NOGGIT_ACTION_MGR->endAction();
+        return make_error(QString("autotexture: ") + e.what());
+      }
+      NOGGIT_ACTION_MGR->endAction();
+
+      world->wait_for_all_tile_updates();
+      _view->requestRedraw();
+      _view->update();
+
+      QJsonObject o = make_ok();
+      o["chunks"] = static_cast<int>(chunks.size());
+      o["accents"] = painted_accents;
+      return o;
     }
 
     QJsonObject McpServer::cmd_add_water(QJsonObject const& req)

@@ -60,6 +60,19 @@ uniform int fog_color_mode;
 // 1 when this WMO has exterior groups (an "open" WMO, e.g. a cave mouth). Lets outdoor zone light
 // bleed into its interior groups; 0 for fully enclosed dungeons (keep their dark authored interior).
 uniform int wmo_open;
+// 1 when the camera is INSIDE a WMO this frame. An exterior-lit or portal-spill face viewed from inside an
+// enclosed WMO (e.g. Ironforge's building fronts) must NOT be lit by the outdoor map light -- there is no
+// zone light positioned inside a city WMO (verified: no Light.dbc row covers Ironforge), so the outdoor
+// fallback is the bright/cool Dun Morogh daylight. The client lights those faces from the WMO's own
+// interior context instead. So while inside, route exterior-lit + portal-spill faces to the interior
+// branch (MOHD ambient + MOCV + point lights), matching the surrounding interior. When outside (viewing
+// the WMO from the world) they keep the outdoor lighting. Only affects WMO exterior-lit/portal-spill faces.
+uniform int camera_inside_wmo;
+// 1 = VERBATIM MOCV (1.12-client-exact, trace-proven wow_cap_ironforge_interior): the client draws WMO
+// geometry lighting-OFF, ambient 0 -> surface = tex x MOCV (raw baked per-vertex colour). So interior
+// lighting is just the MOCV, and dark-baked faces stay dark. The old path added the MOHD ambient (a floor
+// that lit black faces -- the reported gryphon-tunnel bug). Set by WMORender from NOGGIT_WMO_VERBATIM_MOCV.
+uniform int wmo_verbatim_mocv;
 // Debug: 1 = output the raw fixed-up MOCV vertex colour (magenta where a batch has NO MOCV flag), so we
 // can see whether the black doorway-reveal faces actually carry the warm baked colour or lose it.
 uniform int debug_mocv;
@@ -199,9 +212,14 @@ vec3 apply_lighting(vec3 material)
     // of glowing. Fullbright matches the client; the emissive bloom write in main() adds the halo.
     light_color = vec3(1.0);
   }
-  else if (bool(flags & eWMOBatch_ExteriorLit))
+  else if (bool(flags & eWMOBatch_ExteriorLit) && camera_inside_wmo == 0 && wmo_verbatim_mocv == 0)
   {
     // Exterior geometry: outdoor sun diffuse (N.L) + outdoor ambient (+ any baked color).
+    // GATED OFF when verbatim MOCV is on (the default): the 1.12 client renders EVERY WMO face as tex x
+    // MOCV with lighting OFF -- there is no runtime outdoor-sun branch. Trace-proven. This is what left the
+    // gryphon-tunnel / window-opening faces (routed here by WMOGroupRender's batch_is_exterior rule even
+    // though they carry dark MOCV) lit from outside. With verbatim on, they fall through to the verbatim
+    // branch below and use their own dark baked MOCV -> dark, like in-game. (Legacy path kept for =0.)
     float nDotL = clamp(dot(normalize(f_normal),
                             -normalize(vec3(LightDir_FogRate.x, LightDir_FogRate.z, LightDir_FogRate.y))),
                         0.0, 1.0);
@@ -221,9 +239,19 @@ vec3 apply_lighting(vec3 material)
                 + lit_ambient
                 + vertex_color;
   }
+  else if (wmo_verbatim_mocv != 0)
+  {
+    // VERBATIM interior (1.12-client-exact, trace-proven): the client draws WMO geometry lighting-OFF with
+    // ambient 0, so the surface is just tex x MOCV -- the raw baked per-vertex colour, NO additive ambient
+    // (dark-baked faces like the gryphon tunnels stay dark) and NO runtime portal spill (the client bakes
+    // the doorway light falloff into MOCV). A face in a group with no MOCV chunk defaults to white diffuse
+    // (the D3D FVF default when lighting is off) so it renders at full texture brightness rather than black.
+    light_color = bool(flags & eWMOBatch_HasMOCV) ? f_vertex_color.rgb : vec3(1.0);
+  }
   else
   {
-    // Interior geometry: the WMO's own MOHD ambient + the baked MOCV -- the client / reference noggit3
+    // Interior geometry (LEGACY subtract-and-add path, NOGGIT_WMO_VERBATIM_MOCV=0): the WMO's own MOHD
+    // ambient + the baked MOCV -- the client / reference noggit3
     // formula `ambient_color + vertex_color`. (The removed wmo_open spill, interior_sun and time-of-day
     // MOCV multiply were the real hand-tuned hacks that washed out / crushed Ironforge -- gone for good.)
     //
@@ -239,7 +267,7 @@ vec3 apply_lighting(vec3 material)
     vec3 interior_ambient = all(greaterThan(ambient_color, vec3(0.95))) ? vec3(0.04) : ambient_color;
     light_color = interior_ambient + vertex_color;
 
-    if (bool(flags & eWMOBatch_PortalSpill))
+    if (bool(flags & eWMOBatch_PortalSpill) && camera_inside_wmo == 0)
     {
       float openness = clamp(f_vertex_color.a, 0.0, 1.0);
       float nDotL = clamp(dot(normalize(f_normal),
@@ -279,6 +307,18 @@ void main()
   {
     float o = bool(flags & eWMOBatch_PortalSpill) ? clamp(f_vertex_color.a, 0.0, 1.0) : 0.0;
     out_color = vec4(vec3(o), 1.0);
+    return;
+  }
+  if (debug_mocv == 3) // BRANCH visualiser: which lighting path does this face take?
+  {
+    vec3 c;
+    if (bool(flags & eWMOBatch_Unlit))                                                                c = vec3(1.0, 1.0, 1.0); // WHITE  = unlit/fullbright
+    else if (bool(flags & eWMOBatch_ExteriorLit) && camera_inside_wmo == 0 && wmo_verbatim_mocv == 0) c = vec3(1.0, 0.0, 0.0); // RED    = ExteriorLit outdoor branch (the bug we're chasing)
+    else if (wmo_verbatim_mocv != 0)                                                                  c = bool(flags & eWMOBatch_HasMOCV) ? vec3(0.0, 1.0, 0.0)  // GREEN  = verbatim, HAS MOCV (uses baked colour)
+                                                                                                                                            : vec3(0.0, 0.0, 1.0); // BLUE   = verbatim, NO MOCV (falls back to white -> lit)
+    else                                                                                              c = vec3(1.0, 1.0, 0.0); // YELLOW = legacy interior (verbatim off)
+    // tint slightly by camera_inside_wmo so I can also read that flag: darker if outside-detected
+    out_color = vec4(c * (camera_inside_wmo != 0 ? 1.0 : 0.45), 1.0);
     return;
   }
 

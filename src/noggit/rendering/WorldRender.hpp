@@ -52,6 +52,10 @@ namespace Noggit::Rendering
     void upload() override;
     void unload() override;
 
+    // True while the camera is inside a WMO this frame (cached in draw()). Read by WMORender to route WMO
+    // exterior-lit/portal-spill faces to the WMO's interior context instead of the outdoor map light.
+    bool cameraInsideWmo() const { return _camera_inside_wmo; }
+
     void draw (glm::mat4x4 const& model_view
         , glm::mat4x4 const& projection
         , glm::vec3 const& cursor_pos
@@ -270,6 +274,7 @@ namespace Noggit::Rendering
     OpenGL::MVPUniformBlock _mvp_ubo_data;
     OpenGL::LightingUniformBlock _lighting_ubo_data;
     bool _point_lights_scoped = false; // true while the UBO carries a WMO group's MOLR set
+    bool _camera_inside_wmo = false;   // cached per frame; drives the WMO shader's camera_inside_wmo uniform
     OpenGL::TerrainParamsUniformBlock _terrain_params_ubo_data;
 
 
