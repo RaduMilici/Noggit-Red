@@ -7591,6 +7591,20 @@ void MapView::paintGL()
       LogDebug << "MapView::paintGL before draw_map" << std::endl;
     }
     draw_map();
+    {
+      // [perf] GPU-boundedness probe (NOGGIT_FRAME_PROFILE only): time a glFinish right after the render.
+      // GpuWait ~= how long the CPU must WAIT for the GPU to finish the frame's draws beyond what already
+      // overlapped the CPU submit. Large GpuWait => GPU-BOUND (GPU render time ~= WorldDraw + GpuWait);
+      // ~0 => CPU-bound. Intrusive (it serializes CPU<->GPU), so it only runs while profiling.
+      auto& _prof_gpu = noggit::perf::FrameProfiler::get();
+      if (_prof_gpu.on)
+      {
+        auto const _gt0 = std::chrono::steady_clock::now();
+        gl.finish();
+        _prof_gpu.add(noggit::perf::Phase::GpuWait,
+                      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _gt0).count());
+      }
+    }
     if (capture_debug_enabled())
     {
       LogDebug << "MapView::paintGL after draw_map" << std::endl;

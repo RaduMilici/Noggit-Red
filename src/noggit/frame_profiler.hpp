@@ -22,7 +22,7 @@ namespace noggit::perf
     SubmitInst, SubmitIndiv,                               // M2Submit split: instanced buckets vs one-by-one per-instance draws
     GatherCull, GatherMerge,                               // WMO-doodad gather serial sub-phases: Phase A cull / Phase C merge
     AnimateCPU,                                            // CPU bone/billboard compute + bone upload inside single-instance draw (animate())
-    WorldDraw, Selection, Frame,                           // coarse (MapView): 3D total / selection pass / whole frame
+    WorldDraw, GpuWait, Selection, Frame,                  // coarse (MapView): 3D CPU render / glFinish GPU-wait probe / selection / whole frame
     COUNT
   };
 
@@ -46,6 +46,7 @@ namespace noggit::perf
       case Phase::GatherMerge:  return "GatherMerge";
       case Phase::AnimateCPU:   return "AnimateCPU";
       case Phase::WorldDraw:    return "WorldDraw";
+      case Phase::GpuWait:      return "GpuWait";
       case Phase::Selection:    return "Selection";
       case Phase::Frame:        return "Frame";
       default:                  return "?";

@@ -4471,6 +4471,74 @@ void WorldRender::draw (glm::mat4x4 const& model_view
     // static position), advances it, and draws with its own transform. Independent clouds = no
     // clone stacking (the IF forge white-column root cause) and every placement emits like the
     // client (all four forge pots steam at once).
+
+    // [doc 23 #3, M2UseThreads] Threaded particle SIM pre-pass. The 3.3.5a client offloads the CPU particle
+    // simulation to a worker (the draw stays on the main thread). We thread it BY MODEL: each worker owns a
+    // DISJOINT set of models, so no two threads ever touch the same model's shared _particles / instance
+    // state -> no race (the shared-scratch hazard that parked the older per-instance attempt). frand() is
+    // thread-local and updateParticleSystems() touches no async-loader/GL state, so per-model sim is safe.
+    // Each instance's advanced state is stored back; the draw loop below then only swaps-in + draws (its own
+    // update is gated off by threaded_sim). Default ON (2026-07-23, user-confirmed correct + no crash; the
+    // particle-heavy M2Particles dropped ~8->~5ms). Set NOGGIT_NO_PARALLEL_PARTICLE_SIM=1 to disable.
+    static bool const s_parallel_particle_sim = std::getenv("NOGGIT_NO_PARALLEL_PARTICLE_SIM") == nullptr;
+    bool const threaded_sim = s_parallel_particle_sim && draw_model_animations && !model_with_particles.empty();
+    if (threaded_sim)
+    {
+      noggit::perf::Scoped _prof_simthr(noggit::perf::Phase::M2Particles);
+      std::vector<Model*> sim_models;
+      sim_models.reserve(model_with_particles.size());
+      for (auto& mp : model_with_particles)
+      {
+        if (!mp.first->_particles.empty()) { sim_models.push_back(mp.first); }
+      }
+      float const sim_dt = _world->models_emitter_dt();
+      auto sim_range = [&](std::size_t rbegin, std::size_t rend)
+      {
+        auto mix = [](std::uint64_t h, std::int64_t v)
+        { return h ^ (static_cast<std::uint64_t>(v) + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2)); };
+        for (std::size_t si = rbegin; si < rend; ++si)
+        {
+          Model* pmodel = sim_models[si];
+          auto const mit = model_with_particles.find(pmodel);
+          if (mit == model_with_particles.end()) { continue; }
+          std::unordered_set<std::uint64_t> seen;
+          for (auto const& transform : mit->second)
+          {
+            glm::vec3 const inst_pos(transform[3]);
+            std::uint64_t key = 0x517CC1B727220A95ull;
+            key = mix(key, static_cast<std::int64_t>(std::llround(inst_pos.x * 8.0f)));
+            key = mix(key, static_cast<std::int64_t>(std::llround(inst_pos.y * 8.0f)));
+            key = mix(key, static_cast<std::int64_t>(std::llround(inst_pos.z * 8.0f)));
+            if (!seen.insert(key).second) { continue; }
+            pmodel->swapInstanceEmitterState(key);
+            float adt = sim_dt;
+            while (adt > 0.1f) { pmodel->updateParticleSystems(0.1f); adt -= 0.1f; }
+            pmodel->updateParticleSystems(adt);
+            pmodel->swapInstanceEmitterState(key); // store the advanced state for the draw pass
+          }
+        }
+      };
+      std::size_t const n = sim_models.size();
+      unsigned const hw = std::max(1u, std::thread::hardware_concurrency());
+      std::size_t const workers = std::min<std::size_t>(hw, n);
+      if (workers <= 1)
+      {
+        sim_range(0, n);
+      }
+      else
+      {
+        std::vector<std::thread> pool;
+        std::size_t const per = (n + workers - 1) / workers;
+        for (std::size_t w = 0; w < workers; ++w)
+        {
+          std::size_t const b = w * per, e = std::min(n, b + per);
+          if (b >= e) { break; }
+          pool.emplace_back(sim_range, b, e);
+        }
+        for (auto& t : pool) { t.join(); }
+      }
+    }
+
     {
       float const emitter_frame_dt = _world->models_emitter_dt();
       for (auto& it : model_with_particles)
@@ -4504,7 +4572,7 @@ void WorldRender::draw (glm::mat4x4 const& model_view
           }
 
           pmodel->swapInstanceEmitterState(key);
-          if (draw_model_animations)
+          if (draw_model_animations && !threaded_sim) // when threaded, the sim already advanced in the pre-pass
           {
             float adt = emitter_frame_dt;
             while (adt > 0.1f)
