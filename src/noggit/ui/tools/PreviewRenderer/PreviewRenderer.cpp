@@ -14,6 +14,7 @@
 #include <limits>
 #include <thread>
 #include <chrono>
+#include <cstdlib>
 
 #include <QSettings>
 #include <QColor>
@@ -22,6 +23,24 @@
 
 
 using namespace Noggit::Ui::Tools;
+
+
+namespace
+{
+  // Offscreen thumbnail rendering is DISABLED by default. The preview model/WMO draw __fastfails the
+  // NVIDIA driver (0xC0000409 in nvoglv64), surfacing at the next GL flush (readback). Dump-confirmed
+  // it's a DRIVER-level fastfail on that draw: it crashes even with the main map-view context current,
+  // it is NOT a catchable C++ exception (try/catch is useless), and app code can only AVOID it by not
+  // issuing the draw. This is the fix the user confirmed 2026-07-13 -- it lived ONLY in the
+  // noggit-red-features tree, but the nrcln build compiles noggit-red, which never got it, so the
+  // asset-browser crash "kept coming back". Ported into the build tree here.
+  // Set NOGGIT_ENABLE_PREVIEW_THUMBS=1 to re-enable the render (for a future real driver-trigger fix).
+  bool offscreen_previews_enabled()
+  {
+    static bool const on = std::getenv("NOGGIT_ENABLE_PREVIEW_THUMBS") != nullptr;
+    return on;
+  }
+}
 
 
 PreviewRenderer::PreviewRenderer(int width, int height, Noggit::NoggitRenderContext context, QWidget* parent)
@@ -115,6 +134,16 @@ void PreviewRenderer::setModel(std::string const &filename)
 
 void PreviewRenderer::setModelOffscreen(std::string const& filename)
 {
+  // Offscreen thumbnails disabled (see offscreen_previews_enabled / renderToPixmap): don't load or
+  // touch the offscreen GL context for a preview that will never be drawn -- renderToPixmap returns a
+  // blank thumbnail. Just remember the filename. (This is what neutralises the AssetBrowser showEvent
+  // farm.wmo warm-up that used to __fastfail on first open.)
+  if (!offscreen_previews_enabled())
+  {
+    _filename = filename;
+    return;
+  }
+
   OpenGL::context::save_current_context const context_save (::gl);
   _offscreen_context.makeCurrent(&_offscreen_surface);
   OpenGL::context::scoped_setter const context_set (::gl, &_offscreen_context);
@@ -477,6 +506,13 @@ QPixmap* PreviewRenderer::renderToPixmap()
 
   if(it != _cache.end())
     return &it->second;
+
+  // Offscreen thumbnails DISABLED (see offscreen_previews_enabled): the preview draw __fastfails the
+  // NVIDIA driver at the next GL flush -- a driver kill, NOT a C++ exception, so the try/catch below
+  // cannot save us. Return a blank thumbnail instead of issuing the crashing draw. The onscreen 3D
+  // ModelViewer is a different path and still renders. NOGGIT_ENABLE_PREVIEW_THUMBS=1 re-enables.
+  if (!offscreen_previews_enabled())
+    return &(_cache[curEntry] = QPixmap());
 
   // The whole GL section is wrapped: noggit's GL-error-check throws (from verify_context AND its
   // destructor) on any GL error, and the preview offscreen context legitimately hits errors

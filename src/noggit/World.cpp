@@ -5074,6 +5074,24 @@ void World::collect_camera_fog(glm::vec3 const& camera, float scale,
   std::vector<Cand> cands;
   _model_instance_storage.for_each_wmo_instance([&](WMOInstance& wmo_instance)
   {
+    // PERF (2026-07-21): this walked EVERY loaded WMO in the map every frame (finishedLoading() per WMO)
+    // and cost ~3.3s in Elwynn/Goldshire -- it tanked all outdoor zones. A fog sphere only fogs the view
+    // when the CAMERA is INSIDE it (d < wf.r2 below), and each sphere's centre sits within the WMO's
+    // bounding box, so the camera-to-box distance is a lower bound on the camera-to-sphere distance. If
+    // the box is farther than the largest plausible placed fog radius (1024yd) from the camera, the
+    // camera cannot be inside any of this WMO's spheres -- skip it BEFORE the expensive load check.
+    // Karazhan's camera stands INSIDE its WMO (box contains it -> distance 0) so it is never culled and
+    // no authored fog is lost. NOTE: getExtents() must precede finishedLoading() -- same order the light
+    // collect uses; it is cheap (cached AABB).
+    {
+      auto const& e = wmo_instance.getExtents();
+      glm::vec3 const nearest = glm::clamp(camera, e[0], e[1]);
+      glm::vec3 const dd = camera - nearest;
+      if (glm::dot(dd, dd) > 1024.0f * 1024.0f)
+      {
+        return;
+      }
+    }
     if (!wmo_instance.finishedLoading() || wmo_instance.wmo->loading_failed()
         || wmo_instance.wmo->fogs.size() <= 1)
     {

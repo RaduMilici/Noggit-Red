@@ -204,6 +204,7 @@ namespace Noggit::Rendering::Primitives
                            , GLuint scene_depth_tex
                            , GLuint empty_vao
                            , glm::vec3 const& center
+                           , glm::vec3 const& camera
                            , float radius
                            , glm::vec4 const& color
                            , float uv_rotation

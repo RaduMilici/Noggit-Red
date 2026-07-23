@@ -8,6 +8,7 @@
 #include <external/tracy/Tracy.hpp>
 #include <math/bounding_box.hpp>
 #include <noggit/Misc.h>
+#include <QtGui/QOpenGLContext>
 #include <fstream>
 #include <cstdlib>
 #include <cstring>
@@ -227,6 +228,22 @@ ModelRender::ModelRender(Model* model)
 
 }
 
+ModelRender::~ModelRender()
+{
+  // Leak fix (2026-07-22): model eviction destroys the Model via AsyncObjectMultimap::erase, which does
+  // NOT call unload() -- so the bone-matrix texture buffer, the ONLY ModelRender GL object stored as a raw
+  // GLuint (every other one lives in the RAII _buffers / _vertex_arrays wrappers), leaked once per animated
+  // model on churn until VRAM/texture handles were exhausted. Free it here. Same teardown-safe guard the
+  // deferred_upload_* member destructors use: only touch GL with a live context, and never let the delete
+  // throw out of a destructor (a throwing dtor -> std::terminate; teardown can run with no/mismatched
+  // context, e.g. return-to-menu). Non-animated models never generated it (0), so this is a no-op for them.
+  if (_bone_matrices_buf_tex && QOpenGLContext::currentContext())
+  {
+    try { gl.deleteTextures(1, &_bone_matrices_buf_tex); } catch (...) {}
+    _bone_matrices_buf_tex = 0;
+  }
+}
+
 void ModelRender::upload()
 {
   _vertex_box_points = math::box_points(
@@ -298,7 +315,10 @@ void ModelRender::unload()
   _vertex_arrays.unload();
 
   if (_bone_matrices_buf_tex)
+  {
     gl.deleteTextures(1, &_bone_matrices_buf_tex);
+    _bone_matrices_buf_tex = 0; // clear the stale name so a re-upload / dtor can't double-target it
+  }
 
   for (auto& particle : _model->_particles)
   {
@@ -923,6 +943,20 @@ void ModelRender::draw(glm::mat4x4 const& model_view
         }
       }
     }
+
+    // Match the individual draw path's end-of-draw GL reset (single-instance overload, ~line 614): this
+    // overload runs ONCE PER MODEL in a loop that SHARES one M2RenderState, so restore the caller's
+    // baseline (blend OFF, cull ON, depth-write ON) and sync the cache to it. Without this, an additive
+    // glow model leaves GL_BLEND enabled and the cache reading "additive"; the NEXT model whose first
+    // pass is also additive then SKIPS re-issuing blend after an intervening state change, so additive
+    // glow cards draw with blend disabled = opaque-black ("black mesh slices"). This was the parked
+    // instanced-doodad bug -- the individual path fixed the identical class of desync the same way.
+    gl.disable(GL_BLEND);
+    gl.enable(GL_CULL_FACE);
+    gl.depthMask(GL_TRUE);
+    model_render_state.blend = 0xFFFF;
+    model_render_state.backface_cull = true;
+    model_render_state.z_buffered = false;
 
     // Leave the FULL instance set in the transform buffer for the particle/ribbon draws that follow
     // (they instance-count off it). Interior partitioning only affects the mesh passes above.

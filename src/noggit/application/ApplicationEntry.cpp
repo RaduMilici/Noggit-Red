@@ -20,6 +20,7 @@
 #include <qcommandlineparser.h>
 #include <qcommandlineoption.h>
 #include <QtWidgets/QApplication>
+#include <QtGui/QSurfaceFormat>
 #include <QtWidgets/QFileDialog>
 #include <QtWidgets/QMessageBox>
 #include <QSplashScreen>
@@ -435,6 +436,17 @@ int main(int argc, char *argv[])
   // the NVIDIA driver __fastfails when the draw is flushed (the asset-browser crash-on-load). Must
   // be set BEFORE the QApplication is constructed.
   QCoreApplication::setAttribute(Qt::AA_ShareOpenGLContexts);
+
+  // [PERF 2026-07-21] Frame-to-frame time carries a ~15ms CONSTANT gap beyond the CPU world-draw
+  // (independent of scene cost) = the present/vsync wait. NOGGIT_NO_VSYNC=1 sets the GL swap interval to 0
+  // so fps can exceed the display refresh (toward the 165fps goal); tearing is the tradeoff. Default keeps
+  // vsync ON (interval 1). Must be set BEFORE the QApplication, like the attributes above.
+  {
+    QSurfaceFormat fmt = QSurfaceFormat::defaultFormat();
+    fmt.setSwapInterval(std::getenv("NOGGIT_NO_VSYNC") != nullptr ? 0 : 1);
+    QSurfaceFormat::setDefaultFormat(fmt);
+  }
+
   QApplication q_application (argc, argv);
   q_application.setApplicationName ("Noggit");
   q_application.setOrganizationName ("Noggit");

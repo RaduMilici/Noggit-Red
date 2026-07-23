@@ -7600,7 +7600,12 @@ void MapView::paintGL()
     {
       LogDebug << "MapView::paintGL before tick" << std::endl;
     }
-    tick (now - _last_update);
+    {
+      // [perf] time tick() into the (otherwise-unused) Overlays bucket so the frame-to-frame gap can be
+      // split: Frame - WorldDraw - Overlays = pure Qt event-loop/compositor cost outside our draw code.
+      noggit::perf::Scoped _prof_tick(noggit::perf::Phase::Overlays);
+      tick (now - _last_update);
+    }
     if (capture_debug_enabled())
     {
       LogDebug << "MapView::paintGL after tick" << std::endl;
@@ -8758,6 +8763,25 @@ void MapView::doSelection (bool selectTerrainOnly, bool mouseMove)
 
 void MapView::update_cursor_pos()
 {
+  // PERF (2026-07-21): this does a full ray-vs-terrain pick (World::intersect) EVERY frame to place the 3D
+  // brush cursor -- ~7ms, measured in the tick() phase (invisible to WorldDraw but real frame cost). The
+  // cursor only matters when the camera is SETTLED for editing; while you fly / look around it's wasted.
+  // Skip the pick on any frame the view is still changing -- it re-picks the instant you stop, and painting
+  // (camera still, mouse dragging) still picks every frame. Exact == is correct here: an unchanged camera
+  // keeps identical float bits, a moving one does not.
+  {
+    static glm::vec3 s_last_cam_pos(std::numeric_limits<float>::max());
+    static float s_last_yaw = std::numeric_limits<float>::max();
+    static float s_last_pitch = std::numeric_limits<float>::max();
+    bool const cam_still = s_last_cam_pos == _camera.position
+                        && s_last_yaw == _camera.yaw()._ && s_last_pitch == _camera.pitch()._;
+    s_last_cam_pos = _camera.position;
+    s_last_yaw = _camera.yaw()._;
+    s_last_pitch = _camera.pitch()._;
+    if (!cam_still)
+      return;
+  }
+
   static bool buffer_switch = false;
 
   if (false && terrainMode != editing_mode::holes) // figure out why this does not work on every hardware.
@@ -8941,7 +8965,16 @@ void MapView::draw_map()
 
   if (_camera_moved_since_last_draw)
   {
-      _minimap->update();
+      // PERF (2026-07-21): _minimap->update() schedules a full repaint of the minimap widget, which Qt
+      // runs in the event loop BETWEEN paintGL calls -- i.e. inside the frame-to-frame gap, invisible to
+      // WorldDraw but counted in Frame. Firing it every camera-move frame (i.e. every frame while panning)
+      // is the "massive performance issues" flagged in tick() above. 4 Hz is ample for an overview marker.
+      static QElapsedTimer s_minimap_throttle;
+      if (!s_minimap_throttle.isValid() || s_minimap_throttle.elapsed() > 250)
+      {
+        _minimap->update();
+        s_minimap_throttle.restart();
+      }
   }
 
   bool classic_ui = _settings->value("classicUI", true).toBool();

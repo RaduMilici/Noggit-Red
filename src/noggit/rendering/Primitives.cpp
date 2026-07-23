@@ -440,6 +440,7 @@ void Square::setup_buffers()
                                  , GLuint scene_depth_tex
                                  , GLuint empty_vao
                                  , glm::vec3 const& center
+                                 , glm::vec3 const& camera
                                  , float radius
                                  , glm::vec4 const& color
                                  , float uv_rotation)
@@ -484,6 +485,7 @@ void Square::setup_buffers()
     shader.uniform("inv_view_projection", inv_view_projection);
     shader.uniform("inv_viewport", inv_viewport);
     shader.uniform("center", center);
+    shader.uniform("camera", camera);
     shader.uniform("radius", radius);
     // vertical range generous enough that a bumpy WMO floor within the disc still gets painted
     shader.uniform("v_range", std::max(radius, 3.0f));

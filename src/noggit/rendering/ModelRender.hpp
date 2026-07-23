@@ -116,6 +116,10 @@ namespace Noggit::Rendering
 
   public:
     ModelRender(Model* model);
+    // NOT override: BaseRender has no virtual destructor. ModelRender is only ever destroyed as a concrete
+    // value member of Model (never through a BaseRender*), so a non-virtual dtor is safe. Frees the raw
+    // _bone_matrices_buf_tex on model eviction (which never calls unload()) -- see ModelRender.cpp.
+    ~ModelRender();
 
     void upload() override;
     void unload() override;
@@ -234,7 +238,10 @@ namespace Noggit::Rendering
     GLuint const& _box_vao = _vertex_arrays[1];
     GLuint const& _box_vbo = _buffers[2];
 
-    GLuint _bone_matrices_buf_tex;
+    // 0 = not generated. This raw GLuint is the sentinel the guarded deletes in unload() and ~ModelRender
+    // key off, so it MUST start at 0: a model that loads but is never drawn never runs upload() (which
+    // otherwise zeroes it), and the destructor would then read an uninitialized name and delete garbage.
+    GLuint _bone_matrices_buf_tex = 0;
     std::size_t _bone_matrices_buffer_size = 0;
     std::vector<glm::vec3> _vertex_box_points;
     std::vector<ModelRenderPass> _render_passes;

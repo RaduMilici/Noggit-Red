@@ -1,15 +1,22 @@
 // This file is part of Noggit3, licensed under GNU General Public License (version 3).
 #version 330 core
 
-in vec4 pos;
-in vec3 normal;
-in vec2 texcoord1;
-in vec2 texcoord2;
-in uvec4 bones_weight;
-in uvec4 bones_indices;
+// CORRECTNESS (2026-07-22): PIN attribute locations. This shader is compiled TWICE -- as _m2_program
+// (transform = uniform) and _m2_instanced_program (transform = per-instance attribute) -- and BOTH share the
+// same per-model VAO. Without pinned locations the linker may assign pos/normal/etc. to DIFFERENT locations
+// per program; then after the individual path (creature/gameobject/minimap) binds the shared VAO at
+// _m2_program's locations, the instanced draw (re-asserts only `transform`) reads `normal` from the wrong
+// location -> normalize(garbage) -> interior diffuse collapses to 0 -> the doodad renders BLACK yet correctly
+// positioned (the Timbermaw interior-doodad black). Pinning makes both programs agree on the shared VAO.
+layout(location = 0) in vec4 pos;
+layout(location = 1) in vec3 normal;
+layout(location = 2) in vec2 texcoord1;
+layout(location = 3) in vec2 texcoord2;
+layout(location = 4) in uvec4 bones_weight;
+layout(location = 5) in uvec4 bones_indices;
 
 #ifdef instanced
-  in mat4 transform;              // model->world
+  layout(location = 6) in mat4 transform;   // model->world (a mat4 attribute spans locations 6..9)
 #else
   uniform mat4 transform;
 #endif

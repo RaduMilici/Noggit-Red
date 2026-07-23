@@ -695,6 +695,13 @@ void WorldRender::draw (glm::mat4x4 const& model_view
   ZoneScoped;
   noggit::perf::Scoped _prof_world(noggit::perf::Phase::WorldDraw);
 
+  // GL-API-error safety net (2026-07-23): the per-call glGetError() is dropped by default for perf
+  // (context.inl -- it was ~half the dense frame and caught nothing once the instanced path was off). This
+  // ONE glGetError/frame drains any GL error the previous frame produced, so a future regression can't
+  // silently corrupt (green/black) UNlogged. One round-trip/frame is negligible. Set
+  // NOGGIT_GL_ERROR_CHECK_PER_CALL=1 to restore per-call checking and pinpoint the exact bad call.
+  gl.check_gl_errors("WorldRender::draw");
+
   // Anisotropic filtering (Settings -> Anisotropic filtering) applies LIVE. Unlike MSAA (a per-frame
   // framebuffer realloc), AF is a per-texture parameter set at upload, so a change means re-applying
   // it to every loaded array. Polling the setting each frame is cheap (Qt caches it); the re-apply
@@ -901,7 +908,16 @@ void WorldRender::draw (glm::mat4x4 const& model_view
 
     bool hadSky = false;
 
-    if (draw_wmo || _world->mapIndex.hasAGlobalWMO())
+    // BLACK-SKY FIX (2026-07-22): the WMO skybox (MOSB) may only REPLACE the outdoor sky when the camera
+    // is GENUINELY inside an indoor group -- not merely inside the WMO's loose outer AABB. drawSkybox()
+    // itself tests only raw is_inside_of(group AABB) with NO indoor/exterior filter, so the OPEN Karazhan/
+    // Malchezaar tower (camera high in the exterior shell, still within the huge AABB) drew the dark
+    // interior skybox and SUPPRESSED the outdoor sky -> black sky. _camera_inside_wmo already applies the
+    // correct test (World::camera_is_inside_wmo: indoor && !exterior_lit && !exterior). Global-WMO maps
+    // (dungeons that ARE one WMO) keep trying the skybox unconditionally; placed-WMO terrain maps only
+    // when actually inside. Outside an indoor group -> fall through to the outdoor _skies->draw.
+    bool const try_wmo_skybox = _world->mapIndex.hasAGlobalWMO() || (draw_wmo && _camera_inside_wmo);
+    if (try_wmo_skybox)
     {
       _world->_model_instance_storage.for_each_wmo_instance
           (
@@ -930,6 +946,22 @@ void WorldRender::draw (glm::mat4x4 const& model_view
               }
               , [&] () { return hadSky; }
           );
+    }
+
+    // TRACE (NOGGIT_LIGHT_DEBUG): which sky path ran. hadSky=1 -> a WMO skybox drew and the outdoor sky
+    // was SUPPRESSED (the black-sky path); hadSky=0 -> outdoor _skies->draw ran (if THAT is black, the
+    // zone-light sky color is the culprit, not the skybox). inside_wmo pairs with the FOGFINAL line.
+    {
+      static bool const s_skp_dbg = std::getenv("NOGGIT_LIGHT_DEBUG") != nullptr;
+      static int s_skp_tick = 0;
+      if (s_skp_dbg && (++s_skp_tick % 30) == 0)
+      {
+        LogError << "SKYPATH hadSky=" << (hadSky ? 1 : 0)
+                 << " inside_wmo=" << (_camera_inside_wmo ? 1 : 0)
+                 << " try_wmo_skybox=" << (try_wmo_skybox ? 1 : 0)
+                 << " cam=(" << camera_pos.x << "," << camera_pos.y << "," << camera_pos.z << ")"
+                 << std::endl;
+      }
     }
 
     if (!hadSky)
@@ -3062,10 +3094,17 @@ void WorldRender::draw (glm::mat4x4 const& model_view
         // in the instanced program "transform" is a vertex ATTRIBUTE (4 slots, divisor 1), and calling
         // the non-instanced draw under it left the VAO/attrib state inconsistent, which the NVIDIA
         // driver eventually faulted on in a later (particle) draw. Own program scope, like creatures.
-        // INSTANCED-DOODAD toggle (perf 2026-07-20): DEFAULT = original per-doodad path (correct). The
-        // instanced path (block after this) is OPT-IN via NOGGIT_INSTANCED_DOODADS=1. Transform-attribute bug
-        // fixed, but a remaining "black mesh slices" bug on some glow/lightray doodads (opaque-black instead of
-        // additive) is still under debug -- so the instanced path is NOT default until that's resolved.
+        // INSTANCED billboard-doodad path: OPT-IN, DEFAULT OFF (restored 2026-07-22 per RE doc 23 and the
+        // prior session's finding above). doc 23 = disassembled Wow.exe ground truth: the 3.3.5a client
+        // draws ANIMATED + BILLBOARD doodads INDIVIDUALLY, material-sorted, and DELIBERATELY EXCLUDES them
+        // from batching (anim gate 0x824580) -- merge bakes rest-pose matrices and can't do per-frame
+        // camera-facing billboards. Our instanced billboard path is the exact "instancing detour" doc 23
+        // calls WRONG: it shares ONE VAO between the instanced and individual m2 programs, leaving a
+        // per-instance-attribute GL error that renders as the "black mesh slices" (Timbermaw). The DEFAULT
+        // is now the client's real mechanism -- the individual path below, material-sorted (doc 23
+        // technique #2, the std::sort at ~line 3125). The STATIC-doodad bucket instancing (SubmitInst
+        // above, = client Path A) is a SEPARATE path and stays on. Opt into the (still-buggy) instanced
+        // billboard path with NOGGIT_INSTANCED_DOODADS=1 ONLY to develop the separate-VAO fix.
         static bool const s_inst_doodads = std::getenv("NOGGIT_INSTANCED_DOODADS") != nullptr;
         if (!per_instance_wmo_doodads.empty() && !s_inst_doodads)
         {
@@ -3085,6 +3124,16 @@ void WorldRender::draw (glm::mat4x4 const& model_view
           doodad_shader.uniform("tex_unit_lookup_1", 0);
           doodad_shader.uniform("tex_unit_lookup_2", 0);
           doodad_shader.uniform("pixel_shader", 0);
+
+          // [STUDY APPLY, RE doc 23] The 3.3.5a client material-sorts every doodad (group-hash 0x81cc50 +
+          // heapsort) so consecutive individual draws share texture/blend/state and prepareDraw's
+          // check-before-set M2RenderState cache HITS instead of re-issuing full state per doodad. noggit
+          // drew them in gather order -> cache miss on nearly every doodad = redundant blend/cull/tex/shader
+          // uniform churn in the SubmitIndiv wall. Group by model (same model == same materials/passes).
+          // Cheap (model.get() is a plain pointer read); the earlier "3000ms" from this was the fog bug,
+          // not the sort. NOT batching -- still one draw per doodad, like the client's individual path.
+          std::sort(per_instance_wmo_doodads.begin(), per_instance_wmo_doodads.end(),
+            [](ModelInstance* a, ModelInstance* b) { return a->model.get() < b->model.get(); });
 
           std::unordered_set<std::uint64_t> seen_doodad_keys;
           for (ModelInstance* _dptr : per_instance_wmo_doodads)
@@ -3185,54 +3234,118 @@ void WorldRender::draw (glm::mat4x4 const& model_view
           }
 
           std::unordered_map<Model*, std::size_t> pib_boxes; // unused (all_boxes = false)
-          for (auto& model_group : pib_by_model)
+
+          // [2026 MODERNIZATION -- parallel bone-animate across models] The 3.3.5a client (M2UseThreads)
+          // threads only its particle sim on ONE worker because its bone matrices are shared per model FILE.
+          // noggit's pib_by_model groups are DISTINCT Model objects with independent bones[]/bone_matrices/
+          // _instance_emitter_states, and the workers join before ANY GL -- so we animate every model on its
+          // own core, which the client's data model cannot. interior_light_at() writes a shared position
+          // cache (the sole non-thread-safe call), so interiors + transforms are precomputed SERIALLY first;
+          // the parallel phase then touches ONLY per-Model state. NOGGIT_SERIAL_PIB_ANIMATE=1 forces serial.
+          struct PibGroup
           {
-            Model* const pmodel = model_group.first;
-            auto const& group_doodads = model_group.second;
-            std::size_t const bc = pmodel->bone_matrices.size();
-            bool const has_bones = pmodel->animBones && bc > 0;
-
-            std::vector<glm::mat4x4> transforms; transforms.reserve(group_doodads.size());
-            std::vector<glm::vec4> interiors;    interiors.reserve(group_doodads.size());
+            Model* pmodel = nullptr;
+            std::vector<ModelInstance*> const* doodads = nullptr;
+            bool has_bones = false;
+            std::vector<glm::mat4x4> transforms;
+            std::vector<glm::vec4> interiors;
+            std::vector<std::uint64_t> keys;
             std::vector<glm::mat4x4> big_bones;
-            if (has_bones) { big_bones.reserve(group_doodads.size() * bc); }
+          };
+          std::vector<PibGroup> pib_groups;
+          pib_groups.reserve(pib_by_model.size());
+          for (auto& mg : pib_by_model)
+          {
+            PibGroup g;
+            g.pmodel = mg.first;
+            g.doodads = &mg.second;
+            g.has_bones = mg.first->animBones && mg.first->bone_matrices.size() > 0;
+            pib_groups.push_back(std::move(g));
+          }
 
-            noggit::perf::Scoped _prof_submit2(noggit::perf::Phase::SubmitIndiv);
-            for (ModelInstance* _dptr : group_doodads)
+          // Serial: interiors (writes the shared position cache) + transforms + particle keys. Cheap --
+          // interior_light_at is dominated by cache hits, transformMatrix() returns a cached matrix.
+          for (auto& g : pib_groups)
+          {
+            g.transforms.reserve(g.doodads->size());
+            g.interiors.reserve(g.doodads->size());
+            g.keys.reserve(g.doodads->size());
+            for (ModelInstance* _dptr : *g.doodads)
             {
-              ModelInstance& doodad = *_dptr;
-              std::uint64_t const key = wmo_doodad_placement_key(doodad.get_pos());
-              if (has_bones)
-              {
-                // Animate THIS instance's billboard bones (serial; writes shared Model bone state) then
-                // snapshot into the big buffer -- mirrors the individual path's per-doodad animate.
-                if (draw_model_animations) { pmodel->animcalc = false; }
-                pmodel->animate(model_view * doodad.transformMatrix(), 0, static_cast<int>(_world->model_animtime));
-                big_bones.insert(big_bones.end(), pmodel->bone_matrices.begin(), pmodel->bone_matrices.end());
-              }
-              transforms.push_back(doodad.transformMatrix());
-              interiors.push_back(interior_light_at(doodad.get_pos()));
-              ++_world->_n_rendered_objects;
-
-              if (draw_model_animations && !pmodel->_particles.empty())
-              {
-                pmodel->swapInstanceEmitterState(key);
-                float pdt = _world->models_emitter_dt();
-                while (pdt > 0.1f) { pmodel->updateParticleSystems(0.1f); pdt -= 0.1f; }
-                pmodel->updateParticleSystems(pdt);
-                pmodel->swapInstanceEmitterState(key);
-              }
+              g.transforms.push_back(_dptr->transformMatrix());
+              g.interiors.push_back(interior_light_at(_dptr->get_pos()));
+              g.keys.push_back(wmo_doodad_placement_key(_dptr->get_pos()));
             }
+            _world->_n_rendered_objects += static_cast<int>(g.doodads->size());
+          }
 
-            if (transforms.empty()) { continue; }
-            std::vector<float> const fades(transforms.size(), 1.0f);
+          // Parallel across models: the expensive animate() + per-model particle sim. Each group is a UNIQUE
+          // Model, so no two workers touch the same Model state, and nothing global is written here.
+          {
+            noggit::perf::Scoped _prof_submit2(noggit::perf::Phase::SubmitIndiv);
+            auto const animate_group = [&](PibGroup& g)
+            {
+              Model* const pmodel = g.pmodel;
+              if (g.has_bones) { g.big_bones.reserve(g.transforms.size() * pmodel->bone_matrices.size()); }
+              for (std::size_t di = 0; di < g.transforms.size(); ++di)
+              {
+                if (g.has_bones)
+                {
+                  if (draw_model_animations) { pmodel->animcalc = false; }
+                  pmodel->animate(model_view * g.transforms[di], 0, static_cast<int>(_world->model_animtime));
+                  g.big_bones.insert(g.big_bones.end(), pmodel->bone_matrices.begin(), pmodel->bone_matrices.end());
+                }
+                if (draw_model_animations && !pmodel->_particles.empty())
+                {
+                  pmodel->swapInstanceEmitterState(g.keys[di]);
+                  float pdt = _world->models_emitter_dt();
+                  while (pdt > 0.1f) { pmodel->updateParticleSystems(0.1f); pdt -= 0.1f; }
+                  pmodel->updateParticleSystems(pdt);
+                  pmodel->swapInstanceEmitterState(g.keys[di]);
+                }
+              }
+            };
+
+            // DEFAULT SERIAL for now -- the parallel path crashed (SIGABRT) on Karazhan load; a worker is
+            // throwing, so animate()/particle sim touches shared state beyond per-Model after all. Opt-in
+            // via NOGGIT_PARALLEL_PIB_ANIMATE=1 while that's traced. The serial branch is the original order.
+            static bool const s_parallel_pib = std::getenv("NOGGIT_PARALLEL_PIB_ANIMATE") != nullptr;
+            std::size_t const ng = pib_groups.size();
+            unsigned const hw = std::max(2u, std::thread::hardware_concurrency());
+            std::size_t const nthreads = (!s_parallel_pib || ng <= 1) ? 1 : std::min<std::size_t>(hw, ng);
+            if (nthreads <= 1)
+            {
+              for (auto& g : pib_groups) { animate_group(g); }
+            }
+            else
+            {
+              std::atomic<std::size_t> next{0};
+              std::vector<std::thread> pool;
+              pool.reserve(nthreads);
+              for (std::size_t t = 0; t < nthreads; ++t)
+              {
+                pool.emplace_back([&]
+                {
+                  for (std::size_t gi = next.fetch_add(1); gi < ng; gi = next.fetch_add(1))
+                  {
+                    animate_group(pib_groups[gi]);
+                  }
+                });
+              }
+              for (auto& th : pool) { th.join(); }
+            }
+          }
+
+          // Serial GL draw of each computed group (GL is single-threaded).
+          for (auto& g : pib_groups)
+          {
+            if (g.transforms.empty()) { continue; }
+            std::vector<float> const fades(g.transforms.size(), 1.0f);
             std::vector<glm::mat4x4> const no_bones;
-            // has_bones -> per-instance bone slices (pib path). Else -> empty => draw()'s shared animate
-            // (static / texanim-only doodads are correctly shared across instances).
-            pmodel->renderer()->draw(model_view, transforms, m2_shader, doodad_render_state, frustum,
+            g.pmodel->renderer()->draw(model_view, g.transforms, m2_shader, doodad_render_state, frustum,
                 _cull_distance, camera_pos, static_cast<int>(_world->model_animtime), false, pib_boxes,
-                display, /*no_cull*/ false, /*representative*/ nullptr, interiors, fades,
-                has_bones ? big_bones : no_bones);
+                display, /*no_cull*/ false, /*representative*/ nullptr, g.interiors, fades,
+                g.has_bones ? g.big_bones : no_bones);
           }
         }
 
@@ -3954,11 +4067,15 @@ void WorldRender::draw (glm::mat4x4 const& model_view
         GLint cvp[4] = {0, 0, 0, 0};
         gl.getIntegerv(GL_VIEWPORT, cvp);
         glm::vec2 const inv_vp(1.0f / std::max(cvp[2], 1), 1.0f / std::max(cvp[3], 1));
-        glm::mat4x4 const inv_mvp = glm::inverse(mvp);
+        // Reconstruct CAMERA-RELATIVE positions in the frag shader (inverse of the rotation-only MVP,
+        // NOT the world MVP). At Karazhan's ~19000 world coords, reconstructing the full world position
+        // lost float precision, so the ring shook as the camera moved. mvp_rel * v_rel == mvp * world for
+        // the same clip point, so the same screen NDC reconstructs to (world - camera) -- small, precise.
+        glm::mat4x4 const inv_mvp_rel = glm::inverse(mvp_rel);
         for (auto const& m : markers)
         {
-          _circle_render.drawProjectedDecal(mvp, inv_mvp, inv_vp, _decal_depth_tex, _bloom_vao,
-                                            m.pos, m.radius, m.color, uv_rotation_for(m.pos));
+          _circle_render.drawProjectedDecal(mvp, inv_mvp_rel, inv_vp, _decal_depth_tex, _bloom_vao,
+                                            m.pos, camera_pos, m.radius, m.color, uv_rotation_for(m.pos));
         }
       }
 
@@ -4035,11 +4152,15 @@ void WorldRender::draw (glm::mat4x4 const& model_view
         GLint gvp[4] = {0, 0, 0, 0};
         gl.getIntegerv(GL_VIEWPORT, gvp);
         glm::vec2 const inv_vp(1.0f / std::max(gvp[2], 1), 1.0f / std::max(gvp[3], 1));
-        glm::mat4x4 const inv_mvp = glm::inverse(mvp);
+        // Reconstruct CAMERA-RELATIVE positions in the frag shader (inverse of the rotation-only MVP,
+        // NOT the world MVP). At Karazhan's ~19000 world coords, reconstructing the full world position
+        // lost float precision, so the ring shook as the camera moved. mvp_rel * v_rel == mvp * world for
+        // the same clip point, so the same screen NDC reconstructs to (world - camera) -- small, precise.
+        glm::mat4x4 const inv_mvp_rel = glm::inverse(mvp_rel);
         for (auto const& m : markers)
         {
-          _circle_render.drawProjectedDecal(mvp, inv_mvp, inv_vp, _decal_depth_tex, _bloom_vao,
-                                            m.pos, m.radius, m.color, uv_rotation_for(m.pos));
+          _circle_render.drawProjectedDecal(mvp, inv_mvp_rel, inv_vp, _decal_depth_tex, _bloom_vao,
+                                            m.pos, camera_pos, m.radius, m.color, uv_rotation_for(m.pos));
         }
       }
       gl.blendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
@@ -4801,6 +4922,7 @@ void WorldRender::ensureBloomTargets(int w, int h)
   // MSAA sample count (Settings -> Render features): 0/2/4/8, clamped to the driver max. Read every
   // call so a settings change reallocates live.
   int msaa = QSettings().value("render/msaa", 8).toInt();
+  if (char const* e = std::getenv("NOGGIT_MSAA")) { msaa = std::atoi(e); } // [PERF A/B 2026-07-21] override
   if (msaa != 0 && msaa != 2 && msaa != 4 && msaa != 8) { msaa = 0; }
   if (msaa > 0)
   {
@@ -5506,12 +5628,44 @@ void WorldRender::updateLightingUniformBlock(bool draw_fog, glm::vec3 const& cam
   // can add their warm falloff. M2 lights are sparse in 1.12 (mostly campfires); we keep the nearest
   // MAX_POINT_LIGHTS to the camera. (M2 attenuation range isn't parsed, so we use a default radius.)
   {
+    // [PERF 2026-07-21] The two authored-light walks below iterate ALL m2 + ALL wmo instances (the WMO one
+    // calls get_doodads per WMO) EVERY frame -- ~4-5ms, the bulk of the LightCollect phase -- even though
+    // almost every instance early-outs at lights().empty(). But point lights are STATIC world-space
+    // (campfires don't move): only WHICH nearest-16 are selected changes as the camera moves, and only the
+    // flicker COLOUR animates. So rebuild the collected set every 3rd frame, or immediately on a >20yd
+    // camera jump (teleport / click-move); on the other frames reuse the cached _lighting_ubo_data.Point*
+    // set, which is re-uploaded verbatim below. Flicker then updates at ~20Hz (imperceptible; film is 24),
+    // a light fades in/out at most ~3 frames late -- and the per-frame instance walk cost drops ~3x. Same
+    // caching principle as the interior-light 60-frame epoch and the collect_camera_fog cull.
+    static unsigned s_light_collect_epoch = 0;
+    static glm::vec3 s_last_light_collect_pos(1e18f, 1e18f, 1e18f);
+    bool const rebuild_point_lights = (s_light_collect_epoch++ % 3u == 0u)
+        || glm::distance(camera_pos, s_last_light_collect_pos) > 20.0f;
+    if (rebuild_point_lights)
+    {
+    s_last_light_collect_pos = camera_pos;
     // is_molt: WMO MOLT lights are flagged so the m2 shader can EXCLUDE them for units -- the client
     // never lights units with MOLT point lights (they convert to linear-falloff directionals that are
     // hard-skipped at d>=attenEnd, i.e. always skipped in classic WMOs with attenEnd=0; RE_notes/15
     // section 5). Doodads/WMO geometry keep them.
     struct CollectedLight { glm::vec3 pos; glm::vec3 color; float radius; float dist2; bool is_molt = false; };
     std::vector<CollectedLight> collected;
+
+    // [PERF 2026-07-21] AABB distance cull for the authored-light walks below. Both walk uncached over ALL
+    // m2 + ALL wmo instances (the WMO one calls get_doodads per WMO). A collected point light's radius is
+    // clamped to <=60yd, so any instance whose bounding box is farther than view_distance+64 from the
+    // camera CANNOT illuminate a visible surface -- skip it. Using the AABB (not the origin) keeps big
+    // WMOs correct when the camera stands inside them (Ironforge). Exact: no visible light is dropped.
+    // (The dominant ~3.3s/frame outdoor cost was World::collect_camera_fog, fixed there with the same
+    // cull; this walk was the cheaper sibling.) NOGGIT_NO_LIGHT_CULL=1 disables for A/B.
+    static bool const s_no_light_cull = std::getenv("NOGGIT_NO_LIGHT_CULL") != nullptr;
+    float const _light_cull_d2 = (_view_distance + 64.0f) * (_view_distance + 64.0f);
+    auto const _too_far_for_light = [&](glm::vec3 const& mn, glm::vec3 const& mx) -> bool
+    {
+      glm::vec3 const nearest = glm::clamp(camera_pos, mn, mx);
+      glm::vec3 const dd = camera_pos - nearest;
+      return glm::dot(dd, dd) > _light_cull_d2;
+    };
 
     _world->_model_instance_storage.for_each_m2_instance([&] (ModelInstance& inst)
     {
@@ -5530,6 +5684,13 @@ void WorldRender::updateLightingUniformBlock(bool draw_fog, glm::vec3 const& cam
       if (m->lights().empty())
       {
         return;
+      }
+      {
+        auto const& _e = inst.getExtents();
+        if (!s_no_light_cull && _too_far_for_light(_e[0], _e[1]))
+        {
+          return; // its lights (<=60yd radius) can't reach any visible surface
+        }
       }
       glm::mat4x4 const transform = inst.transformMatrix();
       float const inst_scale = glm::length(glm::vec3(transform[0])); // world scale from the placement matrix
@@ -5561,6 +5722,13 @@ void WorldRender::updateLightingUniformBlock(bool draw_fog, glm::vec3 const& cam
     int wmo_molt_lights = 0;
     _world->_model_instance_storage.for_each_wmo_instance([&] (WMOInstance& wmo)
     {
+      {
+        auto const& _e = wmo.getExtents();
+        if (!s_no_light_cull && _too_far_for_light(_e[0], _e[1]))
+        {
+          return; // WMO's MOLT + doodad lights (<=60yd) can't reach a visible surface -- skip get_doodads
+        }
+      }
       // Authored WMO lights (MOLT) -- e.g. Ironforge's 209 forge/torch lights, dungeon braziers. These
       // are parsed but were never fed to a renderer; wire them into the same point-light set the
       // terrain/WMO/M2 shaders already consume, so interiors are lit by their real authored lights.
@@ -5673,6 +5841,7 @@ void WorldRender::updateLightingUniformBlock(bool draw_fog, glm::vec3 const& cam
         _lighting_ubo_data.PointLightColor[i] = glm::vec4(0.f);
       }
     }
+    } // end if (rebuild_point_lights) -- else frames reuse last-built cached point-light UBO set
   }
 
   gl.bindBuffer(GL_UNIFORM_BUFFER, _lighting_ubo);

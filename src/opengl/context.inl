@@ -84,14 +84,18 @@ namespace
         return;
       }
 
-      // PERF A/B MEASUREMENT (2026-07-19): the per-GL-call glGetError() below is a driver round-trip that
-      // can serialize the CPU against the GL driver on EVERY call (thousands/frame) -- the prime suspect for
-      // "CPU+GPU both idle / low fps". Set NOGGIT_GL_NO_ERROR_CHECK=1 to skip it and measure the fps delta.
-      // If the app then CRASHES, the per-call sync was masking a real use-after-free that must be fixed
-      // BEFORE this can be turned off for real (see memory noggit-perf-and-glcheck-crash). This env var is
-      // the measurement lever, NOT the ship fix.
-      static bool const s_no_gl_error_check = std::getenv("NOGGIT_GL_NO_ERROR_CHECK") != nullptr;
-      if (s_no_gl_error_check)
+      // PERF (2026-07-23, SHIPPED default): the per-GL-call glGetError() below is a CPU<->driver round-trip
+      // on EVERY GL call (thousands/frame). Measured as HALF the frame in dense scenes -- SubmitIndiv 43->10ms,
+      // WorldDraw 80->24ms, ~2.5x fps -- while catching NOTHING in normal running (0 GL errors over a full
+      // dense session once the instanced-doodad path, its only error source, was made default-off). So the
+      // per-call glGetError is SKIPPED BY DEFAULT. NOTE: the CONTEXT-VALIDITY check in the ctor above is a
+      // SEPARATE, cheap (no round-trip) check and STILL RUNS -- it caught the real "no active context"
+      // teardown crashes. A single once-per-frame glGetError (OpenGL::context::check_gl_errors, called from
+      // WorldRender::draw) keeps the GL-API-error safety net: it flags any error the moment it appears, just
+      // not which exact call issued it. To PINPOINT a bad call, opt back into the per-call check with
+      // NOGGIT_GL_ERROR_CHECK_PER_CALL=1. (memory noggit-perf-and-glcheck-crash.)
+      static bool const s_per_call_gl_error_check = std::getenv("NOGGIT_GL_ERROR_CHECK_PER_CALL") != nullptr;
+      if (!s_per_call_gl_error_check)
       {
         return;
       }
@@ -180,6 +184,39 @@ void OpenGL::context::finish()
   verify_context_and_check_for_gl_errors const _ (_current_context, NOGGIT_CURRENT_FUNCTION);
 #endif
   return _current_context->functions()->glFinish();
+}
+
+inline void OpenGL::context::check_gl_errors (char const* where)
+{
+  // Once-per-frame GL-API-error safety net. The per-call glGetError() in the verify dtor is dropped by
+  // default for perf; this drains any accumulated GL error ONCE per frame instead of on every call -- one
+  // driver round-trip/frame, not thousands. It flags THAT an error happened (decimal GL code), not which
+  // call issued it -- set NOGGIT_GL_ERROR_CHECK_PER_CALL=1 to pinpoint. No verify wrapper here: this IS the
+  // error check.
+  if (!_current_context)
+  {
+    return;
+  }
+  auto* const functions = _current_context->functions();
+  std::string errors;
+  std::size_t count = 0;
+  while (GLenum const error = functions->glGetError())
+  {
+    errors += " " + std::to_string (static_cast<unsigned long> (error));
+    if (++count >= 10)
+    {
+      break;
+    }
+  }
+  if (!errors.empty())
+  {
+    static int s_logged = 0;
+    if (s_logged < 30)
+    {
+      ++s_logged;
+      LogError << "[GL-ERROR/frame] " << where << ":" << errors << std::endl;
+    }
+  }
 }
 void OpenGL::context::flush()
 {

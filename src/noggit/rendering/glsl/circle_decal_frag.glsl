@@ -11,6 +11,7 @@ uniform sampler2D scene_depth;
 uniform vec2 inv_viewport;
 uniform mat4 inv_view_projection;
 uniform vec3 center;
+uniform vec3 camera;             // world camera position -- for the precision-safe (camera - center) disc offset
 uniform float radius;
 uniform float v_range;           // vertical range: reject ground too far above/below the foot plane
 uniform vec4 color;
@@ -34,22 +35,26 @@ void main()
   // pixel's view ray with the flat plane y = center.y for a clean, precise circle regardless of floor detail.
   // (The scene depth is still read below, ONLY to occlude the ring behind raised bodies / lower ledges.)
   vec2 ndc = sc * 2.0 - 1.0;
+  // inv_view_projection is the CAMERA-RELATIVE inverse (see WorldRender): np4/fp4 come out as small
+  // camera-relative coords, not ~19000 world ones, so the ray direction is precise (no big-coord jitter).
   vec4 np4 = inv_view_projection * vec4(ndc, -1.0, 1.0);
   vec4 fp4 = inv_view_projection * vec4(ndc,  1.0, 1.0);
-  vec3 np = np4.xyz / np4.w;
-  vec3 ray = fp4.xyz / fp4.w - np;
-  if (abs(ray.y) < 1e-5)
+  vec3 dir = normalize(fp4.xyz / fp4.w - np4.xyz / np4.w); // pixel's world-space ray direction
+  if (abs(dir.y) < 1e-5)
   {
     discard; // view ray parallel to the ground plane
   }
-  float t = (center.y - np.y) / ray.y;
-  if (t < 0.0 || t > 1.0)
+  // PRECISION (2026-07-20): compute the disc offset from cam_rel = (camera - center) -- a SMALL vector, the
+  // same for every fragment this frame -- plus the ray, NOT from a reconstructed ~19000 world position minus
+  // the ~19000 center. That big-minus-big cancellation lost precision at Karazhan's world coords, so the ring
+  // DITHERED / shook side-to-side as the camera moved. Intersect the camera ray with the foot plane (rel.y=0):
+  vec3 cam_rel = camera - center;
+  float s = -cam_rel.y / dir.y;
+  if (s < 0.0)
   {
-    discard; // plane intersection behind the camera / past the far clip
+    discard; // foot plane is behind the camera
   }
-  vec3 wp = np + t * ray;
-
-  vec3 rel = wp - center;
+  vec3 rel = cam_rel + s * dir;
   vec2 local = vec2(rel.x, rel.z) / radius; // disc space, [-1,1] across the circle
   float r = length(local);
   if (r > 1.0)
@@ -61,14 +66,17 @@ void main()
   // rises STEEPLY within the footprint (base 0.4 + 0.6 * horizontal dist above the foot plane); leave those
   // pixels to the model so it occludes the ring instead of the ring bleeding over it. A much lower floor
   // (ledge/pit) is likewise not painted.
+  // inv_view_projection now reconstructs CAMERA-RELATIVE positions (world - camera), so the scene surface
+  // and the foot plane are compared in that same small-coord space: foot plane sits at -cam_rel.y.
   vec4 sp4 = inv_view_projection * vec4(ndc, d * 2.0 - 1.0, 1.0);
-  vec3 scene_wp = sp4.xyz / sp4.w;
+  vec3 scene_rel = sp4.xyz / sp4.w;   // scene surface, camera-relative
+  float foot_rel_y = -cam_rel.y;      // foot plane height in camera-relative space (= center.y - camera.y)
   float horiz = length(rel.xz);
-  if (scene_wp.y > center.y + 0.4 + 0.6 * horiz)
+  if (scene_rel.y > foot_rel_y + 0.4 + 0.6 * horiz)
   {
     discard; // raised object surface (creature/doodad body) -- let it draw over the ring
   }
-  if (scene_wp.y < center.y - v_range)
+  if (scene_rel.y < foot_rel_y - v_range)
   {
     discard; // a much lower floor (ledge/pit inside the quad) -- don't paint it
   }

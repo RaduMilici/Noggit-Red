@@ -62,6 +62,11 @@ namespace OpenGL
     NOGGIT_FORCEINLINE void finish();
     NOGGIT_FORCEINLINE void flush();
 
+    // Once-per-frame GL-API-error drain. Replaces the per-call glGetError() (dropped by default for perf,
+    // see context.inl): call once at frame start to flag any error the previous frame produced. Not FORCEINLINE
+    // (loops + logs). NOGGIT_GL_ERROR_CHECK_PER_CALL=1 restores per-call checking to pinpoint the exact call.
+    void check_gl_errors (char const* where);
+
     NOGGIT_FORCEINLINE void viewport (GLint x, GLint y, GLsizei width, GLsizei height);
 
     NOGGIT_FORCEINLINE void depthFunc (GLenum);
