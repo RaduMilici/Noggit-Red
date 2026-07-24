@@ -2163,7 +2163,9 @@ bool ModelRenderPass::prepareDraw(OpenGL::Scoped::use_program& m2_shader, Model 
 
   if (tex_anim_lookup != -1 && static_cast<size_t>(tex_anim_lookup) < m->_texture_animations.size())
   {
+    // animated UV: the matrix changes per frame, so always re-upload (these models are rare).
     m2_shader.uniform("tex_matrix_1", m->_texture_animations[tex_anim_lookup].mat);
+    model_render_state.tex_matrix_state[0] = 0;
     if (texture_count > 1)
     {
       int16_t tex_anim_lookup_2 = -1;
@@ -2186,17 +2188,30 @@ bool ModelRenderPass::prepareDraw(OpenGL::Scoped::use_program& m2_shader, Model 
           mat2[3].y += 0.5f;
         }
         m2_shader.uniform("tex_matrix_2", mat2);
+        model_render_state.tex_matrix_state[1] = 0;
       }
-      else
+      else if (model_render_state.tex_matrix_state[1] != 1)
       {
         m2_shader.uniform("tex_matrix_2", unit);
+        model_render_state.tex_matrix_state[1] = 1;
       }
     }
   }
   else
   {
-    m2_shader.uniform("tex_matrix_1", unit);
-    m2_shader.uniform("tex_matrix_2", unit);
+    // [perf 2026-07-23] static UV (the common case): both matrices are identity. Skip re-uploading
+    // identity if the last upload on this unit was already identity within this draw call. A mat4
+    // uniform is 64 bytes to the driver -- eliminating the redundant ones is the biggest single win.
+    if (model_render_state.tex_matrix_state[0] != 1)
+    {
+      m2_shader.uniform("tex_matrix_1", unit);
+      model_render_state.tex_matrix_state[0] = 1;
+    }
+    if (model_render_state.tex_matrix_state[1] != 1)
+    {
+      m2_shader.uniform("tex_matrix_2", unit);
+      model_render_state.tex_matrix_state[1] = 1;
+    }
   }
 
 
@@ -2207,7 +2222,14 @@ bool ModelRenderPass::prepareDraw(OpenGL::Scoped::use_program& m2_shader, Model 
     model_render_state.pixel_shader = ps;
   }
 
-  m2_shader.uniform("mesh_color", mesh_color);
+  // [perf 2026-07-23] check-before-set: most world doodads have a constant (1,1,1,trans) mesh_color, so
+  // it repeats across a model's passes (and across instances whose alpha/tint match). A per-instance
+  // alpha/tint difference correctly misses and re-uploads.
+  if (model_render_state.mesh_color != mesh_color)
+  {
+    m2_shader.uniform("mesh_color", mesh_color);
+    model_render_state.mesh_color = mesh_color;
+  }
 
   return true;
 }
@@ -2341,18 +2363,32 @@ bool ModelRenderPass::bindTexture(size_t index, Model* m, ModelInstance const* i
   GLuint tex_array = resolved_texture->texture_array();
   int tex_index = resolved_texture->array_index();
 
-  gl.activeTexture(static_cast<GLenum>(GL_TEXTURE0 + index + 1));
-  gl.bindTexture(GL_TEXTURE_2D_ARRAY, tex_array);
-  m2_shader.uniform(index ? "tex2_index" : "tex1_index", tex_index);
+  // [perf 2026-07-23] check-before-set: the same GL_TEXTURE_2D_ARRAY object stays bound on this unit
+  // across consecutive passes of a model and across same-atlas models in a bucket, so re-binding it is
+  // pure CPU cost. 0 is never a valid GL texture name -> the {0,0}-initialised cache always misses the
+  // first bind of a draw call. activeTexture is coupled to the bind (only meaningful when we bind).
+  if (model_render_state.tex_arrays[index] != tex_array)
+  {
+    gl.activeTexture(static_cast<GLenum>(GL_TEXTURE0 + index + 1));
+    gl.bindTexture(GL_TEXTURE_2D_ARRAY, tex_array);
+    model_render_state.tex_arrays[index] = tex_array;
+  }
+  if (model_render_state.tex_indices[index] != static_cast<GLuint>(tex_index))
+  {
+    m2_shader.uniform(index ? "tex2_index" : "tex1_index", tex_index);
+    model_render_state.tex_indices[index] = static_cast<GLuint>(tex_index);
+  }
 
   // M2 texture wrap flags (0x1 wrap X, 0x2 wrap Y): an unset bit means CLAMP addressing on that
   // axis (trace-verified against the 1.12 client). Handed to the shader inverted, as a clamp mask,
   // where it is emulated in-shader (textures share array textures, so GL wrap state can't change).
   uint32_t const wrap_flags = tex < m->_texture_flags.size() ? m->_texture_flags[tex] : 0x3;
   int const clamp_mask = (~wrap_flags) & 0x3;
-  m2_shader.uniform(index ? "tex2_clamp" : "tex1_clamp", clamp_mask);
-
-  model_render_state.tex_indices[index] = tex_index;
+  if (model_render_state.tex_clamp[index] != clamp_mask)
+  {
+    m2_shader.uniform(index ? "tex2_clamp" : "tex1_clamp", clamp_mask);
+    model_render_state.tex_clamp[index] = clamp_mask;
+  }
   return true;
 }
 

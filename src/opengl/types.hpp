@@ -4,6 +4,7 @@
 
 #include <QtGui/QOpenGLContext>
 #include <glm/mat4x4.hpp>
+#include <glm/vec4.hpp>
 #include <cstdint>
 #include <array>
 
@@ -126,10 +127,19 @@ namespace OpenGL
     bool bloom_mask_pass = false; // drawing the alpha-only bloom-mask re-draw of a translucent creature
     int discard_invisible = 0; // promoted creature pass: discard texels that add nothing (no depth write)
     bool allow_lightray_model = true;
-    std::array<GLuint, 2> tex_arrays;
-    std::array<GLuint, 2> tex_indices;
+    // [perf 2026-07-23] texture-bind + per-texture uniform caches (check-before-set, per-draw-call).
+    // Consumed by ModelRenderPass::bindTexture so an unchanged array/index/clamp on a unit skips the GL
+    // call. Sentinels matter: 0 is never a valid GL texture name (tex_arrays); tex_index 0 IS valid so
+    // its cache starts at 0xFFFFFFFF; clamp mask is 0..3 so -1 forces the first upload.
+    std::array<GLuint, 2> tex_arrays = {0, 0};
+    std::array<GLuint, 2> tex_indices = {0xFFFFFFFFu, 0xFFFFFFFFu};
+    std::array<int, 2> tex_clamp = {-1, -1};
     std::array<GLint, 2> tex_unit_lookups;
     GLint pixel_shader = 0;
+    // tex_matrix upload state per unit: -1 unset, 0 last upload was animated (re-upload), 1 last upload was
+    // identity (skip). Most world M2s have no UV scroll -> identity every pass -> uploaded once per draw.
+    int tex_matrix_state[2] = {-1, -1};
+    glm::vec4 mesh_color = glm::vec4(-1e30f); // sentinel; skip re-uploading an unchanged mesh_color
 
   };
 
