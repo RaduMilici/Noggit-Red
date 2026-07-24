@@ -359,6 +359,16 @@ void WMO::finishLoading ()
   assert (fourcc == 'MFOG');
 
   int nfogs = size / 0x30;
+  // [2026-07-24] Defensive: assert() is a NO-OP in Release, so a misaligned/garbage MFOG chunk silently made
+  // nfogs balloon to ~28.7 MILLION for a Stormwind WMO -- its per-fog loop then cost ~3.4s/frame in
+  // World::collect_camera_fog (0 fps in Stormwind). A real WMO has at most a few dozen fogs; reject an
+  // absurd count (or a fourcc mismatch) so we neither allocate 1.4 GB nor iterate garbage every frame.
+  if (fourcc != 'MFOG' || nfogs < 0 || nfogs > 4096)
+  {
+    LogError << "WMO: invalid MFOG chunk (fourcc mismatch or absurd nfogs=" << nfogs
+             << ") -- skipping placed fog" << std::endl;
+    nfogs = 0;
+  }
   fogs.reserve(nfogs);
 
   for (size_t i (0); i < nfogs; ++i)
