@@ -8787,12 +8787,28 @@ void MapView::update_cursor_pos()
     static glm::vec3 s_last_cam_pos(std::numeric_limits<float>::max());
     static float s_last_yaw = std::numeric_limits<float>::max();
     static float s_last_pitch = std::numeric_limits<float>::max();
+    static float s_last_mx = std::numeric_limits<float>::max();
+    static float s_last_mz = std::numeric_limits<float>::max();
     bool const cam_still = s_last_cam_pos == _camera.position
                         && s_last_yaw == _camera.yaw()._ && s_last_pitch == _camera.pitch()._;
     s_last_cam_pos = _camera.position;
     s_last_yaw = _camera.yaw()._;
     s_last_pitch = _camera.pitch()._;
     if (!cam_still)
+    {
+      s_last_mx = std::numeric_limits<float>::max(); // force a re-pick the instant the camera settles
+      return;
+    }
+    // PERF (2026-07-24): camera settled. While idle-hovering with no mouse button held, a still mouse cannot
+    // move the cursor, so the World::intersect pick is redundant -- skip it. This reclaims the same ~4-7ms
+    // (tick phase) when paused over a dense scene, on top of the fly-time skip above. A held button
+    // (painting/sculpting) always picks, and ANY mouse move re-picks on the next frame.
+    float const cur_mx = static_cast<float>(_last_mouse_pos.x());
+    float const cur_mz = static_cast<float>(_last_mouse_pos.y());
+    bool const mouse_still = cur_mx == s_last_mx && cur_mz == s_last_mz;
+    s_last_mx = cur_mx;
+    s_last_mz = cur_mz;
+    if (mouse_still && !leftMouse && !rightMouse)
       return;
   }
 
