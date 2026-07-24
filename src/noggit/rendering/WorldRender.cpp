@@ -3571,8 +3571,89 @@ void WorldRender::draw (glm::mat4x4 const& model_view
       m2_shader.uniform("tex_unit_lookup_2", 0);
       m2_shader.uniform("pixel_shader", 0);
 
-      for (auto const& draw_item : creature_spawn_instances_to_draw)
+      // [2026-07-24] PARALLEL CREATURE BONE-ANIMATE (DEFAULT ON; opt out NOGGIT_NO_PARALLEL_CREATURE_ANIMATE).
+      // The dense-city AnimateCPU cost is per-instance creature bone computation on the main thread. Thread
+      // it BY MODEL (each worker owns ALL instances of one Model -> disjoint bones[]/bone_matrices, no
+      // cross-worker clobber of per-Model state) with upload_bones=false (compute only, no GL on the worker;
+      // see the animate() CPU/GL split). FIRST CUT: only NON-mounted, NON-particle creatures are pre-computed
+      // -- mounted NPCs need live mount bones for rider seating, and particle creatures need per-instance
+      // emitter setup at draw time; both fall through to the serial draw below. The draw loop restores each
+      // precomputed set into bone_matrices + draws with skip_animate=true (upload + draw, no recompute).
+      static bool const s_parallel_creature = std::getenv("NOGGIT_NO_PARALLEL_CREATURE_ANIMATE") == nullptr;
+      std::size_t const n_creature_items = creature_spawn_instances_to_draw.size();
+      std::vector<std::vector<glm::mat4x4>> creature_precomputed_bones;
+      std::vector<char> creature_bones_ready;
+      if (s_parallel_creature && draw_model_animations && n_creature_items > 1)
       {
+        // Time the whole pre-pass (grouping + worker compute + join) into AnimateCPU so the profile shows
+        // the TRUE main-thread animate cost (parallelised) vs the old serial 5-10ms -- else it hides in WorldDraw.
+        noggit::perf::Scoped _prof_ca(noggit::perf::Phase::AnimateCPU);
+        creature_precomputed_bones.assign(n_creature_items, {});
+        creature_bones_ready.assign(n_creature_items, 0);
+        std::unordered_map<Model*, std::vector<std::size_t>> creature_by_model;
+        for (std::size_t i = 0; i < n_creature_items; ++i)
+        {
+          auto const& di = creature_spawn_instances_to_draw[i];
+          auto* inst = di.instance;
+          if (!inst || inst->model->loading_failed()) { continue; }
+          Model* m = inst->model.get();
+          if (!m->animated || !m->animBones) { continue; }                   // nothing to compute
+          if (di.spawn && di.spawn->mount_instance.has_value()) { continue; } // mount: serial (seat bones)
+          if (!m->_particles.empty()) { continue; }                          // particle: serial (emitter)
+          if (!draw_hidden_models && m->is_hidden()) { continue; }
+          creature_by_model[m].push_back(i);
+        }
+        std::vector<std::pair<Model*, std::vector<std::size_t>>> creature_groups(
+            creature_by_model.begin(), creature_by_model.end());
+        auto const animate_creature_group = [&](std::pair<Model*, std::vector<std::size_t>>& grp)
+        {
+          Model* const m = grp.first;
+          for (std::size_t idx : grp.second)
+          {
+            auto const& di = creature_spawn_instances_to_draw[idx];
+            auto* inst = di.instance;
+            int const c_animtime = di.spawn
+              ? static_cast<int>(_world->model_animtime) + di.spawn->animation_time_offset
+              : static_cast<int>(_world->model_animtime);
+            int anim_id = inst->forcedAnimationId() >= 0 ? inst->forcedAnimationId() : 0;
+            if (anim_id != 0 && !m->hasAnimationId(anim_id)) { anim_id = 0; }
+            m->_hand_overlay_active = inst->closeHands();
+            m->_active_idle_key = static_cast<std::uint64_t>(inst->uid);
+            m->animcalc = false;
+            m->animate(model_view * inst->transformMatrix(), anim_id, c_animtime, /*upload_bones=*/false);
+            creature_precomputed_bones[idx] = m->bone_matrices; // per-instance copy of the computed result
+            creature_bones_ready[idx] = 1;
+          }
+        };
+        std::size_t const ng = creature_groups.size();
+        unsigned const hw = std::max(2u, std::thread::hardware_concurrency());
+        std::size_t const nthreads = (ng <= 1) ? 1 : std::min<std::size_t>(hw, ng);
+        if (nthreads <= 1)
+        {
+          for (auto& g : creature_groups) { animate_creature_group(g); }
+        }
+        else
+        {
+          std::atomic<std::size_t> next{0};
+          std::vector<std::thread> pool;
+          pool.reserve(nthreads);
+          for (std::size_t t = 0; t < nthreads; ++t)
+          {
+            pool.emplace_back([&]
+            {
+              for (std::size_t gi = next.fetch_add(1); gi < ng; gi = next.fetch_add(1))
+              {
+                animate_creature_group(creature_groups[gi]);
+              }
+            });
+          }
+          for (auto& th : pool) { th.join(); }
+        }
+      }
+
+      for (std::size_t _ci = 0; _ci < n_creature_items; ++_ci)
+      {
+        auto const& draw_item = creature_spawn_instances_to_draw[_ci];
         auto* instance = draw_item.instance;
         if (!instance || instance->model->loading_failed())
         {
@@ -3644,6 +3725,13 @@ void WorldRender::draw (glm::mat4x4 const& model_view
             }
           }
 
+          // Parallel-animate: if this instance's bones were pre-computed on a worker thread, restore them
+          // and draw with skip_animate (upload + draw, no main-thread recompute). Else the serial path.
+          bool const use_precomputed_bones = _ci < creature_bones_ready.size() && creature_bones_ready[_ci];
+          if (use_precomputed_bones)
+          {
+            instance->model->bone_matrices = creature_precomputed_bones[_ci];
+          }
           instance->model->renderer()->draw(model_view
             , *instance
             , m2_shader
@@ -3657,6 +3745,7 @@ void WorldRender::draw (glm::mat4x4 const& model_view
             , /*bloom_mask_only*/ false
             , interior_light_at(instance->get_pos())
             , creature_fade
+            , /*skip_animate*/ use_precomputed_bones
           );
           ++_world->_n_rendered_objects;
 

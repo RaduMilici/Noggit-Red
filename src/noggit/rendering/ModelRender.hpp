@@ -141,6 +141,9 @@ namespace Noggit::Rendering
         , glm::vec4 const& interior_light = glm::vec4(0.f)
         // Cull-range fade alpha for this instance (client 2000 ms fade; 1.0 = fully shown).
         , float dist_fade = 1.0f
+        // skip_animate: bones were pre-computed for this instance on a worker thread (creature parallel-
+        // animate pre-pass) and already restored into _model->bone_matrices -- upload them, don't recompute.
+        , bool skip_animate = false
     );
 
     void draw (glm::mat4x4 const& model_view

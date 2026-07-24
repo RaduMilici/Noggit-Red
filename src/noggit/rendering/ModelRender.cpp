@@ -347,6 +347,7 @@ void ModelRender::draw(glm::mat4x4 const& model_view
     , bool bloom_mask_only
     , glm::vec4 const& interior_light
     , float dist_fade
+    , bool skip_animate
 )
 {
   if (!_model->finishedLoading() || _model->loading_failed())
@@ -366,7 +367,7 @@ void ModelRender::draw(glm::mat4x4 const& model_view
     upload();
   }
 
-  if (_model->animated && (!_model->animcalc || _model->_per_instance_animation))
+  if (!skip_animate && _model->animated && (!_model->animcalc || _model->_per_instance_animation))
   {
     int anim_id = instance.forcedAnimationId() >= 0 ? instance.forcedAnimationId() : 0;
     // A forced animation may not exist on this model. Fall back to Stand(0) so animate() never indexes a
@@ -393,6 +394,13 @@ void ModelRender::draw(glm::mat4x4 const& model_view
       _model->animate(model_view * instance.transformMatrix(), anim_id, animtime);
     }
     _model->animcalc = true;
+  }
+  else if (skip_animate && _model->animated && !_model->bone_matrices.empty())
+  {
+    // Bones were computed for this instance on a worker thread (creature parallel-animate pre-pass) and the
+    // caller has already restored them into _model->bone_matrices. Just upload the TBO here (GL, main
+    // thread) -- no recompute. animcalc stays as-is; the caller owns per-instance bone state this frame.
+    updateBoneMatrices();
   }
 
   OpenGL::Scoped::vao_binder const _(_vao);
