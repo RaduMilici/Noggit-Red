@@ -2589,7 +2589,7 @@ bool Model::advanceIdleSchedule(int anim_id, long long anim_time,
   return true;
 }
 
-void Model::animate(glm::mat4x4 const& model_view, int anim_id, int anim_time)
+void Model::animate(glm::mat4x4 const& model_view, int anim_id, int anim_time, bool upload_bones)
 {
   if (!_logged_animation_branch && classic_m2_debug_enabled())
   {
@@ -2614,7 +2614,7 @@ void Model::animate(glm::mat4x4 const& model_view, int anim_id, int anim_time)
       _anim_time = 0;
       _global_animtime = anim_time;
       calcClassicStaticBones(model_view);
-      _renderer.updateBoneMatrices();
+      if (upload_bones) { _renderer.updateBoneMatrices(); } // GL: main-thread only (see upload_bones doc)
       for (auto& particle : _particles)
       {
         particle.setup(_current_anim_seq, _anim_time, _global_animtime);
@@ -2762,7 +2762,7 @@ void Model::animate(glm::mat4x4 const& model_view, int anim_id, int anim_time)
                << "'" << std::endl;
     }
 
-    _renderer.updateBoneMatrices();
+    if (upload_bones) { _renderer.updateBoneMatrices(); } // GL: main-thread only (see upload_bones doc)
 
     if (capture_m2_animation_debug_enabled()
         && _file_key.filepath().find("gnomemachine") != std::string::npos)

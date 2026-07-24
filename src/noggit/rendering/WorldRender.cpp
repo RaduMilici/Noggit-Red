@@ -3298,7 +3298,10 @@ void WorldRender::draw (glm::mat4x4 const& model_view
                 if (g.has_bones)
                 {
                   if (draw_model_animations) { pmodel->animcalc = false; }
-                  pmodel->animate(model_view * g.transforms[di], 0, static_cast<int>(_world->model_animtime));
+                  // upload_bones=false: compute bones on this worker thread but DON'T touch GL. The bake
+                  // copies bone_matrices into big_bones below; the per-model TBO is unused by the instanced
+                  // draw, so its upload was both redundant AND the GL-on-worker-thread crash (SIGABRT).
+                  pmodel->animate(model_view * g.transforms[di], 0, static_cast<int>(_world->model_animtime), false);
                   g.big_bones.insert(g.big_bones.end(), pmodel->bone_matrices.begin(), pmodel->bone_matrices.end());
                 }
                 if (draw_model_animations && !pmodel->_particles.empty())
@@ -3312,10 +3315,11 @@ void WorldRender::draw (glm::mat4x4 const& model_view
               }
             };
 
-            // DEFAULT SERIAL for now -- the parallel path crashed (SIGABRT) on Karazhan load; a worker is
-            // throwing, so animate()/particle sim touches shared state beyond per-Model after all. Opt-in
-            // via NOGGIT_PARALLEL_PIB_ANIMATE=1 while that's traced. The serial branch is the original order.
-            static bool const s_parallel_pib = std::getenv("NOGGIT_PARALLEL_PIB_ANIMATE") != nullptr;
+            // DEFAULT PARALLEL (2026-07-24): the SIGABRT was animate() doing a GL bone-TBO upload on the
+            // worker thread -- NOT "shared state beyond per-Model". Fixed by the upload_bones=false split
+            // (compute bones on the worker, touch no GL; the instanced draw uses big_bones, not the per-model
+            // TBO). User-validated at Karazhan: no crash. Opt OUT with NOGGIT_NO_PARALLEL_PIB_ANIMATE=1.
+            static bool const s_parallel_pib = std::getenv("NOGGIT_NO_PARALLEL_PIB_ANIMATE") == nullptr;
             std::size_t const ng = pib_groups.size();
             unsigned const hw = std::max(2u, std::thread::hardware_concurrency());
             std::size_t const nthreads = (!s_parallel_pib || ng <= 1) ? 1 : std::min<std::size_t>(hw, ng);

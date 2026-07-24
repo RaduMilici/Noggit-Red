@@ -373,7 +373,10 @@ private:
   bool initClassicStaticBones(const BlizzardArchive::ClientFile& f);
   void calcClassicStaticBones(glm::mat4x4 const& model_view);
 
-  void animate(glm::mat4x4 const& model_view, int anim_id, int anim_time);
+  // upload_bones: when false, compute the bone matrices into bone_matrices[] but DO NOT touch GL (skip the
+  // updateBoneMatrices TBO upload). This lets the CPU bone math run on a worker thread; the caller uploads
+  // on the main thread afterwards. Default true preserves every single-threaded caller unchanged.
+  void animate(glm::mat4x4 const& model_view, int anim_id, int anim_time, bool upload_bones = true);
   void calcBones(glm::mat4x4 const& model_view, int anim, int time, int animation_time);
 
   void lightsOn(OpenGL::light lbase);
