@@ -3104,8 +3104,14 @@ void WorldRender::draw (glm::mat4x4 const& model_view
         // is now the client's real mechanism -- the individual path below, material-sorted (doc 23
         // technique #2, the std::sort at ~line 3125). The STATIC-doodad bucket instancing (SubmitInst
         // above, = client Path A) is a SEPARATE path and stays on. Opt into the (still-buggy) instanced
-        // billboard path with NOGGIT_INSTANCED_DOODADS=1 ONLY to develop the separate-VAO fix.
-        static bool const s_inst_doodads = std::getenv("NOGGIT_INSTANCED_DOODADS") != nullptr;
+        // billboard path. NOW DEFAULT ON (2026-07-23): GpuWait proved we are CPU-BOUND on draw submission, so
+        // instancing the animated doodads to cut draw-call count is a big win (SubmitIndiv ~15->~2.8ms, WorldDraw
+        // ~40->~13ms, Timbermaw ~11->~45fps) -- the client (D3D9-cheap submission) doesn't bother, but we must.
+        // The recurring Timbermaw BLACK was a premature GL bone-TBO upload during the per-instance bake (FIXED in
+        // ModelRender::updateBoneMatrices via a buffer-existence guard), NOT the shared VAO. A separate sporadic
+        // GL_INVALID_OPERATION remains (a benign RACE the per-call check masks; no visual corruption) -- watch it.
+        // Opt OUT with NOGGIT_NO_INSTANCED_DOODADS=1 if a scene ever blacks.
+        static bool const s_inst_doodads = std::getenv("NOGGIT_NO_INSTANCED_DOODADS") == nullptr;
         if (!per_instance_wmo_doodads.empty() && !s_inst_doodads)
         {
           OpenGL::Scoped::use_program doodad_shader {*_m2_program.get()};
