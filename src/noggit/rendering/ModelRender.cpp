@@ -1689,6 +1689,14 @@ void ModelRender::updateBoneMatrices()
              << std::endl;
   }
 
+  // GUARD (2026-07-23): only upload when the GL bone buffer + texture actually exist. The instanced
+  // billboard bake (WorldRender ~3295) calls animate() PER INSTANCE to compute CPU bones BEFORE
+  // ModelRender::draw() runs upload(), so both are still 0 here -> bufferData(GL_TEXTURE_BUFFER) on the 0
+  // buffer = GL_INVALID_OPERATION, corrupting GL state -> the Timbermaw billboard doodads render BLACK
+  // (masked only by the per-call glGetError sync). The bake reads the CPU bone_matrices directly and
+  // uploads bones per-group inside draw(), so this per-instance GL upload is both unneeded AND harmful
+  // here -- skip it until the buffers exist (the real per-instance/creature uploads run after upload()).
+  if (_bone_matrices_buf_tex != 0 && _bone_matrices_buffer != 0)
   {
     OpenGL::Scoped::buffer_binder<GL_TEXTURE_BUFFER> const binder (_bone_matrices_buffer);
     // Orphan-on-upload (perf 2026-07-20). The per-instance doodad/creature path re-uploads this SHARED
