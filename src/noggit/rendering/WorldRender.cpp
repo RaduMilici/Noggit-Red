@@ -4557,6 +4557,15 @@ void WorldRender::draw (glm::mat4x4 const& model_view
     OpenGL::texture::set_active_texture(0);
     particles_shader.uniform("tex", 0);
 
+    // [PERF 2026-07-24] Particle draw-distance cull. Particles are small; the client draws them only up
+    // close, but noggit simulated + drew EVERY emitter across a whole city -- Stormwind's hundreds of
+    // torches/fountains cost 5-11ms (M2Particles). Skip emitters past NOGGIT_PARTICLE_DIST yards (default
+    // 250; a flame is ~1px there), applied in BOTH the threaded sim and the main-thread draw below.
+    static float const s_particle_dist2 = [] { char const* e = std::getenv("NOGGIT_PARTICLE_DIST");
+      float const d = e ? static_cast<float>(std::atof(e)) : 250.0f; return d * d; }();
+    auto const particle_too_far = [&](glm::vec3 const& p) -> bool
+    { glm::vec3 const d = p - camera_pos; return glm::dot(d, d) > s_particle_dist2; };
+
     // Particles OWN the bloom mask under themselves now (alpha write ON). Each particle's blend uses
     // glBlendFuncSeparate (see Particle.cpp) so its RGB is unchanged but its alpha MULTIPLIES the mask by
     // (1 - coverage): a bright additive fire erases the emissive mask it would otherwise inherit from the
@@ -4604,6 +4613,7 @@ void WorldRender::draw (glm::mat4x4 const& model_view
           for (auto const& transform : mit->second)
           {
             glm::vec3 const inst_pos(transform[3]);
+            if (particle_too_far(inst_pos)) { continue; } // [PERF] skip the sim for far emitters too
             std::uint64_t key = 0x517CC1B727220A95ull;
             key = mix(key, static_cast<std::int64_t>(std::llround(inst_pos.x * 8.0f)));
             key = mix(key, static_cast<std::int64_t>(std::llround(inst_pos.y * 8.0f)));
@@ -4655,6 +4665,7 @@ void WorldRender::draw (glm::mat4x4 const& model_view
         for (auto const& transform : it.second)
         {
           glm::vec3 const inst_pos(transform[3]);
+          if (particle_too_far(inst_pos)) { continue; } // [PERF] skip drawing far emitters' particles
           // Stable per-placement key from the (static) doodad position.
           auto mix = [](std::uint64_t h, std::int64_t v)
           {
@@ -4700,6 +4711,7 @@ void WorldRender::draw (glm::mat4x4 const& model_view
       // Only swap it in when animations are on -- otherwise fall through to the shared frozen state so
       // particles freeze in place (matching the body, which also freezes) when animations are toggled off.
       Model* pmodel = instance->model.get();
+      if (particle_too_far(instance->get_pos())) { continue; } // [PERF] skip far creature-effect particles
       bool const use_instance_state = draw_model_animations && draw_item.spawn;
       if (use_instance_state)
       {
@@ -4758,6 +4770,7 @@ void WorldRender::draw (glm::mat4x4 const& model_view
         }
         if (!_dptr) { continue; } // defensive: cache pointers are never null in practice
         ModelInstance& doodad = *_dptr;
+        if (particle_too_far(doodad.get_pos())) { continue; } // [PERF] skip far per-instance doodad particles
         Model* pmodel = doodad.model.get();
         if (!pmodel || !pmodel->finishedLoading() || pmodel->loading_failed()
             || (!draw_hidden_models && pmodel->is_hidden())
