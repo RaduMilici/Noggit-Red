@@ -1531,7 +1531,10 @@ namespace
             : item_display.getUInt(ItemDisplayInfoDB::HelmetGeosetVis1);
           if (helmet_vis != 0)
           {
-            hide_geoset_family(selection, CharacterGeosetFamily::SkinOrHairStyle);
+            // Bald under the helm: set group 0 to geoset 0 (no hair) rather than hide_geoset_family, which
+            // would drop geoset 0 too -- and the base BODY submesh is geoset 0 (family 0), so hiding the whole
+            // family left unarmored NPCs (naked/underwear dwarves) with NO body. [2026-07-25 regression fix]
+            assign_geoset_selection(selection, CharacterGeosetFamily::SkinOrHairStyle, 0, false);
             debug << " helmetHidHair=" << helmet_vis;
           }
           else
@@ -2154,10 +2157,15 @@ namespace
                                                               hair_style_id,
                                                               hair_color_id,
                                                               hair_color_id);
+            // FIX (2026-07-25): the facial-hair TEXTURE section is keyed like the Hair section --
+            // VariationIndex = the facial-hair STYLE, ColorIndex = the hair color -- but this passed the hair
+            // COLOR as the variation, so any NPC whose facial-hair style != hair color got the wrong row (or
+            // none) and rendered a missing/mismatched beard. facial_hair_id already drives the beard GEOSET;
+            // use it for the texture variation too, with hair_color_id as the colour.
             facial_hair_section = resolve_character_section_textures(race_id,
                                                                      sex_id,
                                                                      CharacterSectionType::FacialHair,
-                                                                     hair_color_id,
+                                                                     facial_hair_id,
                                                                      hair_color_id,
                                                                      hair_color_id);
             underwear_section = resolve_character_section_textures(race_id,
