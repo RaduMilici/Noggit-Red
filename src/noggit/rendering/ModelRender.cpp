@@ -798,7 +798,13 @@ void ModelRender::draw(glm::mat4x4 const& model_view
     {
       glm::vec4 const inter = (i < instance_interior.size()) ? instance_interior[i] : glm::vec4(0.f);
       float const fade_raw = (i < instance_fades.size()) ? instance_fades[i] : 1.0f;
-      float fade = std::round(std::clamp(fade_raw, 0.0f, 1.0f) * 64.0f) / 64.0f;
+      // [PERF 2026-07-25] Quantize the cull-fade to 1/8 (was 1/64) for GROUPING ONLY. Instances are batched
+      // into one instanced draw per distinct (interior, fade) value; ground clutter (grass/flowers, 2000+
+      // instances) at the distance-fade ring was splitting into ~48 tiny groups by exact fade -> ~48
+      // bufferData+draw(+depth-prepass) calls per model, the dominant SubmitInst cost. 1/8 collapses the ring
+      // to ~8 alpha steps (imperceptible on distant fogged clutter) and ~5x fewer draws. The opaque bulk
+      // (fade==1, most instances) is one draw either way.
+      float fade = std::round(std::clamp(fade_raw, 0.0f, 1.0f) * 8.0f) / 8.0f;
       if (fade <= 0.0f)
       {
         // hold the faintest visible step until the raw alpha is truly imperceptible, so the final
