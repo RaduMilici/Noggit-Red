@@ -8505,6 +8505,17 @@ void MapView::tick (float dt)
     _rotation_editor_need_update = false;
   }
 
+  // [PERF 2026-07-25] Throttle the status-bar + area / zone-music / detail-widget / db-status display refresh
+  // to ~10Hz. All of it is human-readable status (coords, area name, FPS, loaded/rendered counts, zone-music
+  // polling, the selection detail widget, water UI) that nobody perceives faster than that -- yet it ran EVERY
+  // frame and cost ~4ms of the tick in Stormwind (QLabel setText churn + getAreaID / getZoneMusic DBC lookups
+  // + updateDetailInfos). Camera movement and edit actions are handled ABOVE this gate, so they're unaffected.
+  static double s_status_accum = 0.0;
+  s_status_accum += dt;
+  if (s_status_accum >= 0.1)
+  {
+    s_status_accum = 0.0;
+
   QString status;
   status += ( QString ("tile: %1 %2")
             . arg (std::floor (_camera.position.x / TILESIZE))
@@ -8624,6 +8635,7 @@ void MapView::tick (float dt)
   updateDatabaseStatus();
 
   guiWater->updatePos (_camera.position);
+  } // end ~10Hz status-display throttle
 }
 
 glm::vec4 MapView::normalized_device_coords (int x, int y) const

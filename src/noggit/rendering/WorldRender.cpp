@@ -4663,7 +4663,8 @@ void WorldRender::draw (glm::mat4x4 const& model_view
     bool const threaded_sim = s_parallel_particle_sim && draw_model_animations && !model_with_particles.empty();
     if (threaded_sim)
     {
-      noggit::perf::Scoped _prof_simthr(noggit::perf::Phase::M2Particles);
+      // NOTE: no perf::Scoped here -- this threaded sim is already inside the outer M2Particles scope
+      // (_prof_part); adding one double-counted the sim into M2Particles. [2026-07-25]
       std::vector<Model*> sim_models;
       sim_models.reserve(model_with_particles.size());
       for (auto& mp : model_with_particles)
