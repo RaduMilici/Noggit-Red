@@ -1227,13 +1227,11 @@ namespace
                                    race_id,
                                    sex_id);
 
-      append_item_attachment_specs(attachments,
-                                   ranged_display_id,
-                                   "weapon",
-                                   static_cast<int>(CharacterAttachmentId::RightBackSheath),
-                                   -1,
-                                   race_id,
-                                   sex_id);
+      // RANGED weapon (gun/bow/crossbow) back-sheath: SUPPRESSED (2026-07-25, user request). The ranged
+      // item was force-attached to the RightBackSheath so every ranged NPC showed a weapon slung across its
+      // back; the user does not want those rendered. Re-enable by restoring the append below (attach
+      // ranged_display_id at CharacterAttachmentId::RightBackSheath).
+      (void)ranged_display_id;
     }
     catch (DBCFile::NotFound const&)
     {
