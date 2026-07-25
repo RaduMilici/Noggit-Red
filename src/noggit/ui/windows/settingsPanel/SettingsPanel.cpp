@@ -228,9 +228,10 @@ namespace Noggit
                 });
       }
 
-      // Fog distance scale (live): multiplies the authored fog start/end distances (zone fog AND WMO
-      // room fog). 1.0 = client-authored distances; >1 pushes the fog band out for editing visibility.
-      // Purely visual -- fog never affects render distance.
+      // Fog distance scale (live): multiplies the authored fog start/end distances. SEPARATE OUTDOOR (zone
+      // fog) and INDOOR (WMO room fog) sliders (2026-07-25) -- the renderer applies the one matching whether
+      // the camera is inside a WMO. 1.0 = client-authored distances; >1 pushes the fog band out for editing
+      // visibility. Purely visual -- fog never affects render distance.
       {
         auto* fs_label = new QLabel(this);
         auto* fs_slider = new QSlider(Qt::Horizontal, this);
@@ -239,13 +240,34 @@ namespace Noggit
         fs_slider->setMaximum(500);
         int const init_fs = static_cast<int>(_settings->value("fog_distance_scale", 2.0f).toFloat() * 100.f);
         fs_slider->setValue(std::clamp(init_fs, 10, 500));
-        fs_label->setText(tr("Fog distance scale: %1x").arg(fs_slider->value() / 100.0, 0, 'f', 2));
+        fs_label->setText(tr("Outdoor fog distance scale: %1x").arg(fs_slider->value() / 100.0, 0, 'f', 2));
         _perf_layout->addWidget(fs_label);
         _perf_layout->addWidget(fs_slider);
         connect(fs_slider, &QSlider::valueChanged, [this, fs_label](int v)
                 {
-                  fs_label->setText(tr("Fog distance scale: %1x").arg(v / 100.0, 0, 'f', 2));
+                  fs_label->setText(tr("Outdoor fog distance scale: %1x").arg(v / 100.0, 0, 'f', 2));
                   _settings->setValue("fog_distance_scale", v / 100.0f);
+                  _settings->sync();
+                });
+      }
+
+      // Indoor (WMO) fog distance scale (live): same as above but applied only while the camera is inside a
+      // WMO, so interior fog depth can be tuned independently of the outdoor zone fog.
+      {
+        auto* fsi_label = new QLabel(this);
+        auto* fsi_slider = new QSlider(Qt::Horizontal, this);
+        fsi_slider->setObjectName("_fog_distance_scale_interior_slider");
+        fsi_slider->setMinimum(10);
+        fsi_slider->setMaximum(500);
+        int const init_fsi = static_cast<int>(_settings->value("fog_distance_scale_interior", 2.0f).toFloat() * 100.f);
+        fsi_slider->setValue(std::clamp(init_fsi, 10, 500));
+        fsi_label->setText(tr("Indoor fog distance scale: %1x").arg(fsi_slider->value() / 100.0, 0, 'f', 2));
+        _perf_layout->addWidget(fsi_label);
+        _perf_layout->addWidget(fsi_slider);
+        connect(fsi_slider, &QSlider::valueChanged, [this, fsi_label](int v)
+                {
+                  fsi_label->setText(tr("Indoor fog distance scale: %1x").arg(v / 100.0, 0, 'f', 2));
+                  _settings->setValue("fog_distance_scale_interior", v / 100.0f);
                   _settings->sync();
                 });
       }

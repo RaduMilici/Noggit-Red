@@ -760,22 +760,23 @@ void WorldRender::draw (glm::mat4x4 const& model_view
 
   gl.disable(GL_DEPTH_TEST);
 
-  if (!minimap_render)
-    updateLightingUniformBlock(draw_fog, camera_pos);
-  else
-    updateLightingUniformBlockMinimap(minimap_render_settings);
-
   // Cache "camera inside a WMO" for this frame -- the WMO shader (camera_inside_wmo uniform) uses it to
   // light exterior-lit / portal-spill faces from the WMO's own interior context instead of the outdoor map
   // light when viewed from inside. Ironforge's building fronts + gryphon tunnels were getting Dun Morogh
   // daylight because no Light.dbc row sits inside a city WMO. Guarded like the sibling camera_is_* calls,
-  // which can throw while a tile streams in.
+  // which can throw while a tile streams in. Computed BEFORE updateLightingUniformBlock (2026-07-25) so the
+  // fog block picks the INTERIOR vs OUTDOOR fog-distance scale for THIS frame, not a frame stale.
   _camera_inside_wmo = false;
   if (!minimap_render)
   {
     try { _camera_inside_wmo = _world->camera_is_inside_wmo(camera_pos); }
     catch (...) { _camera_inside_wmo = false; }
   }
+
+  if (!minimap_render)
+    updateLightingUniformBlock(draw_fog, camera_pos);
+  else
+    updateLightingUniformBlockMinimap(minimap_render_settings);
 
   // Bloom: render the whole 3D scene into an offscreen colour target first, so afterwards we can pull
   // out the bright areas, blur them and add them back (the glow/bleed of bright sky openings, light
@@ -1195,9 +1196,11 @@ void WorldRender::draw (glm::mat4x4 const& model_view
   // The fog band itself still hides geometry past the fog end visually; the shader fog is the sole
   // fog effect.
   _terrain_cull_distance = _view_distance;
-  // Editor lever: scales the authored fog start/end distances (zone + WMO room fog), default 1.0 =
-  // client-authored. Applied in updateLightingUniformBlock and WMORender's per-group fog.
+  // Editor levers: scale the authored fog start/end distances, default 2.0. SEPARATE outdoor (zone) vs
+  // indoor (WMO) multipliers (2026-07-25) -- updateLightingUniformBlock picks the one matching whether the
+  // camera is inside a WMO. Applied there + in WMORender's per-group fog (via fogDistanceScale()).
   _fog_distance_scale = _world->_settings->value("fog_distance_scale", 2.0f).toFloat();
+  _fog_distance_scale_interior = _world->_settings->value("fog_distance_scale_interior", 2.0f).toFloat();
   // Object render distance: its own slider, defaulting to the view distance (so first run / unset =
   // old behaviour). Clamped to the terrain distance -- objects past the terrain/fog horizon would just
   // float in the void, so there's no point drawing them further than the world itself renders.
@@ -5688,9 +5691,11 @@ void WorldRender::updateLightingUniformBlock(bool draw_fog, glm::vec3 const& cam
   // jumps to it whenever this underground zone light becomes nearest-dominant (the trace shows both regimes:
   // -125/416.67 overblown and 0/1200 clear). An earlier std::max(0,fog_start) clamp here forced the start to
   // 0 and made noggit SOFTER than the client -- removed so noggit is bit-exact to the traced client fog.
-  // Editor fog-distance scale (Settings, default 1.0 = client-authored). fog_start is a fraction of
-  // fog_end, so scaling the end stretches the whole band uniformly.
-  fog_end *= _fog_distance_scale;
+  // Editor fog-distance scale (Settings, default 2.0). Pick the INTERIOR (WMO) multiplier when the camera
+  // is inside a WMO, else the OUTDOOR (zone) one; store it so WMORender's per-group fog (fogDistanceScale())
+  // uses the SAME band. fog_start is a fraction of fog_end, so scaling the end stretches the whole band.
+  _active_fog_distance_scale = _camera_inside_wmo ? _fog_distance_scale_interior : _fog_distance_scale;
+  fog_end *= _active_fog_distance_scale;
 
   // NOTE (trace: wow_cap_kara_cull_fog, per-draw fog attribution): the client does NOT override the
   // scene fog when the camera enters a WMO. Fog is PER-REGION within the frame -- terrain/doodads keep
@@ -5719,7 +5724,7 @@ void WorldRender::updateLightingUniformBlock(bool draw_fog, glm::vec3 const& cam
       glm::vec3 cam_color = fog_color;
       float cam_end = fog_end;
       float cam_start_abs = fog_start * fog_end;
-      _world->collect_camera_fog(camera_pos, _fog_distance_scale, cam_color, cam_end, cam_start_abs);
+      _world->collect_camera_fog(camera_pos, _active_fog_distance_scale, cam_color, cam_end, cam_start_abs);
       fog_color = cam_color;
       fog_end = std::min(cam_end, _view_distance);
       fog_start = (fog_end > 0.001f) ? (cam_start_abs / fog_end) : fog_start;
@@ -5735,7 +5740,7 @@ void WorldRender::updateLightingUniformBlock(bool draw_fog, glm::vec3 const& cam
     {
       LogError << "FOGFINAL pos=(" << camera_pos.x << "," << camera_pos.y << "," << camera_pos.z << ")"
                << " raw_end(/36)=" << _skies->fog_distance_end()
-               << " scale=" << _fog_distance_scale
+               << " scale=" << _active_fog_distance_scale
                << " view_dist=" << _view_distance
                << " -> FOG_END=" << fog_end
                << " fog_start_abs=" << (fog_start * fog_end)
@@ -5807,8 +5812,8 @@ void WorldRender::updateLightingUniformBlock(bool draw_fog, glm::vec3 const& cam
       {
         env_w = 1.0f;
         env_color = mf_color;
-        env_end = std::min(mf_end * _fog_distance_scale, _view_distance);
-        env_start_abs = mf_start * _fog_distance_scale;
+        env_end = std::min(mf_end * _active_fog_distance_scale, _view_distance);
+        env_start_abs = mf_start * _active_fog_distance_scale;
       }
 
       // DIAGNOSTIC (NOGGIT_LIGHT_DEBUG): the ENTITY fog fed to M2/doodads. env_w=1 => doodads use this

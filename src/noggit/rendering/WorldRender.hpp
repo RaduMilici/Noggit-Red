@@ -127,9 +127,12 @@ namespace Noggit::Rendering
       end = _lighting_ubo_data.AmbientColor_FogEnd.w;
     }
 
-    // Editor fog-distance multiplier ("fog_distance_scale" setting, default 1.0 = client-authored).
-    // The zone fog in the UBO already has it applied; WMORender applies it to per-group MFOG.
-    float fogDistanceScale() const { return _fog_distance_scale; }
+    // Editor fog-distance multiplier. There are now TWO (2026-07-25): "fog_distance_scale" for OUTDOOR
+    // (zone) fog and "fog_distance_scale_interior" for INDOOR (WMO) fog. updateLightingUniformBlock picks
+    // the one matching _camera_inside_wmo each frame and stores it in _active_fog_distance_scale; the zone
+    // fog in the UBO already has it applied, and WMORender reads this getter for per-group MFOG so WMO
+    // geometry matches the scene's active fog band.
+    float fogDistanceScale() const { return _active_fog_distance_scale; }
 
   private:
 
@@ -163,7 +166,9 @@ namespace Noggit::Rendering
     float _cull_distance;         // how far OBJECTS/WMOs/models render (Object Render Distance slider), clamped to terrain
     float _terrain_cull_distance; // how far TERRAIN/horizon/sky render = view distance; fog never affects it
     float _view_distance;
-    float _fog_distance_scale = 1.0f;
+    float _fog_distance_scale = 1.0f;          // OUTDOOR (zone) fog distance multiplier
+    float _fog_distance_scale_interior = 1.0f; // INDOOR (WMO) fog distance multiplier
+    float _active_fog_distance_scale = 1.0f;   // whichever of the two matches _camera_inside_wmo this frame
 
     // Ground clutter (checklist 14.1): persistent model refs for detail doodads, keyed by path, so
     // the handful of shared grass/pebble M2s stay resident while the camera moves.
