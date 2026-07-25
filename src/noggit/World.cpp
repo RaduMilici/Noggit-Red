@@ -1518,7 +1518,27 @@ namespace
       };
 
       apply_item("head", display_extra.getUInt(CreatureDisplayInfoExtraDB::HeadDisplayID),
-        [&](DBCFile::Record const&){});
+        [&](DBCFile::Record const& item_display)
+        {
+          // Hide the hair under a helmet (2026-07-25 -- this callback was empty, so hair poked through every
+          // helmeted NPC). 1.12 ItemDisplayInfo.HelmetGeosetVis[sex] indexes HelmetGeosetVisData (exactly
+          // which geoset groups the helm hides). That DBC isn't wrapped here, so use the robust rule that a
+          // NON-ZERO HelmetGeosetVis means the helm covers the head -> hide the hair geoset (group 0). Open
+          // helms / circlets that keep hair carry HelmetGeosetVis 0 and are left untouched. (If a specific
+          // helm over-/under-hides, wire HelmetGeosetVisData for per-helm hair/facial/ear precision.)
+          auto const helmet_vis = (sex_id == 1)
+            ? item_display.getUInt(ItemDisplayInfoDB::HelmetGeosetVis2)
+            : item_display.getUInt(ItemDisplayInfoDB::HelmetGeosetVis1);
+          if (helmet_vis != 0)
+          {
+            hide_geoset_family(selection, CharacterGeosetFamily::SkinOrHairStyle);
+            debug << " helmetHidHair=" << helmet_vis;
+          }
+          else
+          {
+            debug << " helmetKeepsHair=1";
+          }
+        });
 
       apply_item("shirt", display_extra.getUInt(CreatureDisplayInfoExtraDB::ShirtDisplayID),
         [&](DBCFile::Record const& item_display)
