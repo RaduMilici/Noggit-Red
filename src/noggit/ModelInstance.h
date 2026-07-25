@@ -77,7 +77,8 @@ public:
     , size_cat (other.size_cat)
     , _need_recalc_extents(other._need_recalc_extents)
     , _forced_anim_id(other._forced_anim_id)
-    , _close_hands(other._close_hands)
+    , _close_hand_main(other._close_hand_main)
+    , _close_hand_off(other._close_hand_off)
     , _replace_textures(std::move(other._replace_textures))
     , _show_geosets(std::move(other._show_geosets))
     , _visible_geoset_ids(std::move(other._visible_geoset_ids))
@@ -106,7 +107,8 @@ public:
     std::swap (size_cat, other.size_cat);
     std::swap (_need_recalc_extents, other._need_recalc_extents);
     std::swap (_forced_anim_id, other._forced_anim_id);
-    std::swap (_close_hands, other._close_hands);
+    std::swap (_close_hand_main, other._close_hand_main);
+    std::swap (_close_hand_off, other._close_hand_off);
     std::swap (_replace_textures, other._replace_textures);
     std::swap (_show_geosets, other._show_geosets);
     std::swap (_visible_geoset_ids, other._visible_geoset_ids);
@@ -190,17 +192,21 @@ public:
   void setForcedAnimationId(int anim_id) { _forced_anim_id = anim_id; }
   [[nodiscard]] int forcedAnimationId() const { return _forced_anim_id; }
 
-  // Weapon grip: when true, the model overlays the HandsClosed pose onto the finger bones only (fist
-  // closes around a held weapon) while the body keeps its normal idle. See Model::applyHandGripOverlay.
-  void setCloseHands(bool v) { _close_hands = v; }
-  [[nodiscard]] bool closeHands() const { return _close_hands; }
+  // Weapon grip: overlay the HandsClosed pose onto the finger bones only (fist closes around a held weapon)
+  // while the body keeps its normal idle. PER-HAND (2026-07-25): main = right/mainhand, off = left/offhand,
+  // so an empty hand stays open. See Model::applyHandGripOverlay.
+  void setCloseHandMain(bool v) { _close_hand_main = v; }
+  void setCloseHandOff(bool v) { _close_hand_off = v; }
+  [[nodiscard]] bool closeHandMain() const { return _close_hand_main; }
+  [[nodiscard]] bool closeHandOff() const { return _close_hand_off; }
 
 protected:
   bool _need_recalc_extents = true;
   bool _need_gpu_transform_update = true;
   std::uint32_t _gpu_transform_uid;
   int _forced_anim_id = -1;
-  bool _close_hands = false;
+  bool _close_hand_main = false;
+  bool _close_hand_off = false;
   std::map<std::size_t, scoped_blp_texture_reference> _replace_textures;
   std::vector<bool> _show_geosets;
   std::vector<std::uint16_t> _visible_geoset_ids;

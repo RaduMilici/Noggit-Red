@@ -3409,16 +3409,14 @@ std::vector<std::pair<std::size_t, std::string>> World::applyCreatureSpawnModelA
     }
   }
 
-  // Hand grip on a held weapon. A creature with an in-hand weapon must close its fist around the grip;
-  // the default Stand (animID 0) leaves the hand open, so a drawn weapon floats in an open palm. The
-  // client keeps the BODY on its normal breathing idle and overlays the HandsClosed (animID 15) pose
-  // onto the FINGER bones only (HandsClosed is a single-frame pose that also keys the arms/shoulders,
-  // so it must NOT be played as a whole idle -- that freezes the body). We flag the instance; the model
-  // applies the finger-only overlay in calcBones (see Model::applyHandGripOverlay).
-  if (spawn.mainhand_display_id != 0)
-  {
-    model_instance.setCloseHands(true);
-  }
+  // Hand grip on a held item. A hand holding a weapon/shield must close its fist around the grip; the
+  // default Stand (animID 0) leaves the hand open, so a drawn weapon floats in an open palm. The client
+  // keeps the BODY on its normal breathing idle and overlays the HandsClosed (animID 15) pose onto the
+  // FINGER bones only. PER-HAND (2026-07-25): close the MAINHAND (right) fist only when a mainhand item is
+  // present and the OFFHAND (left) only when an offhand item is present -- an empty hand stays open (a
+  // mainhand weapon used to wrongly close BOTH hands). See Model::applyHandGripOverlay.
+  model_instance.setCloseHandMain(spawn.mainhand_display_id != 0);
+  model_instance.setCloseHandOff(spawn.offhand_display_id != 0);
 
   return overrides;
 }

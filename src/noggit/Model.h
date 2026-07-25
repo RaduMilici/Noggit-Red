@@ -394,13 +394,17 @@ private:
   std::map<uint16_t, std::map<uint16_t, ModelAnimation>> _animations_seq_per_id;
   std::map<int16_t, uint32_t> _animation_length;
 
-  // Weapon-grip hand overlay. When _hand_overlay_active (set per-draw from ModelInstance::closeHands),
-  // calcBones runs the normal body pass then re-poses ONLY the finger-subtree bones from the HandsClosed
-  // sequence so a held weapon gets a closed fist while the body keeps its idle. _hand_overlay_bones is
-  // built once at load = finger bones (KeyBoneID 8..17) + their descendants, in parents-first order.
-  // The HandsClosed sequence index is resolved from _animations_seq_per_id[15] at apply time.
-  bool _hand_overlay_active = false;
+  // Weapon-grip hand overlay. When active (set per-draw from ModelInstance::closeHandMain/Off), calcBones
+  // runs the normal body pass then re-poses ONLY the finger-subtree bones from the HandsClosed sequence so a
+  // held weapon gets a closed fist while the body keeps its idle. _hand_overlay_bones is built once at load =
+  // finger bones (KeyBoneID 8..17) + their descendants, parents-first; _hand_overlay_bone_is_off tags each
+  // as MAINHAND/right (kb 8-12, 0) or OFFHAND/left (kb 13-17, 1) so a fist closes ONLY on the hand that
+  // actually holds a weapon (2026-07-25 -- a mainhand weapon used to close BOTH hands). The HandsClosed
+  // sequence index is resolved from _animations_seq_per_id[15] at apply time.
+  bool _hand_overlay_active_main = false; // close the RIGHT (mainhand) fingers this draw
+  bool _hand_overlay_active_off = false;  // close the LEFT (offhand) fingers this draw
   std::vector<uint16_t> _hand_overlay_bones;
+  std::vector<uint8_t> _hand_overlay_bone_is_off; // parallel to _hand_overlay_bones: 1 = left/offhand
   void applyHandGripOverlay(int time, int animtime);
 
   // Scratch pose (final bone matrices of the blend-FROM sequence) used by animate()'s cross-fade on

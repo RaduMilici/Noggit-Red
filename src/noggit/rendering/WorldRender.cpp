@@ -3682,7 +3682,8 @@ void WorldRender::draw (glm::mat4x4 const& model_view
               : static_cast<int>(_world->model_animtime);
             int anim_id = inst->forcedAnimationId() >= 0 ? inst->forcedAnimationId() : 0;
             if (anim_id != 0 && !m->hasAnimationId(anim_id)) { anim_id = 0; }
-            m->_hand_overlay_active = inst->closeHands();
+            m->_hand_overlay_active_main = inst->closeHandMain();
+            m->_hand_overlay_active_off = inst->closeHandOff();
             m->_active_idle_key = static_cast<std::uint64_t>(inst->uid);
             m->animcalc = false;
             m->animate(model_view * inst->transformMatrix(), anim_id, c_animtime, /*upload_bones=*/false);

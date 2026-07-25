@@ -379,7 +379,8 @@ void ModelRender::draw(glm::mat4x4 const& model_view
     // Weapon grip: this instance holds an in-hand weapon -> after the body pass, overlay the HandsClosed
     // pose onto the finger bones only (see Model::applyHandGripOverlay). Set on the shared model just
     // before this instance's animate() -- creatures re-animate per draw, so it applies to this spawn only.
-    _model->_hand_overlay_active = instance.closeHands();
+    _model->_hand_overlay_active_main = instance.closeHandMain();
+    _model->_hand_overlay_active_off = instance.closeHandOff();
     // Identify which spawn is animating so the idle-variation scheduler keeps a per-instance timeline
     // (each spawn leans on its own schedule instead of all in unison). uid is the spawn guid for creatures.
     _model->_active_idle_key = static_cast<std::uint64_t>(instance.uid);

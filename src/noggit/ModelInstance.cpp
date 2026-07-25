@@ -104,7 +104,8 @@ ModelInstance& ModelInstance::operator=(ModelInstance const& other)
   _need_gpu_transform_update = other._need_gpu_transform_update;
   _gpu_transform_uid = other._gpu_transform_uid;
   _forced_anim_id = other._forced_anim_id;
-  _close_hands = other._close_hands;
+  _close_hand_main = other._close_hand_main;
+  _close_hand_off = other._close_hand_off;
 
   _replace_textures.clear();
   for (auto const& pair : other._replace_textures)

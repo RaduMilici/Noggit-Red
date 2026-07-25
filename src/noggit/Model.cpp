@@ -1988,22 +1988,32 @@ void Model::initAnimated(const BlizzardArchive::ClientFile& f)
     // "which bones HandsClosed animates" -- because HandsClosed also keys the arms/shoulders (as a static
     // single-frame pose); including those would freeze the upper body. Fingers only.
     _hand_overlay_bones.clear();
+    _hand_overlay_bone_is_off.clear();
     if (bones.size() == key_bone_ids.size())
     {
-      std::vector<uint8_t> in_set(bones.size(), 0);
+      // side_of[i]: -1 = not a finger bone, 0 = MAINHAND/right (kb 8-12), 1 = OFFHAND/left (kb 13-17).
+      // Descendant finger segments inherit their parent's side. This lets the grip close only the hand that
+      // holds a weapon (mainhand -> right fingers, offhand -> left fingers) instead of both.
+      std::vector<int8_t> side_of(bones.size(), -1);
       for (size_t i = 0; i < bones.size(); ++i)
       {
         int32_t const kb = key_bone_ids[i];
-        bool finger = (kb >= 8 && kb <= 17);
-        int const parent = bones[i].parent;
-        if (!finger && parent >= 0 && static_cast<size_t>(parent) < in_set.size() && in_set[parent])
+        int8_t side = -1;
+        if (kb >= 8 && kb <= 12) side = 0;       // right / mainhand fingers
+        else if (kb >= 13 && kb <= 17) side = 1; // left / offhand fingers
+        else
         {
-          finger = true; // descendant of a finger bone (a finger segment)
+          int const parent = bones[i].parent;
+          if (parent >= 0 && static_cast<size_t>(parent) < side_of.size() && side_of[parent] >= 0)
+          {
+            side = side_of[parent]; // descendant of a finger bone inherits that hand
+          }
         }
-        if (finger)
+        side_of[i] = side;
+        if (side >= 0)
         {
-          in_set[i] = 1;
           _hand_overlay_bones.push_back(static_cast<uint16_t>(i));
+          _hand_overlay_bone_is_off.push_back(static_cast<uint8_t>(side)); // 1 = offhand/left
         }
       }
     }
@@ -2374,7 +2384,7 @@ void Model::calcBones(glm::mat4x4 const& model_view
   // Weapon-grip: after the normal body pass, curl the fingers closed from the HandsClosed pose. Only the
   // finger-subtree bones are touched, each anchored to its already-posed (breathing) parent, so the body
   // animation is preserved. Enabled per-draw for creatures holding an in-hand weapon.
-  if (_hand_overlay_active)
+  if (_hand_overlay_active_main || _hand_overlay_active_off)
   {
     applyHandGripOverlay(time, animation_time);
   }
@@ -2396,10 +2406,18 @@ void Model::applyHandGripOverlay(int time, int animtime)
   }
   int const seq = it->second.begin()->second.Index;
 
-  // Re-pose each finger-subtree bone from that sequence. _hand_overlay_bones is parents-first, and finger
-  // parents (the hand) are NOT in the set, so every bone here reads an already-final parent matrix.
-  for (uint16_t const bi : _hand_overlay_bones)
+  // Re-pose each finger-subtree bone from that sequence, but ONLY for the hand(s) whose grip is active this
+  // draw (mainhand -> right fingers, offhand -> left) so an empty hand keeps its open idle pose. Parents-first
+  // order holds within each hand (finger parents/the wrist are not in the set), so a skipped hand never
+  // breaks the other hand's parent chain.
+  for (size_t j = 0; j < _hand_overlay_bones.size(); ++j)
   {
+    bool const is_off = j < _hand_overlay_bone_is_off.size() && _hand_overlay_bone_is_off[j] != 0;
+    if (is_off ? !_hand_overlay_active_off : !_hand_overlay_active_main)
+    {
+      continue; // this hand's grip is not active -> leave its fingers open
+    }
+    uint16_t const bi = _hand_overlay_bones[j];
     if (bi < bones.size())
     {
       bones[bi].overrideLocalFromSeq(bones.data(), seq, time, animtime);
