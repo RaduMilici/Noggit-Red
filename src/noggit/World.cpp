@@ -3413,8 +3413,10 @@ std::vector<std::pair<std::size_t, std::string>> World::applyCreatureSpawnModelA
   // FINGER bones only. PER-HAND (2026-07-25): close the MAINHAND (right) fist only when a mainhand item is
   // present and the OFFHAND (left) only when an offhand item is present -- an empty hand stays open (a
   // mainhand weapon used to wrongly close BOTH hands). See Model::applyHandGripOverlay.
+  // Offhand: close the fist only for a WEAPON, NOT a shield (invtype 14) -- a shield straps to the forearm
+  // (LeftWrist), so that hand stays OPEN. [2026-07-25 follow-up]
   model_instance.setCloseHandMain(spawn.mainhand_display_id != 0);
-  model_instance.setCloseHandOff(spawn.offhand_display_id != 0);
+  model_instance.setCloseHandOff(spawn.offhand_display_id != 0 && spawn.offhand_inventory_type != 14);
 
   return overrides;
 }
