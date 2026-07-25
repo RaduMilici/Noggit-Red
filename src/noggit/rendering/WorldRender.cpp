@@ -3689,7 +3689,16 @@ void WorldRender::draw (glm::mat4x4 const& model_view
         };
         std::size_t const ng = creature_groups.size();
         unsigned const hw = std::max(2u, std::thread::hardware_concurrency());
-        std::size_t const nthreads = (ng <= 1) ? 1 : std::min<std::size_t>(hw, ng);
+        // Don't over-spawn: this pool is created+joined EVERY frame and each std::thread costs ~50-100us to
+        // spawn on Windows, so for small creature counts the churn exceeds the compute it saves. Give each
+        // worker >= ~8 items of work; tiny counts fall to the serial path (nthreads==1). Compute can't beat
+        // the largest model-group anyway (same-model instances are serial -- animate() writes shared Model
+        // state), and the work-stealing queue balances the rest. [2026-07-25 perf]
+        std::size_t grouped_items = 0;
+        for (auto const& g : creature_groups) { grouped_items += g.second.size(); }
+        std::size_t const by_work = grouped_items / 8;
+        std::size_t const nthreads =
+          (ng <= 1) ? 1 : std::min<std::size_t>({static_cast<std::size_t>(hw), ng, std::max<std::size_t>(1, by_work)});
         if (nthreads <= 1)
         {
           for (auto& g : creature_groups) { animate_creature_group(g); }
