@@ -5172,8 +5172,10 @@ void WorldRender::ensureBloomTargets(int w, int h)
   }
 
   // MSAA sample count (Settings -> Render features): 0/2/4/8, clamped to the driver max. Read every
-  // call so a settings change reallocates live.
-  int msaa = QSettings().value("render/msaa", 8).toInt();
+  // call so a settings change reallocates live. DEFAULT 4 (2026-07-25 perf): the internal scene FBO is
+  // fragment-shaded per sample, so 8x MSAA roughly DOUBLED the frame in Stormwind (Frame ~40 -> ~20ms, fps
+  // ~24 -> ~40 at 4x, user-confirmed still smooth). 8x was the single largest cost and hid inside WorldDraw.
+  int msaa = QSettings().value("render/msaa", 4).toInt();
   if (char const* e = std::getenv("NOGGIT_MSAA")) { msaa = std::atoi(e); } // [PERF A/B 2026-07-21] override
   if (msaa != 0 && msaa != 2 && msaa != 4 && msaa != 8) { msaa = 0; }
   if (msaa > 0)
