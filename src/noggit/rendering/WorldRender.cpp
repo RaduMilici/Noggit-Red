@@ -2429,6 +2429,28 @@ void WorldRender::draw (glm::mat4x4 const& model_view
           continue;
         }
 
+        // [PERF 2026-07-24] Early frustum cull on the spawn POSITION (+ generous margin) BEFORE the expensive
+        // per-spawn work (model create, ensureExtents, cull_fade). In a packed city most in-range spawns are
+        // off-screen (behind/beside the camera) -- this loop was fully processing every one of them (the
+        // untimed ~3-34ms "M2" cost) even though only the few IN-frustum ones draw (M2Creatures=0 while the
+        // inject burned 30ms). The precise isInFrustum test further down still runs for survivors; the 64yd
+        // box margin means no creature whose model straddles the frustum edge is ever dropped here.
+        // NOGGIT_NO_CREATURE_PRECULL=1 disables. (An off-screen creature's cull-fade isn't advanced while
+        // skipped, so it may fade-pop on first appearance -- imperceptible next to a static 30ms/frame cost.)
+        {
+          static bool const s_no_creature_precull = std::getenv("NOGGIT_NO_CREATURE_PRECULL") != nullptr;
+          if (!s_no_creature_precull)
+          {
+            float const m = 64.0f;
+            glm::vec3 const lo(spawn.pos.x - m, spawn.pos.y - m, spawn.pos.z - m);
+            glm::vec3 const hi(spawn.pos.x + m, spawn.pos.y + m, spawn.pos.z + m);
+            if (!frustum.intersects(hi, lo))
+            {
+              continue;
+            }
+          }
+        }
+
         if (!spawn.model_instance.has_value())
         {
           if (models_created_this_frame >= model_create_budget)
@@ -2576,6 +2598,23 @@ void WorldRender::draw (glm::mat4x4 const& model_view
         {
           trace_gameobject_spawn("skip-distance", spawn, gameobject_distance, "draw distance");
           continue;
+        }
+
+        // [PERF 2026-07-24] Early frustum cull on the spawn POSITION (+ margin) before the expensive per-spawn
+        // work -- same rationale as the creature loop above, and far more impactful here: a Turtle city has
+        // ~45k gameobject spawns and this loop walked + fully processed every in-range one each frame.
+        {
+          static bool const s_no_go_precull = std::getenv("NOGGIT_NO_CREATURE_PRECULL") != nullptr;
+          if (!s_no_go_precull)
+          {
+            float const m = 64.0f;
+            glm::vec3 const lo(spawn.pos.x - m, spawn.pos.y - m, spawn.pos.z - m);
+            glm::vec3 const hi(spawn.pos.x + m, spawn.pos.y + m, spawn.pos.z + m);
+            if (!frustum.intersects(hi, lo))
+            {
+              continue;
+            }
+          }
         }
 
         if (!spawn.model_instance.has_value())
