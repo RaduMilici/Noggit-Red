@@ -605,6 +605,22 @@ namespace
 // clear() keeps the map's capacity so this is allocation-light across frames.
 void Noggit::Rendering::WorldRender::rebuildLegacySuppressIndex()
 {
+  // THROTTLE (2026-07-25 perf): this map is derived from STATIC spawn placements; the only per-frame drift
+  // is a lazily-loaded model refining its entry's overlay radius/path. Rebuilding the whole string-keyed
+  // map every frame cost ~3ms in Stormwind (measured, ~10% of the frame) for no visible benefit. Rebuild
+  // only when the spawn count changes (immediate -- covers spawns first loading in) or every 30 frames (to
+  // fold in model-radius refinement as distant spawns come into range). The stale window is <=0.5s and the
+  // suppression test is a coarse visual doodad-dedup, so a slightly-stale radius is imperceptible.
+  std::size_t const spawn_count =
+    _world->drawCreatureSpawns() ? _world->creatureSpawns().size() : 0;
+  bool const dirty =
+    (spawn_count != _legacy_suppress_last_count) || ((_legacy_suppress_tick++ % 30) == 0);
+  if (!dirty)
+  {
+    return;
+  }
+  _legacy_suppress_last_count = spawn_count;
+
   _legacy_suppress_index.clear();
 
   if (!_world->drawCreatureSpawns())
@@ -1647,8 +1663,8 @@ void WorldRender::draw (glm::mat4x4 const& model_view
     frame++;
   }
 
-  // Build the per-frame creature-spawn index ONCE (O(spawns)) so the legacy-doodad overlap test below is
-  // an O(1) lookup instead of an O(instances x spawns) walk. See rebuildLegacySuppressIndex().
+  // Build the per-frame creature-spawn index (THROTTLED inside -- see rebuildLegacySuppressIndex) so the
+  // legacy-doodad overlap test below is an O(1) lookup instead of an O(instances x spawns) walk.
   rebuildLegacySuppressIndex();
 
   for (auto& pair : _world->_loaded_tiles_buffer)
@@ -2402,8 +2418,15 @@ void WorldRender::draw (glm::mat4x4 const& model_view
       // path (shared timeline, stale idle key) -- desyncing its idle schedule so the animation RESET
       // every time the camera crossed 80 yd in or out (user-reported bird/dragon wing-flap reset at
       // a fixed distance). Instancing stays off until the instanced-render path is repaired.
-      float const creature_instance_lod_dist =
-        QSettings().value("render/creature_instance_lod_distance", 1.0e9f).toFloat();
+      // NOGGIT_CREATURE_INSTANCE_LOD=<yards> overrides the QSettings default for A/B testing the hybrid
+      // instancing LOD (batch distant simple creatures -> 1 draw + no per-instance bone compute). Default
+      // 1e9 = off. [2026-07-24 perf hunt: AnimateCPU+M2Creatures dominate the M2 phase once the inject cost
+      // was pre-culled away; batching far simple creatures is the next lever.]
+      float const creature_instance_lod_dist = [] {
+        if (char const* e = std::getenv("NOGGIT_CREATURE_INSTANCE_LOD"))
+          return static_cast<float>(std::atof(e));
+        return QSettings().value("render/creature_instance_lod_distance", 1.0e9f).toFloat();
+      }();
       // Models that have at least one INDIVIDUAL copy this frame (near, or complex at any distance). Any
       // far/simple copy of such a model must also go individual, never instanced.
       std::set<Model*> models_drawn_individually;

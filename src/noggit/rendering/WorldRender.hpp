@@ -169,8 +169,13 @@ namespace Noggit::Rendering
     // the handful of shared grass/pebble M2s stay resident while the camera moves.
     std::unordered_map<std::string, scoped_model_reference> _detail_doodad_models;
 
-    // Rebuilt at the start of each draw() from the world's creature spawns; keyed by spawn model_path.
+    // Rebuilt from the world's creature spawns; keyed by spawn model_path. THROTTLED (2026-07-25 perf):
+    // the index is derived from static spawn placements + lazily-refining model radii, but rebuilding the
+    // whole string-keyed map every frame cost ~3ms in Stormwind (10% of the frame). rebuildLegacySuppressIndex
+    // now only rebuilds on a spawn-count change or every N frames; these track the throttle state.
     std::unordered_map<std::string, std::vector<LegacyOverlayInfo>> _legacy_suppress_index;
+    std::size_t _legacy_suppress_last_count = static_cast<std::size_t>(-1);
+    unsigned _legacy_suppress_tick = 0;
     void rebuildLegacySuppressIndex();
 
     // shaders
