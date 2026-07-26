@@ -4846,7 +4846,10 @@ void WorldRender::draw (glm::mat4x4 const& model_view
         }
         if (!_dptr) { continue; } // defensive: cache pointers are never null in practice
         ModelInstance& doodad = *_dptr;
-        if (particle_too_far(doodad.get_pos())) { continue; } // [PERF] skip far per-instance doodad particles
+        // Cull on the WORLD position: for WMO doodads get_pos() is the WMO-LOCAL position (the draw below
+        // uses transformMatrix()), so comparing it to the world camera made EVERY WMO-doodad emitter read as
+        // "too far" and culled all of them at any distance -- steam/lavasteam vanished. [2026-07-25 fix]
+        if (particle_too_far(glm::vec3(doodad.transformMatrix()[3]))) { continue; } // [PERF] skip far per-instance doodad particles
         Model* pmodel = doodad.model.get();
         if (!pmodel || !pmodel->finishedLoading() || pmodel->loading_failed()
             || (!draw_hidden_models && pmodel->is_hidden())
