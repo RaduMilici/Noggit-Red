@@ -339,6 +339,14 @@ namespace Noggit::Ui
         intro_sound_id = static_cast<int>(zi.getUInt(ZoneIntroMusicTableDB::SoundId));
         // MinDelayMinutes -> ms cooldown (client: FUN_00461440 blocks replay for MinDelayMinutes*60000).
         _intro_min_delay_ms = static_cast<int>(zi.getUInt(ZoneIntroMusicTableDB::MinDelayMinutes)) * 60000;
+        if (std::getenv("NOGGIT_MUSIC_DEBUG")) // TEMP 2026-07-25
+        {
+          LogError << "MUSICDBG intro id=" << _current_intro_music_id
+                   << " name='" << zi.getString(ZoneIntroMusicTableDB::Name) << "'"
+                   << " soundId=" << intro_sound_id
+                   << " minDelayMin=" << zi.getUInt(ZoneIntroMusicTableDB::MinDelayMinutes)
+                   << " priority=" << zi.getUInt(ZoneIntroMusicTableDB::Priority) << std::endl;
+        }
         if (zone_name == "-" || zone_name.empty())
         {
           zone_name = zi.getString(ZoneIntroMusicTableDB::Name); // label the zone even if it has intro-only music

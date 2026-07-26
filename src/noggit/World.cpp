@@ -5235,22 +5235,40 @@ int World::getZoneMusic(glm::vec3 const& pos)
 
 int World::getZoneIntroMusic(glm::vec3 const& pos)
 {
+  // Zone INTRO stingers fire only on the open world / cities in-game; the client NEVER plays them inside
+  // dungeon/raid INSTANCE maps (2026-07-25, user-confirmed). E.g. Molten Core's WMOAreaTable.IntroSound is
+  // 465 = "Raid Desert", which never plays in MC. Gate on Map.dbc AreaType: 0 = normal/continent (Ironforge,
+  // Caverns-of-Time-in-Tanaris -> intros play), non-zero = dungeon/raid/BG -> no zone intro. This is also why
+  // so many instance maps were showing spurious [Intro] entries.
+  try
+  {
+    if (gMapDB.CheckIfIdExists(mapIndex._map_id)
+        && gMapDB.getByID(mapIndex._map_id).getUInt(MapDB::AreaType) != 0)
+    {
+      return 0;
+    }
+  }
+  catch (...) {}
+
   // One-shot zone INTRO music: WMOAreaTable.IntroSound (col 8) then AreaTable.IntroSound (col 9).
-  // City/instance intros (Ironforge Intro, CoT intro) live here, NOT on ZoneMusic -- this is what the
-  // ZoneMusicPlayer was missing, so they never appeared in the list or played.
+  // City intros (Ironforge Intro, CoT intro) live here, NOT on ZoneMusic.
   return getZoneMusicField(pos, WMOAreaTableDB::ZoneIntroMusicTable, AreaDB::ZoneIntroMusicTable);
 }
 
 int World::getZoneMusicField(glm::vec3 const& pos, size_t wmo_field, size_t area_field)
 {
-  static bool s_zm_dbg = std::getenv("NOGGIT_LIGHT_DEBUG") != nullptr;
+  static bool s_zm_dbg = std::getenv("NOGGIT_LIGHT_DEBUG") != nullptr
+                      || std::getenv("NOGGIT_MUSIC_DEBUG") != nullptr;
+  // Also announce which FIELD is being resolved (looping ZoneMusic vs one-shot intro) so the trace is
+  // unambiguous when diagnosing wrong/spurious intros. [2026-07-25]
+  bool const s_zm_is_intro = (wmo_field == WMOAreaTableDB::ZoneIntroMusicTable);
 
   // 1) WMO interior music (WMOAreaTable) -- dungeons/caves/cities (Ironforge, Timbermaw, Caverns of Time).
   unsigned int wmo_music = 0;
   try { wmo_music = getWMOZoneMusic(pos, wmo_field); } catch (...) {}
   if (wmo_music > 0)
   {
-    if (s_zm_dbg) { LogError << "ZONEMUSIC via WMOAreaTable -> " << wmo_music << std::endl; }
+    if (s_zm_dbg) { LogError << "ZONEMUSIC[" << (s_zm_is_intro ? "intro" : "loop") << "] via WMOAreaTable -> " << wmo_music << std::endl; }
     return static_cast<int>(wmo_music);
   }
 
@@ -5269,9 +5287,9 @@ int World::getZoneMusicField(glm::vec3 const& pos, size_t wmo_field, size_t area
         unsigned int const parent = rec.getUInt(AreaDB::Region);
         if (s_zm_dbg)
         {
-          LogError << "ZONEMUSIC   walk area=" << a << " zoneMusic=" << zm
-                   << " ambience=" << rec.getUInt(AreaDB::ZoneMusic - 1)
-                   << " parent=" << parent << std::endl;
+          LogError << "ZONEMUSIC[" << (s_zm_is_intro ? "intro" : "loop") << "]   walk area=" << a
+                   << " field=" << zm << " parent=" << parent
+                   << " (name='" << rec.getString(AreaDB::Name) << "')" << std::endl;
         }
         if (zm > 0) { return zm; }
         a = parent;
