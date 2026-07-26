@@ -855,9 +855,13 @@ void Model::calcClassicStaticBones(glm::mat4x4 const& model_view)
         // Per-card upright fix (see Bone::calcMatrix's billboard branch): keep the derived up if it points
         // world-up, else re-fixCoordSystem the basis to swing a texture-rotated (horizontal) up vertical.
         bool const refix = std::abs(bone.bb_local_up.y) < std::abs(bone.bb_local_right.y);
-        glm::mat3 const local_sph(refix ? fixCoordSystem(bone.bb_local_normal) : bone.bb_local_normal,
-                                  refix ? fixCoordSystem(bone.bb_local_right)  : bone.bb_local_right,
-                                  refix ? fixCoordSystem(bone.bb_local_up)     : bone.bb_local_up);
+        glm::vec3 l_normal = refix ? fixCoordSystem(bone.bb_local_normal) : bone.bb_local_normal;
+        glm::vec3 l_right  = refix ? fixCoordSystem(bone.bb_local_right)  : bone.bb_local_right;
+        glm::vec3 l_up     = refix ? fixCoordSystem(bone.bb_local_up)     : bone.bb_local_up;
+        // Canonicalize up to model-up: if it resolves downward the card renders upside-down (see the runtime
+        // billboard branch -- worgen sleeve rag). Rotate 180deg in-plane (negate up+right); no-op for glows.
+        if (l_up.y < 0.0f) { l_up = -l_up; l_right = -l_right; }
+        glm::mat3 const local_sph(l_normal, l_right, l_up);
         glm::mat3 const cam(camFwd, camRight, camUp);
         bb3 = cam * glm::transpose(local_sph);
       }
@@ -3161,9 +3165,17 @@ void Bone::calcMatrix(glm::mat4x4 const& model_view
     // if it came out horizontal (Anomalus) re-apply fixCoordSystem, a det-+1 rotation that swings that
     // horizontal up back to vertical -- i.e. each card gets the exact basis it was confirmed upright with.
     bool const refix = std::abs(bb_local_up.y) < std::abs(bb_local_right.y);
-    glm::mat3 const local(refix ? fixCoordSystem(bb_local_normal) : bb_local_normal,
-                          refix ? fixCoordSystem(bb_local_right)  : bb_local_right,
-                          refix ? fixCoordSystem(bb_local_up)     : bb_local_up);   // columns
+    glm::vec3 l_normal = refix ? fixCoordSystem(bb_local_normal) : bb_local_normal;
+    glm::vec3 l_right  = refix ? fixCoordSystem(bb_local_right)  : bb_local_right;
+    glm::vec3 l_up     = refix ? fixCoordSystem(bb_local_up)     : bb_local_up;
+    // Canonicalize the resolved card up to point toward MODEL up. The refix/geometry derivation can leave a
+    // card's up pointing model-DOWN -- e.g. the worgen sleeve-rag billboard bones derive up=(0,0,-1), which
+    // fixCoordSystem rotates to (0,-1,0): screen-up then maps to the rag's hanging (model -Y) end and the rag
+    // renders upside-down (defying gravity / rising). Rotate the card 180deg in its own plane (negate up AND
+    // right, preserving the camera-facing normal + winding) whenever the resolved up points downward. This is
+    // a no-op for flame/glow cards, whose up already points up, so it fixes the rag without touching them.
+    if (l_up.y < 0.0f) { l_up = -l_up; l_right = -l_right; }
+    glm::mat3 const local(l_normal, l_right, l_up);   // columns
     glm::mat3 const bb3 = cam * glm::transpose(local);
 
     // PRESERVE the animated bone SCALE: `mat` (about to be replaced) carries the hierarchy's scale --
