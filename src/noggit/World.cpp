@@ -2413,15 +2413,14 @@ namespace
               baked_texture_probe = probe_client_file_header(baked_texture);
             }
 
-            if (baked_texture_exists && is_character_model && !disable_baked_npc_textures)
-            {
-              QImage baked_texture_image;
-              baked_texture_loadable = load_client_texture_image(baked_texture,
-                                                                 baked_texture_image,
-                                                                 nullptr,
-                                                                 &baked_texture_load_method);
-            }
-
+            // Use the baked NPC texture DIRECTLY as the body override -- gate on EXISTENCE, not on CPU
+            // decodability (2026-07-25). append_character_fallback only sets a texture PATH; the model's
+            // renderer loads it through the normal texture manager, which uploads DXT to the GPU natively --
+            // no CPU decode needed. The old load_client_texture_image gate rejected these DXT5 baked files
+            // (its "raw" path reads blp_texture::data() = the palettized `_data`, which is EMPTY for DXT; DXT
+            // lives in `_compressed_data`), so Dark Iron / Shadowforge NPCs fell back to the naked skin. The
+            // baked texture is the COMPLETE pre-composited character, so we also skip the CPU overlay composite
+            // below (matches the client, which bakes once and uses it as-is).
             if (baked_texture_exists && baked_texture_loadable && !disable_baked_npc_textures)
             {
               if (debug_character_override)
@@ -2440,6 +2439,10 @@ namespace
                 }
               }
               append_character_fallback(std::move(baked_texture));
+              // The baked texture already contains the whole character, so drop the CPU overlay layers ->
+              // the composite below (gated on !body_texture_layers.empty()) is skipped and the DXT baked
+              // texture is used as-is on the GPU.
+              body_texture_layers.clear();
             }
             else
             {
