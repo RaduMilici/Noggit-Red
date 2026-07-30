@@ -797,6 +797,13 @@ void WMOGroupRender::initRenderBatches()
       flags |= WMORenderBatchFlags::eWMOBatch_ClampT;
     }
 
+    // Env/EnvMetal material whose MOTX second entry is EMPTY: there is no environment map to reflect.
+    if (batch.texture < _wmo_group->wmo->material_env_texture_missing.size()
+        && _wmo_group->wmo->material_env_texture_missing[batch.texture])
+    {
+      flags |= WMORenderBatchFlags::eWMOBatch_NoEnvTexture;
+    }
+
     std::uint32_t alpha_test;
 
     switch (mat.blend_mode)

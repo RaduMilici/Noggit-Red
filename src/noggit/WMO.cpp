@@ -108,16 +108,32 @@ void WMO::finishLoading ()
 
   std::size_t const num_materials (size / 0x40);
   materials.resize (num_materials);
+  material_env_texture_missing.assign (num_materials, 0u);
 
   // note: used to map to size_t, but our other values don't support that.
   //std::map<std::uint32_t, std::size_t> texture_offset_to_inmem_index;
   std::map<std::uint32_t, std::uint32_t> texture_offset_to_inmem_index;
 
   auto load_texture
-    ( [&] (std::uint32_t ofs)
+    ( [&] (std::uint32_t ofs, bool is_second_texture)
       {
+        // An EMPTY MOTX entry means the material simply has NO texture in that slot.
+        //
+        // Substituting the green shanecube placeholder is reasonable for a missing FIRST texture (it makes
+        // an authoring error obvious), but it is wrong for the SECOND: Env/EnvMetal ADD that layer
+        // (out = lighting(tex) + tex_2 * tex * tex.a), so the placeholder's bright-green grid got added on
+        // top of the surface -- and because the env coordinate is a reflection vector, the green swam
+        // across the model as the camera turned. Stormwind's SW_Harbor_Docks.wmo does exactly this: the
+        // docked ship's 4 EnvMetal materials (front/rear/blade/metalhull) declare an EMPTY texture2, while
+        // the standalone Transport_Icebreaker_ship_nomasts.wmo names a real env map (WR_ENV.BLP) and
+        // renders correctly. Black is the neutral element for an additive layer, so an absent env map now
+        // contributes nothing. Note this path never logged "file not found" -- the name is empty, not
+        // missing -- which is why it hid for so long. [2026-07-30]
+        bool const is_empty = !texbuf[ofs];
         std::string texture
-          (texbuf[ofs] ? std::string(&texbuf[ofs]) : std::string("textures/shanecube.blp"));
+          (is_empty ? std::string(is_second_texture ? "tileset/generic/black.blp"
+                                                    : "textures/shanecube.blp")
+                    : std::string(&texbuf[ofs]));
 
         // Custom WMOs (Turtle world/custom/kttown/kttown.wmo) reference textures by BARE filename
         // (window.blp, floor.blp, wall3.blp) with NO directory. A bare name collides with same-named
@@ -139,8 +155,13 @@ void WMO::finishLoading ()
           }
         }
 
+        // Empty entries resolve to a DIFFERENT substitute depending on the slot, so fold the slot into the
+        // cache key for them -- otherwise a first-slot shanecube could be handed back for a second slot
+        // (or vice versa) whenever both reference the same empty offset.
+        std::uint32_t const cache_key = (is_empty && is_second_texture) ? (ofs | 0x80000000u) : ofs;
+
         auto const mapping
-          (texture_offset_to_inmem_index.emplace(ofs, static_cast<std::uint32_t>(textures.size())));
+          (texture_offset_to_inmem_index.emplace(cache_key, static_cast<std::uint32_t>(textures.size())));
 
         if (mapping.second)
         {
@@ -157,10 +178,11 @@ void WMO::finishLoading ()
     uint32_t shader = materials[i].shader;
     bool use_second_texture = (shader == 6 || shader == 5 || shader == 3);
 
-    materials[i].texture1 = load_texture(materials[i].texture_offset_1);
+    materials[i].texture1 = load_texture(materials[i].texture_offset_1, false);
     if (use_second_texture)
     {
-      materials[i].texture2 = load_texture(materials[i].texture_offset_2);
+      material_env_texture_missing[i] = !texbuf[materials[i].texture_offset_2] ? 1u : 0u;
+      materials[i].texture2 = load_texture(materials[i].texture_offset_2, true);
     }
   }
 

@@ -41,7 +41,11 @@ namespace Noggit::Rendering
     // The batch carries a two-layer texture-blend ALPHA in its vertex colour (either a real lighting MOCV's
     // alpha, or a dedicated texture-blend mocv2 whose RGB is 0). Distinct from HasMOCV, which means the
     // vertex colour is real per-vertex LIGHTING. A modern WMO can have the blend without the lighting.
-    eWMOBatch_HasMOCVBlend = 0x400
+    eWMOBatch_HasMOCVBlend = 0x400,
+    // The material declares Env/EnvMetal but ships NO environment map (empty MOTX second entry). The env
+    // term must not sample a texture -- noggit used to substitute the green shanecube placeholder there,
+    // which the additive env term then painted over the surface (Stormwind harbour's docked ship).
+    eWMOBatch_NoEnvTexture = 0x800
   };
 
   // One member batch of a combined draw call: its (contiguous) index span and its local-space AABB,

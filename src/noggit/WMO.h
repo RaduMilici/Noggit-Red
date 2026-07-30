@@ -407,6 +407,10 @@ public:
 
   std::vector<WMOGroup> groups;
   std::vector<WMOMaterial> materials;
+  // Per material: the material asks for an Env/EnvMetal shader but its MOTX second-texture entry is EMPTY
+  // (e.g. Stormwind's SW_Harbor_Docks.wmo on the docked ship). There is no environment map to reflect, so
+  // the renderer must not sample one -- see eWMOBatch_NoEnvTexture.
+  std::vector<std::uint8_t> material_env_texture_missing;
   glm::vec3 extents[2];
   std::vector<scoped_blp_texture_reference> textures;
   std::vector<std::string> models;

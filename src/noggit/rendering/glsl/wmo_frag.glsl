@@ -14,6 +14,8 @@
 // The vertex-colour ALPHA is a valid two-layer texture-blend factor (either from a real lighting MOCV or a
 // dedicated texture-blend mocv2 whose RGB is 0). Set independently of HasMOCV, which gates LIGHTING.
 #define eWMOBatch_HasMOCVBlend 0x400u
+// Env/EnvMetal material that ships NO environment map (empty MOTX second entry).
+#define eWMOBatch_NoEnvTexture 0x800u
 
 layout (std140) uniform lighting
 {
@@ -370,6 +372,17 @@ void main()
 
   vec4 tex = get_tex_color(tex_coord, tex_array0, int(tex0));
   vec4 tex_2 = get_tex_color(tex_coord_2, tex_array1, int(tex1));
+
+  // No environment map authored for this Env/EnvMetal material -> nothing to reflect, so the ADDITIVE env
+  // term must contribute NOTHING (zero is its neutral element). noggit used to substitute the green
+  // shanecube placeholder for an empty MOTX entry, and the env term painted that grid over the surface --
+  // it swam around with the reflection vector as the camera turned (Stormwind harbour's docked ship,
+  // SW_Harbor_Docks.wmo). Do not substitute white here: that invents a metallic shine the model never asks
+  // for, and in game those materials show none.
+  if (bool(flags & eWMOBatch_NoEnvTexture))
+  {
+    tex_2 = vec4(0.0);
+  }
 
   float alpha_test = !bool(alpha_test_mode) ? -1.f : (alpha_test_mode < 2 ? 0.878431372 : 0.003921568);
 
