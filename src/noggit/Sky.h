@@ -215,6 +215,7 @@ private:
   ModelInstance stars;
 
   int _last_time = -1;
+  float _celestial_flow = 0.f; // LightFloatBand[2] CELESTIAL_FLOW: dusk/dawn sky-glow weight (FUN_006d0f50)
   glm::vec3 _last_pos;
 
   float _river_shallow_alpha = 0.6f;

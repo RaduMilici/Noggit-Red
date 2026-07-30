@@ -779,22 +779,22 @@ namespace
   {
     debug << " " << slot_name << "Item=" << item_display_id
           << " geoset=["
-          << item_display.getUInt(ItemDisplayInfoDB::GeosetGroup1) << ","
-          << item_display.getUInt(ItemDisplayInfoDB::GeosetGroup2) << ","
-          << item_display.getUInt(ItemDisplayInfoDB::GeosetGroup3) << "]"
+          << item_display.getUInt(ItemDisplayInfoDB::GeosetGroup1()) << ","
+          << item_display.getUInt(ItemDisplayInfoDB::GeosetGroup2()) << ","
+          << item_display.getUInt(ItemDisplayInfoDB::GeosetGroup3()) << "]"
           << " helmetVis=["
-          << item_display.getUInt(ItemDisplayInfoDB::HelmetGeosetVis1) << ","
-          << item_display.getUInt(ItemDisplayInfoDB::HelmetGeosetVis2) << "]"
+          << item_display.getUInt(ItemDisplayInfoDB::HelmetGeosetVis1()) << ","
+          << item_display.getUInt(ItemDisplayInfoDB::HelmetGeosetVis2()) << "]"
           << " model1='" << item_display.getString(ItemDisplayInfoDB::ModelName1) << "'"
               << " model2='" << item_display.getString(ItemDisplayInfoDB::ModelName2) << "'";
 
-            auto const upper_arm_texture = item_display.getString(ItemDisplayInfoDB::TextureUpperArm);
-            auto const lower_arm_texture = item_display.getString(ItemDisplayInfoDB::TextureLowerArm);
-            auto const hands_texture = item_display.getString(ItemDisplayInfoDB::TextureHands);
-            auto const upper_chest_texture = item_display.getString(ItemDisplayInfoDB::TextureUpperChest);
-            auto const lower_chest_texture = item_display.getString(ItemDisplayInfoDB::TextureLowerChest);
-            auto const upper_leg_texture = item_display.getString(ItemDisplayInfoDB::TextureUpperLeg);
-            auto const lower_leg_texture = item_display.getString(ItemDisplayInfoDB::TextureLowerLeg);
+            auto const upper_arm_texture = item_display.getString(ItemDisplayInfoDB::TextureUpperArm());
+            auto const lower_arm_texture = item_display.getString(ItemDisplayInfoDB::TextureLowerArm());
+            auto const hands_texture = item_display.getString(ItemDisplayInfoDB::TextureHands());
+            auto const upper_chest_texture = item_display.getString(ItemDisplayInfoDB::TextureUpperChest());
+            auto const lower_chest_texture = item_display.getString(ItemDisplayInfoDB::TextureLowerChest());
+            auto const upper_leg_texture = item_display.getString(ItemDisplayInfoDB::TextureUpperLeg());
+            auto const lower_leg_texture = item_display.getString(ItemDisplayInfoDB::TextureLowerLeg());
 
             if (*upper_arm_texture || *lower_arm_texture || *hands_texture)
             {
@@ -1520,16 +1520,30 @@ namespace
       apply_item("head", display_extra.getUInt(CreatureDisplayInfoExtraDB::HeadDisplayID),
         [&](DBCFile::Record const& item_display)
         {
-          // Hide the hair under a helmet (2026-07-25 -- this callback was empty, so hair poked through every
-          // helmeted NPC). 1.12 ItemDisplayInfo.HelmetGeosetVis[sex] indexes HelmetGeosetVisData (exactly
-          // which geoset groups the helm hides). That DBC isn't wrapped here, so use the robust rule that a
-          // NON-ZERO HelmetGeosetVis means the helm covers the head -> hide the hair geoset (group 0). Open
-          // helms / circlets that keep hair carry HelmetGeosetVis 0 and are left untouched. (If a specific
-          // helm over-/under-hides, wire HelmetGeosetVisData for per-helm hair/facial/ear precision.)
+          // Hide the hair under a helmet. ItemDisplayInfo.HelmetGeosetVis[sex] is a ROW INDEX into
+          // HelmetGeosetVisData, whose field[1] (HairFlags) says whether THIS helm hides the hair: 0 = keep
+          // (bandanas/circlets/open helms that only cover the face), non-zero = hide (full helms). The old
+          // rule "HelmetGeosetVis != 0 -> bald" was too crude and balded partial head items -- e.g. the
+          // Defias bandana (item 15308, vis 247, HairFlags 0: it covers the mouth, not the hair), which made
+          // Defias NPCs bald. Now wired to the real DBC (gHelmetGeosetVisDataDB). Verified vs the stock rows.
           auto const helmet_vis = (sex_id == 1)
-            ? item_display.getUInt(ItemDisplayInfoDB::HelmetGeosetVis2)
-            : item_display.getUInt(ItemDisplayInfoDB::HelmetGeosetVis1);
-          if (helmet_vis != 0)
+            ? item_display.getUInt(ItemDisplayInfoDB::HelmetGeosetVis2())
+            : item_display.getUInt(ItemDisplayInfoDB::HelmetGeosetVis1());
+          bool helm_hides_hair = helmet_vis != 0; // fallback when the DBC/row is unavailable
+          if (helmet_vis != 0 && gHelmetGeosetVisDataDB.getRecordCount() > 0)
+          {
+            try
+            {
+              helm_hides_hair = gHelmetGeosetVisDataDB.getByID(helmet_vis)
+                                  .getUInt(HelmetGeosetVisDataDB::HairFlags) != 0;
+            }
+            catch (DBCFile::NotFound const&) { /* keep the vis != 0 fallback */ }
+          }
+          // Also require a visible head MODEL: a model-less appearance head item (empty ModelName1) shows no
+          // helmet, so it must not bald the NPC -- e.g. Joseph Dalton (display 14492, item 15676, no model,
+          // vis 248). [2026-07-25 empty-model guard; 2026-07-28 HelmetGeosetVisData wiring]
+          std::string const head_model = item_display.getString(ItemDisplayInfoDB::ModelName1);
+          if (helm_hides_hair && !head_model.empty())
           {
             // Bald under the helm: set group 0 to geoset 0 (no hair) rather than hide_geoset_family, which
             // would drop geoset 0 too -- and the base BODY submesh is geoset 0 (family 0), so hiding the whole
@@ -1539,15 +1553,15 @@ namespace
           }
           else
           {
-            debug << " helmetKeepsHair=1";
+            debug << " helmetKeepsHair=1 model='" << head_model << "' vis=" << helmet_vis;
           }
         });
 
       apply_item("shirt", display_extra.getUInt(CreatureDisplayInfoExtraDB::ShirtDisplayID),
         [&](DBCFile::Record const& item_display)
         {
-          auto const wrist_flags = item_display.getUInt(ItemDisplayInfoDB::GeosetGroup1);
-          auto const robe_flags = item_display.getUInt(ItemDisplayInfoDB::GeosetGroup3);
+          auto const wrist_flags = item_display.getUInt(ItemDisplayInfoDB::GeosetGroup1());
+          auto const robe_flags = item_display.getUInt(ItemDisplayInfoDB::GeosetGroup3());
           assign_geoset_selection(selection, CharacterGeosetFamily::Wristbands, wrist_flags);
           debug << " shirtWristApplied=" << wrist_flags;
           if (robe_flags != 0)
@@ -1561,8 +1575,8 @@ namespace
       apply_item("chest", display_extra.getUInt(CreatureDisplayInfoExtraDB::ChestDisplayID),
         [&](DBCFile::Record const& item_display)
         {
-          auto const wrist_flags = item_display.getUInt(ItemDisplayInfoDB::GeosetGroup1);
-          auto const robe_flags = item_display.getUInt(ItemDisplayInfoDB::GeosetGroup3);
+          auto const wrist_flags = item_display.getUInt(ItemDisplayInfoDB::GeosetGroup1());
+          auto const robe_flags = item_display.getUInt(ItemDisplayInfoDB::GeosetGroup3());
           assign_geoset_selection(selection, CharacterGeosetFamily::Wristbands, wrist_flags);
           debug << " chestWristApplied=" << wrist_flags;
           if (robe_flags != 0)
@@ -1576,8 +1590,8 @@ namespace
       apply_item("legs", display_extra.getUInt(CreatureDisplayInfoExtraDB::LegsDisplayID),
         [&](DBCFile::Record const& item_display)
         {
-          auto const kneepad_flags = item_display.getUInt(ItemDisplayInfoDB::GeosetGroup2);
-          auto const robe_flags = item_display.getUInt(ItemDisplayInfoDB::GeosetGroup3);
+          auto const kneepad_flags = item_display.getUInt(ItemDisplayInfoDB::GeosetGroup2());
+          auto const robe_flags = item_display.getUInt(ItemDisplayInfoDB::GeosetGroup3());
           assign_geoset_selection(selection, CharacterGeosetFamily::Kneepads, kneepad_flags);
           assign_geoset_selection(selection, CharacterGeosetFamily::Trousers, robe_flags);
           has_robe_bottom = has_robe_bottom || robe_flags == 1;
@@ -1588,7 +1602,7 @@ namespace
       apply_item("gloves", gloves_display_id,
         [&](DBCFile::Record const& item_display)
         {
-          auto const glove_flags = item_display.getUInt(ItemDisplayInfoDB::GeosetGroup1);
+          auto const glove_flags = item_display.getUInt(ItemDisplayInfoDB::GeosetGroup1());
           assign_geoset_selection(selection, CharacterGeosetFamily::Gloves, glove_flags);
           debug << " glovesApplied=" << glove_flags;
         });
@@ -1598,7 +1612,7 @@ namespace
         {
           if (!has_robe_bottom)
           {
-            auto const boot_flags = item_display.getUInt(ItemDisplayInfoDB::GeosetGroup1);
+            auto const boot_flags = item_display.getUInt(ItemDisplayInfoDB::GeosetGroup1());
             assign_geoset_selection(selection, CharacterGeosetFamily::Boots, boot_flags);
             debug << " bootsApplied=" << boot_flags;
           }
@@ -2273,16 +2287,16 @@ namespace
 
           auto append_chest_like_layers = [&](DBCFile::Record const& item_display)
           {
-            append_body_layer(item_display, ItemDisplayInfoDB::TextureUpperArm, CharacterTextureRegion::ArmUpper);
-            append_body_layer(item_display, ItemDisplayInfoDB::TextureLowerArm, CharacterTextureRegion::ArmLower);
-            append_body_layer(item_display, ItemDisplayInfoDB::TextureUpperChest, CharacterTextureRegion::TorsoUpper);
-            append_body_layer(item_display, ItemDisplayInfoDB::TextureLowerChest, CharacterTextureRegion::TorsoLower);
+            append_body_layer(item_display, ItemDisplayInfoDB::TextureUpperArm(), CharacterTextureRegion::ArmUpper);
+            append_body_layer(item_display, ItemDisplayInfoDB::TextureLowerArm(), CharacterTextureRegion::ArmLower);
+            append_body_layer(item_display, ItemDisplayInfoDB::TextureUpperChest(), CharacterTextureRegion::TorsoUpper);
+            append_body_layer(item_display, ItemDisplayInfoDB::TextureLowerChest(), CharacterTextureRegion::TorsoLower);
 
-            auto const robe_flags = item_display.getUInt(ItemDisplayInfoDB::GeosetGroup3);
+            auto const robe_flags = item_display.getUInt(ItemDisplayInfoDB::GeosetGroup3());
             if (robe_flags != 0)
             {
-              append_body_layer(item_display, ItemDisplayInfoDB::TextureUpperLeg, CharacterTextureRegion::LegUpper);
-              append_body_layer(item_display, ItemDisplayInfoDB::TextureLowerLeg, CharacterTextureRegion::LegLower);
+              append_body_layer(item_display, ItemDisplayInfoDB::TextureUpperLeg(), CharacterTextureRegion::LegUpper);
+              append_body_layer(item_display, ItemDisplayInfoDB::TextureLowerLeg(), CharacterTextureRegion::LegLower);
             }
           };
 
@@ -2291,37 +2305,37 @@ namespace
           append_item_body_layers(belt_display_id,
             [&](DBCFile::Record const& item_display)
             {
-              append_body_layer(item_display, ItemDisplayInfoDB::TextureLowerChest, CharacterTextureRegion::TorsoLower);
-              append_body_layer(item_display, ItemDisplayInfoDB::TextureUpperLeg, CharacterTextureRegion::LegUpper);
+              append_body_layer(item_display, ItemDisplayInfoDB::TextureLowerChest(), CharacterTextureRegion::TorsoLower);
+              append_body_layer(item_display, ItemDisplayInfoDB::TextureUpperLeg(), CharacterTextureRegion::LegUpper);
             });
           append_item_body_layers(bracers_display_id,
             [&](DBCFile::Record const& item_display)
             {
-              append_body_layer(item_display, ItemDisplayInfoDB::TextureLowerArm, CharacterTextureRegion::ArmLower);
+              append_body_layer(item_display, ItemDisplayInfoDB::TextureLowerArm(), CharacterTextureRegion::ArmLower);
             });
           append_item_body_layers(legs_display_id,
             [&](DBCFile::Record const& item_display)
             {
-              append_body_layer(item_display, ItemDisplayInfoDB::TextureUpperLeg, CharacterTextureRegion::LegUpper);
-              append_body_layer(item_display, ItemDisplayInfoDB::TextureLowerLeg, CharacterTextureRegion::LegLower);
+              append_body_layer(item_display, ItemDisplayInfoDB::TextureUpperLeg(), CharacterTextureRegion::LegUpper);
+              append_body_layer(item_display, ItemDisplayInfoDB::TextureLowerLeg(), CharacterTextureRegion::LegLower);
             });
           append_item_body_layers(gloves_display_id,
             [&](DBCFile::Record const& item_display)
             {
-              append_body_layer(item_display, ItemDisplayInfoDB::TextureHands, CharacterTextureRegion::Hand);
-              append_body_layer(item_display, ItemDisplayInfoDB::TextureLowerArm, CharacterTextureRegion::ArmLower);
+              append_body_layer(item_display, ItemDisplayInfoDB::TextureHands(), CharacterTextureRegion::Hand);
+              append_body_layer(item_display, ItemDisplayInfoDB::TextureLowerArm(), CharacterTextureRegion::ArmLower);
             });
           append_item_body_layers(boots_display_id,
             [&](DBCFile::Record const& item_display)
             {
-              append_body_layer(item_display, ItemDisplayInfoDB::TextureLowerLeg, CharacterTextureRegion::LegLower);
-              append_body_layer(item_display, ItemDisplayInfoDB::TextureFoot, CharacterTextureRegion::Foot);
+              append_body_layer(item_display, ItemDisplayInfoDB::TextureLowerLeg(), CharacterTextureRegion::LegLower);
+              append_body_layer(item_display, ItemDisplayInfoDB::TextureFoot(), CharacterTextureRegion::Foot);
             });
           append_item_body_layers(tabard_display_id,
             [&](DBCFile::Record const& item_display)
             {
-              append_body_layer(item_display, ItemDisplayInfoDB::TextureUpperChest, CharacterTextureRegion::TorsoUpper);
-              append_body_layer(item_display, ItemDisplayInfoDB::TextureLowerChest, CharacterTextureRegion::TorsoLower);
+              append_body_layer(item_display, ItemDisplayInfoDB::TextureUpperChest(), CharacterTextureRegion::TorsoUpper);
+              append_body_layer(item_display, ItemDisplayInfoDB::TextureLowerChest(), CharacterTextureRegion::TorsoLower);
             });
 
           std::string character_skin_texture;
@@ -2890,6 +2904,9 @@ bool World::reloadCreatureSpawns()
     spawn.entry = row.entry;
     spawn.display_id = row.display_id;
     spawn.faction = row.faction;
+    spawn.event = row.event;
+    spawn.stand_state = row.stand_state;
+    spawn.emote_state = row.emote_state;
     spawn.name = row.name;
     spawn.pos = server_to_client_position(row.position_x,
               row.position_y,
@@ -2986,6 +3003,41 @@ bool World::reloadCreatureSpawns()
         info.description = row.description;
         _spell_infos.emplace(spell_id, std::move(info));
       }
+
+      // Schemas with no spell_template (the 3.3.5a cores) return nothing above, which silently disabled
+      // EVERY aura state-kit visual -- including the stealth translucency: SpellVisual 184 -> StateKit 312
+      // -> charProc 14 = 0.3 alpha, verified present in both the 1.12 and 3.3.5a client DBCs. Fill the gap
+      // from the client's Spell.dbc so `spell_visual` resolves and resolve_creature_aura_model_effects()
+      // works the same on both versions.
+      std::size_t dbc_filled = 0;
+      for (auto const spell_id : aura_spell_ids)
+      {
+        auto const existing = _spell_infos.find(spell_id);
+        if (existing != _spell_infos.end() && existing->second.spell_visual)
+        {
+          continue;
+        }
+
+        SpellDbcInfo dbc;
+        if (!lookupSpellDbcInfo(spell_id, dbc))
+        {
+          continue;
+        }
+
+        SpellInfo info;
+        info.entry = dbc.entry;
+        info.spell_visual = dbc.spell_visual;
+        info.icon_id = dbc.icon_id;
+        info.school = existing != _spell_infos.end() ? existing->second.school : 0;
+        info.name = dbc.name;
+        info.description = dbc.description;
+        _spell_infos[spell_id] = std::move(info);
+        ++dbc_filled;
+      }
+      if (dbc_filled)
+      {
+        LogDebug << "Aura spell infos: " << dbc_filled << " filled from Spell.dbc" << std::endl;
+      }
       LogDebug << "Aura spell infos loaded: " << _spell_infos.size()
                << " (requested " << aura_spell_ids.size() << ")" << std::endl;
     }
@@ -3018,6 +3070,7 @@ bool World::reloadCreatureSpawns()
     spawn.guid = row.guid;
     spawn.entry = row.entry;
     spawn.display_id = row.display_id;
+    spawn.event = row.event;
     spawn.name = row.name;
     spawn.pos = server_to_client_position(row.position_x,
               row.position_y,
@@ -3063,11 +3116,90 @@ bool World::reloadCreatureSpawns()
              << ", noModel: " << gameobject_missing_model << ")"
              << std::endl;
   }
+
+  // Seasonal game-event labels + default visibility. Fetch the event descriptions once so the Seasonal
+  // Events panel can name each toggle, then apply the current filter (no events active by default => only
+  // base-world spawns show, instead of every seasonal spawn at once).
+  {
+    std::string event_error;
+    _game_event_names.clear();
+    for (auto const& ev : mysql::getGameEvents(&event_error))
+    {
+      _game_event_names[ev.entry] = ev.description;
+    }
+    if (!event_error.empty())
+    {
+      LogDebug << "Game event load failed: " << event_error << std::endl;
+    }
+  }
+  recomputeEventSuppression();
   return true;
 #else
   _creature_spawn_status = "Creature spawns unavailable: build without MySQL support";
   return false;
 #endif
+}
+
+namespace
+{
+  // UnitStandState -> AnimationData.dbc animation id (ids read from AnimationData.dbc). Returns -1 for
+  // Stand / unknown (no forced anim -> the model's normal idle). The draw path already falls back to Stand
+  // if the model lacks the id, so these are safe to force. emote_state (Emotes.dbc AnimID) handled separately.
+  int creature_stand_state_animation_id(std::uint8_t stand_state)
+  {
+    switch (stand_state)
+    {
+      case 1:  return 97;  // SIT              -> SitGround
+      case 2:  return 102; // SIT_CHAIR        -> SitChairLow (generic chair)
+      case 3:  return 100; // SLEEP            -> Sleep
+      case 4:  return 102; // SIT_LOW_CHAIR    -> SitChairLow
+      case 5:  return 103; // SIT_MEDIUM_CHAIR -> SitChairMed
+      case 6:  return 104; // SIT_HIGH_CHAIR   -> SitChairHigh
+      case 7:  return 6;   // DEAD             -> Dead
+      case 8:  return 115; // KNEEL            -> KneelLoop
+      default: return -1;  // STAND (0) / SUBMERGED (9) / unknown -> no override
+    }
+  }
+
+  // Does this spawn's aura list contain a stealth aura? A stealthed creature idles in StealthStand
+  // (AnimationData.dbc 120) rather than Stand -- e.g. the Deadmines Defias Blackguard, which carries
+  // Stealth 1785 in Turtle's creature_template.auras and Faded 6408 in CMaNGOS/AzerothCore's
+  // creature_template_addon.auras (noggit already reads whichever column the schema provides).
+  //
+  // The set is every spell whose Spell.dbc effect applies SPELL_AURA_MOD_STEALTH (16), minus the ones that
+  // are a phase/submerge/burrow rather than a crouch. NOT derived from unit_flags: 0x40 is UNIT_FLAG_UNK_6
+  // in the 1.12 server source (Hogger and 846 others carry it), not a sneak bit.
+  bool creature_auras_include_stealth(std::string const& auras)
+  {
+    static std::unordered_set<std::uint32_t> const stealth_auras = {
+      1784, 1785, 1786, 1787, // Stealth ranks 1-4
+      8822,                   // Stealth (creature)
+      10032,                  // Uber Stealth
+      5916,                   // Shadowstalker Stealth
+      6408,                   // Faded -- the generic creature stealth aura in CMaNGOS/Turtle data
+      8216,                   // zzOLDStealth
+      8218, 22766, 20540,     // Sneak / Ashenvale Outrunner Sneak
+      6920,                   // Hide
+      743, 20580,             // Shadowmeld
+      5215, 6783, 8152, 9913, // Prowl
+      24450, 24452, 24453,    // Prowl (creature variants)
+    };
+
+    // Aura lists are space separated in some schemas and comma separated in others.
+    std::string normalized = auras;
+    std::replace(normalized.begin(), normalized.end(), ',', ' ');
+
+    std::istringstream tokens(normalized);
+    std::uint32_t aura_id = 0;
+    while (tokens >> aura_id)
+    {
+      if (stealth_auras.count(aura_id))
+      {
+        return true;
+      }
+    }
+    return false;
+  }
 }
 
 bool World::ensureCreatureSpawnModel(CreatureSpawnOverlay& spawn)
@@ -3095,6 +3227,21 @@ bool World::ensureCreatureSpawnModel(CreatureSpawnOverlay& spawn)
                                              ModelInstance::min_scale(),
                                              ModelInstance::max_scale());
     spawn.model_instance->updateTransformMatrix();
+
+    // NPC pose: play the authored sit/sleep/kneel/etc idle from creature_addon.stand_state. Set here (before
+    // the mount branch below), so a mounted NPC's Mount pose (anim 91) still wins by overwriting it later.
+    // Stand (0) leaves the default (-1 -> the model's normal idle-variation animation).
+    {
+      int pose_anim = creature_stand_state_animation_id(spawn.stand_state);
+      if (pose_anim < 0 && creature_auras_include_stealth(spawn.auras))
+      {
+        pose_anim = 120; // StealthStand -- an authored sit/sleep pose still wins over stealth
+      }
+      if (pose_anim >= 0)
+      {
+        spawn.model_instance->setForcedAnimationId(pose_anim);
+      }
+    }
 
     auto const overrides = applyCreatureSpawnModelAppearance(spawn, *spawn.model_instance, Noggit::NoggitRenderContext::MAP_VIEW);
 
@@ -3579,6 +3726,77 @@ World::GameObjectSpawnOverlay const* World::findGameObjectSpawn(std::uint32_t gu
     });
 
   return it != _gameobject_spawns.end() ? &*it : nullptr;
+}
+
+void World::recomputeEventSuppression()
+{
+  // A spawn is hidden by the seasonal filter based on its signed event id:
+  //   event == 0            -> base world, always visible.
+  //   event  > 0            -> hidden UNLESS that event is active.
+  //   event  < 0            -> hidden WHEN abs(event) is active ("spawn except during the event").
+  auto suppressed = [this](std::int32_t event) -> bool
+  {
+    if (event == 0)
+    {
+      return false;
+    }
+    bool const active = _active_events.count(std::abs(event)) != 0;
+    return event > 0 ? !active : active;
+  };
+
+  for (auto& spawn : _creature_spawns)
+  {
+    spawn.event_suppressed = suppressed(spawn.event);
+  }
+  for (auto& spawn : _gameobject_spawns)
+  {
+    spawn.event_suppressed = suppressed(spawn.event);
+  }
+}
+
+void World::setEventActive(std::int32_t entry, bool active)
+{
+  std::int32_t const key = std::abs(entry);
+  if (key == 0)
+  {
+    return;
+  }
+
+  if (active)
+  {
+    _active_events.insert(key);
+  }
+  else
+  {
+    _active_events.erase(key);
+  }
+  recomputeEventSuppression();
+}
+
+void World::clearActiveEvents()
+{
+  _active_events.clear();
+  recomputeEventSuppression();
+}
+
+std::set<std::int32_t> World::spawnedEventEntries() const
+{
+  std::set<std::int32_t> entries;
+  for (auto const& spawn : _creature_spawns)
+  {
+    if (spawn.event != 0)
+    {
+      entries.insert(std::abs(spawn.event));
+    }
+  }
+  for (auto const& spawn : _gameobject_spawns)
+  {
+    if (spawn.event != 0)
+    {
+      entries.insert(std::abs(spawn.event));
+    }
+  }
+  return entries;
 }
 
 void World::LoadSavedSelectionGroups()

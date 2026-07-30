@@ -280,10 +280,12 @@ void main()
   vec3 to_light = -normalize(vec3(LightDir_FogRate.x, LightDir_FogRate.z, LightDir_FogRate.y));
   float nDotL = clamp(dot(normalized_normal, to_light), 0.0, 1.0);
 
-  vec3 skyColor = (AmbientColor_FogEnd.xyz * 1.10000002);
-  vec3 groundColor = (AmbientColor_FogEnd.xyz * 0.699999988);
-
-  currColor = mix(groundColor, skyColor, 0.5 + (0.5 * nDotL));
+  // Client terrain lighting = fixed-function directional with a SINGLE FLAT ambient (LightIntBand[1]),
+  // NOT a sky/ground hemisphere. RE 2026-07-26: the 1.12 FF T&L path writes one D3DLIGHT ambient, and
+  // the 335a terrain vertex shader is `min(1, ambient + saturate(N.L)*diffuse)`. The old ambient*1.1
+  // sky / *0.7 ground mix (keyed on nDotL) was a noggit invention -- it tinted slopes brighter/darker
+  // than the client. See RE_notes/lighting/00_lighting_pipeline_RE.md 7.2.
+  currColor = AmbientColor_FogEnd.xyz;
   lDiffuse = DiffuseColor_FogStart.xyz * nDotL;
 
   // TERRAIN SPECULAR, CLIENT-EXACT (Westfall trace, 25.6k terrain draws + the terrain PS disasm):
@@ -320,8 +322,11 @@ void main()
     out_color.rgb *= vary_mccv;
   }
 
-  // apply world lighting (+ emitter point lights)
-  out_color.rgb = clamp(out_color.rgb * (currColor + lDiffuse + point_lights(vary_position, normalized_normal)), 0.0, 1.0);
+  // apply world lighting (+ emitter point lights). CLIENT-EXACT combine order: clamp the LIGHT to [0,1]
+  // FIRST, then modulate the texture -- `tex * min(1, light)`, NOT `min(1, tex*light)`. The old outer-only
+  // clamp let bright sunlit surfaces clamp UP past the client (a white sunlit wall read hotter than in-game,
+  // exaggerating the city-vs-terrain contrast at e.g. the Stormwind harbor). RE 2026-07-26 (§7.2/§12b).
+  out_color.rgb = out_color.rgb * clamp(currColor + lDiffuse + point_lights(vary_position, normalized_normal), 0.0, 1.0);
 
   // apply overlays
   if(draw_paintability_overlay != 0 && instances[instanceID].ChunkHoles_DrawImpass_TexLayerCount_CantPaint.a != 0)

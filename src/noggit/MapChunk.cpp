@@ -265,13 +265,23 @@ MapChunk::MapChunk(MapTile* maintile, BlizzardArchive::ClientFile* f, bool bigAl
     memset(_shadow_map, 0, 64 * 64);
   }
   // - MCCV ----------------------------------------------
-  if(header.ofsMCCV)
+  // Peek the fourcc at ofsMCCV and only treat it as MCCV if it REALLY is 'MCCV'. `ofsMCCV` sits at MCNK
+  // header offset 0x74 -- the tail where the vanilla-1.12 and WotLK header layouts diverge -- so a true
+  // vanilla ADT can carry a nonzero stale value there that points into MCVT/MCNR/MCAL. The old code trusted
+  // `if(ofsMCCV)` alone (the assert is compiled out in Release), reading terrain bytes as vertex colour ->
+  // the EPL psychedelic per-vertex weave. A real MCCV chunk always has the correct fourcc here, so this
+  // guard never drops legitimate MCCV; it only rejects a mis-pointed offset (-> white default below).
+  bool mccv_valid = false;
+  if (header.ofsMCCV)
   {
     f->seek(base + header.ofsMCCV);
     f->read(&fourcc, 4);
-    f->read(&size, 4);
+    mccv_valid = (fourcc == 'MCCV');
+  }
 
-    assert(fourcc == 'MCCV');
+  if (mccv_valid)
+  {
+    f->read(&size, 4);
 
     if (!(header_flags.flags.has_mccv))
     {
@@ -284,6 +294,11 @@ MapChunk::MapChunk(MapTile* maintile, BlizzardArchive::ClientFile* f, bool bigAl
     for (int i = 0; i < mapbufsize; ++i)
     {
       f->read(t, 4);
+      // /127 is CORRECT (127 = neutral = 1.0), PROVEN from the shipped data: every MCCV-bearing ADT in the
+      // 1.12 Turtle EPL region (azeroth_42_26..29 / 43_26..29 in patch-3.mpq) stores a uniform 127,127,127 --
+      // i.e. the authored "no tint" value in the x2-overbright convention. Decoding /255 would render those 8
+      // tiles at 0.498 = HALF BRIGHTNESS against their no-MCCV neighbours. (A /255 experiment was tried while
+      // chasing the EPL psychedelic bug and reverted: the data is uniform, so no scale can produce a weave.)
       mccv[i] = glm::vec3((float)t[2] / 127.0f, (float)t[1] / 127.0f, (float)t[0] / 127.0f);
     }
   }
@@ -992,7 +1007,10 @@ bool MapChunk::stampMCCV(glm::vec3 const& pos, glm::vec4 const& color, float cha
 void MapChunk::update_vertex_colors()
 {
   if (_chunk_update_flags & ChunkUpdateFlags::MCCV)
-
+    // Row index = px*16+py, the chunk's natural MCNK index -- the SAME slot updateVerticesData writes the
+    // heightmap to ((px*16+py)*mapbufsize*4). MCCV and heightmap are both sampled with instanceID, so they
+    // must use identical rows; heights render correctly, so px*16+py is proven correct. (An earlier py*16+px
+    // "transpose fix" broke this alignment and was reverted -- the EPL psychedelic bug is in the DATA path.)
     gl.texSubImage2D(GL_TEXTURE_2D, 0, 0, px * 16 + py, mapbufsize, 1, GL_RGB, GL_FLOAT, mccv);
 }
 

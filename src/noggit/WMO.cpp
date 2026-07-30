@@ -9,6 +9,7 @@
 #include <noggit/World.h>
 #include <noggit/rendering/Primitives.hpp>
 #include <noggit/application/NoggitApplication.hpp>
+#include <noggit/project/CurrentProject.hpp>
 #include <opengl/scoped.hpp>
 
 #include <algorithm>
@@ -115,8 +116,28 @@ void WMO::finishLoading ()
   auto load_texture
     ( [&] (std::uint32_t ofs)
       {
-        char const* texture
-          (texbuf[ofs] ? &texbuf[ofs] : "textures/shanecube.blp");
+        std::string texture
+          (texbuf[ofs] ? std::string(&texbuf[ofs]) : std::string("textures/shanecube.blp"));
+
+        // Custom WMOs (Turtle world/custom/kttown/kttown.wmo) reference textures by BARE filename
+        // (window.blp, floor.blp, wall3.blp) with NO directory. A bare name collides with same-named
+        // root textures shipped by other patches, so noggit's patch load-order resolves them to the WRONG
+        // image ("wrong textures" on the building). Resolve a directory-less name from the WMO's OWN folder
+        // first (world/custom/kttown/window.blp) -- a unique, collision-free path -- and only fall back to
+        // the bare name if no co-located texture exists. Standard full-path MOTX entries are unaffected.
+        if (texture.find('/') == std::string::npos && texture.find('\\') == std::string::npos)
+        {
+          std::string const wmo_path = _file_key.filepath();
+          auto const slash = wmo_path.find_last_of("/\\");
+          if (slash != std::string::npos)
+          {
+            std::string const co_located = wmo_path.substr(0, slash + 1) + texture;
+            if (Noggit::Application::NoggitApplication::instance()->clientData()->exists(co_located))
+            {
+              texture = co_located;
+            }
+          }
+        }
 
         auto const mapping
           (texture_offset_to_inmem_index.emplace(ofs, static_cast<std::uint32_t>(textures.size())));
@@ -267,30 +288,45 @@ void WMO::finishLoading ()
   // - MOLT ----------------------------------------------
 
   f.read (&fourcc, 4);
-  f.seekRelative (4);
+  f.read (&size, 4);
 
   assert (fourcc == 'MOLT');
 
-  lights.reserve(nLights);
-  for (size_t i (0); i < nLights; ++i) {
+  // Same header-vs-chunk-size guard as MODS below: trust the CHUNK SIZE so a bad MOHD.nLights can't run
+  // the read past the chunk and desync the stream. Each MOLT entry is 0x30 bytes; min() is a no-op when
+  // the header agrees with the chunk (every valid WMO), and seeking to the chunk end keeps alignment.
+  std::size_t const molt_end = f.getPos () + size;
+  std::size_t const light_count = std::min<std::size_t> (nLights, size / 0x30);
+  lights.reserve(light_count);
+  for (size_t i (0); i < light_count; ++i) {
     WMOLight l;
     l.init (&f);
     lights.push_back (l);
   }
+  f.seek (molt_end);
 
   // - MODS ----------------------------------------------
 
   f.read (&fourcc, 4);
-  f.seekRelative (4);
+  f.read (&size, 4);
 
   assert (fourcc == 'MODS');
 
-  doodadsets.reserve(nDoodadSets);
-  for (size_t i (0); i < nDoodadSets; ++i) {
+  // Robustness (Turtle world/custom/kt_Farm/ktfarm.wmo, kt_Inn/ktinn.wmo): read the doodad-set count from
+  // the CHUNK SIZE, not blindly from MOHD.nDoodadSets. Those custom WMOs carry a MOHD nDoodadSets (6, 4)
+  // that OVERRUNS their actual 32-byte (1-set) MODS chunk -> reading nDoodadSets*32 bytes ran past the
+  // chunk and DESYNCED every following chunk (MODN/MODD/MFOG read from garbage offsets -> MODD "claimed"
+  // 34.5M doodads -> async loader crash, SEH 0xC0000005). Clamp to what the chunk holds and seek to its
+  // end so the stream stays aligned. min() is a no-op for valid WMOs (nDoodadSets == size/32).
+  std::size_t const mods_end = f.getPos () + size;
+  std::size_t const set_count = std::min<std::size_t> (nDoodadSets, size / 32);
+  doodadsets.reserve(set_count);
+  for (size_t i (0); i < set_count; ++i) {
     WMODoodadSet dds;
     f.read (&dds, 32);
     doodadsets.push_back (dds);
   }
+  f.seek (mods_end);
 
   // - MODN ----------------------------------------------
 
@@ -1240,8 +1276,20 @@ void WMOGroup::load_mocv(BlizzardArchive::ClientFile& f, uint32_t size)
     _mocv_pristine_alpha[i] = _vertex_colors[i].w;
   }
 
+  // 3.3.5a WMO interior: the client runs CMapObjGroup::FixColorVertexAlpha (a WotLK-era MOCV transform 1.12
+  // lacks) and its interior material shader is mod2x (tex*MOCV*2). noggit is tuned for 1.12 (verbatim MOCV,
+  // x1). Gate the WotLK path to non-CLASSIC projects behind an env toggle (interior lighting = A/B, never a
+  // blind change; RE notes warn the >1 combine can clamp-blow on our pipeline). Evaluated once.
+  // DEFAULT-ON for non-CLASSIC (user-confirmed brighter, 2026-07-29); opt out with NOGGIT_NO_335A_WMO_MOD2X=1.
+  static bool const s_wotlk_wmo_mod2x =
+      (std::getenv("NOGGIT_NO_335A_WMO_MOD2X") == nullptr)
+   && Noggit::Project::CurrentProject::get() != nullptr
+   && Noggit::Project::CurrentProject::get()->projectVersion != Noggit::Project::ProjectVersion::CLASSIC;
+
   if (wmo->flags.do_not_fix_vertex_color_alpha)
   {
+    // MOHD flag 0x08 -> the client SKIPS FixColorVertexAlpha (both versions); MOCV stays verbatim. Under
+    // mod2x that means these faces render tex*MOCV*2 (2x) -- the shader x2 rides on top.
     int interior_batchs_start = 0;
 
     if (header.transparency_batches_count > 0)
@@ -1253,6 +1301,10 @@ void WMOGroup::load_mocv(BlizzardArchive::ClientFile& f, uint32_t size)
     {
       _vertex_colors[n].w = header.flags.exterior ? 1.f : 0.f;
     }
+  }
+  else if (s_wotlk_wmo_mod2x)
+  {
+    fix_vertex_color_alpha_wotlk();
   }
   else
   {
@@ -1267,49 +1319,36 @@ void WMOGroup::load_mocv(BlizzardArchive::ClientFile& f, uint32_t size)
 
 void WMOGroup::fix_vertex_color_alpha()
 {
-  int interior_batchs_start = 0;
+  // Interior = x1 * MOCV (working approximation). The byte-exact tex*MOCV*(1+4a) HDR path blows out on our
+  // content (noggit renders tex*MOCV brighter than the client), so we keep the x1 approximation and, for the
+  // near-white (~1,1,1) MOHD sentinel WMOs (Timbermaw), fold the (1+4a) overbright in at LOAD (clamped) so the
+  // skywrap glows. Normal WMOs stay verbatim; alpha forced to 1 (the shader uses x1*MOCV and the portal spill
+  // rides the alpha channel separately via compute_portal_openness).
+  glm::vec4 const amb = wmo->flags.use_unified_render_path ? glm::vec4(0.f) : wmo->ambient_light_color;
+  bool const neutral_ambient = amb.x > 0.95f && amb.y > 0.95f && amb.z > 0.95f;
 
+  int interior_batchs_start = 0;
   if (header.transparency_batches_count > 0)
   {
     interior_batchs_start = _batches[header.transparency_batches_count - 1].vertex_end + 1;
   }
+  constexpr float normalized_alpha_scale = 255.f / 64.f;
 
-  glm::vec4 wmo_ambient_color;
-
-  if (wmo->flags.use_unified_render_path)
-  {
-    wmo_ambient_color = {0.f, 0.f, 0.f, 0.f};
-  }
-  else
-  {
-    wmo_ambient_color = wmo->ambient_light_color;
-    // w is not used, set it to 0 to avoid changing the vertex color alpha
-    wmo_ambient_color.w = 0.f;
-  }
-
-  // A near-white MOHD ambient (e.g. the Timbermaw instance, authored (1,1,1)) is effectively a
-  // "no extra ambient" sentinel: the baked MOCV already carries the full interior lighting.
-  bool const neutral_ambient = wmo_ambient_color.x > 0.95f
-                            && wmo_ambient_color.y > 0.95f
-                            && wmo_ambient_color.z > 0.95f;
-
-  for (int i = 0; i < _vertex_colors.size(); ++i)
+  for (std::size_t i = 0; i < _vertex_colors.size(); ++i)
   {
     auto& color = _vertex_colors[i];
     float r = color.x;
     float g = color.y;
     float b = color.z;
-    float a = color.w;
-
-    constexpr float normalized_alpha_scale = 255.f / 64.f;
+    float const a = color.w;
 
     if (neutral_ambient)
     {
-      if (i >= interior_batchs_start)
+      if (static_cast<int>(i) >= interior_batchs_start)
       {
-        r = r + (r * a * normalized_alpha_scale);
-        g = g + (g * a * normalized_alpha_scale);
-        b = b + (b * a * normalized_alpha_scale);
+        r = r + r * a * normalized_alpha_scale;   // (1+4a) overbright -> the Timbermaw skywrap glow
+        g = g + g * a * normalized_alpha_scale;
+        b = b + b * a * normalized_alpha_scale;
       }
       else
       {
@@ -1318,39 +1357,84 @@ void WMOGroup::fix_vertex_color_alpha()
         b = b * (1.f - a);
       }
     }
-    else if (i >= interior_batchs_start)
-    {
-      // un-halved (client-MOCV-data justified; the user-approved state)
-      r = r + (r * a * normalized_alpha_scale) - wmo_ambient_color.x;
-      g = g + (g * a * normalized_alpha_scale) - wmo_ambient_color.y;
-      b = b + (b * a * normalized_alpha_scale) - wmo_ambient_color.z;
-    }
-    else
-    {
-      r -= wmo_ambient_color.x;
-      g -= wmo_ambient_color.y;
-      b -= wmo_ambient_color.z;
-
-      r = r * (1.f - a);
-      g = g * (1.f - a);
-      b = b * (1.f - a);
-    }
+    // else: NORMAL WMO -> leave RGB verbatim.
 
     color.x = std::min(1.f, std::max(0.f, r));
     color.y = std::min(1.f, std::max(0.f, g));
     color.z = std::min(1.f, std::max(0.f, b));
-    color.w = 1.f; // default value used in the shader so I simplified it here,
-                   // it can be overriden by the 2nd mocv chunk
+    color.w = 1.f;
   }
+}
+
+void WMOGroup::fix_vertex_color_alpha_wotlk()
+{
+  // Byte-exact port of CMapObjGroup::FixColorVertexAlpha from the stock 3.3.5a client (12340, FUN_007D7380).
+  // Operates on the 0..255 CImVector MOCV. begin_second_fixup splits transparency-batch verts from interior
+  // verts; the two ranges get DIFFERENT arithmetic. Colours here are normalized floats -> quantize to 0..255,
+  // apply the integer ops, renormalize. `color.w` still holds the PRISTINE MOCV alpha at this point (set by
+  // load_mocv before this runs). Pairs with the mod2x (tex*MOCV*2) interior combine in wmo_frag.
+  int begin_second_fixup = 0;
+  if (header.transparency_batches_count > 0)
+  {
+    begin_second_fixup = _batches[header.transparency_batches_count - 1].vertex_end + 1;
+  }
+
+  auto const q = [](float v) -> int { return std::min(255, std::max(0, static_cast<int>(std::lround(v * 255.f)))); };
+
+  for (std::size_t i = 0; i < _vertex_colors.size(); ++i)
+  {
+    auto& color = _vertex_colors[i];
+    int r = q(color.x);
+    int g = q(color.y);
+    int b = q(color.z);
+    int const a = q(color.w);
+
+    if (static_cast<int>(i) < begin_second_fixup)
+    {
+      // transparency-batch verts: rgb >>= 1 (halve); alpha unchanged. (Net under mod2x = x1.)
+      r >>= 1;
+      g >>= 1;
+      b >>= 1;
+    }
+    else
+    {
+      // interior verts: c = min(255, ((c*a >> 6) + c) >> 1); alpha forced to 255.
+      // (Net under mod2x: a=0 -> x1; higher alpha -> brighter, up to the framebuffer ceiling.)
+      r = std::min(255, (((r * a) >> 6) + r) >> 1);
+      g = std::min(255, (((g * a) >> 6) + g) >> 1);
+      b = std::min(255, (((b * a) >> 6) + b) >> 1);
+    }
+
+    color.x = static_cast<float>(r) / 255.f;
+    color.y = static_cast<float>(g) / 255.f;
+    color.z = static_cast<float>(b) / 255.f;
+    color.w = 1.f; // interior forced to 255; trans verts don't use alpha downstream (portal openness overwrites)
+  }
+}
+
+namespace
+{
+  // Forward decls -- defined in the anonymous namespace below (shared with atten_trans_verts); the canon
+  // openness computation in compute_portal_openness needs them and sits above their definitions.
+  int major_axis(glm::vec3 const& n);
+  bool point_in_poly_2d(glm::vec3 const& v, glm::vec3 const* poly, std::size_t n, int drop_axis);
+  float dist_to_polygon_edges_3d(glm::vec3 const& v, glm::vec3 const* poly, std::size_t n);
 }
 
 void WMOGroup::compute_portal_openness()
 {
   // Portal-proximity "openness" baked into the vertex-colour alpha (1 at a portal fading to 0 inward):
   // the shader lerps the interior light toward the outdoor light by it, smoothing doorways.
+  // The `do_not_attenuate_vertices_based_on_distance_to_portal` (MOHD flag 0x1) guard was REMOVED
+  // (2026-07-27, DIFFERENTIAL TEST vs the real client): Stormwind.wmo sets flag 0x1, yet a side-by-side
+  // screenshot of the actual Turtle client shows it DOES spill outdoor light onto the Cathedral doorway
+  // reveal -- warm/bright at the opening, fading to the cool interior. So flag 0x1 does NOT disable the WMO
+  // doorway light-spill; gating on it left Stormwind's (and every 0x1 WMO's) doorways flat and cool, which
+  // is the "doesn't blend with the outside light" the user saw. The portal-distance falloff and the
+  // exterior-target-portal test below already scope the spill to real openings, so honouring the flag here
+  // was pure regression.
   if (!header.flags.indoor
       || header.flags.use_mocv2_for_texture_blending
-      || wmo->flags.do_not_attenuate_vertices_based_on_distance_to_portal
       || header.portal_count == 0
       || _vertices.empty()
       || _vertex_colors.size() < _vertices.size())
@@ -1358,37 +1442,65 @@ void WMOGroup::compute_portal_openness()
     return;
   }
 
-  std::vector<glm::vec3> portal_points;
-  for (std::uint16_t p = 0; p < header.portal_count; ++p)
-  {
-    std::size_t const ref_idx = static_cast<std::size_t>(header.portal_start) + p;
-    if (ref_idx >= wmo->_portal_refs.size()) { continue; }
-    auto const& ref = wmo->_portal_refs[ref_idx];
-    if (ref.portal < 0 || static_cast<std::size_t>(ref.portal) >= wmo->_portal_info.size()) { continue; }
-    auto const& info = wmo->_portal_info[static_cast<std::size_t>(ref.portal)];
-    for (std::uint16_t v = 0; v < info.vertex_count; ++v)
-    {
-      std::size_t const vi = static_cast<std::size_t>(info.base_vertex) + v;
-      if (vi < wmo->_portal_vertices.size())
-      {
-        portal_points.push_back(wmo->_portal_vertices[vi]);
-      }
-    }
-  }
-  if (portal_points.empty())
-  {
-    return;
-  }
-
-  constexpr float FADE = 7.0f;
+  // CANON openness = the client's CMapObjGroup::AttenTransVerts `op` (verified byte-for-byte against the
+  // decompiled function; the port is atten_trans_verts() below): accumulate `1 - 0.15*d` over this group's
+  // MOPR portals whose TARGET group is EXTERIOR (mogi_flags & 0x48), d = 3D distance to the portal polygon;
+  // a vertex ON a portal into another INTERIOR group zeroes it. clamp [0,1]. Stored per-vertex in the MOCV
+  // alpha; the shader brightens the interior light toward WHITE by it (AttenTransVerts does rgb+=(255-rgb)*op),
+  // so a doorway threshold reaches full texture brightness and fades inward exactly where the client's does.
+  //
+  // SCOPE = EVERY vertex of this (indoor, portal-bearing) group -- NOT just the doorway-transition band. The
+  // `1 - 0.15*d` distance falloff is precisely what makes light coming through the opening CONTINUE onto the
+  // interior floor and walls and FADE inward over ~6.7 units, so the room reads as ONE connected space lit
+  // through the doorway -- instead of the reveal being a separate lit patch that hard-cuts at the mesh seam
+  // (the user's real complaint: the outdoor light "shouldn't just cut off" at the boundary; the pieces must
+  // light together, not individually and get stitched). Restricting op to transparency-batch verts confined
+  // the spill to the short reveal and destroyed exactly that continuity. Deep interior verts (d > 6.7)
+  // accumulate 0 -> no spill, so this does NOT flood whole rooms; non-portal groups early-return above, and
+  // their op=1.0-default blowout is separately gated by eWMOBatch_PortalSpill in the shader. Stored in MOCV a.
   for (std::size_t i = 0; i < _vertices.size(); ++i)
   {
-    float mind = std::numeric_limits<float>::max();
-    for (auto const& pp : portal_points)
+    glm::vec3 const& v = _vertices[i];
+    float accum = 0.0f;
+    for (std::size_t r = header.portal_start;
+         r < static_cast<std::size_t>(header.portal_start) + header.portal_count
+         && r < wmo->_portal_refs.size(); ++r)
     {
-      mind = std::min(mind, glm::distance(_vertices[i], pp));
+      auto const& ref = wmo->_portal_refs[r];
+      if (ref.portal < 0 || static_cast<std::size_t>(ref.portal) >= wmo->_portal_info.size()) { continue; }
+      auto const& portal = wmo->_portal_info[static_cast<std::size_t>(ref.portal)];
+      if (portal.vertex_count == 0
+          || static_cast<std::size_t>(portal.base_vertex) + portal.vertex_count > wmo->_portal_vertices.size())
+      {
+        continue;
+      }
+      glm::vec3 const* poly = wmo->_portal_vertices.data() + portal.base_vertex;
+      float const d = glm::dot(portal.plane_normal, v) + portal.plane_dist;
+      float d_use;
+      if (std::abs(d) <= 0.01f
+          && point_in_poly_2d(v, poly, portal.vertex_count, major_axis(portal.plane_normal)))
+      {
+        d_use = static_cast<float>(ref.dir) * d;
+      }
+      else
+      {
+        d_use = dist_to_polygon_edges_3d(v, poly, portal.vertex_count);
+      }
+      bool const target_exterior = ref.group >= 0
+        && static_cast<std::size_t>(ref.group) < wmo->groups.size()
+        && (wmo->groups[static_cast<std::size_t>(ref.group)].mogi_flags & 0x48);
+      if (target_exterior)
+      {
+        float const v25 = (d_use >= 0.0f) ? d_use * 0.15f : 0.0f;
+        if (1.0f - v25 > 0.001f) { accum += 1.0f - v25; }
+      }
+      else if (d_use > -1.0f && d_use < 1.0f)
+      {
+        accum = 0.0f;
+        break;
+      }
     }
-    _vertex_colors[i].w = std::clamp(1.0f - mind / FADE, 0.0f, 1.0f);
+    _vertex_colors[i].w = (accum > 0.001f) ? std::min(accum, 1.0f) : 0.0f;
   }
   _has_portal_openness = true;
 }

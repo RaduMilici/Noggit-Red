@@ -1,5 +1,6 @@
 // This file is part of Noggit3, licensed under GNU General Public License (version 3).
 #include <noggit/TextureManager.h>
+#include <atomic> // [TEXARRAYDBG] temporary
 #include <noggit/Log.h> // LogDebug
 #include <noggit/application/NoggitApplication.hpp>
 #include <ClientFile.hpp>
@@ -142,6 +143,12 @@ void TextureManager::unload_all(Noggit::NoggitRenderContext context)
   {
     gl.deleteTextures(static_cast<GLuint>(pair.second.arrays.size()), pair.second.arrays.data());
   }
+
+  // Drop the bookkeeping too. Without this the map kept the DELETED GL names and their n_used counters,
+  // so every later lookup for the same (format,size,mips) bucket walked past stale entries and the names
+  // were never reconciled with reality -- GL is free to hand those exact names back out to new textures.
+  // Clearing resets both the name list and n_used. [2026-07-30]
+  arrays_for_context.clear();
 }
 
 void TextureManager::reapply_anisotropy()
@@ -453,6 +460,21 @@ void blp_texture::upload()
     }
 
     params.n_used++;
+
+    // [TEXARRAYDBG 2026-07-30] temporary: which texture OWNS each (array, layer)? Cross-referenced against
+    // the layer a WMO batch actually samples, to find where green "junk texture" bleed comes from.
+    {
+      static std::atomic<int> dbg{0};
+      if (dbg.fetch_add(1) < 6000)
+      {
+        LogError << "[TEXARRAYDBG] upload fmt=" << _compression_format.value()
+                 << " " << _width << "x" << _height
+                 << " mips=" << _compressed_data.size()
+                 << " array=" << _texture_array << " layer=" << _array_index
+                 << " n_used=" << params.n_used
+                 << " file='" << _file_key.stringRepr() << "'" << std::endl;
+      }
+    }
 
     //LogDebug << "Mip level (compressed): " << std::to_string(_compressed_data.size()) << std::endl;
     _compressed_data.clear();

@@ -5,6 +5,7 @@
 #include <math/interpolation.hpp>
 #include <algorithm>
 #include <cassert>
+#include <cstddef>
 #include <map>
 #include <vector>
 #include <memory>
@@ -388,10 +389,39 @@ namespace Animation
       const AnimationBlockHeader* timestampHeaders = file.get<AnimationBlockHeader>(animationBlock.ofsTimes);
       const AnimationBlockHeader* keyHeaders = file.get<AnimationBlockHeader>(animationBlock.ofsKeys);
 
+      // External .anim data (WotLK+): animation_files is indexed BY SEQUENCE INDEX and holds nullptr wherever
+      // the keyframes are inline in the M2. ClientFile::get() is unchecked pointer arithmetic, so validate the
+      // requested range against the external file's size before reading it -- a short/mismatched .anim would
+      // otherwise read out of bounds. Both loops below use the SAME predicate, so a rejected sequence ends up
+      // with an empty times[j] AND data[j] (consistent) rather than a half-filled track.
+      auto const external_file = [&animation_files](std::uint32_t j) -> BlizzardArchive::ClientFile const*
+      {
+        return j < animation_files.size() && animation_files[j] ? animation_files[j].get() : nullptr;
+      };
+      auto const external_usable = [&](std::uint32_t j) -> bool
+      {
+        auto const* ext = external_file(j);
+        if (!ext)
+        {
+          return false;
+        }
+        std::size_t const times_end = static_cast<std::size_t>(timestampHeaders[j].ofsEntries)
+          + static_cast<std::size_t>(timestampHeaders[j].nEntries) * sizeof(TimestampType);
+        std::size_t const keys_end = static_cast<std::size_t>(keyHeaders[j].ofsEntries)
+          + static_cast<std::size_t>(keyHeaders[j].nEntries) * sizeof(DataType);
+        return times_end <= ext->getSize() && keys_end <= ext->getSize();
+      };
+
       for (std::uint32_t j = 0; j < animationBlock.nTimes; ++j)
       {
-        const TimestampType* timestamps = j < animation_files.size() && animation_files[j] ?
-          animation_files[j]->get<TimestampType>(timestampHeaders[j].ofsEntries) :
+        auto const* ext = external_file(j);
+        if (ext && !external_usable(j))
+        {
+          continue; // unusable external data -> leave this sequence's track empty
+        }
+
+        const TimestampType* timestamps = ext ?
+          ext->get<TimestampType>(timestampHeaders[j].ofsEntries) :
           file.get<TimestampType>(timestampHeaders[j].ofsEntries);
 
         for (std::uint32_t i = 0; i < timestampHeaders[j].nEntries; ++i)
@@ -402,8 +432,14 @@ namespace Animation
 
       for (std::uint32_t j = 0; j < animationBlock.nKeys; ++j)
       {
-        const DataType* keys = j < animation_files.size() && animation_files[j] ?
-          animation_files[j]->get<DataType>(keyHeaders[j].ofsEntries) :
+        auto const* ext = external_file(j);
+        if (ext && !external_usable(j))
+        {
+          continue; // keep data[j] consistent with the skipped times[j] above
+        }
+
+        const DataType* keys = ext ?
+          ext->get<DataType>(keyHeaders[j].ofsEntries) :
           file.get<DataType>(keyHeaders[j].ofsEntries);
 
         switch (_interpolationType)

@@ -29,6 +29,13 @@ namespace mysql
     // creature_template_addon.auras (AzerothCore). Empty when the schema has neither.
     std::string auras;
     std::uint32_t faction = 0; // creature_template faction (a FactionTemplate.dbc id) -> hostility
+    // Seasonal game-event membership (game_event_creature.event). Signed: 0 = base world (always spawned),
+    // >0 = spawns only while that event is active, <0 = spawns EXCEPT while abs(event) is active.
+    std::int32_t event = 0;
+    // NPC pose from creature_addon: stand_state = UnitStandState (0 stand, 1 sit, 3 sleep, 4/5/6 chair-sit,
+    // 7 dead, 8 kneel); emote_state = an Emotes.dbc id (its AnimID overrides the stand pose when non-zero).
+    std::uint8_t  stand_state = 0;
+    std::uint32_t emote_state = 0;
     float template_scale = 1.0f;
     float position_x = 0.0f;
     float position_y = 0.0f;
@@ -66,11 +73,20 @@ namespace mysql
     std::uint32_t map = 0;
     std::uint32_t display_id = 0;
     std::string name;
+    // Seasonal game-event membership (game_event_gameobject.event). See CreatureSpawnRecord::event.
+    std::int32_t event = 0;
     float template_scale = 1.0f;
     float position_x = 0.0f;
     float position_y = 0.0f;
     float position_z = 0.0f;
     float orientation = 0.0f;
+  };
+
+  // One row of the game_event table: a seasonal event (Winter Veil, Hallow's End, Darkmoon Faire, ...).
+  struct GameEventRecord
+  {
+    std::int32_t entry = 0;
+    std::string description;
   };
 
   struct GameObjectTemplateRecord
@@ -155,6 +171,7 @@ namespace mysql
   void updateUIDinDB (std::size_t mapID, std::uint32_t NewUID);
   std::vector<CreatureSpawnRecord> getCreatureSpawns(std::size_t mapID, std::string* error = nullptr);
   std::vector<GameObjectSpawnRecord> getGameObjectSpawns(std::size_t mapID, std::string* error = nullptr);
+  std::vector<GameEventRecord> getGameEvents(std::string* error = nullptr);
   std::vector<CreaturePatrolPoint> getCreaturePatrolPaths(std::size_t mapID, std::string* error = nullptr);
   std::vector<CreatureSpawnRecord> searchCreatureSpawns(std::string const& searchTerm, std::size_t limit = 200, std::string* error = nullptr);
   std::vector<CreatureTemplateRecord> getCreatureTemplates(std::size_t limit = 10000, std::string* error = nullptr);

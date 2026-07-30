@@ -15,6 +15,8 @@
 #include <algorithm>
 #include <cassert>
 #include <cctype>
+#include <iomanip> // std::setw/setfill for the zero-padded external .anim filenames
+#include <sstream>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -1876,20 +1878,50 @@ void Model::initAnimated(const BlizzardArchive::ClientFile& f)
 
       memcpy(animations.data(), f.getBuffer() + header.ofsAnimations, header.nAnimations * sizeof(ModelAnimation));
 
-      for (auto& anim : animations)
+      // External .anim files (WotLK+): a sequence's keyframes can live outside the M2. TWO bugs fixed here:
+      //
+      // 1. NAMING -- the client zero-pads: "<model><animID:%04d>-<subAnimID:%02d>.anim", e.g.
+      //    "HumanMale0097-00.anim". This built "HumanMale97-0.anim", which never exists, so noggit loaded
+      //    NO external animation at all on the wotlk path (47 such files exist for HumanMale alone). That is
+      //    why NPC poses worked in 1.12 (all keyframes are inline in a vanilla M2) but not in 3.3.5a, where
+      //    SitGround(97)/Sleep(100) keyframes are external -> the forced pose anim had no keys to play.
+      // 2. INDEXING -- Animated.h reads `animation_files[j]` with j = the SEQUENCE INDEX. push_back built a
+      //    dense, compacted vector, so once the names did match, a sequence would have picked up a DIFFERENT
+      //    sequence's file and applied its own (unrelated) offsets to it -- garbage keys / OOB reads, since
+      //    ClientFile::get() is unchecked pointer arithmetic. Size it to nAnimations and assign BY INDEX,
+      //    leaving nullptr wherever the data is inline (Animated.h then falls back to the M2).
+      animation_files.resize(header.nAnimations);
+
+      std::string const lodname = _file_key.filepath().substr(0, _file_key.filepath().length() - 3);
+      auto* const client_data = Noggit::Application::NoggitApplication::instance()->clientData();
+
+      for (std::size_t seq_index = 0; seq_index < animations.size(); ++seq_index)
       {
+        auto& anim = animations[seq_index];
         anim.length = std::max(anim.length, 1U);
 
         _animation_length[anim.animID] += anim.length;
         _animations_seq_per_id[anim.animID][anim.subAnimID] = anim;
 
-        std::string lodname = _file_key.filepath().substr(0, _file_key.filepath().length() - 3);
-        std::stringstream tempname;
-        tempname << lodname << anim.animID << "-" << anim.subAnimID << ".anim";
-        if (Noggit::Application::NoggitApplication::instance()->clientData()->exists(tempname.str()))
+        // ONLY sequences WITHOUT M2Sequence flag 0x20 ("primary bone sequence") keep their keyframes in an
+        // external .anim; a 0x20 sequence's track offsets point INSIDE the M2 instead.
+        //
+        // ! Test `loopType`, NOT `flags` ! This struct's field NAMES are shifted one slot against the real
+        // M2Sequence layout: the real flags live at offset 12, which this struct calls `loopType`, while its
+        // `flags` (offset 16) is actually frequency+padding. Reading `flags` finds frequency == 0x7FFF, which
+        // happens to have 0x20 set, so EVERY sequence looked inline and no external .anim ever loaded --
+        // leaving Sit(97)/Sleep(100)/StealthStand(120) sampling M2 bytes at .anim-relative offsets (~0x150),
+        // i.e. garbage non-unit quaternions -> the mangled/stretched NPC skeletons. Verified against the
+        // 3.3.5a client's patch-3.MPQ HumanMale.m2: seq69 (anim 97) real flags=0x0 but @16=0x7FFF.
+        if (!(anim.loopType & 0x20))
         {
-          animation_files.push_back(std::make_unique<BlizzardArchive::ClientFile>(tempname.str(),
-              Noggit::Application::NoggitApplication::instance()->clientData()));
+          std::stringstream tempname;
+          tempname << lodname << std::setfill('0') << std::setw(4) << anim.animID << "-"
+                   << std::setw(2) << anim.subAnimID << ".anim";
+          if (client_data->exists(tempname.str()))
+          {
+            animation_files[seq_index] = std::make_unique<BlizzardArchive::ClientFile>(tempname.str(), client_data);
+          }
         }
       }
     }
@@ -2572,12 +2604,14 @@ bool Model::advanceIdleSchedule(int anim_id, long long anim_time,
   while (anim_time >= st.play_end && guard++ < 4096)
   {
     AnimVariation const& v = roll_variation();
-    uint32_t replay = v.replay_min;
-    if (v.replay_max > v.replay_min)                    // replayCount in [replayMin, replayMax-1] (client)
-    {
-      replay = v.replay_min + (next_rand() % (v.replay_max - v.replay_min));
-    }
-    if (replay < 1) { replay = 1; }
+    // Play each rolled variation ONCE, then re-roll. The old code held a variation for its authored
+    // replayCount (replayMin..replayMax, e.g. 2-7 -> a single pose held 5-19s). On many creatures a
+    // sub-variation's bone tracks END before its declared sequence length, so the tail HOLDS the last
+    // frame -- and holding that for 5-19s made the NPC visibly FREEZE ("standing still, then moving
+    // again"). Re-rolling after one play keeps the idle continuously cycling (the frequency roulette
+    // keeps the neutral base dominant, and same-sequence re-rolls loop seamlessly with no blend), so the
+    // motion never stalls. [2026-07-28 idle-freeze fix]
+    uint32_t const replay = 1;
     long long const dur = static_cast<long long>(std::max<uint32_t>(1, v.length)) * replay;
 
     st.prev_seq = st.cur_seq;
@@ -2608,6 +2642,7 @@ bool Model::advanceIdleSchedule(int anim_id, long long anim_time,
     out_blend_w = x * x * (3.0f - 2.0f * x);            // smoothstep, matches the client
     out_do_blend = true;
   }
+
   return true;
 }
 
@@ -2710,20 +2745,60 @@ void Model::animate(glm::mat4x4 const& model_view, int anim_id, int anim_time, b
   }
   else
   {
-    // Legacy path (non-classic model, blending disabled, or no variation data): sub-variations
-    // concatenated on one timeline.
+    // Legacy path (non-classic/WotLK model, blending disabled, or no variation data): the sub-variations
+    // of this animID are concatenated onto one looping timeline, with a cross-fade across each sub boundary
+    // so the switch glides instead of hard-cutting.
+    ModelAnimation const* found_sub = nullptr; // the sub whose window contains time_for_anim
+    ModelAnimation const* prev_sub  = nullptr; // the sub immediately before it in the cycle (blend FROM)
+    ModelAnimation const* last_sub  = nullptr; // final sub overall (wrap-around source at cycle start)
+    ModelAnimation const* iter_prev = nullptr;
     for (auto const& sub_animation : subs)
     {
-      if (static_cast<int>(sub_animation.second.length) > time_for_anim)
+      last_sub = &sub_animation.second;
+      if (!found_sub)
       {
-        current_sub_anim = sub_animation.first;
-        break;
+        if (static_cast<int>(sub_animation.second.length) > time_for_anim)
+        {
+          current_sub_anim = sub_animation.first;
+          found_sub = &sub_animation.second;
+          prev_sub  = iter_prev; // null when the current sub is the first one
+        }
+        else
+        {
+          time_for_anim -= sub_animation.second.length;
+        }
       }
-      time_for_anim -= sub_animation.second.length;
+      iter_prev = &sub_animation.second;
     }
-    ModelAnimation const& a = _animations_seq_per_id[anim_id][current_sub_anim];
-    _current_anim_seq = a.Index;
-    _anim_time = _uses_classic_layout ? time_for_anim : t;
+    if (!found_sub) { found_sub = last_sub; }   // safety: t rounded to the very end
+    if (!prev_sub)  { prev_sub  = last_sub; }    // cycle start blends FROM the last sub's end (loop seam)
+
+    _current_anim_seq = found_sub ? found_sub->Index : 0;
+    // Sample the SELECTED sub at its WITHIN-sub time, not the full concatenated `t`. The walk leaves
+    // time_for_anim = t - (preceding sub lengths) = the offset inside that sub. Each sequence's tracks are
+    // normalized to [0, sub.length]; feeding the full `t` (>= sub.length for every sub after the first) made
+    // the sampler clamp to the sub's LAST keyframe -> the sub froze at its final frame for its whole window
+    // (Stand: sub0 breathes, sub1/2/3 hold frozen ~2.5s each, loop -- the WotLK-NPC "play, freeze, play").
+    // time_for_anim == t for the first sub / single-sub anims, so this is a no-op there.
+    // [2026-07-28 idle-freeze ROOT FIX: was `_uses_classic_layout ? time_for_anim : t`]
+    _anim_time = time_for_anim;
+
+    // Cross-fade the first blend_ms of each sub FROM the previous sub's final frame -- the same rigid TRS
+    // blend the classic idle scheduler applies -- so sub boundaries (and the cycle loop seam) glide over
+    // ~0.5s instead of snapping. Gated by the shared blend toggle (NOGGIT_NO_ANIM_BLEND=1 restores hard
+    // cuts). Skipped for single-sub / self loops (prev == current), which wrap seamlessly on their own.
+    if (anim_transition_blend_enabled() && found_sub && prev_sub && prev_sub != found_sub)
+    {
+      int const blend_ms = std::min(500, std::max(1, static_cast<int>(found_sub->length) / 2));
+      if (time_for_anim < blend_ms)
+      {
+        do_blend = true;
+        blend_seq_from = prev_sub->Index;
+        blend_time_from = std::max(0, static_cast<int>(prev_sub->length) - 1); // previous sub at its end
+        float const x = static_cast<float>(time_for_anim) / static_cast<float>(blend_ms);
+        blend_w = x * x * (3.0f - 2.0f * x); // smoothstep (weight of the current/TO pose), matches classic
+      }
+    }
   }
 
   _global_animtime = anim_time;
@@ -2744,10 +2819,34 @@ void Model::animate(glm::mat4x4 const& model_view, int anim_id, int anim_time, b
       }
       calcBones(model_view, _current_anim_seq, _anim_time, _global_animtime);
       float const w_to = blend_w;
-      float const w_from = 1.0f - blend_w;
+      // Rigid TRS blend of the two posed skeletons. The previous component-wise matrix lerp
+      // (from*(1-w) + to*w) is NOT a valid rotation interpolation: blending two rotation matrices
+      // linearly shrinks the determinant/scale (90 deg -> ~0.707, 180 deg -> collapse), so limbs
+      // visibly shrank and detached from their parents during every idle-variation cross-fade -- the
+      // NPC animation jitter/stutter. Decompose each bone into translation + per-axis scale + rotation,
+      // SLERP the rotation and LERP translation/scale, so the blend stays rigid. (Only fires on the
+      // classic idle-variation blend path -- wotlk models use the legacy concatenation path.)
+      auto const blend_bone = [](glm::mat4x4 const& a, glm::mat4x4 const& b, float w) -> glm::mat4x4
+      {
+        float const eps = 1e-6f;
+        glm::vec3 const sa(glm::length(glm::vec3(a[0])), glm::length(glm::vec3(a[1])), glm::length(glm::vec3(a[2])));
+        glm::vec3 const sb(glm::length(glm::vec3(b[0])), glm::length(glm::vec3(b[1])), glm::length(glm::vec3(b[2])));
+        glm::mat3 const ra(glm::vec3(a[0]) / std::max(sa.x, eps), glm::vec3(a[1]) / std::max(sa.y, eps), glm::vec3(a[2]) / std::max(sa.z, eps));
+        glm::mat3 const rb(glm::vec3(b[0]) / std::max(sb.x, eps), glm::vec3(b[1]) / std::max(sb.y, eps), glm::vec3(b[2]) / std::max(sb.z, eps));
+        glm::quat qa = glm::quat_cast(ra);
+        glm::quat qb = glm::quat_cast(rb);
+        if (glm::dot(qa, qb) < 0.0f) { qb = -qb; } // shortest-arc
+        glm::quat const q = glm::normalize(glm::slerp(qa, qb, w));
+        glm::vec3 const t = glm::mix(glm::vec3(a[3]), glm::vec3(b[3]), w);
+        glm::vec3 const s = glm::mix(sa, sb, w);
+        glm::mat4x4 m = glm::mat4_cast(q);
+        m[0] *= s.x; m[1] *= s.y; m[2] *= s.z;
+        m[3] = glm::vec4(t, 1.0f);
+        return m;
+      };
       for (std::size_t i = 0; i < bones.size(); ++i)
       {
-        bones[i].mat = _blend_scratch[i] * w_from + bones[i].mat * w_to;
+        bones[i].mat = blend_bone(_blend_scratch[i], bones[i].mat, w_to);
       }
     }
     else

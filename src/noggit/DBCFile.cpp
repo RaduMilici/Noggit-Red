@@ -31,6 +31,7 @@ DBCFile::DBCFile(const std::string& _filename)
 
 void DBCFile::open(std::shared_ptr<BlizzardArchive::ClientData> clientData)
 {
+  invalidate_id_index();
   BlizzardArchive::ClientFile f (filename, clientData.get());
 
   if (f.isEof())
@@ -93,6 +94,7 @@ void DBCFile::save()
 
 DBCFile::Record DBCFile::addRecord(size_t id, size_t id_field)
 {
+  invalidate_id_index();
   recordCount++;
 
   for (Iterator i = begin(); i != end(); ++i)
@@ -110,6 +112,7 @@ DBCFile::Record DBCFile::addRecord(size_t id, size_t id_field)
 
 DBCFile::Record DBCFile::addRecordCopy(size_t id, size_t id_from, size_t id_field)
 {
+  invalidate_id_index();
   recordCount++;
 
   bool from_found = false;
@@ -148,6 +151,7 @@ DBCFile::Record DBCFile::addRecordCopy(size_t id, size_t id_from, size_t id_fiel
 
 void DBCFile::removeRecord(size_t id, size_t id_field)
 {
+  invalidate_id_index();
   recordCount--;
   size_t counter = 0;
 

@@ -10,6 +10,9 @@
 #include <QtWidgets/QSlider>
 #include <QtWidgets/QLabel>
 #include <QtWidgets/QVBoxLayout>
+#include <QtWidgets/QHBoxLayout>
+#include <QtWidgets/QToolButton>
+#include <QtWidgets/QFrame>
 
 #include <algorithm>
 #include <cmath>
@@ -272,15 +275,29 @@ namespace Noggit::Ui
   {
     if (_popup) return;
     _popup = new QWidget(this, Qt::Popup);
-    _popup->setMinimumWidth(240);
-    auto lay = new QVBoxLayout(_popup);
+    // Horizontal layout: [ clock + time slider ] | [ Seasonal Events button ] on the RIGHT.
+    auto lay = new QHBoxLayout(_popup);
+    auto time_col = new QVBoxLayout();
     _clock = new QLabel("12:00", _popup);
     _clock->setAlignment(Qt::AlignCenter);
     _slider = new QSlider(Qt::Horizontal, _popup);
     _slider->setMinimum(0);
     _slider->setMaximum(1439); // minutes 0:00 .. 23:59
-    lay->addWidget(_clock);
-    lay->addWidget(_slider);
+    _slider->setMinimumWidth(200);
+    time_col->addWidget(_clock);
+    time_col->addWidget(_slider);
+    lay->addLayout(time_col);
+
+    // Seasonal Events section, to the RIGHT of the time slider: a vertical separator then the calendar
+    // button (built by MapView). Its menu flies out further to the right of the popup.
+    if (_mapView)
+    {
+      auto sep = new QFrame(_popup);
+      sep->setFrameShape(QFrame::VLine);
+      sep->setFrameShadow(QFrame::Sunken);
+      lay->addWidget(sep);
+      lay->addWidget(_mapView->makeSeasonalEventsToolButton(_popup), 0, Qt::AlignVCenter);
+    }
 
     auto fmt = [](int m) { return QString("%1:%2").arg(m / 60, 2, 10, QChar('0')).arg(m % 60, 2, 10, QChar('0')); };
     connect(_slider, &QSlider::valueChanged, this, [this, fmt](int minutes)

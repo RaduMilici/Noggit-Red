@@ -50,6 +50,12 @@ vec3 point_lights(vec3 world_pos, vec3 n)
 uniform vec3 camera;
 uniform sampler2DArray texture_samplers[15];
 uniform vec3 ambient_color;
+// [GREENDBG 2026-07-30] temporary bisect for the bright-green patches on EnvMetal WMO surfaces (icebreaker
+// ship figurehead / Icecrown spikes). Set NOGGIT_WMO_DEBUG=1..6 to replace out_color with ONE term, so the
+// green can be attributed without another rebuild:
+//   1 = diffuse texture only      2 = second (env) texture sample only   3 = the env term only
+//   4 = lighting only (on white)  5 = vertex colour only                 6 = tex_coord_2 as colour
+uniform int wmo_debug_mode;
 // Per-region MFOG (client-canon): WMO geometry fogs with the group's authored MFOG (blended toward
 // the zone fog by the volume falloff on the CPU) while terrain keeps the zone fog in the same frame.
 // use_wmo_fog stays 0 in paths that never set it (previews) -> falls back to the UBO zone fog.
@@ -74,6 +80,16 @@ uniform int camera_inside_wmo;
 // Debug: 1 = output the raw fixed-up MOCV vertex colour (magenta where a batch has NO MOCV flag), so we
 // can see whether the black doorway-reveal faces actually carry the warm baked colour or lose it.
 uniform int debug_mocv;
+
+// 3.3.5a WMO interior material shader is mod2x (tex*MOCV*2); 1.12 is x1. Set for non-CLASSIC projects when
+// the NOGGIT_335A_WMO_MOD2X toggle is on; pairs with the load-time WotLK FixColorVertexAlpha. 0 = x1 (1.12).
+uniform int wmo_interior_mod2x;
+// 3.3.5a interior tone knobs (applied to the FINAL interior light when wmo_interior_mod2x is set):
+//   wmo_interior_floor = shadow minimum -- no interior face darker than this (kills pure-black voids).
+//   wmo_interior_gain  = overall interior brightness multiplier (1.0 = neutral).
+// Live-tunable via NOGGIT_335A_INTERIOR_FLOOR / NOGGIT_335A_INTERIOR_GAIN so contrast can be dialled to client.
+uniform float wmo_interior_floor;
+uniform float wmo_interior_gain;
 
 in vec3 f_position;
 in vec3 f_normal;
@@ -218,8 +234,14 @@ vec3 apply_lighting(vec3 material)
     // zone selection picks the dim Ironforge-interior Light.dbc zone (ID 72/73, param 77 #98461d) at that
     // eye -- not from any camera gate. (If they stay bright, the bug is noggit's zone selection wrongly
     // holding the bright surface ID=16 (#546f84) inside IF -- a light-selection fix, not a shader one.)
+    // FRAME FIX (RE 2026-07-26): WMO normals load fixCoordSystem'd = (wow.x, wow.z, -wow.y) (WMO.cpp,
+    // same as M2), so the light must NEGATE its 3rd component like m2_frag does -- NOT the terrain
+    // swizzle (+y). With +y the West/East term had the wrong sign, mirroring the sun's azimuth across
+    // North-South: WMO faces lit from the NE while terrain/M2/client light from the NW. That is why
+    // Stormwind's WMO keep/walls lit from the opposite side of the (correct) terrain mountain. Proven
+    // byte-exact: a west-facing wall gives N.L = +0.646 (client) only with -y; +y gave -0.646 (dark).
     float nDotL = clamp(dot(normalize(f_normal),
-                            -normalize(vec3(LightDir_FogRate.x, LightDir_FogRate.z, LightDir_FogRate.y))),
+                            -normalize(vec3(LightDir_FogRate.x, LightDir_FogRate.z, -LightDir_FogRate.y))),
                         0.0, 1.0);
     vec3 lit_diffuse = DiffuseColor_FogStart.xyz;
     vec3 lit_ambient = AmbientColor_FogEnd.xyz;
@@ -244,31 +266,54 @@ vec3 apply_lighting(vec3 material)
   }
   else
   {
-    // Interior geometry: the WMO's own MOHD ambient + the baked MOCV -- the client / reference noggit3
-    // formula `ambient_color + vertex_color`. (The removed wmo_open spill, interior_sun and time-of-day
-    // MOCV multiply were the real hand-tuned hacks that washed out / crushed Ironforge -- gone for good.)
-    //
-    // ONE required guard, NOT a look-tune: some WMOs (e.g. the Timbermaw instance) author a near-white
-    // (~1,1,1) MOHD ambient as a sentinel meaning "the baked MOCV already carries the full interior
-    // light -- add nothing extra". fix_vertex_color_alpha() detects that same near-white case and PRESERVES
-    // the baked MOCV (it does NOT subtract the ambient the way it does for a normal WMO). So the shader
-    // must match: for near-white ambient, add ~0 (a tiny floor so unlit vertices aren't pure black), not
-    // literal white -- otherwise (1,1,1)+MOCV floods every baked shadow flat (bland Timbermaw). Normal
-    // WMOs (Ironforge et al.) have a real dark authored ambient and take the plain path unchanged.
-    // (Byte-matched client formula tex*MOCV*(1+4a) was tried and REVERTED -- looked worse on our
-    // content; see WMO.cpp load_mocv note. Approved formula below.)
+    // Interior geometry = tex * MOCV (x1). The byte-exact client combine is tex*MOCV.rgb*(1+4*MOCV.a) HDR
+    // (docs/client_re/17), but the (1+4a) overbright BLOWS the doorway reveal + candle/window verts to solid
+    // white on our content: noggit renders `tex*MOCV` brighter than the client, so the same >1 factor clamps
+    // to white here where it stays sub-1 on the client (a texture-decode/render divergence, the true root --
+    // NOT fixable in this shader). Kept x1 * MOCV, stable. No-MOCV faces -> MOHD ambient, floored to 0.04 for
+    // the near-white (~1,1,1) "MOCV carries the light" sentinel (Timbermaw) so no-MOCV skywrap doesn't flood.
+    // NO doorway spill. GROUND TRUTH (apitrace wow_cap_doorway_portal.trace, 2026-07-27): the client does NOT
+    // brighten the reveal at all -- its reveal MOCV alpha is ~0 (92.9% exactly 0) so the `(1+4*a)` term is
+    // dormant (x1), the reveal is just `tex * MOCV` (~0.35, measured (108,92,93)), and it is NATURALLY darker
+    // than the sunlit exterior because it's a recessed opening. ZERO pixels clip to white in the whole client
+    // frame. Every runtime spill I layered on here (toward white, then outdoor, then extended into the room)
+    // was ADDING light the client never adds -- the "overtuned/seam" the user saw. Interior = plain `tex*MOCV`,
+    // which at alpha~0 is byte-exact to the client. (The (1+4a) overbright only lifts candle/emissive hotspots
+    // -- a separate enhancement that needs the raw MOCV alpha plumbed, NOT the portal-openness in .w.)
     vec3 interior_ambient = all(greaterThan(ambient_color, vec3(0.95))) ? vec3(0.04) : ambient_color;
-    light_color = interior_ambient + vertex_color;
-
-    // NO outdoor colour-lerp for WMO faces. CANON (LIGHT_FOG_SELECTION_RE.md §9.5): in the client's interior
-    // lighting (FUN_006a7300), the MOCV-alpha / near-opening (0x800) term only tilts the light DIRECTION
-    // toward the sun -- it NEVER lerps the face COLOUR toward the outdoor light. The colour-lerp toward
-    // CWorldLight (FUN_0069e4c0 / FUN_006a8410) is for placed DOODADS that SAMPLE the WMO light, not the
-    // WMO's own geometry. noggit's old PortalSpill mix() toward the bright Dun Morogh light was exactly what
-    // lit Ironforge's windows/doorways blue-white -- removed. Interior WMO faces are baked MOCV, full stop.
+    // 3.3.5a interior combine is mod2x: tex*MOCV*2 (paired with the load-time WotLK FixColorVertexAlpha, which
+    // pre-halves so alpha~0 verts net x1 and only higher-alpha verts brighten). 1.12 stays x1. Clamp below
+    // caps hotspots. A/B via wmo_interior_mod2x.
+    vec3 mocv_light = (wmo_interior_mod2x != 0) ? (vertex_color * 2.0) : vertex_color;
+    // Doorway/portal SEAM blend: blend the reveal toward the EXTERIOR lighting of THIS SAME face (same normal):
+    // clamp(diffuse*N.L)+ambient, identical to the ExteriorLit branch, so at the opening (openness a->1) a reveal
+    // face equals the abutting exterior face of the same orientation -> continuous seam, fading to interior MOCV
+    // inward (a->0). Applies to BOTH 1.12 and 3.3.5a (portal-spill faces only) -- the doorway hard-seam is the
+    // same in both. This is the `mix` version (bounded), NOT the brighten-only max() (which over-lit whole multi-
+    // window rooms with directional streaks -- reverted 2026-07-29, do NOT reintroduce max here). The 335a
+    // branch is UNCHANGED by ungating (it already ran this); only 1.12 (mod2x==0) newly gains it.
+    if (bool(flags & eWMOBatch_PortalSpill))
+    {
+      float nDotL_ext = clamp(dot(normalize(f_normal),
+                                  -normalize(vec3(LightDir_FogRate.x, LightDir_FogRate.z, -LightDir_FogRate.y))),
+                              0.0, 1.0);
+      vec3 exterior_light = clamp(DiffuseColor_FogStart.xyz * nDotL_ext, 0.0, 1.0) + AmbientColor_FogEnd.xyz;
+      mocv_light = mix(mocv_light, exterior_light, clamp(f_vertex_color.a, 0.0, 1.0));
+    }
+    light_color = bool(flags & eWMOBatch_HasMOCV) ? mocv_light : interior_ambient;
+    // FINAL interior tone (335a): gain brightens the whole interior, then a hard shadow floor guarantees no
+    // interior face renders pure BLACK (catches near-0/absent MOCV AND any seam-darkened deep face -- it clamps
+    // the FINISHED light). Both flat + brighten-friendly, applied LAST so nothing upstream can leave black.
+    if (wmo_interior_mod2x != 0)
+    {
+      light_color = max(light_color * wmo_interior_gain, vec3(wmo_interior_floor));
+    }
   }
 
   light_color += point_lights(f_position, normalize(f_normal));
+
+  // Clamp the light to [0,1] before the texture modulate (client/WMO clamp-before-texture, §12b harbor fix).
+  light_color = clamp(light_color, 0.0, 1.0);
 
   vec3 lit = material.rgb * light_color;
 
@@ -366,6 +411,131 @@ void main()
   else // default shader, used for shader 0,1,2,4 (Diffuse, Specular, Metal, Opaque)
   {
     out_color = vec4(apply_lighting(tex.rgb), 1.);
+  }
+
+  // [GREENDBG 2026-07-30] temporary: isolate one shading term. Placed BEFORE fog/bloom so the term is
+  // shown raw. Alpha test above still applies, so cutouts stay cutouts.
+  if (wmo_debug_mode != 0)
+  {
+    if (wmo_debug_mode == 1) { out_color = vec4(tex.rgb, 1.0); }
+    else if (wmo_debug_mode == 2) { out_color = vec4(tex_2.rgb, 1.0); }
+    else if (wmo_debug_mode == 3) { out_color = vec4(tex_2.rgb * tex.rgb * tex.a, 1.0); }
+    else if (wmo_debug_mode == 4) { out_color = vec4(apply_lighting(vec3(1.0)), 1.0); }
+    else if (wmo_debug_mode == 5) { out_color = vec4(f_vertex_color.rgb, 1.0); }
+    else if (wmo_debug_mode == 6) { out_color = vec4(fract(abs(tex_coord_2)), 0.0, 1.0); }
+    // 7 = IDENTIFY the texture actually bound to the env slot, by its dimensions. The env map for these
+    // materials is wr_env.blp at 128x128, so a correct binding is BLUE. Any other colour means slot 1 holds
+    // a different texture than the one the batch recorded -> a recycled/stale GL texture name.
+    else if (wmo_debug_mode == 7)
+    {
+      float s = get_tex_size(tex_array1).x;
+      if (s == 128.0)      { out_color = vec4(0.0, 0.0, 1.0, 1.0); } // BLUE  = 128 (expected wr_env)
+      else if (s == 256.0) { out_color = vec4(1.0, 1.0, 0.0, 1.0); } // YELLOW= 256
+      else if (s == 512.0) { out_color = vec4(1.0, 0.0, 0.0, 1.0); } // RED   = 512
+      else if (s == 64.0)  { out_color = vec4(0.0, 1.0, 1.0, 1.0); } // CYAN  = 64
+      else                 { out_color = vec4(1.0, 1.0, 1.0, 1.0); } // WHITE = anything else / unbound
+    }
+    // 8 = same identification for the DIFFUSE slot, as a control (ship figurehead is 512 -> RED).
+    else if (wmo_debug_mode == 8)
+    {
+      float s = get_tex_size(tex_array0).x;
+      if (s == 128.0)      { out_color = vec4(0.0, 0.0, 1.0, 1.0); }
+      else if (s == 256.0) { out_color = vec4(1.0, 1.0, 0.0, 1.0); }
+      else if (s == 512.0) { out_color = vec4(1.0, 0.0, 0.0, 1.0); }
+      else if (s == 64.0)  { out_color = vec4(0.0, 1.0, 1.0, 1.0); }
+      else                 { out_color = vec4(1.0, 1.0, 1.0, 1.0); }
+    }
+    // 9 = ONLY EnvMetal/Env batches, coloured by the env slot's texture size; everything else BLACK.
+    // (Mode 7 was useless here: the ship's ~11 non-env materials read their own 256px diffuse and
+    // drowned out the 4 env batches.) BLUE = 128 = the expected wr_env.
+    else if (wmo_debug_mode == 9)
+    {
+      if (shader != 3u && shader != 5u) { out_color = vec4(0.0, 0.0, 0.0, 1.0); }
+      else
+      {
+        float s = get_tex_size(tex_array1).x;
+        if (s == 128.0)      { out_color = vec4(0.0, 0.0, 1.0, 1.0); } // BLUE  = correct wr_env
+        else if (s == 256.0) { out_color = vec4(1.0, 1.0, 0.0, 1.0); } // YELLOW= wrong (256)
+        else if (s == 512.0) { out_color = vec4(1.0, 0.0, 0.0, 1.0); } // RED   = wrong (512)
+        else                 { out_color = vec4(1.0, 1.0, 1.0, 1.0); } // WHITE = other/unbound
+      }
+    }
+    // 10 = THE DECIDER: sample the env texture at a FIXED (0.5,0.5) instead of the computed coordinate,
+    // on env batches only (others black). wr_env's centre is grey/teal, so:
+    //   grey/teal  -> the bound texture is CORRECT and the COORDINATE is what's broken
+    //   still green-> the bound texture itself is wrong (a different texture is in that slot)
+    else if (wmo_debug_mode == 10)
+    {
+      if (shader != 3u && shader != 5u) { out_color = vec4(0.0, 0.0, 0.0, 1.0); }
+      else { out_color = vec4(get_tex_color(vec2(0.5, 0.5), tex_array1, int(tex1)).rgb, 1.0); }
+    }
+    // 11 = what SHADER id reaches the fragment stage?  DARKGREY=0 Diffuse, CYAN=3 Env, BLUE=5 EnvMetal,
+    // MAGENTA=6 TwoLayer, RED=anything else. If the whole ship is one colour here, the batch data is wrong.
+    else if (wmo_debug_mode == 11)
+    {
+      if (shader == 0u)      { out_color = vec4(0.25, 0.25, 0.25, 1.0); }
+      else if (shader == 3u) { out_color = vec4(0.0, 1.0, 1.0, 1.0); }
+      else if (shader == 5u) { out_color = vec4(0.0, 0.0, 1.0, 1.0); }
+      else if (shader == 6u) { out_color = vec4(1.0, 0.0, 1.0, 1.0); }
+      else                   { out_color = vec4(1.0, 0.0, 0.0, 1.0); }
+    }
+    // 12 = what SLOT index does the batch ask for on the second texture?  BLACK=0, GREEN=1, YELLOW=2,
+    // RED=anything else (a slot >= n_used would sample an unbound unit).
+    else if (wmo_debug_mode == 12)
+    {
+      if (tex_array1 == 0u)      { out_color = vec4(0.0, 0.0, 0.0, 1.0); }
+      else if (tex_array1 == 1u) { out_color = vec4(0.0, 1.0, 0.0, 1.0); }
+      else if (tex_array1 == 2u) { out_color = vec4(1.0, 1.0, 0.0, 1.0); }
+      else                       { out_color = vec4(1.0, 0.0, 0.0, 1.0); }
+    }
+    // 13/14 = sample a sampler DIRECTLY, bypassing get_tex_color's if-chain, at a fixed UV. Alpha 0 so the
+    // bloom/emissive post-pass cannot touch the result. 13 = env slot's unit, 14 = diffuse slot's unit.
+    else if (wmo_debug_mode == 13)
+    {
+      out_color = vec4(texture(texture_samplers[1], vec3(0.5, 0.5, 0.0)).rgb, 0.0);
+      return;
+    }
+    else if (wmo_debug_mode == 14)
+    {
+      out_color = vec4(texture(texture_samplers[0], vec3(0.5, 0.5, 0.0)).rgb, 0.0);
+      return;
+    }
+    // 17/18/19 = direct samples of the other sampler slots at a fixed UV (alpha 0). Sweeping the slots
+    // shows WHICH unit actually holds the grey env map, which exposes any off-by-one between the binding
+    // loop (slot i -> unit 1+i) and the uniform mapping.
+    else if (wmo_debug_mode == 17)
+    {
+      out_color = vec4(texture(texture_samplers[2], vec3(0.5, 0.5, 0.0)).rgb, 0.0);
+      return;
+    }
+    else if (wmo_debug_mode == 18)
+    {
+      out_color = vec4(texture(texture_samplers[3], vec3(0.5, 0.5, 0.0)).rgb, 0.0);
+      return;
+    }
+    // 19 = sample the env slot but force the LOWEST mip explicitly. If mip 0 is grey here while mode 13 is
+    // green, the higher mip levels are missing/undefined and mip selection is what produces the colour.
+    else if (wmo_debug_mode == 19)
+    {
+      out_color = vec4(textureLod(texture_samplers[1], vec3(0.5, 0.5, 0.0), 0.0).rgb, 0.0);
+      return;
+    }
+    // 15 = FLAT MID-GREY with alpha 1.0 (the emissive/bloom range every other debug mode wrote). If this
+    // comes out GREEN, the post-process is producing the colour and every earlier debug reading was
+    // contaminated by it -- including the "green" that pointed at the env sample.
+    else if (wmo_debug_mode == 15)
+    {
+      out_color = vec4(0.5, 0.5, 0.5, 1.0);
+      return;
+    }
+    // 16 = the same flat mid-grey but alpha 0.0 (bloom-excluded), as the control for 15.
+    else if (wmo_debug_mode == 16)
+    {
+      out_color = vec4(0.5, 0.5, 0.5, 0.0);
+      return;
+    }
+    out_color.a = 1.0;
+    return;
   }
 
   float bloom_mask = 1.0; // bloom eligibility written into alpha; reduced by fog (see below)

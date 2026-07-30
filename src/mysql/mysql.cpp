@@ -71,6 +71,20 @@ namespace
 
 	std::unique_ptr<MYSQL, ConnectionCloser> connect(std::string* error = nullptr)
 	{
+		// Honor the per-project "MySQL enabled" toggle. Without this, every DB call (e.g. the creature/
+		// gameobject model pickers built on map open) connects regardless of the toggle -- so a project
+		// with MySQL DISABLED but a stale/unreachable host (e.g. Ascension: enabled=false, server=
+		// 192.168.1.28) blocks the main thread in mysql_real_connect on every map open and freezes the
+		// editor. If the user turned MySQL off for this project, do not connect at all.
+		if (!Noggit::mysqlSetting("enabled", true).toBool())
+		{
+			if (error)
+			{
+				*error = "MySQL is disabled for this project.";
+			}
+			return nullptr;
+		}
+
 		auto details = loadConnectionDetails();
 
 		MYSQL* connection = mysql_init(nullptr);
@@ -147,6 +161,16 @@ namespace
 		}
 
 		return static_cast<std::uint32_t>(std::strtoul(value, nullptr, 10));
+	}
+
+	std::int32_t parseSigned(char const* value)
+	{
+		if (!value)
+		{
+			return 0;
+		}
+
+		return static_cast<std::int32_t>(std::strtol(value, nullptr, 10));
 	}
 
 	float parseFloat(char const* value)
@@ -643,6 +667,25 @@ namespace mysql
 			? "COALESCE(CASE WHEN ca.mount_display_id > 0 THEN ca.mount_display_id ELSE 0 END, 0) AS mount_display_id"
 			: "0 AS mount_display_id";
 
+		// NPC POSE (stand-state + emote-state) from creature_addon, so a spawn plays its authored sit/sleep/
+		// kneel/emote instead of Stand. Turtle & CMaNGOS expose stand_state directly; AzerothCore/TrinityCore
+		// pack it into bytes1 (low byte = UnitStandState). Emote column: Turtle=emote_state, CMaNGOS/AC=emote.
+		bool const has_ca_standstate = tableHasColumn(connection.get(), "creature_addon", "stand_state");
+		bool const has_ca_bytes1     = !has_ca_standstate && tableHasColumn(connection.get(), "creature_addon", "bytes1");
+		bool const has_ca_emotestate = tableHasColumn(connection.get(), "creature_addon", "emote_state");
+		bool const has_ca_emote      = !has_ca_emotestate && tableHasColumn(connection.get(), "creature_addon", "emote");
+		std::string const standstate_expr =
+			  has_ca_standstate ? "COALESCE(ca.stand_state, 0) AS standstate"
+			: has_ca_bytes1     ? "COALESCE(ca.bytes1 & 0xFF, 0) AS standstate"
+			:                     "0 AS standstate";
+		std::string const emotestate_expr =
+			  has_ca_emotestate ? "COALESCE(ca.emote_state, 0) AS emotestate"
+			: has_ca_emote      ? "COALESCE(ca.emote, 0) AS emotestate"
+			:                     "0 AS emotestate";
+		// Force the creature_addon join if it is only needed for pose (mount/display may be absent from ca).
+		needs_creature_addon_join = needs_creature_addon_join
+			|| has_ca_standstate || has_ca_bytes1 || has_ca_emotestate || has_ca_emote;
+
 		// Spawn entry column: AzerothCore/TrinityCore 3.3.5a name it id1 (with id2/id3 for variants) and
 		// have no plain `id`; Turtle/mangos use `id`. Pick whichever exists.
 		std::string const creature_entry_col =
@@ -678,6 +721,22 @@ namespace mysql
 		                             : has_template_addon_auras ? "COALESCE(cta.auras, '') AS auras"
 		                             :                            "'' AS auras";
 
+		// Seasonal game-event membership. Turtle/mangos: game_event_creature(guid, event) where event is
+		// signed (negative = "spawn EXCEPT while the event is active"). AzerothCore/TrinityCore name the
+		// column eventEntry. Aggregate to one row per guid (a subquery join, so a guid in multiple event
+		// rows never multiplies the spawn) and default 0 when the schema/link is absent.
+		bool const has_event_creature = tableExists(connection.get(), "game_event_creature");
+		std::string const event_col =
+			  !has_event_creature ? ""
+			: tableHasColumn(connection.get(), "game_event_creature", "event")      ? "event"
+			: tableHasColumn(connection.get(), "game_event_creature", "eventEntry") ? "eventEntry"
+			:                                                                          "";
+		bool const join_event = has_event_creature && !event_col.empty();
+		std::string const event_select = join_event ? "COALESCE(gec.gevent, 0) AS event" : "0 AS event";
+		std::string const event_join = join_event
+			? "LEFT JOIN (SELECT guid, MIN(" + event_col + ") AS gevent FROM game_event_creature GROUP BY guid) gec ON gec.guid = c.guid "
+			: "";
+
 		std::stringstream statement;
 		statement
 			<< "SELECT c.guid, " << creature_entry_col << ", c.map, c.position_x, c.position_y, c.position_z, c.orientation, ct.name, "
@@ -686,13 +745,17 @@ namespace mysql
 			<< mount_expr << ", "
 			<< creatureEquipmentSelectExpr(equipment_schema) << ", "
 			<< auras_expr << ", "
-			<< "COALESCE(" << spawn_faction_expr << ", 0) AS spawn_faction "
+			<< "COALESCE(" << spawn_faction_expr << ", 0) AS spawn_faction, "
+			<< event_select << ", "
+			<< standstate_expr << ", "
+			<< emotestate_expr << " "
 			<< "FROM creature c "
 			<< "INNER JOIN creature_template ct ON ct.entry = " << creature_entry_col << " "
 			<< (needs_ctm_join ? "LEFT JOIN creature_template_model ctm ON ctm.CreatureID = ct.entry AND ctm.Idx = 0 " : "")
 			<< (needs_creature_addon_join ? "LEFT JOIN creature_addon ca ON ca.guid = c.guid " : "")
 			<< (has_template_addon_auras ? "LEFT JOIN creature_template_addon cta ON cta.entry = ct.entry " : "")
 			<< creatureEquipmentJoinExpr(equipment_schema)
+			<< event_join
 			<< "WHERE c.map = " << mapID << " "
 			<< "ORDER BY ct.name, c.guid";
 
@@ -740,6 +803,9 @@ namespace mysql
 			record.ranged_inventory_type = parseUnsigned(row[16]);
 			record.auras = parseString(row[17]);
 			record.faction = parseUnsigned(row[18]);
+			record.event = parseSigned(row[19]);
+			record.stand_state = static_cast<std::uint8_t>(parseUnsigned(row[20]));
+			record.emote_state = parseUnsigned(row[21]);
 			records.push_back(record);
 		}
 
@@ -852,25 +918,91 @@ namespace mysql
 			return d;
 		}
 
-		// Turtle/vmangos schema check (AzerothCore names these completely differently).
-		if (!tableHasColumn(connection.get(), "creature_template", "level_min"))
+		if (!tableExists(connection.get(), "creature_template"))
 		{
 			if (error)
 			{
-				*error = "creature_template schema not supported (no level_min column)";
+				*error = "no creature_template table in this database";
 			}
 			return d;
 		}
 
-		bool const has_auras = tableHasColumn(connection.get(), "creature_template", "auras");
+		// Resolve every field by NAME across the supported world schemas instead of assuming Turtle/vmangos.
+		// The old code bailed out entirely when `level_min` was absent, so the Quick Facts panel showed
+		// "creature_template schema not supported" on every 3.3.5a project: CMaNGOS calls it MinLevel and
+		// AzerothCore minlevel. Each entry below emits EXACTLY ONE column so the fixed row[0..31] parsing
+		// order stays valid; a field no schema provides falls back to a literal (0 / '').
+		auto const col = [&](std::initializer_list<char const*> candidates, char const* fallback) -> std::string
+		{
+			for (auto const* candidate : candidates)
+			{
+				if (tableHasColumn(connection.get(), "creature_template", candidate))
+				{
+					return std::string("`") + candidate + "`";
+				}
+			}
+			return fallback;
+		};
+
+		// Auras: Turtle keeps them inline on creature_template; CMaNGOS/AzerothCore put them on
+		// creature_template_addon (a scalar subquery keeps this one column, so the indices don't shift).
+		std::string auras_expr = "''";
+		if (tableHasColumn(connection.get(), "creature_template", "auras"))
+		{
+			auras_expr = "COALESCE(`auras`, '')";
+		}
+		else if (tableHasColumn(connection.get(), "creature_template_addon", "auras"))
+		{
+			auras_expr = "COALESCE((SELECT cta.auras FROM creature_template_addon cta"
+			             " WHERE cta.entry = creature_template.entry LIMIT 1), '')";
+		}
+
+		// AzerothCore has no inline display column -- it lives in creature_template_model.
+		std::string display_expr = col({"display_id1", "DisplayId1"}, "");
+		if (display_expr.empty())
+		{
+			display_expr = tableHasColumn(connection.get(), "creature_template_model", "CreatureDisplayID")
+				? "COALESCE((SELECT ctm.CreatureDisplayID FROM creature_template_model ctm"
+				  " WHERE ctm.CreatureID = creature_template.entry ORDER BY ctm.Idx LIMIT 1), 0)"
+				: "0";
+		}
+
 		std::stringstream statement;
-		statement << "SELECT name, subname, level_min, level_max, `rank`, faction, npc_flags, "
-		          << "health_min, health_max, mana_min, mana_max, gold_min, gold_max, "
-		          << "dmg_min, dmg_max, armor, holy_res, fire_res, nature_res, frost_res, shadow_res, arcane_res, "
-		          << "display_id1, equipment_id, unit_class, type, "
-		          << "spell_id1, spell_id2, spell_id3, spell_id4, spell_list_id, "
-		          << (has_auras ? "COALESCE(auras, '')" : "''") << " AS auras "
-		          << "FROM creature_template WHERE entry = " << entry;
+		statement << "SELECT "
+		          << col({"name", "Name"}, "''") << ", "
+		          << col({"subname", "SubName"}, "''") << ", "
+		          << col({"level_min", "MinLevel", "minlevel"}, "0") << ", "
+		          << col({"level_max", "MaxLevel", "maxlevel"}, "0") << ", "
+		          << col({"rank", "Rank"}, "0") << ", "
+		          << col({"faction", "Faction", "faction_A"}, "0") << ", "
+		          << col({"npc_flags", "NpcFlags", "npcflag"}, "0") << ", "
+		          << col({"health_min", "MinLevelHealth"}, "0") << ", "
+		          << col({"health_max", "MaxLevelHealth"}, "0") << ", "
+		          << col({"mana_min", "MinLevelMana"}, "0") << ", "
+		          << col({"mana_max", "MaxLevelMana"}, "0") << ", "
+		          << col({"gold_min", "MinLootGold", "mingold"}, "0") << ", "
+		          << col({"gold_max", "MaxLootGold", "maxgold"}, "0") << ", "
+		          << col({"dmg_min", "MinMeleeDmg"}, "0") << ", "
+		          << col({"dmg_max", "MaxMeleeDmg"}, "0") << ", "
+		          << col({"armor", "Armor"}, "0") << ", "
+		          << col({"holy_res", "ResistanceHoly"}, "0") << ", "
+		          << col({"fire_res", "ResistanceFire"}, "0") << ", "
+		          << col({"nature_res", "ResistanceNature"}, "0") << ", "
+		          << col({"frost_res", "ResistanceFrost"}, "0") << ", "
+		          << col({"shadow_res", "ResistanceShadow"}, "0") << ", "
+		          << col({"arcane_res", "ResistanceArcane"}, "0") << ", "
+		          << display_expr << ", "
+		          << col({"equipment_id", "EquipmentTemplateId"}, "0") << ", "
+		          << col({"unit_class", "UnitClass"}, "0") << ", "
+		          << col({"type", "CreatureType"}, "0") << ", "
+		          << col({"spell_id1"}, "0") << ", "
+		          << col({"spell_id2"}, "0") << ", "
+		          << col({"spell_id3"}, "0") << ", "
+		          << col({"spell_id4"}, "0") << ", "
+		          << col({"spell_list_id", "SpellList"}, "0") << ", "
+		          << auras_expr << " AS auras "
+		          << "FROM creature_template WHERE "
+		          << col({"entry", "Entry"}, "entry") << " = " << entry;
 
 		if (mysql_query(connection.get(), statement.str().c_str()) != 0)
 		{
@@ -941,6 +1073,62 @@ namespace mysql
 			d.ok = true;
 		}
 		mysql_free_result(result);
+
+		// Scripted combat spells. Each world schema stores them somewhere different, and creature_template's
+		// inline spell_id1..4 only exist on Turtle/vmangos -- which is why the 3.3.5a projects showed an EMPTY
+		// "Spells:" row. Collect from whichever tables this database actually has:
+		//   CMaNGOS  creature_template_spells (entry, spell1..spell10)   <- keyed by the CREATURE entry
+		//   CMaNGOS  creature_spell_list (Id, SpellId)                   <- via creature_template.SpellList
+		//   AC/Trin  creature_template_spell (CreatureID, Index, Spell)  <- one row per spell
+		auto const add_spell = [&d](std::uint32_t spell_id)
+		{
+			if (spell_id && std::find(d.spells.begin(), d.spells.end(), spell_id) == d.spells.end())
+			{
+				d.spells.push_back(spell_id);
+			}
+		};
+
+		auto const collect_spells = [&](std::string const& query)
+		{
+			if (mysql_query(connection.get(), query.c_str()) != 0)
+			{
+				return;
+			}
+			if (MYSQL_RES* result_set = mysql_store_result(connection.get()))
+			{
+				unsigned const columns = mysql_num_fields(result_set);
+				while (MYSQL_ROW row = mysql_fetch_row(result_set))
+				{
+					for (unsigned i = 0; i < columns; ++i)
+					{
+						add_spell(parseUnsigned(row[i]));
+					}
+				}
+				mysql_free_result(result_set);
+			}
+		};
+
+		if (d.ok && tableHasColumn(connection.get(), "creature_template_spells", "spell1"))
+		{
+			std::stringstream q;
+			q << "SELECT spell1, spell2, spell3, spell4, spell5, spell6, spell7, spell8, spell9, spell10 "
+			  << "FROM creature_template_spells WHERE entry = " << entry;
+			collect_spells(q.str());
+		}
+
+		if (d.ok && spell_list_id && tableHasColumn(connection.get(), "creature_spell_list", "SpellId"))
+		{
+			std::stringstream q;
+			q << "SELECT SpellId FROM creature_spell_list WHERE Id = " << spell_list_id << " ORDER BY Position";
+			collect_spells(q.str());
+		}
+
+		if (d.ok && tableHasColumn(connection.get(), "creature_template_spell", "Spell"))
+		{
+			std::stringstream q;
+			q << "SELECT Spell FROM creature_template_spell WHERE CreatureID = " << entry << " ORDER BY `Index`";
+			collect_spells(q.str());
+		}
 
 		// creature_spells list (Turtle): spell_list_id -> up to 8 scripted combat spells.
 		if (d.ok && spell_list_id && tableExists(connection.get(), "creature_spells"))
@@ -1050,14 +1238,29 @@ namespace mysql
 		                                 "1");
 		auto display_expr = buildGameObjectDisplayExpr(connection.get());
 
+		// Seasonal game-event membership (see getCreatureSpawns for the sign semantics).
+		bool const has_event_gameobject = tableExists(connection.get(), "game_event_gameobject");
+		std::string const event_col =
+			  !has_event_gameobject ? ""
+			: tableHasColumn(connection.get(), "game_event_gameobject", "event")      ? "event"
+			: tableHasColumn(connection.get(), "game_event_gameobject", "eventEntry") ? "eventEntry"
+			:                                                                            "";
+		bool const join_event = has_event_gameobject && !event_col.empty();
+		std::string const event_select = join_event ? "COALESCE(geg.gevent, 0) AS event" : "0 AS event";
+		std::string const event_join = join_event
+			? "LEFT JOIN (SELECT guid, MIN(" + event_col + ") AS gevent FROM game_event_gameobject GROUP BY guid) geg ON geg.guid = go.guid "
+			: "";
+
 		std::stringstream statement;
 		statement
 			<< "SELECT go.guid, go.id, go.map, go.position_x, go.position_y, go.position_z, go.orientation, "
 			<< "COALESCE(" << name_expr << ", '') AS name, "
 			<< "COALESCE(NULLIF(" << scale_expr << ", 0), 1) AS template_scale, "
-			<< display_expr << " "
+			<< display_expr << ", "
+			<< event_select << " "
 			<< "FROM gameobject go "
 			<< "INNER JOIN gameobject_template gt ON gt.entry = go.id "
+			<< event_join
 			<< "WHERE go.map = " << mapID << " "
 			<< "ORDER BY name, go.guid";
 
@@ -1096,6 +1299,7 @@ namespace mysql
 			record.name = parseString(row[7]);
 			record.template_scale = parseFloat(row[8]);
 			record.display_id = parseUnsigned(row[9]);
+			record.event = parseSigned(row[10]);
 			if (record.template_scale <= 0.0f)
 			{
 				record.template_scale = 1.0f;
@@ -1106,6 +1310,65 @@ namespace mysql
 		mysql_free_result(result);
 		return records;
   }
+
+	std::vector<GameEventRecord> getGameEvents(std::string* error)
+	{
+		auto connection = connect(error);
+		if (!connection)
+		{
+			return {};
+		}
+
+		if (!tableExists(connection.get(), "game_event"))
+		{
+			return {};
+		}
+
+		// Mangos/Turtle: game_event(entry, description). AzerothCore/TrinityCore: game_event(eventEntry, description).
+		std::string const entry_col =
+			  tableHasColumn(connection.get(), "game_event", "entry")      ? "entry"
+			: tableHasColumn(connection.get(), "game_event", "eventEntry") ? "eventEntry"
+			:                                                                "entry";
+		std::string const desc_col =
+			  tableHasColumn(connection.get(), "game_event", "description") ? "description"
+			: tableHasColumn(connection.get(), "game_event", "name")        ? "name"
+			:                                                                 "''";
+
+		std::stringstream statement;
+		statement << "SELECT " << entry_col << ", COALESCE(" << desc_col << ", '') FROM game_event ORDER BY " << entry_col;
+
+		if (mysql_query(connection.get(), statement.str().c_str()) != 0)
+		{
+			if (error)
+			{
+				*error = mysql_error(connection.get());
+			}
+			return {};
+		}
+
+		MYSQL_RES* result = mysql_store_result(connection.get());
+		if (!result)
+		{
+			if (error)
+			{
+				*error = mysql_error(connection.get());
+			}
+			return {};
+		}
+
+		std::vector<GameEventRecord> records;
+		records.reserve(static_cast<std::size_t>(mysql_num_rows(result)));
+		while (MYSQL_ROW row = mysql_fetch_row(result))
+		{
+			GameEventRecord record;
+			record.entry = parseSigned(row[0]);
+			record.description = parseString(row[1]);
+			records.push_back(record);
+		}
+
+		mysql_free_result(result);
+		return records;
+	}
 
 	std::vector<CreaturePatrolPoint> getCreaturePatrolPaths(std::size_t mapID, std::string* error)
 	{

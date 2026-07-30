@@ -49,6 +49,10 @@ class QComboBox;
 class QLineEdit;
 class QGroupBox;
 class QListWidget;
+class QVBoxLayout;
+class QMenu;
+class QToolButton;
+class QToolBar;
 class QListWidgetItem;
 class QPushButton;
 class QTreeWidget;
@@ -344,6 +348,10 @@ public:
   [[nodiscard]]
   World* getWorld() { return _world.get(); };
 
+  // Calendar dropdown button (checkable game-events that toggle which seasonal event's spawns render).
+  // Public so the time-globe popup can host it under its time slider.
+  QToolButton* makeSeasonalEventsToolButton(QWidget* parent);
+
   [[nodiscard]]
   QDockWidget* getAssetBrowser() {return _asset_browser_dock; };
 
@@ -559,6 +567,8 @@ private:
   QTreeWidget* _gameobject_model_tree = nullptr;
   QLabel* _gameobject_model_picker_status = nullptr;
 
+  // Seasonal Events calendar dropdown lives in the toolbar strip right of the time globe (see makeSeasonalEventsToolButton).
+
   QLineEdit* _gameobject_search_field = nullptr;
   QListWidget* _gameobject_list_widget = nullptr;
   QLabel* _gameobject_browser_status = nullptr;
@@ -630,6 +640,7 @@ private:
   void setupGameObjectBrowserUi();
   void setupGameObjectModelPickerUi();
   void setupGameObjectActionsUi();
+  void populateSeasonalEventsMenu(QMenu* menu);
   void setupMinimapEditorUi();
   void setupStampUi();
   void setupLightEditorUi();

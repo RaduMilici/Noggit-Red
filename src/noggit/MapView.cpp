@@ -96,6 +96,13 @@
 #include <QtWidgets/QToolTip>
 #include <QtWidgets/QTreeWidget>
 #include <QtWidgets/QVBoxLayout>
+#include <QtWidgets/QScrollArea>
+#include <QtWidgets/QToolButton>
+#include <QtGui/QIconEngine>
+#include <QtGui/QPainter>
+#include <QtGui/QPalette>
+#include <QtGui/QPixmap>
+#include <QtGui/QIcon>
 #include <QWidgetAction>
 #include <QSurfaceFormat>
 #include <QMessageBox>
@@ -238,6 +245,79 @@ namespace
       event->accept();
     }
   };
+
+  // A QMenu that stays open when a CHECKABLE item is clicked, so the Seasonal Events dropdown can toggle
+  // several events without reopening each time. Non-checkable items (All / None) and outside clicks close
+  // it as usual.
+  class MultiToggleMenu final : public QMenu
+  {
+  public:
+    using QMenu::QMenu;
+
+  protected:
+    void mouseReleaseEvent(QMouseEvent* event) override
+    {
+      QAction* const action = activeAction();
+      if (action && action->isEnabled() && action->isCheckable())
+      {
+        action->trigger(); // toggle in place; keep the menu open
+        return;
+      }
+      QMenu::mouseReleaseEvent(event);
+    }
+  };
+
+  // A clean calendar QIcon rendered ONCE at high resolution (so Qt smooth-scales it down without the
+  // aliasing/artifacts a per-size QIconEngine produced at 16px), tinted to the SAME palette color as the
+  // noggit font-glyph toolbar icons (see FontNoggitIconEngine).
+  QIcon make_calendar_icon()
+  {
+    Noggit::Ui::FontNoggitButtonStyle style;
+    style.ensurePolished();
+    QColor const color = style.palette().color(QPalette::WindowText);
+
+    int const S = 128;
+    QPixmap pm(S, S);
+    pm.fill(Qt::transparent);
+
+    QPainter p(&pm);
+    p.setRenderHint(QPainter::Antialiasing, true);
+
+    QPen pen(color);
+    pen.setWidthF(S * 0.055);
+    pen.setJoinStyle(Qt::RoundJoin);
+    pen.setCapStyle(Qt::RoundCap);
+    p.setPen(pen);
+    p.setBrush(Qt::NoBrush);
+
+    // Calendar body (rounded), leaving headroom at the top for the two binding tabs.
+    QRectF const body(S * 0.15, S * 0.24, S * 0.70, S * 0.60);
+    p.drawRoundedRect(body, S * 0.07, S * 0.07);
+
+    // Two binding tabs crossing the top edge.
+    qreal const tabX1 = body.left() + body.width() * 0.28;
+    qreal const tabX2 = body.left() + body.width() * 0.72;
+    qreal const tabTop = S * 0.15;
+    qreal const tabBot = body.top() + body.height() * 0.10;
+    p.drawLine(QPointF(tabX1, tabTop), QPointF(tabX1, tabBot));
+    p.drawLine(QPointF(tabX2, tabTop), QPointF(tabX2, tabBot));
+
+    // Header separator, then a filled header strip so it reads clearly as a calendar at small sizes.
+    qreal const headerY = body.top() + body.height() * 0.30;
+    p.drawLine(QPointF(body.left(), headerY), QPointF(body.right(), headerY));
+
+    // A single centered "day" block in the lower area (one clean mark scales far better than a dot grid).
+    p.setPen(Qt::NoPen);
+    p.setBrush(color);
+    QRectF const day(body.center().x() - body.width() * 0.16,
+                     headerY + body.height() * 0.22,
+                     body.width() * 0.32,
+                     body.height() * 0.30);
+    p.drawRoundedRect(day, S * 0.03, S * 0.03);
+
+    p.end();
+    return QIcon(pm);
+  }
 }
 
 
@@ -2835,6 +2915,94 @@ void MapView::setupGameObjectActionsUi()
           });
 }
 
+QToolButton* MapView::makeSeasonalEventsToolButton(QWidget* parent)
+{
+  // Calendar section button hosted under the time-globe popup's slider. Its menu of checkable game-events
+  // (checked = that event's creatures/objects render; nothing = base world only, the default) flies out to
+  // the RIGHT of the popup instead of dropping down, so it expands the panel sideways. Rebuilt on open so
+  // it always reflects the events in the loaded spawns. Affects both creature AND gameobject spawns.
+  auto button = new QToolButton(parent);
+  button->setIcon(make_calendar_icon());
+  button->setIconSize(QSize(18, 18));
+  button->setText("Seasonal Events");
+  button->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+  button->setToolTip("Toggle which event's creatures and objects are shown.\n"
+                     "Nothing checked = base world only.");
+  button->setAutoRaise(true);
+
+  // Not setMenu() (that drops DOWN): pop the menu manually anchored to the host popup's top-right corner so
+  // it opens to the right, like a submenu flyout.
+  auto menu = new MultiToggleMenu(button);
+  connect(menu, &QMenu::aboutToShow, [this, menu]() { populateSeasonalEventsMenu(menu); });
+  connect(button, &QToolButton::clicked, [button, menu]()
+  {
+    if (menu->isVisible())
+    {
+      menu->hide();
+      return;
+    }
+    QWidget* const host = button->parentWidget() ? button->parentWidget() : button;
+    QPoint const anchor = host->mapToGlobal(QPoint(host->width() + 2, 0));
+    menu->popup(anchor);
+  });
+  return button;
+}
+
+void MapView::populateSeasonalEventsMenu(QMenu* menu)
+{
+  if (!menu)
+  {
+    return;
+  }
+
+  menu->clear();
+
+  auto const entries = _world->spawnedEventEntries();
+  if (entries.empty())
+  {
+    auto* empty = menu->addAction(_world->hasCreatureSpawnsLoaded()
+                                    ? "No seasonal-event spawns on this map"
+                                    : "Enable creature/object spawns first");
+    empty->setEnabled(false);
+    return;
+  }
+
+  auto* all_action = menu->addAction("Show all events");
+  auto* none_action = menu->addAction("Hide all (base world only)");
+  connect(all_action, &QAction::triggered, [this]()
+  {
+    for (auto entry : _world->spawnedEventEntries())
+    {
+      _world->setEventActive(entry, true);
+    }
+    update();
+  });
+  connect(none_action, &QAction::triggered, [this]()
+  {
+    _world->clearActiveEvents();
+    update();
+  });
+  menu->addSeparator();
+
+  auto const& names = _world->gameEventNames();
+  for (std::int32_t entry : entries)
+  {
+    auto const name_it = names.find(entry);
+    QString const label = name_it != names.end() && !name_it->second.empty()
+      ? QString("%1 - %2").arg(entry).arg(QString::fromStdString(name_it->second))
+      : QString("Event %1").arg(entry);
+
+    auto* action = menu->addAction(label);
+    action->setCheckable(true);
+    action->setChecked(_world->isEventActive(entry));
+    connect(action, &QAction::toggled, [this, entry](bool checked)
+    {
+      _world->setEventActive(entry, checked);
+      update();
+    });
+  }
+}
+
 void MapView::setupMinimapEditorUi()
 {
   minimapTool = new Noggit::Ui::MinimapCreator(this, _world.get(), this);
@@ -4627,6 +4795,10 @@ void MapView::selectCreatureSpawnsInArea(QRect const& rect, bool add_to_selectio
 
   for (auto& spawn : _world->creatureSpawns())
   {
+    if (spawn.event_suppressed) // hidden by the Seasonal Events filter -> not box-selectable
+    {
+      continue;
+    }
     glm::vec3 const screen = glm::project(spawn.pos, mv, proj, vp);
     if (screen.z < 0.0f || screen.z > 1.0f)
     {
@@ -4826,7 +4998,7 @@ std::optional<std::uint32_t> MapView::findCreatureSpawnAtCursor()
     std::optional<std::uint32_t> best_guid;
     for (auto& spawn : _world->creatureSpawns())
     {
-      if (spawn.pending_delete || !spawn.model_instance.has_value())
+      if (spawn.pending_delete || spawn.event_suppressed || !spawn.model_instance.has_value())
         continue;
       auto& inst = *spawn.model_instance;
       if (!inst.model.get() || !inst.model->finishedLoading() || inst.model->loading_failed())
@@ -4854,7 +5026,7 @@ std::optional<std::uint32_t> MapView::findCreatureSpawnAtCursor()
   std::optional<std::uint32_t> best_guid;
   for (auto const& spawn : _world->creatureSpawns())
   {
-    if (spawn.pending_delete)
+    if (spawn.pending_delete || spawn.event_suppressed)
       continue;
     float const ring_radius = spawn.selectionRingWorldRadius();
     if (std::abs(ray_dir.y) < 1e-6f)
@@ -5686,6 +5858,10 @@ void MapView::selectGameObjectSpawnsInArea(QRect const& rect, bool add_to_select
 
   for (auto& spawn : _world->gameObjectSpawns())
   {
+    if (spawn.event_suppressed) // hidden by the Seasonal Events filter -> not box-selectable
+    {
+      continue;
+    }
     glm::vec3 const screen = glm::project(spawn.pos, mv, proj, vp);
     if (screen.z < 0.0f || screen.z > 1.0f)
     {
@@ -5825,7 +6001,7 @@ std::optional<std::uint32_t> MapView::findGameObjectSpawnAtCursor()
     std::optional<std::uint32_t> best_guid;
     for (auto& spawn : _world->gameObjectSpawns())
     {
-      if (spawn.pending_delete || !spawn.model_instance.has_value())
+      if (spawn.pending_delete || spawn.event_suppressed || !spawn.model_instance.has_value())
         continue;
       auto& inst = *spawn.model_instance;
       if (!inst.model.get() || !inst.model->finishedLoading() || inst.model->loading_failed())
@@ -5850,7 +6026,7 @@ std::optional<std::uint32_t> MapView::findGameObjectSpawnAtCursor()
   std::optional<std::uint32_t> best_guid;
   for (auto const& spawn : _world->gameObjectSpawns())
   {
-    if (spawn.pending_delete)
+    if (spawn.pending_delete || spawn.event_suppressed)
       continue;
     float ring_radius = 0.5f;
     if (spawn.model_instance.has_value())

@@ -28,6 +28,7 @@
 #include <optional>
 #include <QtCore/QSettings>
 #include <map>
+#include <set>
 #include <string>
 #include <unordered_set>
 #include <unordered_map>
@@ -78,6 +79,12 @@ public:
     std::uint32_t entry = 0;
     std::uint32_t display_id = 0;
     std::uint32_t faction = 0; // creature_template faction (FactionTemplate.dbc id) -> circle hostility color
+    // Seasonal game-event membership (game_event_creature.event). 0 = base world; >0 = only while that
+    // event is active; <0 = except while abs(event) is active. event_suppressed is the cached view-only
+    // "hidden by the Seasonal Events filter" flag (recomputed by World::recomputeEventSuppression);
+    // it never affects save/export -- only rendering and picking.
+    std::int32_t event = 0;
+    bool event_suppressed = false;
     std::string name;
     glm::vec3 pos = glm::vec3(0.0f);
     glm::vec3 original_pos = glm::vec3(0.0f);
@@ -118,6 +125,12 @@ public:
     bool mount_create_failed = false;
     std::optional<ModelInstance> mount_instance;
 
+    // NPC pose (creature_addon): UnitStandState (0 stand, 1 sit, 3 sleep, 4/5/6 chair-sit, 7 dead, 8 kneel)
+    // + emote_state (Emotes.dbc id). Drives the forced idle animation so the spawn sits/sleeps/kneels/emotes
+    // instead of standing. Mount pose (anim 91) takes priority when the NPC is also mounted.
+    std::uint8_t  stand_state = 0;
+    std::uint32_t emote_state = 0;
+
     // World radius of the ground selection circle, EXACTLY like the live client (see
     // bounding_radius above; the scale is already applied). Falls back to the model footprint
     // estimate when the DB has no bounding radius for this display.
@@ -153,6 +166,9 @@ public:
     std::uint32_t guid = 0;
     std::uint32_t entry = 0;
     std::uint32_t display_id = 0;
+    // Seasonal game-event membership (game_event_gameobject.event). See CreatureSpawnOverlay::event.
+    std::int32_t event = 0;
+    bool event_suppressed = false;
     std::string name;
     glm::vec3 pos = glm::vec3(0.0f);
     glm::vec3 original_pos = glm::vec3(0.0f);
@@ -649,6 +665,20 @@ public:
   GameObjectSpawnOverlay* findGameObjectSpawn(std::uint32_t guid);
   GameObjectSpawnOverlay const* findGameObjectSpawn(std::uint32_t guid) const;
 
+  // --- Seasonal game-event visibility filter (view-only; never affects save/export) ---
+  // Populated from game_event + game_event_creature/_gameobject when spawns load. A spawn's `event` is
+  // 0 for base-world spawns (always shown). Marking an event "active" reveals its event>0 spawns and
+  // hides its event<0 ("spawn except during") spawns; recomputeEventSuppression() caches the result on
+  // each overlay's event_suppressed. Default: no events active => base world only.
+  void setEventActive(std::int32_t entry, bool active);
+  bool isEventActive(std::int32_t entry) const { return _active_events.count(entry) != 0; }
+  void clearActiveEvents();
+  void recomputeEventSuppression();
+  // game_event entry -> description for every event in the DB (labels for the Seasonal Events panel).
+  std::map<std::int32_t, std::string> const& gameEventNames() const { return _game_event_names; }
+  // Event entries (abs value, excluding 0) that actually have spawns on the currently loaded map.
+  std::set<std::int32_t> spawnedEventEntries() const;
+
 protected:
   // void update_models_by_filename();
 
@@ -678,6 +708,9 @@ protected:
   std::vector<CreatureSpawnOverlay> _creature_spawns;
   std::vector<GameObjectSpawnOverlay> _gameobject_spawns;
   std::map<std::uint32_t, SpellInfo> _spell_infos;
+  // Seasonal event filter state (see the accessors above).
+  std::unordered_set<std::int32_t> _active_events;
+  std::map<std::int32_t, std::string> _game_event_names;
 
   std::array<std::pair<std::pair<int, int>, MapTile*>, 64 * 64 > _loaded_tiles_buffer;
 

@@ -131,6 +131,55 @@ namespace
   }
 
 #ifdef USE_MYSQL_UID_STORAGE
+  // Fill in spells the world DB could not supply, from the CLIENT's Spell.dbc (see lookupSpellDbcInfo).
+  // Turtle/vmangos ship a spell_template table, but the 3.3.5a cores do not -- they read the DBC -- so
+  // every aura there used to render as a bare "Spell ID N (no spell_template row)". Producing the same
+  // record shape as the SQL path leaves the tooltip/icon/macro-resolver code below unchanged.
+  void fill_missing_spell_infos_from_dbc(std::set<std::uint32_t> const& ids,
+                                         std::map<std::uint32_t, mysql::SpellInfoRecord>& infos)
+  {
+    for (auto const id : ids)
+    {
+      if (!id || infos.count(id))
+      {
+        continue;
+      }
+
+      SpellDbcInfo dbc;
+      if (!lookupSpellDbcInfo(id, dbc))
+      {
+        continue; // not in the client's DBC either -- the caller still shows the raw id
+      }
+
+      mysql::SpellInfoRecord info;
+      info.entry = dbc.entry;
+      info.name = dbc.name;
+      info.description = dbc.description;
+      info.icon_id = dbc.icon_id;
+      info.spell_visual = dbc.spell_visual;
+      info.mana_cost = dbc.mana_cost;
+      info.power_type = dbc.power_type;
+      info.range_index = dbc.range_index;
+      info.casting_time_index = dbc.casting_time_index;
+      info.duration_index = dbc.duration_index;
+      info.proc_chance = dbc.proc_chance;
+      info.proc_charges = dbc.proc_charges;
+      info.stack_amount = dbc.stack_amount;
+
+      for (size_t i = 0; i < 3; ++i)
+      {
+        info.effect_base_points[i] = dbc.effect_base_points[i];
+        info.effect_die_sides[i] = dbc.effect_die_sides[i];
+        info.effect_amplitude[i] = dbc.effect_amplitude[i];
+        info.effect_chain_target[i] = dbc.effect_chain_target[i];
+        info.effect_radius_index[i] = dbc.effect_radius_index[i];
+        info.effect_multiple_value[i] = dbc.effect_multiple_value[i];
+      }
+
+      infos.emplace(id, info);
+    }
+  }
+
   // Collect every spell id referenced by cross-spell description macros ($17466s1 etc.) so the
   // caller can fetch those spells' data before resolving.
   void collect_referenced_spell_ids(std::string const& description, std::set<std::uint32_t>& out)
@@ -591,6 +640,8 @@ namespace Noggit
       if (!all_ids.empty())
       {
         infos = mysql::getSpellInfos(all_ids);
+        // Schemas without spell_template (the 3.3.5a cores) return nothing -- fall back to the client DBC.
+        fill_missing_spell_infos_from_dbc(all_ids, infos);
 
         // Descriptions may reference OTHER spells' values ($17466s1 etc.) -- fetch those too so the
         // resolver has their data.
@@ -607,6 +658,7 @@ namespace Noggit
         {
           auto ref_infos = mysql::getSpellInfos(referenced);
           infos.insert(ref_infos.begin(), ref_infos.end());
+          fill_missing_spell_infos_from_dbc(referenced, infos);
         }
       }
 

@@ -975,6 +975,22 @@ Sky* Skies::findSkyWeights(glm::vec3 pos)
     return glm::distance(pos, a.pos) > glm::distance(pos, b.pos);
   });
 
+  // The in-place sort above MOVED every Sky element, invalidating the `default_sky` pointer captured
+  // before it -- it now aliases whichever light sorted into that slot (the NEAREST positional light after
+  // a descending-distance sort). Left stale, `update_sky_colors` built the full-strength base color/fog
+  // from that nearest light (fog collapse -> "fog fills the zone") and the weight loop below forced that
+  // light's weight to 0 so `Skies::draw` skipped its skybox (wrong skybox / "holes in the sky"). This was
+  // the Icecrown zone-boundary bug. Re-resolve the global/default light (pos==0) in the SORTED vector.
+  default_sky = nullptr;
+  for (auto& sky : skies)
+  {
+    if (sky.pos == glm::vec3(0, 0, 0))
+    {
+      default_sky = &sky;
+      break;
+    }
+  }
+
   for (auto& sky : skies)
   {
     float distance_to_light = glm::distance(pos, sky.pos);
@@ -1081,6 +1097,7 @@ void Skies::update_sky_colors(glm::vec3 pos, int time)
     _fog_distance = default_sky->floatParamFor(0, time);
     _fog_multiplier = default_sky->floatParamFor(1, time);
     _cloud_coverage = default_sky->floatParamFor(CLOUD_DENSITY, time);
+    _celestial_flow = default_sky->floatParamFor(CELESTIAL_FLOW, time); // dusk twilight weight (was unread)
 
     auto default_sky_param = active_sky_param(*default_sky);
     if (default_sky_param)
@@ -1105,6 +1122,7 @@ void Skies::update_sky_colors(glm::vec3 pos, int time)
     _fog_multiplier = 0.f;
     _fog_distance = 0.f;
     _cloud_coverage = 0.f;
+    _celestial_flow = 0.f;
 
     _river_shallow_alpha = 0.f;
     _river_deep_alpha = 0.f;
@@ -1136,6 +1154,7 @@ void Skies::update_sky_colors(glm::vec3 pos, int time)
       _fog_distance = (_fog_distance * (1.0f - sky.weight)) + (sky.floatParamFor(0, time) * sky.weight);
       _fog_multiplier = (_fog_multiplier * (1.0f - sky.weight)) + (sky.floatParamFor(1, time) * sky.weight);
       _cloud_coverage = (_cloud_coverage * (1.0f - sky.weight)) + (sky.floatParamFor(CLOUD_DENSITY, time) * sky.weight);
+      _celestial_flow = (_celestial_flow * (1.0f - sky.weight)) + (sky.floatParamFor(CELESTIAL_FLOW, time) * sky.weight);
       // sky.skyParams[sky.curr_sky_param]->river_shallow_alpha(); // new
       // sky.skyParams[sky.curr_sky_param].river_shallow_alpha(); // old
       auto sky_param = active_sky_param(sky);
@@ -1164,7 +1183,20 @@ void Skies::update_sky_colors(glm::vec3 pos, int time)
     if (s_zf_dbg && (++s_zf_tick % 30) == 0)
     {
       int weighted = 0;
-      for (auto const& s : skies) if (s.weight > 0.f) ++weighted;
+      float total_zone_weight = 0.f;
+      for (auto const& s : skies) if (s.weight > 0.f) { ++weighted; total_zone_weight += s.weight; }
+      // LIGHTSEL: the resulting outdoor light colour + how much of it is the GLOBAL DEFAULT light.
+      // total_zone_weight < 1 means the sequential blend leaves (1 - total) of the pos-(0,0,0) default
+      // light in the mix -- and map 0's default (Light id 1, param 12) is a garish ORANGE sun by day
+      // (LightIntBand band0 noon = (255,136,0)). So a warm/orange DIFFUSE here with low total_zone_weight
+      // == the "exterior too warm" bleed (open/transition terrain not fully covered by a cool zone light).
+      glm::vec3 const dbg_dif = color_set[LIGHT_GLOBAL_DIFFUSE];
+      glm::vec3 const dbg_amb = color_set[LIGHT_GLOBAL_AMBIENT];
+      LogError << "LIGHTSEL pos=(" << pos.x << "," << pos.y << "," << pos.z << ")"
+               << " default=" << (default_sky ? std::to_string(default_sky->Id) : std::string("NULL"))
+               << " weightedSkies=" << weighted << " totalZoneWeight=" << total_zone_weight
+               << " DIFFUSE=(" << dbg_dif.x << "," << dbg_dif.y << "," << dbg_dif.z << ")"
+               << " AMBIENT=(" << dbg_amb.x << "," << dbg_amb.y << "," << dbg_amb.z << ")" << std::endl;
       LogError << "ZONEFOG pos=(" << pos.x << "," << pos.y << "," << pos.z << ")"
                << " default=" << (default_sky ? std::to_string(default_sky->Id) : std::string("NULL"))
                << " fog_distance=" << _fog_distance << " fog_end=" << fog_distance_end()
@@ -1610,10 +1642,27 @@ bool Skies::draw(glm::mat4x4 const& model_view
   draw_clouds(projection * model_view, camera_pos, animtime);
 
   bool has_skybox = false;
+  // Draw ONLY the highest-weight skybox. The loop below used to draw every weight>0 skybox opaquely in
+  // `skies` order (far->near after findSkyWeights' sort), so the LAST-drawn (nearest) light's skybox won
+  // -- a hard switch to whatever light is merely nearest, not the one that dominates the zone-light blend.
+  // In a big wotlk zone with many overlapping lights (Icecrown) that made the sky snap to the WRONG skybox
+  // at every boundary crossing. The client's dominant sky is the greatest-WEIGHT light, so pick that one.
+  Sky* top_sky = nullptr;
+  SkyParam* top_param = nullptr;
   for (Sky& sky : skies)
   {
     SkyParam* sky_param = drawable_skybox_param(sky);
-    if (sky.weight > 0.f && sky_param && sky_param->skybox)
+    if (sky.weight > 0.f && sky_param && sky_param->skybox
+        && (!top_sky || sky.weight > top_sky->weight))
+    {
+      top_sky = &sky;
+      top_param = sky_param;
+    }
+  }
+  if (top_sky && top_param && top_param->skybox)
+  {
+    Sky& sky = *top_sky;
+    SkyParam* sky_param = top_param;
     {
       has_skybox = true;
 
@@ -1859,18 +1908,81 @@ void Skies::update_vao(OpenGL::Scoped::use_program& shader)
   _need_vao_update = false;
 }
 
+// Dusk/dawn twilight dome curves -- CLIENT-CANON, dumped from wow.exe 5875 (FUN_006ce120 @0xce9b2c,
+// FUN_006ce210 @0xce9af8; consumed by the dome builder FUN_006d0f50). NOT hand-tuned.
+// TWILIGHT envelope over day fraction (0=00:00): dawn pulse ~05:30, dusk pulse ~21:30, 0->1->0.
+static std::pair<float, float> const twilight_time_keys[] = {
+  { 0.125000f, 0.0f }, { 0.270833f, 1.0f }, { 0.291667f, 0.0f },   // dawn (center 0.229167)
+  { 0.854167f, 0.0f }, { 0.895833f, 1.0f }, { 0.999306f, 0.0f },   // dusk (center 0.895833)
+};
+// AZIMUTH glow shape over the per-column phase local_14: NEGATIVE = sun-facing glow branch (|value| =
+// strength), 0..1 positive = plain branch (1 => keep raw band). Peak glow -0.7 at phase 0.625.
+static std::pair<float, float> const azimuth_glow_keys[] = {
+  { 0.125f, 1.0f }, { 0.375f, 0.0f }, { 0.5f, -0.5f }, { 0.625f, -0.7f }, { 0.75f, -0.5f }, { 0.875f, 0.0f },
+};
+
 void Skies::update_color_buffer()
 {
+  // CLIENT dome builder FUN_006d0f50 (byte-exact). The dome bands (colorFor) already interpolate to
+  // dark-blue night verbatim; the two TWILIGHT terms below are what the client adds so dusk/dawn read
+  // as a warm directional gradient instead of a flat near-black dome. Both vanish when w==0 (daytime,
+  // deep night, or a map that doesn't author CELESTIAL_FLOW) -- then this reduces to the old flat dome.
   std::vector<glm::vec3> colors;
+  colors.reserve(static_cast<std::size_t>(hseg) * (cnum - 1) * 4);
+
+  // w = twilight-envelope(dayFrac) * CELESTIAL_FLOW (LightFloatBand 2). local_24 in FUN_006d0f50.
+  float const dayFrac = glm::fract(static_cast<float>(_last_time) / 2880.f);
+  float const w = sky_keyframe(twilight_time_keys, 6, dayFrac) * _celestial_flow;
+
+  // Per-ring twilight pre-blend: pull bands 3..6 toward band 3 (SKY_COLOR_1) by w (FUN_006d0f50 phase 2).
+  glm::vec3 scratch[NUM_SkyColorNames];
+  for (int b = 0; b < NUM_SkyColorNames; ++b) { scratch[b] = color_set[b]; }
+  if (w > 0.f)
+  {
+    for (int b = SKY_COLOR_1; b <= SKY_COLOR_4; ++b)
+    {
+      scratch[b] = glm::mix(color_set[b], color_set[SKY_COLOR_1], w);
+    }
+  }
+
+  // Per-column phase: local_14 = sunBearing/(2pi) + 0.25, stepped by -1/columns (FUN_006d0f50). Sun
+  // azimuth is fixed 225deg so the glow sits at a fixed compass and only w animates; anchor to
+  // _celestial_dir (render frame, x-z) so it tracks the drawn sun.
+  float const two_pi = glm::two_pi<float>();
+  float const sun_az = std::atan2(_celestial_dir.z, _celestial_dir.x);
+  float const l14_start = sun_az / two_pi + 0.25f;
+  float const l14_step = -1.0f / static_cast<float>(hseg);
+
+  auto ring_col_color = [&](int v, int col) -> glm::vec3
+  {
+    int const band = skycolors[v];
+    if (w <= 0.f || band == SKY_COLOR_0 || band == FOG_COLOR)
+    {
+      return color_set[band]; // zenith + horizon/fog rings: flat, no twilight (matches the client)
+    }
+    float const l14 = glm::fract(l14_start + l14_step * static_cast<float>(col));
+    float const g = sky_keyframe(azimuth_glow_keys, 6, l14);
+    glm::vec3 out;
+    if (g < 0.f) // sun-facing GLOW: bend the pre-blended band toward the zenith band by w*0.7, weight |g|*w
+    {
+      glm::vec3 const zmix = glm::mix(scratch[band], color_set[SKY_COLOR_0], w * 0.7f);
+      out = glm::mix(scratch[band], zmix, -g * w);
+    }
+    else // plain: raw band toward the pre-blended scratch by (1-g)*w
+    {
+      out = glm::mix(color_set[band], scratch[band], (1.0f - g) * w);
+    }
+    return glm::clamp(out, 0.f, 1.f);
+  };
 
   for (int h = 0; h < hseg; h++)
   {
     for (int v = 0; v < cnum - 1; v++)
     {
-      colors.push_back(color_set[skycolors[v]]);
-      colors.push_back(color_set[skycolors[v]]);
-      colors.push_back(color_set[skycolors[v + 1]]);
-      colors.push_back(color_set[skycolors[v + 1]]);
+      colors.push_back(ring_col_color(v,     h + 1)); // vtx0 = basepos2[v]   (col h+1, ring v)
+      colors.push_back(ring_col_color(v,     h    )); // vtx1 = basepos1[v]   (col h,   ring v)
+      colors.push_back(ring_col_color(v + 1, h    )); // vtx2 = basepos1[v+1] (col h,   ring v+1)
+      colors.push_back(ring_col_color(v + 1, h + 1)); // vtx3 = basepos2[v+1] (col h+1, ring v+1)
     }
   }
 
@@ -1909,18 +2021,22 @@ void OutdoorLightStats::interpolate(OutdoorLightStats *a, OutdoorLightStats *b, 
 
   float progressDayAndNight = r / DayNight_SecondsPerDay;
 
-  // SCENE LIGHT direction -- CLIENT-CANON (wow.exe 5875 FUN_006d3a10 key tables): the 1.12 scene
-  // light does NOT follow the visible sun disc; it oscillates gently between polar 110 deg
-  // (2.2165682) and 127 deg (1.9198623) at a FIXED azimuth, day and night.
-  // AZIMUTH FIX (2026-07-18): the visible sun disc's celestial_dir (WorldRender) maps wow azimuth ->
-  // render bearing with a +180 flip (a = theta_wow + pi), matching the position-frame direction map
-  // (wx,wy,wz)->(-wy,wz,-wx). But the scene-light shaders reorder dayDir WITHOUT that flip
-  // (to_light = -normalize(dayDir.x, dayDir.z, dayDir.y)). With thetaValue = 225 the lit side came out
-  // 180 deg OPPOSITE the sun disc (reported: "scene lit 180 from where the sun is in the sky").
-  // thetaValue = pi/4 (45 deg) makes to_light render on the SAME bearing as the disc (render-SW /
-  // wow-45 sun), so the lit side of terrain, WMO and M2 geometry faces the visible sun.
+  // SCENE LIGHT direction -- CLIENT-CANON (wow.exe 5875 FUN_006d3a10): the 1.12 scene light does NOT
+  // travel across the sky; it oscillates gently between polar 110 deg (1.9198623) and 127 deg
+  // (2.2165682) at a FIXED AZIMUTH = pi*1.25 = 225 deg, day and night. The azimuth is the constant
+  // azimuth table (_DAT_00811508 = pi, times 1.25); the polar is the oscillating table [pi*0.705556,
+  // pi*0.611111] = [127,110] deg -- matched exactly by phiTable below. RE 2026-07-26.
+  //
+  // AZIMUTH (2026-07-26): pi*1.25 (225 deg) is the CLIENT value. A prior change (2026-07-18) set this
+  // to pi/4 (45 deg) to make the lit side agree with noggit's sun DISC -- but that flipped the scene
+  // light 180 deg OPPOSITE the client, so terrain/WMO/M2 lit the WRONG compass side (the Stormwind-
+  // harbor mountain, lit in-game, stayed dark at every time of day -- the light direction never
+  // reached it). Restored to the client's 225 deg. The sun DISC (WorldRender celestial_dir) was
+  // already correct at quarter_pi/45 deg and is LEFT there -- its celestial_dir uses a different frame
+  // (a +180 flip + a different swizzle than this scene-light path), so 45 for the disc and 225 here
+  // both land client-correct. (Flipping the disc to 225 to "match" put the visible sun 180 deg wrong.)
   float phiValue = 0;
-  const float thetaValue = 0.7853982f; // pi/4 == 45 deg (was 3.926991 = 225 deg, which lit 180 backwards)
+  const float thetaValue = 3.926990817f; // pi * 1.25 == 225 deg (CLIENT canon, FUN_006d3a10 azimuth table)
   const float phiTable[4] =
     {
       2.2165682f,

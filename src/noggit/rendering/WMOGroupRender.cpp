@@ -1,6 +1,10 @@
 // This file is part of Noggit3, licensed under GNU General Public License (version 3).
 
 #include "WMOGroupRender.hpp"
+#include <atomic> // [TEXARRAYDBG] temporary
+#include <sstream> // [TEXARRAYDBG] temporary
+#include <vector> // [TEXBINDDBG] temporary
+#include <string> // [TEXBINDDBG] temporary
 #include <noggit/WMO.h>
 
 #include <cstdlib>
@@ -96,6 +100,26 @@ void WMOGroupRender::upload()
     _render_batches[batch_counter].tex_array1 = tex_array1;
     _render_batches[batch_counter].tex0 = array_index0;
     _render_batches[batch_counter].tex1 = array_index1;
+
+    // [TEXARRAYDBG 2026-07-30] temporary: what does this batch sample? Compare (array,layer) against the
+    // TEXARRAYDBG upload lines to see whether the layer really belongs to this material's texture.
+    {
+      static std::atomic<int> dbg{0};
+      bool const of_interest = _wmo_group->wmo->file_key().hasFilepath()
+        && _wmo_group->wmo->file_key().filepath().find("icebreaker") != std::string::npos;
+      if (of_interest && dbg.fetch_add(1) < 200)
+      {
+        LogError << "[TEXARRAYDBG] batch wmo='" << _wmo_group->wmo->file_key().stringRepr()
+                 << "' mat=" << batch.texture
+                 << " shader=" << mat.shader
+                 << " flags=0x" << std::hex << mat.flags.value << std::dec
+                 << " blend=" << static_cast<int>(mat.blend_mode)
+                 << " tex1_file='" << tex1->file_key().stringRepr() << "'"
+                 << " array0=" << tex_array0 << " layer0=" << array_index0
+                 << " array1=" << tex_array1 << " layer1=" << array_index1
+                 << std::endl;
+      }
+    }
 
     batch_counter++;
   }
@@ -219,6 +243,33 @@ void WMOGroupRender::upload()
         _render_batches[batch_counter].tex_array1 = 1;
       }
 
+    }
+
+    // [TEXARRAYDBG 2026-07-30] temporary: the slot->array mapping this batch ends up sampling. With
+    // N_ARRAY_TEX==1 every texture owns a single-layer array, so a wrong SLOT is the only way a batch can
+    // sample a different texture. Any slot that is still -1 has nothing bound -> undefined sample.
+    {
+      static std::atomic<int> dbg{0};
+      bool const of_interest = _wmo_group->wmo->file_key().hasFilepath()
+        && _wmo_group->wmo->file_key().filepath().find("icebreaker") != std::string::npos;
+      if (of_interest && dbg.fetch_add(1) < 200)
+      {
+        std::ostringstream slot_list; // NOT named 'slots': Qt defines that as a macro
+        for (std::size_t s = 0; s < draw_call->samplers.size(); ++s)
+        {
+          if (s) slot_list << ",";
+          slot_list << draw_call->samplers[s];
+        }
+        LogError << "[TEXARRAYDBG] drawcall wmo='" << _wmo_group->wmo->file_key().stringRepr()
+                 << "' mat=" << batch.texture
+                 << " shader=" << mat.shader
+                 << " use_tex2=" << (use_tex2 ? 1 : 0)
+                 << " newcall=" << (create_draw_call ? 1 : 0)
+                 << " slot0=" << _render_batches[batch_counter].tex_array0
+                 << " slot1=" << _render_batches[batch_counter].tex_array1
+                 << " n_used=" << draw_call->n_used_samplers
+                 << " samplers=[" << slot_list.str() << "]" << std::endl;
+      }
     }
 
     draw_call->index_count += batch.index_count;
@@ -468,6 +519,89 @@ void WMOGroupRender::draw(OpenGL::Scoped::use_program& wmo_shader
       gl.bindTexture(GL_TEXTURE_2D_ARRAY, draw_call.samplers[i]);
     }
 
+    // [TEXBINDDBG 2026-07-30] temporary: read back what is ACTUALLY bound to each texture unit right before
+    // the draw, and the sampler-array uniform values. The shader proves slot 0 samples correctly while slot 1
+    // returns garbage even at a fixed UV, so either unit 2 holds a different texture than the draw call
+    // recorded, or the sampler uniform doesn't map slot 1 -> unit 2.
+    {
+      static std::atomic<int> dbg{0};
+      bool const of_interest = _wmo_group->wmo->file_key().hasFilepath()
+        && _wmo_group->wmo->file_key().filepath().find("icebreaker") != std::string::npos;
+      if (of_interest && dbg.fetch_add(1) < 12)
+      {
+        std::ostringstream o;
+        o << "[TEXBINDDBG] drawcall n_used=" << draw_call.n_used_samplers << " expected=[";
+        for (std::size_t i = 0; i < draw_call.samplers.size() && draw_call.samplers[i] >= 0; ++i)
+        {
+          if (i) o << ",";
+          o << draw_call.samplers[i];
+        }
+        o << "] actually_bound=[";
+        for (int unit = 1; unit <= 6; ++unit)
+        {
+          GLint bound = 0;
+          gl.activeTexture(static_cast<GLenum>(GL_TEXTURE0 + unit));
+          gl.getIntegerv(GL_TEXTURE_BINDING_2D_ARRAY, &bound);
+          if (unit > 1) o << ",";
+          o << "u" << unit << ":" << bound;
+        }
+        o << "]";
+
+        // Read the ENV slot's texture straight off the GPU. Everything else checks out (right name bound,
+        // right file uploaded, no GL errors), yet sampling it at a fixed (0.5,0.5) returns green while
+        // wr_env's centre is (164,174,180). WIDTH==0 would mean the object has no storage at all.
+        if (auto* f = gl._4_1_core_func)
+        {
+          gl.activeTexture(GL_TEXTURE0 + 2);
+          GLint tw = 0, th = 0, td = 0, tfmt = 0;
+          f->glGetTexLevelParameteriv(GL_TEXTURE_2D_ARRAY, 0, GL_TEXTURE_WIDTH, &tw);
+          f->glGetTexLevelParameteriv(GL_TEXTURE_2D_ARRAY, 0, GL_TEXTURE_HEIGHT, &th);
+          f->glGetTexLevelParameteriv(GL_TEXTURE_2D_ARRAY, 0, GL_TEXTURE_DEPTH, &td);
+          f->glGetTexLevelParameteriv(GL_TEXTURE_2D_ARRAY, 0, GL_TEXTURE_INTERNAL_FORMAT, &tfmt);
+          o << " unit2_tex: " << tw << "x" << th << " layers=" << td << " fmt=" << tfmt;
+          if (tw > 0 && th > 0 && td > 0)
+          {
+            std::vector<unsigned char> px(static_cast<std::size_t>(tw) * th * td * 4, 0);
+            f->glGetTexImage(GL_TEXTURE_2D_ARRAY, 0, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+            auto at = [&](int x, int y) -> std::string
+            {
+              std::size_t const i = (static_cast<std::size_t>(y) * tw + x) * 4;
+              std::ostringstream p;
+              p << "(" << int(px[i]) << "," << int(px[i+1]) << "," << int(px[i+2]) << ")";
+              return p.str();
+            };
+            o << " centre=" << at(tw/2, th/2) << " topleft=" << at(0, 0) << " q=" << at(tw/4, th/4);
+          }
+        }
+
+        // The texture at unit 2 reads back CORRECT (128x128, centre = wr_env's real centre), yet sampling
+        // slot 1 returns green while slot 0 is fine. So check the sampler-array uniform itself: element i
+        // MUST equal texture unit 1+i. Query each element BY NAME -- glUniform1iv on the array's base
+        // location silently does nothing if the driver doesn't lay the elements out contiguously.
+        if (auto* f = gl._4_1_core_func)
+        {
+          GLint prog = 0;
+          gl.getIntegerv(GL_CURRENT_PROGRAM, &prog);
+          o << " prog=" << prog << " texture_samplers=[";
+          for (int i = 0; i < 4; ++i)
+          {
+            std::string const nm = "texture_samplers[" + std::to_string(i) + "]";
+            GLint const l = f->glGetUniformLocation(static_cast<GLuint>(prog), nm.c_str());
+            GLint v = -999;
+            if (l >= 0)
+            {
+              f->glGetUniformiv(static_cast<GLuint>(prog), l, &v);
+            }
+            if (i) o << ",";
+            o << v << "@loc" << l;
+          }
+          o << "] (expect 1@..,2@..,3@..,4@..)";
+        }
+
+        LogError << o.str() << std::endl;
+      }
+    }
+
     for (auto const& run : visible_runs)
     {
       gl.drawElements (GL_TRIANGLES, run.second, GL_UNSIGNED_SHORT, reinterpret_cast<void*>(sizeof(std::uint16_t)*run.first));
@@ -556,9 +690,25 @@ void WMOGroupRender::initRenderBatches()
   std::size_t batch_counter = 0;
   for (auto& batch : _wmo_group->_batches)
   {
-    for (std::size_t i = 0; i < (batch.vertex_end - batch.vertex_start + 1); ++i)
+    // Tag each vertex with the batch that draws it, so the shader can pick the batch's texture/flags per
+    // fragment. WMO batches partition faces by INDEX range; a batch's [vertex_start..vertex_end] is only the
+    // min/max vertex its indices REACH, NOT an exclusive owned span. Many custom WMOs (Turtle
+    // world/custom/kttown/kttown_000.wmo -- 11 batches, ALL with vertex range [0..1614]) give every batch the
+    // same whole-group vertex range, so filling [vertex_start..vertex_end] let each batch overwrite the ENTIRE
+    // mapping and the LAST batch won for all 1614 verts -> the whole building sampled ONE texture (the reported
+    // "all one texture" bug; only visible when a group's textures land in separate GL arrays so they can only
+    // be told apart per-vertex). Walk the batch's own INDEX range and tag only the vertices its triangles use.
+    // WMOs with exclusive vertex ranges (Stormwind etc.) get the identical result; verts shared across batches
+    // at a seam resolve to the last writer -- negligible vs. the total collapse.
+    for (std::size_t idx = batch.index_start;
+         idx < static_cast<std::size_t>(batch.index_start) + batch.index_count && idx < _wmo_group->_indices.size();
+         ++idx)
     {
-      _render_batch_mapping[batch.vertex_start + i] = static_cast<unsigned>(batch_counter + 1);
+      unsigned const vert = _wmo_group->_indices[idx];
+      if (vert < _render_batch_mapping.size())
+      {
+        _render_batch_mapping[vert] = static_cast<unsigned>(batch_counter + 1);
+      }
     }
 
     std::uint32_t flags = 0;
@@ -573,18 +723,21 @@ void WMOGroupRender::initRenderBatches()
     bool const has_blend_mocv =
       _wmo_group->header.flags.has_vertex_color || _wmo_group->header.flags.use_mocv2_for_texture_blending;
 
-    // CANON, decompiled (wow.exe FUN_00695960 batch-build + FUN_006a4cc0/FUN_006a4dc0 interior samplers;
-    // RE_notes 17 + LIGHT_FOG_SELECTION_RE.md §9): the interior-vs-exterior lighting choice is PER MOGP
-    // GROUP by `flags & 0x48` (0x8 EXTERIOR | 0x40 EXTERIOR_LIT). A group WITHOUT 0x48 is INTERIOR (baked
-    // MOCV); a group WITH it is EXTERIOR (outdoor sun; MOCV is not the base). That single flag is the ENTIRE
-    // client decision -- there is NO per-batch split, NO transparency-count test, NO MOCV-luma test, and NO
-    // camera inside/outside test anywhere in the client's WMO lighting. noggit's old heuristics
-    // (batch_is_exterior, has_transparency_batches, mocv_peak_luma, the camera_inside_wmo gate) were all
-    // non-canon and each mislit some WMO (Ironforge tunnels lit-from-outside, Stormwind buildings black,
-    // tunnels over-lit, harbor warehouses black). Running the INTERIOR formula on an EXTERIOR group is
-    // exactly what blacked out the harbor warehouses / gundrak_entrance -- the client routes 0x48 groups to
-    // the outdoor sun, so a near-black-MOCV shell is sun-lit, never black. One flag ends the whack-a-mole.
-    if (_wmo_group->header.flags.exterior || _wmo_group->header.flags.exterior_lit)
+    // PER-BATCH interior/exterior lighting (CANON, client_re/17 + wow_cap_doorway_portal.trace, 2026-07-27).
+    // A single MOGP group draws its INTERIOR batches MOCV-lit (LIGHTING=FALSE, real vertex colour) AND its
+    // EXTERIOR batches sun-lit (LIGHTING=TRUE, white-placeholder MOCV) -- the split is by the batch's position
+    // in the MOBA list, NOT a per-group flag. The MOGP batch counts order the list [transparency][interior]
+    // [exterior]; a batch is EXTERIOR only if its index falls in the trailing exterior range. The OLD per-GROUP
+    // test `flags & 0x48` sun-lit the WHOLE group, so a doorway REVEAL (an INTERIOR batch of a group that also
+    // carries the 0x40 EXTERIOR_LIT flag / some exterior batches) got flooded with the outdoor sun -- bright,
+    // and not dimming at night, exactly the reported doorway bug (the client draws that face interior MOCV,
+    // measured ~0.4). Genuine exterior geometry stays sun-lit: real OUTDOOR groups (0x8) light every batch,
+    // and any group's actual exterior batches light from the sun (harbor warehouse shells etc.).
+    std::size_t const exterior_batch_start =
+        static_cast<std::size_t>(_wmo_group->header.transparency_batches_count)
+      + static_cast<std::size_t>(_wmo_group->header.interior_batch_count);
+    bool const is_exterior_batch = batch_counter >= exterior_batch_start;
+    if (_wmo_group->header.flags.exterior /* 0x8 OUTDOOR group -> all batches sun */ || is_exterior_batch)
     {
       flags |= WMORenderBatchFlags::eWMOBatch_ExteriorLit;
     }

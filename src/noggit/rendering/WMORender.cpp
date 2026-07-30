@@ -4,6 +4,7 @@
 #include <noggit/WMO.h>
 #include <noggit/Log.h>
 #include <noggit/rendering/WorldRender.hpp>
+#include <noggit/project/CurrentProject.hpp>
 
 #include <cstdlib>
 #include <algorithm>
@@ -266,6 +267,36 @@ void WMORender::draw(OpenGL::Scoped::use_program& wmo_shader
   static int const s_debug_mocv =
       std::getenv("NOGGIT_WMO_DEBUG_MOCV") ? std::atoi(std::getenv("NOGGIT_WMO_DEBUG_MOCV")) : 0;
   wmo_shader.uniform("debug_mocv", s_debug_mocv);
+
+  // 3.3.5a interior mod2x (tex*MOCV*2). Gated to non-CLASSIC projects behind NOGGIT_335A_WMO_MOD2X, matching
+  // the load-side WotLK FixColorVertexAlpha gate in WMO::load_mocv (A/B; interior-lighting rule). 0 = 1.12 x1.
+  // DEFAULT-ON for non-CLASSIC (user-confirmed brighter, 2026-07-29); opt out with NOGGIT_NO_335A_WMO_MOD2X=1.
+  // Must match the load-side gate in WMO::load_mocv.
+  static int const s_wmo_interior_mod2x =
+      (std::getenv("NOGGIT_NO_335A_WMO_MOD2X") == nullptr
+       && Noggit::Project::CurrentProject::get() != nullptr
+       && Noggit::Project::CurrentProject::get()->projectVersion != Noggit::Project::ProjectVersion::CLASSIC) ? 1 : 0;
+  wmo_shader.uniform("wmo_interior_mod2x", s_wmo_interior_mod2x);
+
+  // [GREENDBG 2026-07-30] temporary: NOGGIT_WMO_DEBUG=1..6 isolates one shading term (see wmo_frag.glsl).
+  {
+    static int const s_wmo_debug_mode = []
+    {
+      char const* v = std::getenv("NOGGIT_WMO_DEBUG");
+      return (v && *v) ? std::atoi(v) : 0;
+    }();
+    wmo_shader.uniform("wmo_debug_mode", s_wmo_debug_mode);
+  }
+
+  // Interior tone knobs: shadow FLOOR (no interior face darker than this -> no pure-black voids) + GAIN (overall
+  // interior brightness). Live-tunable so contrast can be dialled to the client without a rebuild.
+  // Defaults target the client's ~0.5 interior-floor brightness (Goldshire apitrace: floor ~120-150/255).
+  static float const s_wmo_interior_floor =
+      std::getenv("NOGGIT_335A_INTERIOR_FLOOR") ? static_cast<float>(std::atof(std::getenv("NOGGIT_335A_INTERIOR_FLOOR"))) : 0.10f;
+  wmo_shader.uniform("wmo_interior_floor", s_wmo_interior_floor);
+  static float const s_wmo_interior_gain =
+      std::getenv("NOGGIT_335A_INTERIOR_GAIN") ? static_cast<float>(std::atof(std::getenv("NOGGIT_335A_INTERIOR_GAIN"))) : 1.30f;
+  wmo_shader.uniform("wmo_interior_gain", s_wmo_interior_gain);
 
   // (Removed the "wmo_open" outdoor-spill heuristic: it lifted EVERY interior group toward the outdoor
   // ambient whenever the WMO had any exterior group, flooding big mixed WMOs like Ironforge with Dun

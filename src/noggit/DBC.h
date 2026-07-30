@@ -350,24 +350,30 @@ public:
       DBCFile("DBFilesClient\\ItemDisplayInfo.dbc")
     { }
 
+    // ID + model/texture names sit BEFORE the layout divergence, so they are stable constants.
     static const size_t ID = 0;
     static const size_t ModelName1 = 1;
     static const size_t ModelName2 = 2;
     static const size_t ModelTexture1 = 3;
     static const size_t ModelTexture2 = 4;
-    static const size_t GeosetGroup1 = 6;
-    static const size_t GeosetGroup2 = 7;
-    static const size_t GeosetGroup3 = 8;
-    static const size_t HelmetGeosetVis1 = 12;
-    static const size_t HelmetGeosetVis2 = 13;
-    static const size_t TextureUpperArm = 14;
-    static const size_t TextureLowerArm = 15;
-    static const size_t TextureHands = 16;
-    static const size_t TextureUpperChest = 17;
-    static const size_t TextureLowerChest = 18;
-    static const size_t TextureUpperLeg = 19;
-    static const size_t TextureLowerLeg = 20;
-    static const size_t TextureFoot = 21;
+    // WotLK ItemDisplayInfo.dbc has 25 fields vs Vanilla/Classic's 23: it inserts a 2nd inventory-icon
+    // column at index 6, shifting EVERY column from the geoset groups onward by +1 (empirically verified
+    // -- item 15676 HelmetGeosetVis 248,306 sits at 12,13 in Turtle vs 13,14 in WotLK). Reading the fixed
+    // 1.12 indices on a WotLK client mis-read equipment geosets + helmet/hair hiding. Version-gated in
+    // DBC.cpp like CreatureDisplayInfoExtra::BakedTexture / CharacterSections.
+    static size_t GeosetGroup1();
+    static size_t GeosetGroup2();
+    static size_t GeosetGroup3();
+    static size_t HelmetGeosetVis1();
+    static size_t HelmetGeosetVis2();
+    static size_t TextureUpperArm();
+    static size_t TextureLowerArm();
+    static size_t TextureHands();
+    static size_t TextureUpperChest();
+    static size_t TextureLowerChest();
+    static size_t TextureUpperLeg();
+    static size_t TextureLowerLeg();
+    static size_t TextureFoot();
   };
 
   class CharacterFacialHairStylesDB : public DBCFile
@@ -398,6 +404,26 @@ public:
     static const size_t VariationID = 3;
     static const size_t GeosetID = 4;
     static const size_t ShowsScalp = 5;
+  };
+
+  // HelmetGeosetVisData.dbc: a head item's ItemDisplayInfo.HelmetGeosetVis[sex] indexes this table, whose
+  // per-geoset-group masks say WHICH of the wearer's geosets a helm hides. field[1] (HairFlags) is the hair
+  // mask: 0 = KEEP hair (bandanas/circlets/open helms that only cover the face), non-zero = HIDE hair (full
+  // helms). Empirically verified against the stock rows: the Defias bandana (row 247) has HairFlags=0 (keeps
+  // hair) but non-zero facial masks (covers the mouth). 1.12 = 6 fields (ID + 5 masks), WotLK = 8 (2 extra
+  // masks appended), so the hair/facial column indices are version-stable.
+  class HelmetGeosetVisDataDB : public DBCFile
+  {
+  public:
+    HelmetGeosetVisDataDB() :
+      DBCFile("DBFilesClient\\HelmetGeosetVisData.dbc")
+    { }
+
+    static const size_t ID = 0;
+    static const size_t HairFlags = 1;
+    static const size_t Facial1Flags = 2;
+    static const size_t Facial2Flags = 3;
+    static const size_t Facial3Flags = 4;
   };
 
   class CharacterSectionsDB : public DBCFile
@@ -545,6 +571,66 @@ public:
   static const size_t TextureFilename = 1;
 };
 
+// Spell.dbc -- the CLIENT's spell data, used when the world DB has no spell_template table.
+// Turtle/vmangos ship spell_template, but the 3.3.5a cores (CMaNGOS/AzerothCore) do not: they read the
+// client DBC instead, so creature-info aura tooltips there had nothing to resolve and fell back to a bare
+// "Spell ID N (no spell_template row)".
+//
+// Field indices differ between the 1.12 (173 field) and 3.3.5a (234 field) layouts -- vanilla carries extra
+// EffectBaseDice/DicePerLevel blocks that WotLK dropped, which shifts the whole effect region. Both sets were
+// located EMPIRICALLY against known values (spell 1784 Stealth: icon 250, visual 184, durationIndex 21,
+// basePoints -1/4/-51, auras 36/16/33) and cross-checked (field 117/133 resolves to a valid SpellIcon.dbc id
+// for 100% of sampled rows). Pick the set with layout() -- do NOT assume one layout.
+class SpellDB : public DBCFile
+{
+public:
+  SpellDB() :
+    DBCFile("DBFilesClient\\Spell.dbc")
+  { }
+
+  struct Layout
+  {
+    size_t casting_time_index;
+    size_t proc_chance;
+    size_t proc_charges;
+    size_t duration_index;
+    size_t power_type;
+    size_t mana_cost;
+    size_t range_index;
+    size_t stack_amount;
+    size_t effect_die_sides;      // [3]
+    size_t effect_base_points;    // [3]
+    size_t effect_radius_index;   // [3]
+    size_t effect_apply_aura;     // [3]
+    size_t effect_amplitude;      // [3]
+    size_t effect_multiple_value; // [3]
+    size_t effect_chain_target;   // [3]
+    size_t spell_visual;
+    size_t icon_id;
+    size_t name;
+    size_t description;
+  };
+
+  static constexpr Layout Vanilla // 1.12, 173 fields
+  {
+    18, 25, 26, 30, 31, 32, 36, 39,
+    64, 76, 88, 91, 94, 97, 100,
+    115, 117, 120, 138
+  };
+
+  static constexpr Layout WotLK // 3.3.5a, 234 fields
+  {
+    28, 35, 36, 40, 41, 42, 46, 49,
+    74, 80, 92, 95, 98, 101, 104,
+    131, 133, 136, 170
+  };
+
+  static const size_t ID = 0;
+
+  // Chosen by field count: anything at or beyond the WotLK width uses the WotLK offsets.
+  Layout const& layout() { return getFieldCount() >= 200 ? WotLK : Vanilla; }
+};
+
 // Spell durations for resolving the $d macro in spell descriptions (creature-info tooltips).
 class SpellDurationDB : public DBCFile
 {
@@ -650,6 +736,7 @@ extern ItemDisplayInfoDB gItemDisplayInfoDB;
 extern CharacterFacialHairStylesDB gCharacterFacialHairStylesDB;
 extern CharacterHairGeosetsDB gCharacterHairGeosetsDB;
 extern CharacterSectionsDB gCharacterSectionsDB;
+extern HelmetGeosetVisDataDB gHelmetGeosetVisDataDB;
 extern WMOAreaTableDB gWMOAreaTableDB;
 extern GameObjectDisplayInfoDB gGameObjectDisplayInfoDB;
 extern SpellVisualDB gSpellVisualDB;
@@ -658,6 +745,37 @@ extern SpellVisualEffectNameDB gSpellVisualEffectNameDB;
 extern SpellIconDB gSpellIconDB;
 extern FactionTemplateDB gFactionTemplateDB;
 extern FactionDB gFactionDB;
+extern SpellDB gSpellDB; // opened LAZILY by lookupSpellDbcInfo(), NOT by OpenDBs()
+
+// Spell data read from the CLIENT's Spell.dbc, for world DBs that have no spell_template table (the 3.3.5a
+// cores read the DBC instead). Deliberately free of any MySQL dependency so both the creature-info panel
+// and World's aura-visual resolution can use it.
+struct SpellDbcInfo
+{
+  std::uint32_t entry = 0;
+  std::uint32_t spell_visual = 0;
+  std::uint32_t icon_id = 0;
+  std::string name;
+  std::string description;
+  std::int32_t effect_base_points[3] = { 0, 0, 0 };
+  std::int32_t effect_die_sides[3] = { 0, 0, 0 };
+  std::int32_t effect_amplitude[3] = { 0, 0, 0 };
+  std::int32_t effect_chain_target[3] = { 0, 0, 0 };
+  std::int32_t effect_radius_index[3] = { 0, 0, 0 };
+  float effect_multiple_value[3] = { 0.0f, 0.0f, 0.0f };
+  std::uint32_t duration_index = 0;
+  std::uint32_t stack_amount = 0;
+  std::uint32_t proc_charges = 0;
+  std::uint32_t proc_chance = 0;
+  std::uint32_t mana_cost = 0;
+  std::uint32_t power_type = 0;
+  std::uint32_t range_index = 0;
+  std::uint32_t casting_time_index = 0;
+};
+
+// Look one spell up in Spell.dbc, opening the DBC on FIRST USE (it is ~46 MB at 3.3.5a's ~50k rows, so
+// OpenDBs() deliberately skips it). Returns false when the DBC is unavailable or has no such row.
+bool lookupSpellDbcInfo(std::uint32_t spell_id, SpellDbcInfo& out);
 extern SpellDurationDB gSpellDurationDB;
 extern SpellRadiusDB gSpellRadiusDB;
 extern SpellRangeDB gSpellRangeDB;

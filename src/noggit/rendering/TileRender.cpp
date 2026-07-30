@@ -7,6 +7,7 @@
 #include <external/tracy/Tracy.hpp>
 
 #include <algorithm>
+#include <vector>
 
 using namespace Noggit::Rendering;
 
@@ -33,6 +34,24 @@ void TileRender::upload()
   std::fill(draw_call.samplers.begin(), draw_call.samplers.end(), -1);
 
   gl.genQueries(1, &_tile_occlusion_query);
+
+  // The GPU textures were just (re)allocated, so every chunk row is empty -- re-register the full update set on
+  // ALL 256 chunks so the next draw definitely refills them. Without this the fill depends on whatever per-chunk
+  // flags happen to still be pending: MapChunk::endChunkUpdates() zeroes them once processed, and while VERTEX
+  // gets re-registered from many places during normal use (so a missed heightmap pass self-heals), MCCV is only
+  // ever re-registered by the MCCV paint tools -- so in a view-only session a missed MCCV pass left that row
+  // permanently unwritten (the EPL psychedelic weave: undefined texels multiplied into terrain colour).
+  // registerChunkUpdate propagates to the tile, which is what gates the update block in draw().
+  for (int z = 0; z < 16; ++z)
+  {
+    for (int x = 0; x < 16; ++x)
+    {
+      _map_tile->mChunks[z][x]->registerChunkUpdate(ChunkUpdateFlags::VERTEX | ChunkUpdateFlags::ALPHAMAP
+                                                    | ChunkUpdateFlags::SHADOW | ChunkUpdateFlags::MCCV
+                                                    | ChunkUpdateFlags::NORMALS | ChunkUpdateFlags::HOLES
+                                                    | ChunkUpdateFlags::AREA_ID | ChunkUpdateFlags::FLAGS);
+    }
+  }
 
   _uploaded = true;
 
@@ -370,8 +389,17 @@ void TileRender::uploadTextures()
 
   gl.activeTexture(GL_TEXTURE0 + 2);
   gl.bindTexture(GL_TEXTURE_2D, _mccv_tex);
-  gl.texImage2D(GL_TEXTURE_2D, 0, GL_RGB32F, mapbufsize,
-                256, 0, GL_RGB, GL_FLOAT, nullptr);
+  // Initialize to WHITE (1,1,1 = the neutral vertex colour) instead of nullptr. With nullptr the contents are
+  // UNDEFINED, so any chunk row that never runs update_vertex_colors samples garbage floats, and the frag
+  // shader multiplies terrain by them (`out_color.rgb *= vary_mccv`) -> a psychedelic per-vertex weave. That is
+  // exactly the EPL bug: every EPL ADT's MCCV is a uniform 127,127,127 (= 1.0 neutral, verified against
+  // patch-3.mpq), so the file data can never tint anything -- the colour could only come from unwritten rows.
+  // Rows that DO upload overwrite this, so a legitimate MCCV is unaffected; unwritten rows now read neutral.
+  {
+    std::vector<float> white(static_cast<std::size_t>(mapbufsize) * 256 * 3, 1.0f);
+    gl.texImage2D(GL_TEXTURE_2D, 0, GL_RGB32F, mapbufsize,
+                  256, 0, GL_RGB, GL_FLOAT, white.data());
+  }
 
   gl.texParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
   //gl.texParameteri(GL_TEXTURE_1D_ARRAY, GL_TEXTURE_MAG_FILTER, GL_NEAREST);

@@ -1042,6 +1042,14 @@ void WorldRender::draw (glm::mat4x4 const& model_view
           float const a = theta_wow + glm::pi<float>();
           return glm::normalize(glm::vec3(std::cos(a) * std::sin(phi), std::cos(phi), std::sin(a) * std::sin(phi)));
         };
+        // Azimuth = quarter_pi (45 deg). This is DELIBERATELY not the same numeric value as the scene
+        // light's 225 deg (Sky.cpp thetaValue): the disc's celestial_dir applies a +180 flip
+        // (a = theta_wow + pi) and renders in a different frame than the scene-light shader swizzle
+        // (to_light = -normalize(dayDir.x, dayDir.z, dayDir.y)), so 45 HERE and 225 THERE both produce
+        // the CLIENT-correct result -- the disc sits where the sun is, and terrain is lit from it.
+        // (2026-07-26: flipping the disc to 225 to "match" the scene light put the visible sun 180 deg
+        // to the wrong side -- user-confirmed. The disc was already correct; only the SCENE LIGHT
+        // azimuth was the 180-off bug. Leave the disc at 45.)
         float const moon_phi = sky_keyframe(moon_phi_keys, 5, day_t);
         glm::vec3 const to_sun = celestial_dir(sky_keyframe(sun_phi_keys, 4, day_t), glm::quarter_pi<float>());
         glm::vec3 const to_moon = celestial_dir(moon_phi, glm::quarter_pi<float>());
@@ -1880,7 +1888,7 @@ void WorldRender::draw (glm::mat4x4 const& model_view
     int gowmo_total = 0, gowmo_queued = 0, gowmo_failed = 0, gowmo_loading = 0;
     for (auto& spawn : _world->gameObjectSpawns())
     {
-      if (spawn.pending_delete || !spawn.model_path.ends_with(".wmo"))
+      if (spawn.pending_delete || spawn.event_suppressed || !spawn.model_path.ends_with(".wmo"))
       {
         continue;
       }
@@ -2442,6 +2450,10 @@ void WorldRender::draw (glm::mat4x4 const& model_view
         {
           continue;
         }
+        if (spawn.event_suppressed) // hidden by the Seasonal Events filter
+        {
+          continue;
+        }
         float const creature_distance = glm::distance(camera_pos, spawn.pos);
         trace_creature_spawn("candidate", spawn, creature_distance);
 
@@ -2615,6 +2627,10 @@ void WorldRender::draw (glm::mat4x4 const& model_view
       std::size_t const model_create_budget = creature_spawn_model_create_budget();
       for (auto& spawn : _world->gameObjectSpawns())
       {
+        if (spawn.event_suppressed) // hidden by the Seasonal Events filter
+        {
+          continue;
+        }
         float const gameobject_distance = glm::distance(camera_pos, spawn.pos);
         trace_gameobject_spawn("candidate", spawn, gameobject_distance);
 
@@ -4136,6 +4152,10 @@ void WorldRender::draw (glm::mat4x4 const& model_view
         {
           continue;
         }
+        if (spawn.event_suppressed) // hidden by the Seasonal Events filter
+        {
+          continue;
+        }
         float distance = glm::distance(camera_pos, spawn.pos);
         if (distance < closest_distance)
         {
@@ -4293,6 +4313,8 @@ void WorldRender::draw (glm::mat4x4 const& model_view
       {
         if (spawn.pending_delete)
           continue;
+        if (spawn.event_suppressed) // hidden by the Seasonal Events filter
+          continue;
         if (glm::distance(camera_pos, spawn.pos) > creature_spawn_marker_distance)
           continue;
 
@@ -4387,6 +4409,8 @@ void WorldRender::draw (glm::mat4x4 const& model_view
         for (auto const& spawn : _world->creatureSpawns())
         {
           if (spawn.pending_delete)
+            continue;
+          if (spawn.event_suppressed) // hidden by the Seasonal Events filter
             continue;
           if (any_selected && !spawn.selected) // only the selected creature's path while one is selected
             continue;

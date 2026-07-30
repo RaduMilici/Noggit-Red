@@ -152,7 +152,10 @@ void AsyncLoader::process()
     {
       if (async_loader_trace_enabled())
       {
-        LogDebug << "Async finish begin type=" << object->async_object_type_name()
+        // LogError (not LogDebug) so it survives to log.txt -- for a HANG, the last "begin" with no
+        // matching "done" names the object whose finishLoading() is stuck (e.g. a malformed WMO/M2 chunk
+        // that allocs/loops forever). cerr is unit-buffered so it reaches disk even before a force-close.
+        LogError << "ASYNCLOAD begin type=" << object->async_object_type_name()
                  << " key='" << async_object_key(object)
                  << "' ptr=" << object << std::endl;
       }
@@ -168,7 +171,7 @@ void AsyncLoader::process()
 
       if (async_loader_trace_enabled())
       {
-        LogDebug << "Async finish done type=" << object->async_object_type_name()
+        LogError << "ASYNCLOAD done  type=" << object->async_object_type_name()
                  << " key='" << async_object_key(object)
                  << "' ptr=" << object << std::endl;
       }

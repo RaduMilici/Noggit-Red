@@ -264,6 +264,10 @@ private:
   // "FixColorVertexAlpha" (ambient subtract / halve / alpha fold) does NOT exist in 1.12.
   void atten_trans_verts(std::vector<std::uint32_t>& colors); // parked (reverted; see WMO.cpp note)
   void fix_vertex_color_alpha();
+  // WotLK/3.3.5a CMapObjGroup::FixColorVertexAlpha (RE'd byte-exact from stock 12340 FUN_007D7380): the
+  // load-time MOCV transform 1.12 lacks. Paired with the mod2x (tex*MOCV*2) interior combine in wmo_frag.
+  // Gated to non-CLASSIC projects behind NOGGIT_335A_WMO_MOD2X (A/B, interior-lighting rule).
+  void fix_vertex_color_alpha_wotlk();
   void compute_portal_openness();
   // Client-faithful (SMOGroup flag `do_not_attenuate_vertices_based_on_distance_to_portal`): brighten
   // interior vertices toward the outdoor light by their proximity to this group's portals, so the light
