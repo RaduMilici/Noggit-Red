@@ -71,6 +71,8 @@
     <file alias="circle_fs">../src/noggit/rendering/glsl/circle_frag.glsl</file>
     <file alias="circle_decal_vs">../src/noggit/rendering/glsl/circle_decal_vert.glsl</file>
     <file alias="circle_decal_fs">../src/noggit/rendering/glsl/circle_decal_frag.glsl</file>
+    <file alias="path_decal_vs">../src/noggit/rendering/glsl/path_decal_vert.glsl</file>
+    <file alias="path_decal_fs">../src/noggit/rendering/glsl/path_decal_frag.glsl</file>
     <file alias="sun_vs">../src/noggit/rendering/glsl/sun_vert.glsl</file>
     <file alias="sun_fs">../src/noggit/rendering/glsl/sun_frag.glsl</file>
     <file alias="sunshaft_fs">../src/noggit/rendering/glsl/sunshaft_frag.glsl</file>

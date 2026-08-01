@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <list>
 #include <limits>
 #include <sstream>
@@ -110,11 +111,11 @@ namespace
       std::memcpy(raw_sizes, file.getBuffer() + params.sizes.ofsKeys, sizeof(raw_sizes));
       for (std::size_t i = 0; i < 3; ++i)
       {
-        float const raw_size = std::max(std::abs(raw_sizes[i].x), std::abs(raw_sizes[i].y));
-        float const scale = std::isfinite(params.scales[i]) && std::abs(params.scales[i]) > 0.001f
-          ? std::abs(params.scales[i])
-          : 1.0f;
-        sizes[i] = raw_size * scale;
+        // The scale track values ARE the authored sizes. This used to be multiplied by params.scales[i],
+        // which the legacy struct mislabelled as a per-key size scale -- those three floats are really
+        // {twinkleScaleMin, twinkleScaleMax, burstMultiplier}. Harmless on the 88% of emitters authoring
+        // twinkleScale (1,1), but it shrank the start size 5x on emitters authoring e.g. (0.2, 1.0).
+        sizes[i] = std::max(std::abs(raw_sizes[i].x), std::abs(raw_sizes[i].y));
       }
     }
     else if (params.sizes.nKeys >= 3
@@ -123,10 +124,7 @@ namespace
       for (std::size_t i = 0; i < 3; ++i)
       {
         float const raw_size = *reinterpret_cast<float const*>(file.getBuffer() + params.sizes.ofsKeys + i * sizeof(float));
-        float const scale = std::isfinite(params.scales[i]) && std::abs(params.scales[i]) > 0.001f
-          ? std::abs(params.scales[i])
-          : 1.0f;
-        sizes[i] = std::abs(raw_size) * scale;
+        sizes[i] = std::abs(raw_size);
       }
     }
   }
@@ -324,7 +322,7 @@ ParticleSystem::ParticleSystem(Model* model_
   , deacceleration (mta.Gravity2, f, globals)
   , enabled (mta.en, f, globals)
   , mid (0.5)
-  , slowdown (mta.p.slowdown)
+  , slowdown (std::isfinite(mta.p.drag) ? mta.p.drag : 0.0f)
   , pos (fixCoordSystem(mta.pos))
   , _texture_id (mta.texture)
   , blend (mta.blend)
@@ -347,6 +345,92 @@ ParticleSystem::ParticleSystem(Model* model_
   read_particle_life_ramp(f, mta.p, colors, sizes);
 
   //transform = mta.flags & 1024;
+
+  // Spin / wind / twinkle / tail. These are the same authored fields the classic ctor already reads --
+  // the WotLK path simply never read them, because the legacy struct buried them under unk*/rotation
+  // names. Measured in the 3.3.5a client: spin is authored on real emitters (SteamGeyser 1-3 rad/s),
+  // twinkleScale min!=max on ~3000 emitters, and windVector on only 2 (so wind is near-dead here, but
+  // it costs nothing to read correctly). Guard non-finite authored floats exactly as classic does.
+  auto const sane = [](float v, float fb) { return std::isfinite(v) ? v : fb; };
+  _spin = sane(mta.p.spin, 0.f);
+  _wind = fixCoordSystem(glm::vec3(sane(mta.p.windVector.x, 0.f),
+                                   sane(mta.p.windVector.y, 0.f),
+                                   sane(mta.p.windVector.z, 0.f)));
+  _wind_time = std::max(0.0f, sane(mta.p.windTime, 0.f));
+  _twinkle_speed = sane(mta.p.twinkleSpeed, 0.f);
+  _twinkle_percent = sane(mta.p.twinklePercent, 1.f);
+  _twinkle_scale_min = sane(mta.p.twinkleScaleMin, 1.f);
+  _twinkle_scale_max = sane(mta.p.twinkleScaleMax, 1.f);
+  _spin_alternate = (mta.flags & 0x8000) != 0;
+  _tail_length = std::max(0.0f, sane(mta.p.tailLength, 0.f));
+  _tail_clamp_age = (mta.flags & 0x400) != 0;
+
+  // Flipbook cell animation. Where classic stores a [startCell, endCell, repeat] triple, WotLK keys the
+  // cell index over the particle's life in an M2PartTrack: times are fixed16 (0..32767 == 0..1 of life)
+  // and values are uint16 cell indices into the rows*cols sheet. Authored on 13004 of 26030 emitters in
+  // the 3.3.5a client, 3333 of which actually vary (e.g. CloudSwampGas 8x8, times [0,16384,16384,32767]
+  // cells [6,33,34,59] -- cells 6->33 over the first half, then 34->59). The duplicated middle timestamp
+  // is what makes the lifespan->decay hand-off an instant jump. 4 keys must cover ~26 cells, so the
+  // client interpolates between keys rather than stepping; we do the same and truncate to a cell.
+  {
+    auto const& cell_track = mta.p.headCellTrack;
+    if (cell_track.nKeys >= 2
+        && cell_track.nKeys == cell_track.nTimes
+        && cell_track.nKeys < 4096
+        && particle_range_fits(f, cell_track.ofsKeys, cell_track.nKeys, sizeof(std::uint16_t))
+        && particle_range_fits(f, cell_track.ofsTimes, cell_track.nTimes, sizeof(std::uint16_t)))
+    {
+      int const cell_count = std::max(1, rows * cols);
+      std::vector<float> times;
+      std::vector<int> cells;
+      times.reserve(cell_track.nKeys);
+      cells.reserve(cell_track.nKeys);
+
+      for (std::uint32_t i = 0; i < cell_track.nKeys; ++i)
+      {
+        auto const t = *reinterpret_cast<std::uint16_t const*>(
+          f.getBuffer() + cell_track.ofsTimes + i * sizeof(std::uint16_t));
+        auto const c = *reinterpret_cast<std::uint16_t const*>(
+          f.getBuffer() + cell_track.ofsKeys + i * sizeof(std::uint16_t));
+        times.push_back(std::clamp(static_cast<float>(t) / 32767.0f, 0.0f, 1.0f));
+        cells.push_back(std::min(static_cast<int>(c), cell_count - 1));
+      }
+
+      // Only animate when the sheet has more than one cell AND the track actually moves. A constant
+      // track is NOT "always show this cell": of the 115 multi-cell emitters with one, 111 are
+      // [0,0,0,0] on a 64-cell sheet (CelestialHorse, ColdWraith, FacelessOne...) -- a default-filled
+      // track, not authoring. Those keep the random tile they had before, which is the variety the
+      // sheet exists for; pinning cell 0 would freeze all of them on the top-left cell.
+      bool const varies = std::adjacent_find(cells.begin(), cells.end(), std::not_equal_to<>()) != cells.end();
+      if (cell_count > 1 && varies)
+      {
+        _cell_times = std::move(times);
+        _cell_values = std::move(cells);
+        _uv_animated = true;
+      }
+    }
+  }
+
+  // Spline emitter (M2 EmitterType 3). The emission path itself is version-agnostic -- newParticle walks
+  // _spline_points whenever it is non-empty -- only the point LOADING was classic-only, so wotlk type-3
+  // emitters silently degraded to a plane. 136 emitters in the 3.3.5a client author splines (ring
+  // effects: FlameCircleEffect, Fel_FlameCircleEffect, Circle_of_Renewal, WellOfSouls), and within any
+  // sampled subset that count matches the emitterType==3 count exactly -- which is what validates these
+  // struct offsets. Same read as the classic ctor, bounds-checked.
+  if (mta.p.nSplinePoints > 0 && mta.p.nSplinePoints < 4096)
+  {
+    std::size_t const need = static_cast<std::size_t>(mta.p.ofsSplinePoints)
+                           + static_cast<std::size_t>(mta.p.nSplinePoints) * sizeof(glm::vec3);
+    if (f.getBuffer() && need <= f.getSize())
+    {
+      auto const* raw = reinterpret_cast<glm::vec3 const*>(f.getBuffer() + mta.p.ofsSplinePoints);
+      _spline_points.reserve(mta.p.nSplinePoints);
+      for (std::uint32_t i = 0; i < mta.p.nSplinePoints; ++i)
+      {
+        _spline_points.push_back(fixCoordSystem(raw[i]));
+      }
+    }
+  }
 
   // init tiles
   for (int i = 0; i<rows*cols; ++i) {
@@ -567,6 +651,8 @@ ParticleSystem::ParticleSystem(ParticleSystem const& other)
   , _uv_seq_start(other._uv_seq_start)
   , _uv_seq_end(other._uv_seq_end)
   , _uv_repeat(other._uv_repeat)
+  , _cell_times(other._cell_times)
+  , _cell_values(other._cell_values)
   , billboard(other.billboard)
   , classic(other.classic)
   , debug_update_log_count(other.debug_update_log_count)
@@ -627,6 +713,8 @@ ParticleSystem::ParticleSystem(ParticleSystem&& other)
   , _uv_seq_start(other._uv_seq_start)
   , _uv_seq_end(other._uv_seq_end)
   , _uv_repeat(other._uv_repeat)
+  , _cell_times(other._cell_times)
+  , _cell_values(other._cell_values)
   , billboard(other.billboard)
   , classic(other.classic)
   , debug_update_log_count(other.debug_update_log_count)
@@ -885,7 +973,41 @@ void ParticleSystem::update(float dt)
     // lifespanUVAnim/decayUVAnim). Overwrites the random tile picked at spawn for animated emitters
     // only; the draw path reads p.tile unchanged. Clamped so the index can never leave [0,cells-1]
     // (an out-of-range tile would break the whole draw loop via the size guard).
-    if (_uv_animated)
+    if (_uv_animated && !_cell_values.empty())
+    {
+      // WotLK keyed cell track: find the segment containing rlife and interpolate the cell index across
+      // it. Times are non-decreasing; duplicated timestamps (the lifespan->decay hand-off) give a zero
+      // width segment, which we treat as an instant jump to the later key. Past the last key the cell
+      // holds -- emitters whose track ends early (last time < 32767) freeze on their final cell.
+      float const f = std::clamp(rlife, 0.0f, 1.0f);
+      int cell = _cell_values.back();
+
+      if (f <= _cell_times.front())
+      {
+        cell = _cell_values.front();
+      }
+      else
+      {
+        for (std::size_t k = 1; k < _cell_times.size(); ++k)
+        {
+          if (f > _cell_times[k]) { continue; }
+
+          float const span = _cell_times[k] - _cell_times[k - 1];
+          float const t = span > 1e-6f ? (f - _cell_times[k - 1]) / span : 1.0f;
+          cell = static_cast<int>(static_cast<float>(_cell_values[k - 1])
+                                  + t * static_cast<float>(_cell_values[k] - _cell_values[k - 1]));
+          break;
+        }
+      }
+
+      if (cell < 0) { cell = 0; }
+      if (!tiles.empty() && static_cast<std::size_t>(cell) >= tiles.size())
+      {
+        cell = static_cast<int>(tiles.size()) - 1;
+      }
+      p.tile = static_cast<unsigned int>(cell);
+    }
+    else if (_uv_animated)
     {
       int const range = _uv_seq_end - _uv_seq_start + 1;
       float const f = std::min(std::max(rlife, 0.0f), 0.99999f);

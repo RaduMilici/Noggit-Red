@@ -20,6 +20,8 @@
 #include <noggit/ModelInstance.h>
 #include <noggit/InteriorVolume.hpp>
 
+#include <QtCore/QElapsedTimer>
+
 #include <chrono>
 #include <cstdint>
 #include <memory>
@@ -29,6 +31,7 @@
 
 class World;
 class WMO;
+class WMOGroup;
 struct MinimapRenderSettings;
 
 namespace Noggit::Rendering
@@ -55,6 +58,13 @@ namespace Noggit::Rendering
     // True while the camera is inside a WMO this frame (cached in draw()). Read by WMORender to route WMO
     // exterior-lit / portal-spill faces to the WMO's interior context instead of the outdoor map light.
     bool cameraInsideWmo() const { return _camera_inside_wmo; }
+
+    // Called by WMORender instead of drawing its liquid inline -- see _deferred_wmo_liquid.
+    void queueWmoLiquid(std::vector<WMOGroup*> groups, glm::mat4x4 const& transform,
+                        bool interior_only, bool draw_fog)
+    {
+      _deferred_wmo_liquid.push_back({std::move(groups), transform, interior_only, draw_fog});
+    }
 
     void draw (glm::mat4x4 const& model_view
         , glm::mat4x4 const& projection
@@ -162,6 +172,9 @@ namespace Noggit::Rendering
     // false if it couldn't (no viewport). Call after terrain+WMO+doodads, before creatures.
     bool snapshotDecalDepth();
 
+    // Same, into _world_depth_tex. Must be called after the WMO pass and before the M2 pass.
+    bool snapshotWorldDepth();
+
     World* _world;
     float _cull_distance;         // how far OBJECTS/WMOs/models render (Object Render Distance slider), clamped to terrain
     float _terrain_cull_distance; // how far TERRAIN/horizon/sky render = view distance; fog never affects it
@@ -237,6 +250,20 @@ namespace Noggit::Rendering
     Noggit::Rendering::Primitives::Square _square_render;
     Noggit::Rendering::Primitives::Line _line_render;
     Noggit::Rendering::Primitives::Circle _circle_render;
+    Noggit::Rendering::Primitives::PathDecal _path_decal_render; // creature patrol routes
+
+    // Patrol routes DRAPED onto the walkable surface. The authored waypoints are only corner points,
+    // so the straight chord between two of them cuts under a bridge deck and through a hill crest.
+    // Trying to absorb that with a vertical tolerance in the shader can't work: the tolerance needed
+    // to clear an arched bridge is also wide enough to swallow a roof, a tree canopy and the body of
+    // an NPC standing on the route. So the route is resampled and probed down onto the real ground
+    // once, cached, and the shader then only has to tolerate micro-relief.
+    // NOTE: routes are NOT probed onto the ground. That was tried and removed: each probe is a
+    // World::intersect against every loaded tile and WMO instance, which cost so much that routes
+    // took many seconds to appear even spread across frames. It is also no longer needed -- draping
+    // existed to keep the shader's height tolerance tight enough to exclude NPC bodies, and the
+    // world-depth comparison now excludes models outright, so the tolerance can be loose enough to
+    // span a bridge arch on its own.
 
     // Per-object interior lighting: cache of quantized-world-position -> interior light (rgb = WMO room
     // ambient, a = 1 when the position is inside an indoor group; (0,0,0,0) = outdoor). Objects in the
@@ -256,6 +283,21 @@ namespace Noggit::Rendering
     GLuint _decal_depth_tex = 0;
     int _decal_depth_w = -1;
     int _decal_depth_h = -1;
+
+    // WORLD-ONLY depth: the same blit, but taken after terrain + WMOs and BEFORE the M2 pass, so it
+    // holds the walkable world without any doodad, creature or gameobject model in it.
+    //
+    // A ground decal needs both. The world depth says where the GROUND is at a pixel -- the surface
+    // the decal belongs on -- while the full scene depth says what is actually VISIBLE there. When
+    // something is visible in front of the ground, the model owns that pixel and the decal must not
+    // paint it. Reconstructing from the full scene depth alone cannot express that: on an NPC's
+    // boots the visible surface IS the NPC, which is why the ribbon and the selection rings were
+    // painting over the models no matter how the height tolerances were tuned.
+    GLuint _world_depth_fbo = 0;
+    GLuint _world_depth_tex = 0;
+    int _world_depth_w = -1;
+    int _world_depth_h = -1;
+    bool _world_depth_ready = false; // snapshot taken THIS frame (reset at draw start)
     // Cache of faction-template id -> selection-circle hostility color (red/green/yellow), so the
     // FactionTemplate.dbc isn't walked per spawn per frame.
     std::unordered_map<std::uint32_t, glm::vec4> _faction_reaction_cache;
@@ -309,6 +351,21 @@ namespace Noggit::Rendering
     GLuint const& _occluder_vao = _vertex_arrays[2];
 
     LiquidTextureManager _liquid_texture_manager;
+
+    // Deferred WMO liquid. WMO groups are drawn in the WMO pass, which runs BEFORE the M2/creature
+    // passes -- so WMO water drawn inline there is behind everything that comes after it: creatures
+    // standing in it painted straight over the surface with no water tint at all. ADT water does not
+    // have this problem because its pass runs after the models. Queue the WMO liquid here during the
+    // WMO pass and flush it in the water phase instead, so it blends over the creatures like ADT
+    // water does. Cleared every frame.
+    struct DeferredWmoLiquid
+    {
+      std::vector<WMOGroup*> groups;
+      glm::mat4x4 transform;
+      bool interior_only;
+      bool draw_fog;
+    };
+    std::vector<DeferredWmoLiquid> _deferred_wmo_liquid;
 
     bool _need_terrain_params_ubo_update = false;
   };

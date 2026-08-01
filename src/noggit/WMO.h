@@ -178,6 +178,9 @@ public:
                   , Noggit::Rendering::LiquidTextureManager& texture_manager
                   , bool draw_fog
                   , int animtime
+                  // translucent = water: keep the caller's additive blend and DO NOT write depth
+                  // (a depth-writing water plane occludes the later M2 pass). false = opaque lava.
+                  , bool translucent = false
                   );
 
   void setupFog (bool draw_fog, std::function<void (bool)> setup_fog);

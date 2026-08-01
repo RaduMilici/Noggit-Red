@@ -445,7 +445,16 @@ void WMORender::draw(OpenGL::Scoped::use_program& wmo_shader
     world_renderer->restoreGlobalPointLights();
   }
 
-  if (wmo_liquid_program && liquid_texture_manager)
+  // DEFER to the water phase when we are drawing the world. The WMO pass runs BEFORE the M2/creature
+  // passes, so liquid drawn here sits behind everything drawn later -- a creature standing in a WMO
+  // canal painted straight over the water surface with no tint. WorldRender flushes the queue after
+  // the models, exactly where ADT water already draws. The asset preview has no WorldRender, so it
+  // keeps drawing inline below.
+  if (wmo_liquid_program && liquid_texture_manager && world_renderer)
+  {
+    world_renderer->queueWmoLiquid(visible_groups, transform_matrix, interior_only, draw_fog);
+  }
+  else if (wmo_liquid_program && liquid_texture_manager)
   {
     OpenGL::Scoped::use_program wmo_liquid_shader{*wmo_liquid_program};
     // Dev water-opacity lever (Settings slider -> water/transparency). WMO liquid is a separate
@@ -470,19 +479,26 @@ void WMORender::draw(OpenGL::Scoped::use_program& wmo_shader
       gl.stencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
     }
 
+    // Exterior liquid = translucent water: it must NOT write depth (see WMOGroup::drawLiquid). The
+    // BLEND is deliberately left alone -- water keeps its normal alpha blend and its normal look.
+    // Interior liquid (Molten Core lava) is genuinely opaque and keeps writing depth.
+    bool const translucent_water = !interior_only;
+
     for (auto* group : visible_groups)
     {
       group->drawLiquid(transform_matrix,
                         wmo_liquid_shader,
                         *liquid_texture_manager,
                         draw_fog,
-                        animtime);
+                        animtime,
+                        /*translucent*/ translucent_water);
     }
 
     if (dedupe_overlap)
     {
       gl.disable(GL_STENCIL_TEST);
     }
+
   }
 
   if (boundingbox)

@@ -438,12 +438,14 @@ void Square::setup_buffers()
                                  , glm::mat4x4 const& inv_view_projection
                                  , glm::vec2 const& inv_viewport
                                  , GLuint scene_depth_tex
+                                 , GLuint world_depth_tex
                                  , GLuint empty_vao
                                  , glm::vec3 const& center
                                  , glm::vec3 const& camera
                                  , float radius
                                  , glm::vec4 const& color
-                                 , float uv_rotation)
+                                 , float uv_rotation
+                                 , bool simple_ring)
   {
     if (!_decal_program)
     {
@@ -468,7 +470,7 @@ void Square::setup_buffers()
         _select_texture_failed = true;
       }
     }
-    if (!scene_depth_tex)
+    if (!scene_depth_tex || !world_depth_tex)
     {
       return; // no depth snapshot -> can't project; but a missing texture is fine (procedural fallback)
     }
@@ -492,10 +494,11 @@ void Square::setup_buffers()
     shader.uniform("color", color);
     shader.uniform("uv_rotation", uv_rotation);
     shader.uniform("expand", 2.0f);
-    shader.uniform("use_texture", use_texture ? 1 : 0);
+    // 2 = plain outline ring (spawn-tool cursor), 1 = client UnitSelectTexture, 0 = blob fallback.
+    shader.uniform("use_texture", simple_ring ? 2 : (use_texture ? 1 : 0));
 
     gl.activeTexture(GL_TEXTURE0);
-    if (use_texture)
+    if (use_texture && !simple_ring)
     {
       gl.bindTexture(GL_TEXTURE_2D_ARRAY, _select_texture->texture_array());
       shader.uniform("tex", 0);
@@ -505,6 +508,9 @@ void Square::setup_buffers()
     gl.activeTexture(GL_TEXTURE1);
     gl.bindTexture(GL_TEXTURE_2D, scene_depth_tex);
     shader.uniform("scene_depth", 1);
+    gl.activeTexture(GL_TEXTURE2);
+    gl.bindTexture(GL_TEXTURE_2D, world_depth_tex);
+    shader.uniform("world_depth", 2);
     gl.activeTexture(GL_TEXTURE0);
 
     gl.bindVertexArray(empty_vao); // corners from gl_VertexID (TRIANGLE_STRIP, 4 verts)
@@ -559,6 +565,106 @@ void Square::setup_buffers()
     _buffers.unload();
     _program.reset();
     _decal_program.reset();
+    _buffers_are_setup = false;
+  }
+
+  void PathDecal::draw(glm::mat4x4 const& mvp_rel
+                      , glm::mat4x4 const& inv_mvp_rel
+                      , glm::vec2 const& inv_viewport
+                      , GLuint scene_depth_tex
+                      , GLuint world_depth_tex
+                      , std::vector<glm::vec3> const& points
+                      , glm::vec3 const& camera
+                      , glm::vec3 const& view_axis
+                      , glm::vec4 const& color
+                      , float world_width
+                      , float min_pixels
+                      , float max_pixels
+                      , float px_scale)
+  {
+    if (points.size() < 2 || !scene_depth_tex || !world_depth_tex)
+    {
+      return; // no route, or no depth snapshot to project onto
+    }
+
+    if (!_buffers_are_setup)
+    {
+      setup_buffers();
+    }
+
+    // One instance per segment, CAMERA-RELATIVE. Absolute coords at Karazhan's ~19000 range lose
+    // float precision and make the ribbon shimmer as the camera moves -- the same fix the selection
+    // circle needed.
+    _segment_data.clear();
+    _segment_data.reserve((points.size() - 1) * 6);
+    for (std::size_t i = 0; i + 1 < points.size(); ++i)
+    {
+      glm::vec3 const a(points[i] - camera);
+      glm::vec3 const b(points[i + 1] - camera);
+      _segment_data.insert(_segment_data.end(), {a.x, a.y, a.z, b.x, b.y, b.z});
+    }
+
+    gl.bufferData<GL_ARRAY_BUFFER, float>(_segments_vbo, _segment_data, GL_STREAM_DRAW);
+
+    OpenGL::Scoped::use_program shader {*_program.get()};
+    // Same GL state as the circle decal: the coverage boxes are not the thing being drawn, and
+    // depth-testing them would clip the decal into the very geometry it is meant to drape over.
+    // Occlusion is resolved per pixel from the depth texture instead.
+    OpenGL::Scoped::bool_setter<GL_DEPTH_TEST, GL_FALSE> const no_depth_test;
+    OpenGL::Scoped::bool_setter<GL_CULL_FACE, GL_FALSE> const no_cull;
+
+    shader.uniform("model_view_projection", mvp_rel);
+    shader.uniform("inv_view_projection", inv_mvp_rel);
+    shader.uniform("inv_viewport", inv_viewport);
+    shader.uniform("view_axis", view_axis);
+    shader.uniform("color", color);
+    shader.uniform("world_width", world_width);
+    shader.uniform("min_pixels", min_pixels);
+    shader.uniform("max_pixels", max_pixels);
+    shader.uniform("px_scale", px_scale);
+
+    gl.activeTexture(GL_TEXTURE1);
+    gl.bindTexture(GL_TEXTURE_2D, scene_depth_tex);
+    shader.uniform("scene_depth", 1);
+    gl.activeTexture(GL_TEXTURE2);
+    gl.bindTexture(GL_TEXTURE_2D, world_depth_tex);
+    shader.uniform("world_depth", 2);
+    gl.activeTexture(GL_TEXTURE0);
+
+    OpenGL::Scoped::vao_binder const _ (_vao[0]);
+    gl.drawArraysInstanced(GL_TRIANGLES, 0, 36, static_cast<GLsizei>(points.size() - 1));
+  }
+
+  void PathDecal::setup_buffers()
+  {
+    _vao.upload();
+    _buffers.upload();
+
+    _program.reset(new OpenGL::program(
+      {{ GL_VERTEX_SHADER,   OpenGL::shader::src_from_qrc("path_decal_vs") }
+      ,{ GL_FRAGMENT_SHADER, OpenGL::shader::src_from_qrc("path_decal_fs") }}));
+
+    OpenGL::Scoped::use_program sp (*_program.get());
+    {
+      OpenGL::Scoped::vao_binder const _ (_vao[0]);
+      OpenGL::Scoped::buffer_binder<GL_ARRAY_BUFFER> const vb (_segments_vbo);
+      // Interleaved (start, end) per instance; the box corners come from gl_VertexID.
+      GLsizei const stride = static_cast<GLsizei>(sizeof(float) * 6);
+      sp.attrib("seg_a", 3, GL_FLOAT, GL_FALSE, stride, nullptr);
+      sp.attrib("seg_b", 3, GL_FLOAT, GL_FALSE, stride,
+                reinterpret_cast<GLvoid const*>(sizeof(float) * 3));
+      sp.attrib_divisor("seg_a", 1);
+      sp.attrib_divisor("seg_b", 1);
+    }
+
+    _buffers_are_setup = true;
+  }
+
+  void PathDecal::unload()
+  {
+    _vao.unload();
+    _buffers.unload();
+    _program.reset();
     _buffers_are_setup = false;
   }
 

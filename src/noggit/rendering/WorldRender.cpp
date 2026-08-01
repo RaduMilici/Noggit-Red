@@ -3,6 +3,7 @@
 #include "WorldRender.hpp"
 #include <external/tracy/Tracy.hpp>
 #include <math/frustum.hpp>
+#include <math/ray.hpp>
 #include <noggit/Log.h>
 #include <noggit/World.h>
 #include <noggit/TileWater.hpp>
@@ -1216,6 +1217,7 @@ void WorldRender::draw (glm::mat4x4 const& model_view
     _world->_settings->value("object_render_distance", 925.0f).toFloat();
   _cull_distance = std::min(_terrain_cull_distance, object_render_distance);
   _decal_depth_ready = false; // fresh depth snapshot needed this frame (shadows + selection circles)
+  _world_depth_ready = false; // and a fresh world-only one, taken between the WMO and M2 passes
 
   // Draw verylowres heightmap (distant horizon backdrop). Toggleable live via Settings
   // ("render_horizon", default on) so it can be disabled to stop fog rendering distant mesh.
@@ -1931,6 +1933,7 @@ void WorldRender::draw (glm::mat4x4 const& model_view
     }
 
     ZoneScopedN("World::draw() : Draw WMOs");
+    _deferred_wmo_liquid.clear(); // refilled by WMORender, flushed in the water phase below
     noggit::perf::Scoped _prof_wmo(noggit::perf::Phase::WMO);
     {
       OpenGL::Scoped::use_program wmo_program{*_wmo_program.get()};
@@ -2116,6 +2119,16 @@ void WorldRender::draw (glm::mat4x4 const& model_view
   bool draw_gameobject_spawns = !minimap_render && (_world->drawCreatureSpawns() || _world->drawGameObjectSpawns());
   float const creature_spawn_model_distance = creature_spawn_model_draw_distance();
   float const creature_spawn_marker_distance = creature_spawn_marker_draw_distance();
+  // Capture the world-only depth HERE, between the WMO pass and the M2 pass: terrain and buildings
+  // are in the depth buffer, nothing model-shaped is yet. The ground decals drawn later (selection
+  // circles, patrol routes) need this to tell "the ground at this pixel" apart from "whatever model
+  // is standing in front of it".
+  if (draw_creature_spawns || draw_gameobject_spawns
+      || terrainMode == editing_mode::creature || terrainMode == editing_mode::gameobject)
+  {
+    snapshotWorldDepth();
+  }
+
   // M2s / models
   if (draw_models || draw_doodads_wmo || draw_creature_spawns || (minimap_render && minimap_render_settings->use_filters))
   {
@@ -4123,6 +4136,11 @@ void WorldRender::draw (glm::mat4x4 const& model_view
       _world->ensureCreatureSpawnsLoaded();
     }
 
+    // Opacity of the selection/state discs drawn under creature + gameobject spawns. These are an
+    // editor overlay, not client art, so they are held back from full strength to keep the model
+    // readable underneath. 0.8 = 20% less opaque than the authored colours.
+    constexpr float spawn_marker_opacity = 0.8f;
+
     if (draw_creature_spawns && _world->drawCreatureMarkers() && creature_spawn_markers_enabled() && !_world->creatureSpawns().empty())
     {
       ZoneScopedN("World::draw() : Draw creature spawn markers");
@@ -4221,6 +4239,7 @@ void WorldRender::draw (glm::mat4x4 const& model_view
         {
           color.a *= fade_it->second;
         }
+        color.a *= spawn_marker_opacity; // editor overlay, kept subtle so it does not fight the model
         markers.push_back({spawn.guid, color, spawn.pos, ring_radius});
       }
 
@@ -4268,7 +4287,7 @@ void WorldRender::draw (glm::mat4x4 const& model_view
         glm::mat4x4 const inv_mvp_rel = glm::inverse(mvp_rel);
         for (auto const& m : markers)
         {
-          _circle_render.drawProjectedDecal(mvp, inv_mvp_rel, inv_vp, _decal_depth_tex, _bloom_vao,
+          _circle_render.drawProjectedDecal(mvp, inv_mvp_rel, inv_vp, _decal_depth_tex, _world_depth_tex, _bloom_vao,
                                             m.pos, camera_pos, m.radius, m.color, uv_rotation_for(m.pos));
         }
       }
@@ -4326,10 +4345,11 @@ void WorldRender::draw (glm::mat4x4 const& model_view
         ring_radius = std::max(0.25f, ring_radius);
 
         // Distinct palette from creatures (which are orange/green): gameobjects use blue/purple.
-        glm::vec4 const color = spawn.selected ? glm::vec4(0.35f, 1.0f, 0.45f, 1.0f)
+        glm::vec4 color = spawn.selected ? glm::vec4(0.35f, 1.0f, 0.45f, 1.0f)
             : spawn.hovered  ? glm::vec4(0.45f, 0.85f, 1.0f, 1.0f)
             : spawn.dirty    ? glm::vec4(1.0f,  0.9f,  0.15f, 1.0f)
                  : glm::vec4(0.55f, 0.45f, 1.0f, 1.0f);
+        color.a *= spawn_marker_opacity; // same overlay opacity as the creature markers
         markers.push_back({spawn.guid, color, spawn.pos, ring_radius});
       }
 
@@ -4355,10 +4375,48 @@ void WorldRender::draw (glm::mat4x4 const& model_view
         glm::mat4x4 const inv_mvp_rel = glm::inverse(mvp_rel);
         for (auto const& m : markers)
         {
-          _circle_render.drawProjectedDecal(mvp, inv_mvp_rel, inv_vp, _decal_depth_tex, _bloom_vao,
+          _circle_render.drawProjectedDecal(mvp, inv_mvp_rel, inv_vp, _decal_depth_tex, _world_depth_tex, _bloom_vao,
                                             m.pos, camera_pos, m.radius, m.color, uv_rotation_for(m.pos));
         }
       }
+      gl.blendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    }
+
+    // Mouse aim circle for the spawn tools, as a PROJECTED DECAL. The normal cursor circle is painted
+    // by the TERRAIN shader (mcnk outer_cursor_radius), so it exists only on terrain: over a WMO it
+    // vanished / showed through the floor, and you could not see where you were about to place. Same
+    // depth-decal machinery as the spawn markers above, so it drapes onto whatever surface is actually
+    // under the cursor -- terrain, WMO floor or roof, doodad. Terrain mode keeps its shader circle;
+    // this only runs for the two spawn tools.
+    if ((terrainMode == editing_mode::creature || terrainMode == editing_mode::gameobject)
+        && cursor_type != CursorType::NONE
+        && brush_radius > 0.0f)
+    {
+      ZoneScopedN("World::draw() : Draw spawn-tool cursor decal");
+      OpenGL::Scoped::bool_setter<GL_CULL_FACE, GL_FALSE> const disable_cull_face;
+      OpenGL::Scoped::bool_setter<GL_BLEND, GL_TRUE> const enable_blend;
+      OpenGL::Scoped::depth_mask_setter<GL_FALSE> const no_depth_write;
+
+      gl.blendFuncSeparate(GL_SRC_ALPHA, GL_ONE, GL_ZERO, GL_ONE);
+
+      // Re-snapshot: the spawn models are in the depth buffer by now, so the ring is correctly
+      // occluded by whatever it is drawn behind instead of painting over it.
+      _decal_depth_ready = false;
+      if (snapshotDecalDepth())
+      {
+        GLint cvp[4] = {0, 0, 0, 0};
+        gl.getIntegerv(GL_VIEWPORT, cvp);
+        glm::vec2 const inv_vp(1.0f / std::max(cvp[2], 1), 1.0f / std::max(cvp[3], 1));
+        glm::mat4x4 const inv_mvp_rel = glm::inverse(mvp_rel);
+        glm::vec2 const to_cam(camera_pos.x - cursor_pos.x, camera_pos.z - cursor_pos.z);
+
+        // simple_ring: a plain outline, NOT the client's UnitSelectTexture -- this is an editor aim
+        // cursor, so it should not borrow the in-game selection-circle art.
+        _circle_render.drawProjectedDecal(mvp, inv_mvp_rel, inv_vp, _decal_depth_tex, _world_depth_tex, _bloom_vao,
+                                          cursor_pos, camera_pos, brush_radius, cursor_color,
+                                          std::atan2(to_cam.x, to_cam.y), /*simple_ring*/ true);
+      }
+
       gl.blendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     }
 
@@ -4398,44 +4456,83 @@ void WorldRender::draw (glm::mat4x4 const& model_view
 
         OpenGL::Scoped::bool_setter<GL_CULL_FACE, GL_FALSE> const disable_cull_face;
         OpenGL::Scoped::bool_setter<GL_BLEND, GL_TRUE> const enable_blend;
-        OpenGL::Scoped::bool_setter<GL_LINE_SMOOTH, GL_TRUE> const line_smooth;
         OpenGL::Scoped::depth_mask_setter<GL_FALSE> const no_depth_write;
-        gl.hint(GL_LINE_SMOOTH_HINT, GL_NICEST);
-        gl.blendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-        gl.lineWidth(2.5f);
-        gl.enable(GL_DEPTH_TEST);
-        gl.depthFunc(GL_LEQUAL); // respect terrain occlusion -> proper line-of-sight, not drawn through
+        // Straight alpha on RGB, but leave the framebuffer ALPHA alone -- that channel is the bloom
+        // emissive mask, and writing route colour into it would make the paths bloom.
+        gl.blendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ZERO, GL_ONE);
 
-        for (auto const& spawn : _world->creatureSpawns())
+        // Ribbon width, three independent knobs. world_width sets the MIDDLE-distance thickness (it
+        // is what you see whenever the clamps are not biting); max_pixels is what you see up close,
+        // where a fixed world width would otherwise fill the screen; min_pixels is the far-distance
+        // floor that keeps a route visible instead of thinning to nothing.
+        constexpr float path_world_width = 0.40f; // was 0.6 -- mid distance read too thick
+        constexpr float path_min_pixels = 2.0f;
+        constexpr float path_max_pixels = 18.0f;  // the close-up width; 14 read too thin zoomed in
+
+        // Editor overlay, not client art: hold the routes back from full strength so the ground and
+        // its texture read through them. 0.7 = 30% more transparent than the authored palette.
+        constexpr float path_opacity = 0.7f;
+
+        // World units per pixel, per unit of view depth: projection[1][1] is 1 / tan(fovy / 2), so
+        // this stays correct if the FOV or the window size changes.
+        GLint pvp[4] = {0, 0, 0, 0};
+        gl.getIntegerv(GL_VIEWPORT, pvp);
+        float const px_scale = 2.0f / (projection[1][1] * static_cast<float>(std::max(pvp[3], 1)));
+        glm::vec2 const inv_vp(1.0f / std::max(pvp[2], 1), 1.0f / std::max(pvp[3], 1));
+        // Camera forward in world space (third row of the view rotation, negated).
+        glm::vec3 const view_axis(-model_view[0][2], -model_view[1][2], -model_view[2][2]);
+
+        // The route is painted as a PROJECTED DECAL onto the scene depth, exactly like the spawn
+        // selection circles: a plain 3D line between two waypoints cuts straight through every hill
+        // and building in between, whereas the decal reconstructs the surface visible at each pixel
+        // and paints the route onto it. So the whole path stays on top of the mesh, and geometry in
+        // front of it occludes it for free (its surface simply isn't near the route).
+        // Re-snapshot so the creature/gameobject models are in the depth used here.
+        _decal_depth_ready = false;
+        if (snapshotDecalDepth())
         {
-          if (spawn.pending_delete)
-            continue;
-          if (spawn.event_suppressed) // hidden by the Seasonal Events filter
-            continue;
-          if (any_selected && !spawn.selected) // only the selected creature's path while one is selected
-            continue;
-          if (glm::distance(camera_pos, spawn.pos) > path_show_distance)
-            continue;
+          glm::mat4x4 const inv_mvp_rel = glm::inverse(mvp_rel);
 
-          auto it = paths.find(spawn.guid);
-          if (it == paths.end() || it->second.empty())
-            continue;
-
-          // Start the line at the (possibly just-moved) spawn position so it tracks live edits, then
-          // run through the authored waypoints. Lift slightly so it doesn't z-fight the ground.
           std::vector<glm::vec3> points;
-          points.reserve(it->second.size() + 1);
-          points.push_back(spawn.pos + glm::vec3(0.0f, 0.4f, 0.0f));
-          for (auto const& wp : it->second)
-            points.push_back(wp + glm::vec3(0.0f, 0.4f, 0.0f));
 
-          if (points.size() < 2)
-            continue;
+          for (auto const& spawn : _world->creatureSpawns())
+          {
+            if (spawn.pending_delete)
+              continue;
+            if (spawn.event_suppressed) // hidden by the Seasonal Events filter
+              continue;
+            if (any_selected && !spawn.selected) // only the selected creature's path while one is selected
+              continue;
+            if (glm::distance(camera_pos, spawn.pos) > path_show_distance)
+              continue;
 
-          _line_render.draw(mvp, points, palette[spawn.guid % palette_size], false);
+            auto it = paths.find(spawn.guid);
+            if (it == paths.end() || it->second.empty())
+              continue;
+
+            // Start at the (possibly just-moved) spawn position so the route tracks live edits, then
+            // run through the authored waypoints. No vertical lift and no ground probing: the decal
+            // takes its height from the surface it lands on, and the shader's depth test is what
+            // keeps it off models -- so the raw route is all this pass needs.
+            points.clear();
+            points.reserve(it->second.size() + 1);
+            points.push_back(spawn.pos);
+            for (auto const& wp : it->second)
+              points.push_back(wp);
+
+            if (points.size() < 2)
+              continue;
+
+            glm::vec4 color = palette[spawn.guid % palette_size];
+            color.a *= path_opacity;
+
+            _path_decal_render.draw(mvp_rel, inv_mvp_rel, inv_vp, _decal_depth_tex, _world_depth_tex, points,
+                                    camera_pos, view_axis, color,
+                                    path_world_width, path_min_pixels, path_max_pixels, px_scale);
+          }
         }
 
-        gl.lineWidth(1.0f);
+        gl.blendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
       }
     }
 
@@ -4586,6 +4683,48 @@ void WorldRender::draw (glm::mat4x4 const& model_view
     {
       LogDebug << "WorldRender::draw water end" << std::endl;
     }
+  }
+
+  // Flush the WMO liquid queued during the WMO pass (see _deferred_wmo_liquid). Drawn HERE, after the
+  // models, so a creature standing in WMO water is blended over by the surface -- same ordering ADT
+  // water already had. Inherits the water pass's blendFuncSeparate, which keeps water opacity out of
+  // the bloom mask.
+  if (draw_water && !_deferred_wmo_liquid.empty() && _wmo_liquid_program)
+  {
+    ZoneScopedN("World::draw() : Draw deferred WMO water");
+    OpenGL::Scoped::bool_setter<GL_CULL_FACE, GL_FALSE> const cull;
+    OpenGL::Scoped::use_program wmo_liquid_shader{*_wmo_liquid_program.get()};
+
+    wmo_liquid_shader.uniform("water_alpha_mult",
+                              _world->_settings->value("water/transparency", 1.0f).toFloat());
+
+    bool const dedupe_overlap = _world->_settings->value("water/wmo_stencil", true).toBool();
+
+    for (auto const& entry : _deferred_wmo_liquid)
+    {
+      // Stencil de-dupe for overlapping EXTERIOR planes only, exactly as the inline path did.
+      bool const stencil = dedupe_overlap && !entry.interior_only;
+      if (stencil)
+      {
+        gl.enable(GL_STENCIL_TEST);
+        gl.stencilFunc(GL_NOTEQUAL, 1, 0xFF);
+        gl.stencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
+      }
+
+      for (auto* group : entry.groups)
+      {
+        group->drawLiquid(entry.transform, wmo_liquid_shader, _liquid_texture_manager,
+                          entry.draw_fog, _world->animtime,
+                          /*translucent*/ !entry.interior_only);
+      }
+
+      if (stencil)
+      {
+        gl.disable(GL_STENCIL_TEST);
+      }
+    }
+
+    _deferred_wmo_liquid.clear();
   }
 
   // Deferred pure-additive light effects (god rays / lighthouse beams), drawn AFTER the water so
@@ -5169,6 +5308,56 @@ bool WorldRender::snapshotDecalDepth()
   return true;
 }
 
+bool WorldRender::snapshotWorldDepth()
+{
+  if (_world_depth_ready)
+  {
+    return _world_depth_tex != 0;
+  }
+
+  GLint vp[4] = {0, 0, 0, 0};
+  gl.getIntegerv(GL_VIEWPORT, vp);
+  if (vp[2] <= 0 || vp[3] <= 0)
+  {
+    return false;
+  }
+
+  GLint prev_draw_fbo = 0;
+  gl.getIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prev_draw_fbo);
+
+  if (_world_depth_w != vp[2] || _world_depth_h != vp[3] || !_world_depth_tex)
+  {
+    if (!_world_depth_tex)
+    {
+      gl.genTextures(1, &_world_depth_tex);
+      gl.genFramebuffers(1, &_world_depth_fbo);
+    }
+    _world_depth_w = vp[2];
+    _world_depth_h = vp[3];
+    gl.activeTexture(GL_TEXTURE2);
+    gl.bindTexture(GL_TEXTURE_2D, _world_depth_tex);
+    gl.texImage2D(GL_TEXTURE_2D, 0, GL_DEPTH24_STENCIL8, vp[2], vp[3], 0,
+                  GL_DEPTH_STENCIL, GL_UNSIGNED_INT_24_8, nullptr);
+    gl.texParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    gl.texParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    gl.texParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    gl.texParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    gl.bindFramebuffer(GL_DRAW_FRAMEBUFFER, _world_depth_fbo);
+    gl.framebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT,
+                            GL_TEXTURE_2D, _world_depth_tex, 0);
+    gl.bindFramebuffer(GL_DRAW_FRAMEBUFFER, static_cast<GLuint>(prev_draw_fbo));
+    gl.activeTexture(GL_TEXTURE0);
+  }
+
+  gl.bindFramebuffer(GL_READ_FRAMEBUFFER, static_cast<GLuint>(prev_draw_fbo));
+  gl.bindFramebuffer(GL_DRAW_FRAMEBUFFER, _world_depth_fbo);
+  gl.blitFramebuffer(0, 0, vp[2], vp[3], 0, 0, vp[2], vp[3], GL_DEPTH_BUFFER_BIT, GL_NEAREST);
+  gl.bindFramebuffer(GL_FRAMEBUFFER, static_cast<GLuint>(prev_draw_fbo));
+
+  _world_depth_ready = true;
+  return true;
+}
+
 void WorldRender::ensureBloomTargets(int w, int h)
 {
   if (w < 1) w = 1;
@@ -5631,6 +5820,7 @@ void WorldRender::unload()
   _square_render.unload();
   _line_render.unload();
   _circle_render.unload();
+  _path_decal_render.unload();
   _horizon_render.reset();
 
   _liquid_texture_manager.unload();

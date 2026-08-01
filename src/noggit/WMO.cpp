@@ -1730,20 +1730,31 @@ void WMOGroup::drawLiquid ( glm::mat4x4 const& transform
                           , Noggit::Rendering::LiquidTextureManager& texture_manager
                           , bool // draw_fog
                           , int animtime
+                          , bool translucent
                           )
 {
   // draw liquid
   //! \todo  culling for liquid boundingbox or something
-  if (lq) 
-  { 
+  if (lq)
+  {
     OpenGL::Scoped::bool_setter<GL_DEPTH_TEST, GL_TRUE> const depth_test;
     gl.enable(GL_BLEND);
+
+    // Blend is the SAME in both cases -- water's appearance is unchanged. The only difference is the
+    // depth write, and that was the actual bug: WMO groups are drawn BEFORE the M2 pass, so a water
+    // plane that writes depth occludes every creature standing below it -- they are depth-rejected
+    // and never rasterized at all. That is why creatures vanished in the Stormwind canals but
+    // reappeared once the camera went under the surface, and why terrain and WMO geometry (both drawn
+    // BEFORE the water plane) looked perfectly fine through it. The ADT water pass already gets this
+    // right via depth_mask_setter<GL_FALSE>.
     gl.blendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-    gl.depthMask(GL_TRUE);
+    // Interior liquid (Molten Core lava) is genuinely opaque and must keep occluding.
+    gl.depthMask(translucent ? GL_FALSE : GL_TRUE);
 
     lq->draw(transform, water_shader, texture_manager, animtime);
 
     gl.disable(GL_BLEND);
+    gl.depthMask(GL_TRUE); // restore for the opaque passes that follow
   }
 }
 

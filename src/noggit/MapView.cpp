@@ -4545,6 +4545,124 @@ void MapView::updateDatabaseStatus()
   updateCreatureBrowserStatus();
 }
 
+// One row's label. Shared by the full rebuild and by refreshCreatureBrowserItems(), so the two can
+// never drift apart in what a row says.
+QString MapView::creature_spawn_item_text(World::CreatureSpawnOverlay const& spawn)
+{
+  QString prefix;
+  if (spawn.selected)
+  {
+    prefix += "[selected] ";
+  }
+  if (spawn.pending_create)
+  {
+    prefix += "[new] ";
+  }
+  if (spawn.dirty)
+  {
+    prefix += "[pending] ";
+  }
+
+  auto const name = QString::fromStdString(spawn.name.empty() ? std::string("<unnamed>") : spawn.name);
+  return QString("%1%2 [entry %3] guid %4").arg(prefix).arg(name).arg(spawn.entry).arg(spawn.guid);
+}
+
+// Retext ONLY the rows whose spawns changed, instead of clearing and repopulating the whole list.
+// Dragging flips a spawn's `dirty` flag, which changes its "[pending]" prefix -- but a full
+// rebuildCreatureBrowserList() allocates a QListWidgetItem for every spawn in the world, which is a
+// ~1s freeze on release. This walks the existing rows and touches the handful that moved.
+void MapView::refreshCreatureBrowserItems(std::vector<std::uint32_t> const& guids)
+{
+  if (!_creature_list_widget || guids.empty())
+  {
+    return;
+  }
+
+  QSignalBlocker blocker(_creature_list_widget);
+  for (int i = 0; i < _creature_list_widget->count(); ++i)
+  {
+    auto* item = _creature_list_widget->item(i);
+    if (!item)
+    {
+      continue;
+    }
+
+    auto const guid = static_cast<std::uint32_t>(item->data(Qt::UserRole).toULongLong());
+    if (std::find(guids.begin(), guids.end(), guid) == guids.end())
+    {
+      continue;
+    }
+
+    if (auto const* spawn = _world->findCreatureSpawn(guid))
+    {
+      item->setText(creature_spawn_item_text(*spawn));
+    }
+  }
+}
+
+// A SELECTION change does not change the list's CONTENT -- only which row is highlighted. Doing that
+// through rebuildCreatureBrowserList() cleared the QListWidget and allocated a fresh item for every
+// spawn in the world (plus a getZoneId() per spawn when the zone filter is on), which is the ~1s
+// freeze on every click in the creature tool -- including a click on empty ground, which only
+// deselects. Move the highlight instead; the rebuild is for content changes (create/delete/filter).
+void MapView::highlightCreatureBrowserSelection()
+{
+  if (!_creature_list_widget)
+  {
+    return;
+  }
+
+  QSignalBlocker blocker(_creature_list_widget);
+
+  if (_selected_creature_spawn_guid)
+  {
+    for (int i = 0; i < _creature_list_widget->count(); ++i)
+    {
+      auto* item = _creature_list_widget->item(i);
+      if (item && static_cast<std::uint32_t>(item->data(Qt::UserRole).toULongLong())
+                    == *_selected_creature_spawn_guid)
+      {
+        _creature_list_widget->setCurrentItem(item);
+        updateCreatureBrowserStatus();
+        return;
+      }
+    }
+  }
+
+  // Nothing selected, or the selected spawn is filtered out of the list by the search / zone / type
+  // filters -- a rebuild would not have highlighted anything either.
+  _creature_list_widget->setCurrentRow(-1);
+  updateCreatureBrowserStatus();
+}
+
+void MapView::highlightGameObjectBrowserSelection()
+{
+  if (!_gameobject_list_widget)
+  {
+    return;
+  }
+
+  QSignalBlocker blocker(_gameobject_list_widget);
+
+  if (_selected_gameobject_spawn_guid)
+  {
+    for (int i = 0; i < _gameobject_list_widget->count(); ++i)
+    {
+      auto* item = _gameobject_list_widget->item(i);
+      if (item && static_cast<std::uint32_t>(item->data(Qt::UserRole).toULongLong())
+                    == *_selected_gameobject_spawn_guid)
+      {
+        _gameobject_list_widget->setCurrentItem(item);
+        updateGameObjectBrowserStatus();
+        return;
+      }
+    }
+  }
+
+  _gameobject_list_widget->setCurrentRow(-1);
+  updateGameObjectBrowserStatus();
+}
+
 void MapView::rebuildCreatureBrowserList(bool preserve_selection)
 {
   if (!_creature_list_widget)
@@ -4621,26 +4739,7 @@ void MapView::rebuildCreatureBrowserList(bool preserve_selection)
       }
     }
 
-    QString prefix;
-    if (spawn.selected)
-    {
-      prefix += "[selected] ";
-    }
-    if (spawn.pending_create)
-    {
-      prefix += "[new] ";
-    }
-    if (spawn.dirty)
-    {
-      prefix += "[pending] ";
-    }
-
-    auto* item = new QListWidgetItem(QString("%1%2 [entry %3] guid %4")
-                                       .arg(prefix)
-                                       .arg(name)
-                                       .arg(spawn.entry)
-                                       .arg(spawn.guid),
-                                     _creature_list_widget);
+    auto* item = new QListWidgetItem(creature_spawn_item_text(spawn), _creature_list_widget);
     item->setData(Qt::UserRole, static_cast<qulonglong>(spawn.guid));
     item->setData(Qt::UserRole + 1, static_cast<int>(_world->getMapID()));
     item->setData(Qt::UserRole + 6, true);
@@ -4704,9 +4803,17 @@ void MapView::setSelectedCreatureSpawn(std::optional<std::uint32_t> guid, bool u
 {
   _selected_creature_spawn_guid = guid;
 
+  // Collect the spawns whose selected flag actually flips: their row text carries a "[selected]"
+  // prefix, so those are the only rows that need new text.
+  std::vector<std::uint32_t> retext;
   for (auto& spawn : _world->creatureSpawns())
   {
-    spawn.selected = guid && spawn.guid == *guid;
+    bool const now_selected = guid && spawn.guid == *guid;
+    if (spawn.selected != now_selected)
+    {
+      retext.push_back(spawn.guid);
+    }
+    spawn.selected = now_selected;
   }
 
   // Populate the "Edit/New Creature" form from the selected spawn (empty = New). So clicking an existing
@@ -4730,7 +4837,10 @@ void MapView::setSelectedCreatureSpawn(std::optional<std::uint32_t> guid, bool u
 
   if (update_browser)
   {
-    rebuildCreatureBrowserList(true);
+    // Selection only -- no content change. Retext the handful of rows whose prefix flipped and move
+    // the highlight, instead of clearing and repopulating the whole list (the ~1s click freeze).
+    refreshCreatureBrowserItems(retext);
+    highlightCreatureBrowserSelection();
   }
   else
   {
@@ -4761,7 +4871,9 @@ void MapView::addCreatureSpawnToSelection(std::uint32_t guid, bool update_browse
 
   if (update_browser)
   {
-    rebuildCreatureBrowserList(true);
+    // Only this row's "[selected]" prefix changed -- see setSelectedCreatureSpawn.
+    refreshCreatureBrowserItems({guid});
+    highlightCreatureBrowserSelection();
   }
   else
   {
@@ -5102,7 +5214,10 @@ bool MapView::tryStartCreatureSpawnDrag()
 
   if (!clicked_spawn->selected || selectedCreatureSpawnCount() <= 1)
   {
-    setSelectedCreatureSpawn(best_guid);
+    // update_browser=false: rebuildCreatureBrowserList() repopulates a QListWidget over every spawn in
+    // the world, which is a ~1s hitch at the moment you grab something. The drag end already rebuilds
+    // it (mouseReleaseEvent), so the list syncs there instead of stalling the grab.
+    setSelectedCreatureSpawn(best_guid, /*update_browser*/ false);
   }
 
   _creature_drag_anchor_pos = _cursor_pos;
@@ -5303,6 +5418,94 @@ bool MapView::undoLastCreatureDelete()
   return true;
 }
 
+// Turn every spawn currently being dragged by `degrees` about its own centre. Used by the wheel while
+// a drag is in progress. Deliberately does NOT rebuild the browser list or the editor knobs -- those
+// are the expensive calls that used to stall the drag; the orientation spinbox is nudged directly and
+// the full resync happens on mouse-up like the position does.
+void MapView::rotateDraggedSpawns(float degrees)
+{
+  auto const wrap360 = [](float v)
+  {
+    v = std::fmod(v, 360.0f);
+    return v < 0.0f ? v + 360.0f : v;
+  };
+
+  if (_dragging_creature_spawn)
+  {
+    for (auto const& drag_state : _creature_drag_initial_positions)
+    {
+      auto* spawn = _world->findCreatureSpawn(drag_state.first);
+      if (!spawn)
+      {
+        continue;
+      }
+
+      spawn->orientation = wrap360(spawn->orientation + degrees);
+      spawn->dirty = spawn->pending_create
+                  || glm::distance(spawn->pos, spawn->original_pos) > 0.01f
+                  || std::abs(spawn->orientation - spawn->original_orientation) > 0.01f;
+
+      if (spawn->model_instance)
+      {
+        spawn->model_instance->dir = glm::vec3(0.0f, spawn->orientation, 0.0f);
+        spawn->model_instance->recalcExtents();
+      }
+      if (spawn->mount_instance)
+      {
+        spawn->mount_instance->dir = glm::vec3(0.0f, spawn->orientation, 0.0f);
+        spawn->mount_instance->recalcExtents();
+      }
+    }
+
+    if (_spawn_edit_orientation && _selected_creature_spawn_guid)
+    {
+      if (auto const* sel = _world->findCreatureSpawn(*_selected_creature_spawn_guid))
+      {
+        QSignalBlocker blocker(_spawn_edit_orientation);
+        _spawn_edit_orientation->setValue(static_cast<double>(sel->orientation));
+      }
+    }
+    return;
+  }
+
+  if (_dragging_gameobject_spawn)
+  {
+    for (auto const& drag_state : _gameobject_drag_initial_positions)
+    {
+      auto* spawn = _world->findGameObjectSpawn(drag_state.first);
+      if (!spawn)
+      {
+        continue;
+      }
+
+      spawn->orientation = wrap360(spawn->orientation + degrees);
+      spawn->dirty = spawn->pending_create
+                  || glm::distance(spawn->pos, spawn->original_pos) > 0.01f
+                  || std::abs(spawn->orientation - spawn->original_orientation) > 0.01f;
+
+      if (spawn->model_instance)
+      {
+        spawn->model_instance->dir = glm::vec3(0.0f, spawn->orientation, 0.0f);
+        spawn->model_instance->recalcExtents();
+      }
+      if (spawn->wmo_instance)
+      {
+        spawn->wmo_instance->dir = glm::vec3(0.0f, spawn->orientation, 0.0f);
+        spawn->wmo_instance->recalcExtents();
+      }
+    }
+
+    if (_go_spawn_edit_orientation && _selected_gameobject_spawn_guid)
+    {
+      if (auto const* sel = _world->findGameObjectSpawn(*_selected_gameobject_spawn_guid))
+      {
+        QSignalBlocker blocker(_go_spawn_edit_orientation);
+        _go_spawn_edit_orientation->setValue(static_cast<double>(sel->orientation));
+      }
+    }
+  }
+}
+
 void MapView::updateSelectedCreatureSpawnPosition(glm::vec3 const& pos)
 {
   if (!_selected_creature_spawn_guid)
@@ -5358,6 +5561,15 @@ void MapView::updateSelectedCreatureSpawnPosition(glm::vec3 const& pos)
     }
 
     apply_position(*spawn, pos);
+  }
+
+  // PERF: this runs on EVERY mouse-move while dragging, and rebuildCreatureBrowserList() clears and
+  // repopulates a QListWidget over every creature spawn in the world -- that is what dropped the drag
+  // to ~1 fps. All three calls are pure UI sync with no bearing on the spawn's position, so defer them
+  // to the end of the drag (mouseReleaseEvent), where they run exactly once.
+  if (_dragging_creature_spawn)
+  {
+    return;
   }
 
   updateDatabaseStatus();
@@ -5623,6 +5835,48 @@ void MapView::jumpToCreatureListItem(QListWidgetItem* item)
 // GameObject tool (mirrors the creature tool above; no model picker / new-spawn creation).
 // ---------------------------------------------------------------------------
 
+// Gameobject counterpart of refreshCreatureBrowserItems -- see that function for why.
+void MapView::refreshGameObjectBrowserItems(std::vector<std::uint32_t> const& guids)
+{
+  if (!_gameobject_list_widget || guids.empty())
+  {
+    return;
+  }
+
+  QSignalBlocker blocker(_gameobject_list_widget);
+  for (int i = 0; i < _gameobject_list_widget->count(); ++i)
+  {
+    auto* item = _gameobject_list_widget->item(i);
+    if (!item)
+    {
+      continue;
+    }
+
+    auto const guid = static_cast<std::uint32_t>(item->data(Qt::UserRole).toULongLong());
+    if (std::find(guids.begin(), guids.end(), guid) == guids.end())
+    {
+      continue;
+    }
+
+    if (auto const* spawn = _world->findGameObjectSpawn(guid))
+    {
+      QString prefix;
+      if (spawn->selected)
+      {
+        prefix += "[selected] ";
+      }
+      if (spawn->dirty)
+      {
+        prefix += "[pending] ";
+      }
+
+      auto const name = QString::fromStdString(spawn->name.empty() ? std::string("<unnamed>") : spawn->name);
+      item->setText(QString("%1%2 [entry %3] guid %4")
+                      .arg(prefix).arg(name).arg(spawn->entry).arg(spawn->guid));
+    }
+  }
+}
+
 void MapView::rebuildGameObjectBrowserList(bool preserve_selection)
 {
   if (!_gameobject_list_widget)
@@ -5771,9 +6025,16 @@ void MapView::setSelectedGameObjectSpawn(std::optional<std::uint32_t> guid, bool
 {
   _selected_gameobject_spawn_guid = guid;
 
+  // Same as the creature path: only the rows whose selected flag flips need new text.
+  std::vector<std::uint32_t> retext;
   for (auto& spawn : _world->gameObjectSpawns())
   {
-    spawn.selected = guid && spawn.guid == *guid;
+    bool const now_selected = guid && spawn.guid == *guid;
+    if (spawn.selected != now_selected)
+    {
+      retext.push_back(spawn.guid);
+    }
+    spawn.selected = now_selected;
   }
 
   // Populate the "Edit/New GameObject" form from the selected spawn (empty = New).
@@ -5796,7 +6057,8 @@ void MapView::setSelectedGameObjectSpawn(std::optional<std::uint32_t> guid, bool
 
   if (update_browser)
   {
-    rebuildGameObjectBrowserList(true);
+    refreshGameObjectBrowserItems(retext);
+    highlightGameObjectBrowserSelection();
   }
   else
   {
@@ -5827,7 +6089,8 @@ void MapView::addGameObjectSpawnToSelection(std::uint32_t guid, bool update_brow
 
   if (update_browser)
   {
-    rebuildGameObjectBrowserList(true);
+    refreshGameObjectBrowserItems({guid});
+    highlightGameObjectBrowserSelection();
   }
   else
   {
@@ -6105,7 +6368,8 @@ bool MapView::tryStartGameObjectSpawnDrag()
 
   if (!clicked_spawn->selected || selectedGameObjectSpawnCount() <= 1)
   {
-    setSelectedGameObjectSpawn(best_guid);
+    // Same as the creature path: skip the full browser-list rebuild on grab, it happens on release.
+    setSelectedGameObjectSpawn(best_guid, /*update_browser*/ false);
   }
 
   _gameobject_drag_anchor_pos = _cursor_pos;
@@ -6254,6 +6518,13 @@ void MapView::updateSelectedGameObjectSpawnPosition(glm::vec3 const& pos)
     }
 
     apply_position(*spawn, pos);
+  }
+
+  // PERF: same as the creature path -- rebuildGameObjectBrowserList() repopulates a list widget over
+  // every gameobject spawn on every mouse-move. Deferred to the drag end.
+  if (_dragging_gameobject_spawn)
+  {
+    return;
   }
 
   updateGameObjectBrowserStatus();
@@ -8851,14 +9122,14 @@ math::ray MapView::intersect_ray() const
   }
 }
 
-selection_result MapView::intersect_result(bool terrain_only)
+selection_result MapView::intersect_result(bool terrain_only, bool force_objects)
 {
   selection_result results
-  ( _world->intersect 
+  ( _world->intersect
     ( glm::transpose(model_view())
     , intersect_ray()
     , terrain_only
-    , terrainMode == editing_mode::object || terrainMode == editing_mode::minimap
+    , force_objects || terrainMode == editing_mode::object || terrainMode == editing_mode::minimap
     , _draw_terrain.get()
     , _draw_wmo.get()
     , _draw_models.get()
@@ -8876,6 +9147,25 @@ selection_result MapView::intersect_result(bool terrain_only)
             );
 
   return std::move(results);
+}
+
+std::optional<glm::vec3> MapView::surface_pos_under_cursor()
+{
+  // _cursor_pos comes from a TERRAIN-ONLY raycast, which is right for the sculpt/paint brushes but
+  // wrong for placing a spawn: dragging an NPC over a building dropped it through the roof onto the
+  // ground underneath. Pick against terrain + WMOs + M2s instead and take the FIRST hit -- results are
+  // already sorted by ray distance, so front() is the nearest surface the cursor is actually over.
+  // Any hit type works because the entry's .first is the distance along the ray; a WMO/M2 entry
+  // carries no hit position of its own, so we evaluate the ray at that distance.
+  math::ray const ray(intersect_ray());
+  selection_result const results(intersect_result(false, true));
+
+  if (results.empty())
+  {
+    return std::nullopt;
+  }
+
+  return ray.position(results.front().first);
 }
 
 void MapView::doSelection (bool selectTerrainOnly, bool mouseMove)
@@ -9046,6 +9336,19 @@ void MapView::update_cursor_pos()
     return;
   }
 
+  // Spawn tools aim at a SURFACE, not at the ground: the cursor must sit on a WMO floor/roof or a
+  // doodad when you hover one, so the aim circle is visible there and a click places the spawn there.
+  // The brush tools below stay terrain-only -- sculpting/painting acts on chunks, so a WMO hit would
+  // be meaningless for them.
+  if (terrainMode == editing_mode::creature || terrainMode == editing_mode::gameobject)
+  {
+    if (auto const surface = surface_pos_under_cursor())
+    {
+      _cursor_pos = *surface;
+    }
+    return;
+  }
+
   // use raycasting for holes
 
   selection_result results (intersect_result (true));
@@ -9159,7 +9462,9 @@ void MapView::draw_map()
   case editing_mode::creature:
   case editing_mode::gameobject:
     // No brush in the spawn tools -- show a fixed aim circle on the ground under the cursor.
-    radius = 3.5f;
+    // Small on purpose: it marks a placement POINT, so a wide ring just obscures what you are
+    // aiming at. (Was 3.5, then 0.7.)
+    radius = 0.4f;
     break;
   case editing_mode::minimap:
     radius = minimapTool->brushRadius();
@@ -9703,16 +10008,26 @@ void MapView::mouseMoveEvent (QMouseEvent* event)
     _camera_moved_since_last_draw = true;
   }
 
-  if (_dragging_creature_spawn && leftMouse)
+  // Drag placement follows the nearest SOLID surface (WMO roof / doodad / terrain). Picked here
+  // rather than reusing _cursor_pos because the per-frame cursor update bails out while the camera is
+  // moving -- so dragging a spawn WHILE flying would otherwise freeze it at a stale point. The result
+  // is written back to _cursor_pos so the aim circle tracks the drag too.
+  if ((_dragging_creature_spawn || _dragging_gameobject_spawn) && leftMouse)
   {
-    updateSelectedCreatureSpawnPosition(_cursor_pos);
-    _last_mouse_pos = event->pos();
-    return;
-  }
+    if (auto const surface = surface_pos_under_cursor())
+    {
+      _cursor_pos = *surface;
+    }
 
-  if (_dragging_gameobject_spawn && leftMouse)
-  {
-    updateSelectedGameObjectSpawnPosition(_cursor_pos);
+    if (_dragging_creature_spawn)
+    {
+      updateSelectedCreatureSpawnPosition(_cursor_pos);
+    }
+    else
+    {
+      updateSelectedGameObjectSpawnPosition(_cursor_pos);
+    }
+
     _last_mouse_pos = event->pos();
     return;
   }
@@ -10123,6 +10438,23 @@ void MapView::wheelEvent (QWheelEvent* event)
   makeCurrent();
   OpenGL::context::scoped_setter const _ (::gl, context());
 
+  // While DRAGGING a spawn, the wheel rotates it instead of doing whatever the tool normally does.
+  // Every dragged spawn turns about its own centre, so a multi-selection keeps its layout and each
+  // member faces the new way. Wheel up = clockwise. Default 1 deg per notch, Shift = 10 deg,
+  // Ctrl = 45 deg.
+  if (_dragging_creature_spawn || _dragging_gameobject_spawn)
+  {
+    float const notches = static_cast<float>(event->angleDelta().y()) / 120.0f;
+    if (notches != 0.0f)
+    {
+      float const step = _mod_shift_down ? 10.0f : (_mod_ctrl_down ? 45.0f : 1.0f);
+      rotateDraggedSpawns(-notches * step); // negative: wheel up reads as clockwise on screen
+    }
+
+    event->accept();
+    return;
+  }
+
   auto&& delta_for_range
     ( [&] (float range)
       {
@@ -10198,8 +10530,21 @@ void MapView::mouseReleaseEvent (QMouseEvent* event)
       leftMouse = false;
       _dragging_creature_spawn = false;
       _creature_drag_anchor_pos = std::optional<glm::vec3>();
+
+      // Only the dragged spawns changed, so retext just their rows. A full rebuild here was a ~1s
+      // freeze on mouse-up (it allocates an item per spawn in the world). Capture the guids before
+      // clearing the drag state.
+      std::vector<std::uint32_t> moved;
+      moved.reserve(_creature_drag_initial_positions.size());
+      for (auto const& drag_state : _creature_drag_initial_positions)
+      {
+        moved.push_back(drag_state.first);
+      }
       _creature_drag_initial_positions.clear();
+
       updateDatabaseStatus();
+      refreshCreatureBrowserItems(moved);
+      refreshCreatureEditorKnobs();
       break;
     }
 
@@ -10208,8 +10553,18 @@ void MapView::mouseReleaseEvent (QMouseEvent* event)
       leftMouse = false;
       _dragging_gameobject_spawn = false;
       _gameobject_drag_anchor_pos = std::optional<glm::vec3>();
+
+      std::vector<std::uint32_t> moved;
+      moved.reserve(_gameobject_drag_initial_positions.size());
+      for (auto const& drag_state : _gameobject_drag_initial_positions)
+      {
+        moved.push_back(drag_state.first);
+      }
       _gameobject_drag_initial_positions.clear();
+
       updateGameObjectBrowserStatus();
+      refreshGameObjectBrowserItems(moved);
+      refreshGameObjectEditorKnobs();
       break;
     }
 

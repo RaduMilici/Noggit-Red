@@ -197,7 +197,13 @@ private:
 
   [[nodiscard]]
   math::ray intersect_ray() const;
-  selection_result intersect_result(bool terrain_only);
+  // force_objects overrides the "objects are only pickable in object/minimap mode" rule. Needed by the
+  // creature/gameobject drag, which must land on top of a WMO roof or a doodad instead of falling
+  // through to the terrain underneath it.
+  selection_result intersect_result(bool terrain_only, bool force_objects = false);
+  // Nearest solid surface under the mouse -- terrain, WMO or M2, whichever the ray hits first.
+  // std::nullopt when the ray hits nothing (e.g. pointing at the sky).
+  std::optional<glm::vec3> surface_pos_under_cursor();
   void doSelection(bool selectTerrainOnly, bool mouseMove = false);
   void update_cursor_pos();
 
@@ -662,6 +668,12 @@ private:
   void refreshCreatureSpawnOverlay(bool force_reload = false);
   void updateDatabaseStatus();
   void rebuildCreatureBrowserList(bool preserve_selection = true);
+  // Move the highlighted row without rebuilding the list -- a selection change touches no content.
+  void highlightCreatureBrowserSelection();
+  // Label for one creature row, shared by the full rebuild and the targeted refresh.
+  static QString creature_spawn_item_text(World::CreatureSpawnOverlay const& spawn);
+  // Retext only the listed spawns' rows (cheap) instead of repopulating the whole list.
+  void refreshCreatureBrowserItems(std::vector<std::uint32_t> const& guids);
   void updateCreatureBrowserStatus(QString const& override_text = QString());
   std::size_t selectedCreatureSpawnCount() const;
   void setSelectedCreatureSpawn(std::optional<std::uint32_t> guid, bool update_browser = true);
@@ -673,6 +685,8 @@ private:
   void updateCreatureSpawnHover(QPoint const& global_pos);
   bool tryStartCreatureSpawnDrag();
   void translateSelectedCreatureSpawns(glm::vec3 const& delta);
+  // Wheel-rotate every spawn currently being dragged, about its own centre (degrees).
+  void rotateDraggedSpawns(float degrees);
   void updateSelectedCreatureSpawnPosition(glm::vec3 const& pos);
   void showSelectedCreatureSpawnMenu(QPoint const& global_pos);
   void discardPendingCreatureSpawns();
@@ -686,6 +700,9 @@ private:
 
   // GameObject tool methods (mirror the creature ones; no model picker / new-spawn creation).
   void rebuildGameObjectBrowserList(bool preserve_selection = true);
+  void highlightGameObjectBrowserSelection();
+  // Retext only the listed gameobject spawns' rows instead of repopulating the whole list.
+  void refreshGameObjectBrowserItems(std::vector<std::uint32_t> const& guids);
   void updateGameObjectBrowserStatus(QString const& override_text = QString());
   std::size_t selectedGameObjectSpawnCount() const;
   void setSelectedGameObjectSpawn(std::optional<std::uint32_t> guid, bool update_browser = true);

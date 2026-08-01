@@ -134,6 +134,12 @@ class ParticleSystem
   int _uv_seq_start = 0;
   int _uv_seq_end = 0;
   int _uv_repeat = 1;
+  // WotLK keys the same animation instead of ramping it: parallel arrays of normalised life time
+  // (0..1, from the fixed16 track times) and cell index. Non-empty selects the keyed evaluation;
+  // classic emitters leave these empty and keep using the _uv_seq_* ramp above. Constant tracks are
+  // rejected at parse time (they are default-filled, not authored) and keep their random tile.
+  std::vector<float> _cell_times;
+  std::vector<int> _cell_values;
   void initTile(glm::vec2 *tc, int num);
   bool billboard;
   bool classic;
