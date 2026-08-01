@@ -63,6 +63,53 @@ namespace
     return !count || (offset < file.getSize() && count <= (file.getSize() - offset) / element_size);
   }
 
+  // Read one M2PartTrack (keyed times + values) as a normalised-life curve. Times are fixed16 over the
+  // particle's life (0..32767), the same encoding the flipbook cell track uses.
+  //
+  // A track is only accepted when it spans real time. Default-filled tracks (every timestamp 0) are
+  // common in the wotlk data and carry no authoring; taking one at face value would pin every particle
+  // to its last value -- black, or size zero -- so those fall through to the three-key ramp instead.
+  template<typename Value, typename Decode>
+  bool read_particle_life_track(BlizzardArchive::ClientFile const& file,
+                                FakeAnimationBlock const& track,
+                                std::size_t raw_value_size,
+                                std::vector<float>& times_out,
+                                std::vector<Value>& values_out,
+                                Decode decode)
+  {
+    times_out.clear();
+    values_out.clear();
+
+    if (track.nKeys < 2 || track.nKeys != track.nTimes || track.nKeys >= 4096)
+    {
+      return false;
+    }
+    if (!particle_range_fits(file, track.ofsTimes, track.nTimes, sizeof(std::uint16_t))
+        || !particle_range_fits(file, track.ofsKeys, track.nKeys, raw_value_size))
+    {
+      return false;
+    }
+
+    times_out.reserve(track.nKeys);
+    values_out.reserve(track.nKeys);
+
+    for (std::uint32_t i = 0; i < track.nKeys; ++i)
+    {
+      auto const t = *reinterpret_cast<std::uint16_t const*>(
+        file.getBuffer() + track.ofsTimes + i * sizeof(std::uint16_t));
+      times_out.push_back(std::clamp(static_cast<float>(t) / 32767.0f, 0.0f, 1.0f));
+      values_out.push_back(decode(file.getBuffer() + track.ofsKeys + i * raw_value_size));
+    }
+
+    if (!(times_out.back() > times_out.front()))
+    {
+      times_out.clear();
+      values_out.clear();
+      return false; // no time extent -> default-filled, not authored
+    }
+    return true;
+  }
+
   void read_particle_life_ramp(BlizzardArchive::ClientFile const& file,
                                ModelParticleParams const& params,
                                std::array<glm::vec4, 3>& colors,
@@ -299,6 +346,26 @@ T lifeRamp(float life, float mid, const T &a, const T &b, const T &c)
   else return math::interpolation::linear((life - mid) / (1.0f - mid), b, c);
 }
 
+// Evaluate a keyed life track at normalised life. Keys are few (2-16 in the wotlk data), so a linear
+// walk beats anything cleverer. Outside the authored range the curve holds its end value, which is
+// what the client does -- it does not extrapolate.
+template<typename T>
+T lifeTrack(std::vector<float> const& times, std::vector<T> const& values, float life)
+{
+  if (life <= times.front()) return values.front();
+  if (life >= times.back()) return values.back();
+
+  std::size_t hi = 1;
+  while (hi + 1 < times.size() && times[hi] < life)
+  {
+    ++hi;
+  }
+
+  float const span = times[hi] - times[hi - 1];
+  float const t = span > 1e-6f ? (life - times[hi - 1]) / span : 0.0f;
+  return math::interpolation::linear(t, values[hi - 1], values[hi]);
+}
+
 ParticleSystem::ParticleSystem(Model* model_
                                , const BlizzardArchive::ClientFile& f
                                , const ModelParticleEmitterDef &mta
@@ -344,6 +411,53 @@ ParticleSystem::ParticleSystem(Model* model_
   _bone_index = mta.bone;
   read_particle_life_ramp(f, mta.p, colors, sizes);
 
+  // ...and, where the emitter actually authors keyed tracks, the full curves. These take precedence
+  // over the three-key ramp above, which stays as the fallback for tracks that are too short or are
+  // default-filled. Each of the three is independent -- an emitter may key its colour while leaving
+  // size on the ramp.
+  {
+    auto const normalize_color_component = [](float value)
+    {
+      if (!std::isfinite(value))
+      {
+        return 1.0f;
+      }
+      return std::clamp(value > 1.0f ? value / 255.0f : value, 0.0f, 1.0f);
+    };
+
+    read_particle_life_track<glm::vec3>(f, mta.p.colors, sizeof(glm::vec3), _color_times, _color_values,
+      [&](auto const* raw)
+      {
+        glm::vec3 c;
+        std::memcpy(&c, raw, sizeof(c));
+        return glm::vec3(normalize_color_component(c.x)
+                        ,normalize_color_component(c.y)
+                        ,normalize_color_component(c.z));
+      });
+
+    read_particle_life_track<float>(f, mta.p.opacity, sizeof(std::int16_t), _alpha_times, _alpha_values,
+      [](auto const* raw)
+      {
+        std::int16_t v;
+        std::memcpy(&v, raw, sizeof(v));
+        return std::clamp(static_cast<float>(v) / 32767.0f, 0.0f, 1.0f);
+      });
+
+    // Size keys are C2Vector; the ramp reader takes the larger axis and so does this. NOT multiplied by
+    // params.scaleVary / twinkleScale -- those are separate effects, see read_particle_life_ramp.
+    read_particle_life_track<float>(f, mta.p.sizes, sizeof(glm::vec2), _size_times, _size_values,
+      [](auto const* raw)
+      {
+        glm::vec2 s;
+        std::memcpy(&s, raw, sizeof(s));
+        if (!std::isfinite(s.x) || !std::isfinite(s.y))
+        {
+          return 1.0f;
+        }
+        return std::max(std::abs(s.x), std::abs(s.y));
+      });
+  }
+
   //transform = mta.flags & 1024;
 
   // Spin / wind / twinkle / tail. These are the same authored fields the classic ctor already reads --
@@ -361,8 +475,16 @@ ParticleSystem::ParticleSystem(Model* model_
   _twinkle_percent = sane(mta.p.twinklePercent, 1.f);
   _twinkle_scale_min = sane(mta.p.twinkleScaleMin, 1.f);
   _twinkle_scale_max = sane(mta.p.twinkleScaleMax, 1.f);
-  _spin_alternate = (mta.flags & 0x8000) != 0;
+  // NOT derived from flag 0x8000 here, unlike the classic ctor. That mapping is 1.12's: in 3.3.5a the
+  // emitter setup (client FUN_00832ea0) remaps every authored M2 flag to a different runtime bit, and
+  // authored 0x8000 is the one flag that CLEARS a runtime bit (`&= ~0x1`) rather than setting one --
+  // it has nothing to do with spin. Whatever drives the alternating spin sign in 3.3.5a has not been
+  // pinned yet, so leave it off rather than apply the 1.12 meaning to WotLK data.
+  // See RE_notes/12_particle_emitter_flags.md for the full authored->runtime remap table.
+  _spin_alternate = false;
   _tail_length = std::max(0.0f, sane(mta.p.tailLength, 0.f));
+  // Likewise 0x400: the 3.3.5a setup never tests it. Harmless either way -- headOrTail is 0 on all
+  // 26030 emitters in this client (checklist 12.8), so _tail_length is 0 and the clamp is inert.
   _tail_clamp_age = (mta.flags & 0x400) != 0;
 
   // Flipbook cell animation. Where classic stores a [startCell, endCell, repeat] triple, WotLK keys the
@@ -653,6 +775,12 @@ ParticleSystem::ParticleSystem(ParticleSystem const& other)
   , _uv_repeat(other._uv_repeat)
   , _cell_times(other._cell_times)
   , _cell_values(other._cell_values)
+  , _color_times(other._color_times)
+  , _color_values(other._color_values)
+  , _alpha_times(other._alpha_times)
+  , _alpha_values(other._alpha_values)
+  , _size_times(other._size_times)
+  , _size_values(other._size_values)
   , billboard(other.billboard)
   , classic(other.classic)
   , debug_update_log_count(other.debug_update_log_count)
@@ -715,6 +843,12 @@ ParticleSystem::ParticleSystem(ParticleSystem&& other)
   , _uv_repeat(other._uv_repeat)
   , _cell_times(other._cell_times)
   , _cell_values(other._cell_values)
+  , _color_times(other._color_times)
+  , _color_values(other._color_values)
+  , _alpha_times(other._alpha_times)
+  , _alpha_values(other._alpha_values)
+  , _size_times(other._size_times)
+  , _size_values(other._size_values)
   , billboard(other.billboard)
   , classic(other.classic)
   , debug_update_log_count(other.debug_update_log_count)
@@ -1022,9 +1156,25 @@ void ParticleSystem::update(float dt)
       p.tile = static_cast<unsigned int>(cell);
     }
 
-    // calculate size and color based on lifetime
-    p.size = lifeRamp<float>(rlife, mid, sizes[0], sizes[1], sizes[2]);
+    // calculate size and color based on lifetime. Keyed tracks win where the emitter authored them
+    // (wotlk); everything else falls back to the classic three-key ramp through `mid`. The three
+    // curves are independent, so an emitter can key its colour and still ramp its size.
+    p.size = _size_times.empty()
+      ? lifeRamp<float>(rlife, mid, sizes[0], sizes[1], sizes[2])
+      : lifeTrack<float>(_size_times, _size_values, rlife);
+
     p.color = lifeRamp<glm::vec4>(rlife, mid, colors[0], colors[1], colors[2]);
+    if (!_color_times.empty())
+    {
+      glm::vec3 const rgb = lifeTrack<glm::vec3>(_color_times, _color_values, rlife);
+      p.color.r = rgb.r;
+      p.color.g = rgb.g;
+      p.color.b = rgb.b;
+    }
+    if (!_alpha_times.empty())
+    {
+      p.color.a = lifeTrack<float>(_alpha_times, _alpha_values, rlife);
+    }
 
     if (classic)
     {

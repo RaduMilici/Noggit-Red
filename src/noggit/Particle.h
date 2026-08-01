@@ -140,6 +140,18 @@ class ParticleSystem
   // rejected at parse time (they are default-filled, not authored) and keep their random tile.
   std::vector<float> _cell_times;
   std::vector<int> _cell_values;
+  // Colour / alpha / size over particle life. Classic stores exactly three inline keys and ramps them
+  // through `mid`; WotLK reaches the same curves through M2PartTrack (keyed times + values) and may
+  // author any number of keys at arbitrary times. Reading just the first three and evaluating them at
+  // 0 / mid / 1 -- which is what the classic ramp does -- both DROPS keys and MISTIMES the ones it
+  // keeps, so a flame that should hold its colour and fade late instead crossfades linearly. Non-empty
+  // selects keyed evaluation; classic emitters leave these empty and keep the three-key ramp.
+  std::vector<float> _color_times;
+  std::vector<glm::vec3> _color_values;
+  std::vector<float> _alpha_times;
+  std::vector<float> _alpha_values;
+  std::vector<float> _size_times;
+  std::vector<float> _size_values;
   void initTile(glm::vec2 *tc, int num);
   bool billboard;
   bool classic;
