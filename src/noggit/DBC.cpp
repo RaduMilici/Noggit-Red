@@ -88,6 +88,18 @@ namespace
 // (19-field) -- see DBC.h. Item slots 8..17 didn't move, so only this string column needs gating.
 size_t CreatureDisplayInfoExtraDB::BakedTexture() { return wotlkDbcLayout() ? 20 : 18; }
 
+// GroundEffectTexture.dbc grew a 4-column weight array in WotLK (7 columns -> 11), pushing the
+// density and terrain-type columns back by 4. Reading the 1.12 index on WotLK data lands on
+// Weights[0], which is 1 almost everywhere -- grass came out ~8x too sparse. See DBC.h.
+size_t GroundEffectTextureDB::Weights()     { return wotlkDbcLayout() ? 5 : 0; }
+size_t GroundEffectTextureDB::Amount()      { return wotlkDbcLayout() ? 9 : 5; }
+size_t GroundEffectTextureDB::TerrainType() { return wotlkDbcLayout() ? 10 : 6; }
+
+// GroundEffectDoodad.dbc keeps 3 columns but swaps the last two between versions, so the 1.12 index
+// resolves every WotLK doodad to the empty string and no detail model loads. See DBC.h.
+size_t GroundEffectDoodadDB::Filename() { return wotlkDbcLayout() ? 1 : 2; }
+size_t GroundEffectDoodadDB::Flags()    { return wotlkDbcLayout() ? 2 : 1; }
+
 // CharSections.dbc reordered Type (VariationIndex) / Color (ColorIndex) behind the texture names + flags
 // in WotLK (see DBC.h for the empirically-verified layouts).
 size_t CharacterSectionsDB::VariationIndex() { return wotlkDbcLayout() ? 8 : 4; }
@@ -408,7 +420,7 @@ const char * getGroundEffectDoodad(unsigned int effectID, int DoodadNum)
   try
   {
     unsigned int doodadId = gGroundEffectTextureDB.getByID(effectID).getUInt(GroundEffectTextureDB::Doodads + DoodadNum);
-    return gGroundEffectDoodadDB.getByID(doodadId).getString(GroundEffectDoodadDB::Filename);
+    return gGroundEffectDoodadDB.getByID(doodadId).getString(GroundEffectDoodadDB::Filename());
   }
   catch (DBCFile::NotFound)
   {

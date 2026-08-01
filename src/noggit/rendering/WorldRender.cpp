@@ -2756,7 +2756,9 @@ void WorldRender::draw (glm::mat4x4 const& model_view
       // so the slider takes effect without a restart.
       QSettings clutter_settings;
       float const clutter_density = std::clamp(clutter_settings.value("render/ground_clutter_density", 100.0f).toFloat(), 0.0f, 100.0f) / 100.0f;
-      float const clutter_dist = clutter_settings.value("render/ground_clutter_distance", 160.0f).toFloat();
+      // Client-matching default: 3.3.5a ships groundEffectDist at 70.0 (string at 0x00a3f2ec).
+      // The slider still reaches 500 so the editor can see further than the client does.
+      float const clutter_dist = clutter_settings.value("render/ground_clutter_distance", 70.0f).toFloat();
 
       auto dist2 = [](glm::vec3 const& a, glm::vec3 const& b)
       {

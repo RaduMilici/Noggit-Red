@@ -358,6 +358,34 @@ namespace Noggit
                 });
       }
 
+      // Ground clutter amount == the client's own density CVar (3.3.5a groundEffectDensity, 1.12
+      // frillDensity): the number of 8x8 subcell visits per chunk, so 64 == every subcell once and
+      // the DBC's authored per-subcell amount is scaled by visits/64. Blizzard validate this to
+      // 16..256 and ship it at 16; the slider keeps their full range so the scene can be made denser
+      // than the client allows itself, without starting there. See RE_notes/14_ground_clutter_335a.md.
+      //
+      // NOT live: the placement is baked into each chunk's cached detail-doodad list, so a change
+      // only shows on chunks loaded afterwards -- hence the reload note in the label.
+      {
+        auto* gcf_label = new QLabel(this);
+        auto* gcf_slider = new QSlider(Qt::Horizontal, this);
+        gcf_slider->setObjectName("_ground_clutter_frill_density_slider");
+        gcf_slider->setMinimum(16);
+        gcf_slider->setMaximum(256);
+        int const init_gcf = static_cast<int>(_settings->value("render/ground_clutter_frill_density", 16.0f).toFloat());
+        gcf_slider->setValue(std::clamp(init_gcf, 16, 256));
+        gcf_label->setText(tr("Ground clutter amount: %1 (client default 16; needs map reload)")
+                             .arg(gcf_slider->value()));
+        _perf_layout->addWidget(gcf_label);
+        _perf_layout->addWidget(gcf_slider);
+        connect(gcf_slider, &QSlider::valueChanged, [this, gcf_label](int v)
+                {
+                  gcf_label->setText(tr("Ground clutter amount: %1 (client default 16; needs map reload)").arg(v));
+                  _settings->setValue("render/ground_clutter_frill_density", static_cast<float>(v));
+                  _settings->sync();
+                });
+      }
+
       // Ground clutter draw distance (live): how far from the camera detail doodads render.
       {
         auto* gcd_label = new QLabel(this);
@@ -365,7 +393,7 @@ namespace Noggit
         gcd_slider->setObjectName("_ground_clutter_distance_slider");
         gcd_slider->setMinimum(20);
         gcd_slider->setMaximum(500);
-        int const init_gcd = static_cast<int>(_settings->value("render/ground_clutter_distance", 160.0f).toFloat());
+        int const init_gcd = static_cast<int>(_settings->value("render/ground_clutter_distance", 70.0f).toFloat());
         gcd_slider->setValue(std::clamp(init_gcd, 20, 500));
         gcd_label->setText(tr("Ground clutter distance: %1").arg(gcd_slider->value()));
         _perf_layout->addWidget(gcd_label);

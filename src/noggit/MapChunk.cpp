@@ -2115,7 +2115,12 @@ void MapChunk::computeDetailDoodads()
   // 64 subcells). Effective doodads per subcell = density * frillDensity / 64. The user's client
   // runs 256 (the max) = 4x the DBC density -- that's the "thick like fur" fullness.
   QSettings clutter_settings;
-  float const frill = std::clamp(clutter_settings.value("render/ground_clutter_frill_density", 256.0f).toFloat(), 1.0f, 256.0f);
+  // Client-matching default. 3.3.5a calls this CVar groundEffectDensity, validates it to 16..256
+  // (FUN_0078dab0) and ships it at 16 -- the string at 0x00a2d570 is literally "16". 1.12 called the
+  // same thing frillDensity with a floor of 1. We keep the slider reaching the client's 256 so the
+  // scene can be made denser than Blizzard ship it, but no longer START 16x denser than the client.
+  // See RE_notes/14_ground_clutter_335a.md.
+  float const frill = std::clamp(clutter_settings.value("render/ground_clutter_frill_density", 16.0f).toFloat(), 1.0f, 256.0f);
   float const frill_scale = frill / 64.0f;
 
   // Liquid coverage for the underwater test below (the client places no ground effects on submerged
@@ -2230,7 +2235,7 @@ void MapChunk::computeDetailDoodads()
         // client (wow.exe FUN_006bfc10): N = density field, default 8 when 0, NO clamp -- dense
         // grass rows (e.g. Westfall) author 16-24 per subcell and the client places them all;
         // multiplied by the frillDensity visit ratio (see above)
-        unsigned const a = tex_rec.getUInt(GroundEffectTextureDB::Amount);
+        unsigned const a = tex_rec.getUInt(GroundEffectTextureDB::Amount());
         amount = std::max(1u, static_cast<unsigned>(static_cast<float>(a ? a : 8u) * frill_scale + 0.5f));
       }
       catch (...)
@@ -2256,7 +2261,7 @@ void MapChunk::computeDetailDoodads()
         std::string filename;
         try
         {
-          filename = gGroundEffectDoodadDB.getByID(doodad_id).getString(GroundEffectDoodadDB::Filename);
+          filename = gGroundEffectDoodadDB.getByID(doodad_id).getString(GroundEffectDoodadDB::Filename());
         }
         catch (...)
         {

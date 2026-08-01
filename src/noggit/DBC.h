@@ -154,12 +154,19 @@ public:
     DBCFile("DBFilesClient\\GroundEffectTexture.dbc")
   { }
 
-  /// Fields (1.12 layout, VERIFIED: 7 columns, NO separate weight array -- repeated doodad ids in
-  /// the 4 slots are the weighting. Amount/density at field 5, sound/terrain-type at 6.)
+  /// VERSION-GATED. The record grew from 7 columns in 1.12 to 11 in 3.3.5a, and everything after the
+  /// doodad slots moved:
+  ///   1.12   : ID(0) Doodads[4](1-4) Amount(5) TerrainType(6)
+  ///   3.3.5a : ID(0) Doodads[4](1-4) Weights[4](5-8) Amount(9) TerrainType(10)
+  /// So on WotLK data the 1.12 indices read Weights[0] as the density -- which is 1 on effectively
+  /// every row, against authored densities of 1..123 (mode 8). That is the "grass far too sparse".
+  /// Proven from the shipped DBCs: of the 734 effect rows present in BOTH datasets, 3.3.5a field 9
+  /// equals the 1.12 Amount on 94.3%, field 10 on only 9%.
   static const size_t ID = 0;         // uint
-  static const size_t Doodads = 1;    // uint[4] (0 / 0xFFFFFFFF = empty slot)
-  static const size_t Amount = 5;     // uint (density; how many to scatter per subcell)
-  static const size_t TerrainType = 6; // uint
+  static const size_t Doodads = 1;    // uint[4] (0 / 0xFFFFFFFF = empty slot) -- same index both versions
+  static size_t Weights();            // uint[4], WotLK only (returns 0 on 1.12 -- no such column)
+  static size_t Amount();             // uint (density; how many to scatter per subcell)
+  static size_t TerrainType();        // uint
 };
 
 class GroundEffectDoodadDB : public DBCFile
@@ -169,11 +176,18 @@ public:
     DBCFile("DBFilesClient\\GroundEffectDoodad.dbc")
   { }
 
-  /// Fields (1.12 layout, VERIFIED: field 1 is a sequential index, the FILENAME string is field 2.
-  /// Reading field 1 as the string gave truncated garbage -> grass never loaded.)
+  /// VERSION-GATED. Both versions have 3 columns but the last two are SWAPPED:
+  ///   1.12   : ID(0) Flags(1)    Filename(2)
+  ///   3.3.5a : ID(0) Filename(1) Flags(2)
+  /// Verified against the shipped DBCs. In 1.12, field 1 is a sequential index that happens to land
+  /// mid-string when read as an offset ("lwFlo01.mdl", "wFlo01.mdl") -- the truncated garbage that
+  /// originally hid the grass. In 3.3.5a it is the other way round: field 1 holds the real offsets
+  /// (1, 14, 27, 40 -> "ElwFlo01.mdl", "ElwFlo02.mdl", ...) and field 2 is 0 on every row. Reading
+  /// the 1.12 index on WotLK data therefore resolves EVERY doodad to the empty string, so nothing
+  /// loads at all -- that is the "no grass".
   static const size_t ID = 0;         // uint
-  static const size_t Filename = 2;   // string  (world\nodxt\detail\*.mdl)
-  static const size_t Flags = 1;      // uint
+  static size_t Filename();           // string  (world\nodxt\detail\*.mdl)
+  static size_t Flags();              // uint
 };
 
 class LiquidTypeDB : public DBCFile

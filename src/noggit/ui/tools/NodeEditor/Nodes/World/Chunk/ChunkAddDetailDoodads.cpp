@@ -262,7 +262,7 @@ void ChunkAddDetailDoodads::compute()
     ->getDoodadMappingBase()[curSplat[1]] & DetailDoodadMgr::bitSplatMask0x2[curSplat[0]])
     >> DetailDoodadMgr::bitSplatShft0x2[curSplat[0]])};
     DBCFile::Record curRecord{gGroundEffectTextureDB.getByID(curRecId)};
-    unsigned curDbDensity{curRecord.getUInt(GroundEffectTextureDB::Amount)};
+    unsigned curDbDensity{curRecord.getUInt(GroundEffectTextureDB::Amount())};
 
     if(!curDbDensity)
       curDbDensity = 8;
@@ -329,7 +329,7 @@ void ChunkAddDetailDoodads::compute()
       , std::ref(randomizer), std::placeholders::_1));
       QString filename{("world/nodxt/detail/"
       + std::string{gGroundEffectDoodadDB.getByID(curDoodadId)
-      .getString(GroundEffectDoodadDB::Filename)}).c_str()};
+      .getString(GroundEffectDoodadDB::Filename())}).c_str()};
       filename = filename.replace(".mdx", ".m2", Qt::CaseInsensitive);
 
       world->addM2(filename.toStdString(), {chunk->xbase - inMinichunkCoords[0]
