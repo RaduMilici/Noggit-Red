@@ -56,6 +56,13 @@ class SkyParam
 {
 public:
     std::optional<ModelInstance> skybox;
+    // LightSkybox.dbc flags (field 2, WotLK-only column -- 0 on 1.12, which has no such field).
+    // Determined empirically from the shipped 3.3.5a data (see 8.6): bit 0x1 = FULL-DAY skybox
+    // (StormPeaks / IceCrown / ZulDrak / Coldarra -- one M2 whose animation spans the whole day and
+    // is driven by time-of-day, not a free-running clock); bit 0x2 = an additive AURORA overlay
+    // (Aurora, DeathKnightFireSkyBox). NOTE the checklist row 8.6 had these backwards ("0x2 =
+    // full-day"); 0x1 is full-day.
+    int skybox_flags = 0;
     int Id;
 
     SkyParam() = default;

@@ -261,6 +261,14 @@ public:
     return it != _animations_seq_per_id.end() && !it->second.empty();
   }
 
+  // Total length (ms) of an animation id, as Model::animate mods time by. 0 if absent. Used by the
+  // full-day skybox path to map the day cycle onto the skybox M2's single animation.
+  [[nodiscard]] uint32_t animationLength(int anim_id) const
+  {
+    auto const it = _animation_length.find(static_cast<int16_t>(anim_id));
+    return it == _animation_length.end() ? 0u : it->second;
+  }
+
   // ===============================
   // Toggles
   // ===============================

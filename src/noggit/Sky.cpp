@@ -212,6 +212,11 @@ namespace
         if (filename && *filename)
         {
           param->skybox.emplace(filename, context);
+          // Field 2 = flags (WotLK-only column; absent on 1.12 -> field_count 2, so stays 0).
+          if (light_skybox.field_count > 2)
+          {
+            param->skybox_flags = light_skybox.word(skybox_row, 2);
+          }
         }
       }
     }
@@ -1672,6 +1677,22 @@ bool Skies::draw(glm::mat4x4 const& model_view
       model.scale = 0.1f;
       model.recalcExtents();
 
+      // FULL-DAY SKYBOX (LightSkybox flag 0x1): the M2's single animation spans the whole day, so
+      // its frame is driven by TIME OF DAY rather than a free-running clock -- this is what makes the
+      // Storm Peaks / Icecrown / Zul'Drak skies visibly morph as you scrub time. Map the day fraction
+      // (0 = midnight) onto anim 0's length; Model::animate mods time by that length, so a value in
+      // [0, length) lands on the matching frame. Other skyboxes keep the free-running animtime.
+      int skybox_animtime = animtime;
+      if (sky_param->skybox_flags & 0x1)
+      {
+        uint32_t const len = model.model->animationLength(0);
+        if (len > 0)
+        {
+          float const day_frac = glm::fract(static_cast<float>(_last_time) / 2880.0f);
+          skybox_animtime = static_cast<int>(day_frac * static_cast<float>(len)) % static_cast<int>(len);
+        }
+      }
+
       OpenGL::M2RenderState model_render_state;
       model_render_state.tex_arrays = {0, 0};
       model_render_state.tex_indices = {0, 0};
@@ -1687,7 +1708,7 @@ bool Skies::draw(glm::mat4x4 const& model_view
       m2_shader.uniform("masked_additive", 0);
       m2_shader.uniform("pixel_shader", 0);
 
-      model.model->renderer()->draw(model_view, model, m2_shader, model_render_state, frustum, 1000000, camera_pos, animtime, display_mode::in_3D);
+      model.model->renderer()->draw(model_view, model, m2_shader, model_render_state, frustum, 1000000, camera_pos, skybox_animtime, display_mode::in_3D);
     }
   }
   // if it's night, draw the stars. CANON (confirmed via wow_westfall_night.trace: the client draws a
