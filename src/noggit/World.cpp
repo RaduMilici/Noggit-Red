@@ -1624,6 +1624,20 @@ namespace
         [&](DBCFile::Record const&){});
       apply_item("belt", display_extra.getUInt(CreatureDisplayInfoExtraDB::BeltDisplayID),
         [&](DBCFile::Record const&){});
+      // Cape. WotLK-only slot (see DBC.h) -- apply_character_default_geosets force-hides the cape
+      // family, so without this every cloaked NPC on 3.3.5a data renders capeless. Guarded on the
+      // accessor rather than the project version so Classic, which has no such column, skips it.
+      if (std::size_t const cape_slot = CreatureDisplayInfoExtraDB::CapeDisplayID())
+      {
+        apply_item("cape", display_extra.getUInt(cape_slot),
+          [&](DBCFile::Record const& item_display)
+          {
+            auto const cape_flags = item_display.getUInt(ItemDisplayInfoDB::GeosetGroup1());
+            assign_geoset_selection(selection, CharacterGeosetFamily::Cape, cape_flags);
+            debug << " capeApplied=" << cape_flags;
+          });
+      }
+
       apply_item("tabard", display_extra.getUInt(CreatureDisplayInfoExtraDB::TabardDisplayID),
         [&](DBCFile::Record const&)
         {
@@ -2143,6 +2157,33 @@ namespace
           auto gloves_display_id = display_extra.getUInt(CreatureDisplayInfoExtraDB::GlovesDisplayID);
           auto tabard_display_id = display_extra.getUInt(CreatureDisplayInfoExtraDB::TabardDisplayID);
           auto* client = Noggit::Application::NoggitApplication::instance()->clientData();
+
+          // Cape texture (WotLK-only slot, see DBC.h). The cape is a geoset ON the character model,
+          // not an attachment, so its skin goes in the model's own OBJECT_SKIN slot -- texture type
+          // 2, the same slot the item attachments above use for their own skins. Without this the
+          // cape geoset enabled in resolve_creature_geoset_selection would draw untextured.
+          if (std::size_t const cape_slot = CreatureDisplayInfoExtraDB::CapeDisplayID())
+          {
+            auto const cape_display_id = display_extra.getUInt(cape_slot);
+            if (cape_display_id)
+            {
+              try
+              {
+                auto const cape_item = gItemDisplayInfoDB.getByID(cape_display_id);
+                auto cape_texture = normalize_texture_filename(
+                  std::string(cape_item.getString(ItemDisplayInfoDB::ModelTexture1)));
+                if (!cape_texture.empty() && cape_texture.find('/') == std::string::npos)
+                {
+                  cape_texture = normalize_texture_filename("item/objectcomponents/cape/" + cape_texture);
+                }
+                append_override(2u, std::move(cape_texture));
+              }
+              catch (DBCFile::NotFound const&)
+              {
+              }
+            }
+          }
+
           std::vector<CharacterTextureLayer> body_texture_layers;
           bool const is_character_model = model_dir.rfind("character/", 0) == 0;
           CharacterSectionTextures skin_section;

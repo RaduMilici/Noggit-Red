@@ -334,6 +334,13 @@ public:
     static const size_t BracersDisplayID = 15;
     static const size_t GlovesDisplayID = 16;
     static const size_t TabardDisplayID = 17;
+    // WotLK ONLY: the 11th NPCItemDisplay slot noted below, holding the CAPE. Returns 0 on Classic,
+    // meaning "no such column" -- 0 is never a real slot because field 0 is the record ID, so
+    // callers just test it. Verified against the shipped DBCs: every non-zero value in 3.3.5a
+    // field 18 is a valid ItemDisplayInfo id (1280 rows) and the items it points at are Cape_*
+    // (Cape_BloodKnight_A_01, Cape_Mage_A_01Black, Cape_Plate_PVPAlliance_Plate_A_01Gold). In
+    // Turtle the same field parses as a string on 9161 of 9177 rows, i.e. it is BakeName there.
+    static size_t CapeDisplayID();
     // BakeName (string) = baked composite NPC texture. WotLK inserted 2 fields before it (an 11th
     // NPCItemDisplay/cape slot + Flags), so it sits at column 18 in the 19-field Vanilla/Classic DBC
     // but column 20 in the 21-field WotLK DBC. Verified empirically: the SAME NPC (ID 23/36) has

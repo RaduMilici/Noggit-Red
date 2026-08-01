@@ -87,6 +87,8 @@ namespace
 // CreatureDisplayInfoExtra.dbc BakeName column: 20 in WotLK (21-field), 18 in Vanilla/Classic
 // (19-field) -- see DBC.h. Item slots 8..17 didn't move, so only this string column needs gating.
 size_t CreatureDisplayInfoExtraDB::BakedTexture() { return wotlkDbcLayout() ? 20 : 18; }
+// The cape slot WotLK added at 18; Classic has no such column (18 is BakeName there). See DBC.h.
+size_t CreatureDisplayInfoExtraDB::CapeDisplayID() { return wotlkDbcLayout() ? 18 : 0; }
 
 // GroundEffectTexture.dbc grew a 4-column weight array in WotLK (7 columns -> 11), pushing the
 // density and terrain-type columns back by 4. Reading the 1.12 index on WotLK data lands on
