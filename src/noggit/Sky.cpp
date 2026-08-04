@@ -774,6 +774,8 @@ Skies::Skies(unsigned int mapid, Noggit::NoggitRenderContext context)
   : stars (ModelInstance("Environments\\Stars\\Stars.mdx", context))
   , _context(context)
 {
+  _map_id = mapid;
+
   for (int color_index = 0; color_index < NUM_SkyColorNames; ++color_index)
   {
     color_set[color_index] = default_sky_color(color_index);
@@ -1174,6 +1176,21 @@ void Skies::update_sky_colors(glm::vec3 pos, int time)
       }
     }
 
+  }
+
+  // NORTHREND SKY DOME (map 571) = dark & gloomy, not the DBC default light's bright cyan. The 3.3.5a
+  // client covers the gradient dome with a dark textured skybox; where noggit has no skybox (falloff gaps
+  // at editor height) the raw bright-cyan sky bands show through as a "blue sunny sky". Desaturate + darken
+  // the 5 sky-gradient bands so the bare dome reads gloomy like the zone should. Northrend-only -- map 571
+  // does not exist pre-WotLK, so the 1.12 render is untouched. Values tunable.
+  if (_map_id == 571)
+  {
+    for (int i = SKY_COLOR_0; i <= SKY_COLOR_4; ++i)
+    {
+      glm::vec3 const c = color_set[i];
+      float const lum = 0.30f * c.r + 0.59f * c.g + 0.11f * c.b;
+      color_set[i] = glm::mix(c, glm::vec3(lum), 0.75f) * 0.55f; // 75% desaturate toward grey, darken to 55%
+    }
   }
 
   // The 1.12 client uses pure LINEAR vertex fog (D3DFOG_LINEAR), verified via apitrace on Elwynn. The
@@ -1652,12 +1669,17 @@ bool Skies::draw(glm::mat4x4 const& model_view
   // -- a hard switch to whatever light is merely nearest, not the one that dominates the zone-light blend.
   // In a big wotlk zone with many overlapping lights (Icecrown) that made the sky snap to the WRONG skybox
   // at every boundary crossing. The client's dominant sky is the greatest-WEIGHT light, so pick that one.
+  // Aurora skyboxes (LightSkybox flag 0x2 = AuroraYellowGreen/AuroraOrange/DragonblightScarlet/DK-fire) are
+  // ADDITIVE OVERLAYS meant to be layered OVER a base sky, never a standalone skybox. The 3.3.5a client never
+  // selects one as THE skybox -> exclude them so noggit stops snapping to a raw aurora sky (see
+  // docs/client_re/30). RE: doc 29/30 + memory noggit-335a-skybox-selection-weighted-only.
+  auto const is_aurora_overlay = [](SkyParam const* p) { return p && (p->skybox_flags & 0x2) != 0; };
   Sky* top_sky = nullptr;
   SkyParam* top_param = nullptr;
   for (Sky& sky : skies)
   {
     SkyParam* sky_param = drawable_skybox_param(sky);
-    if (sky.weight > 0.f && sky_param && sky_param->skybox
+    if (sky.weight > 0.f && sky_param && sky_param->skybox && !is_aurora_overlay(sky_param)
         && (!top_sky || sky.weight > top_sky->weight))
     {
       top_sky = &sky;

@@ -1127,7 +1127,15 @@ void WorldRender::draw (glm::mat4x4 const& model_view
         // exists); the client's few soft rays are the FFXGlow blooming the bright disc. =====
         // -0.05: keep drawing while any part of the disc is still above the horizon; the shader's
         // per-fragment horizon clip cuts everything below it (the sprite sets BEHIND the fog band).
-        if (to_sun.y > -0.05f && day_factor > 0.02f
+        // 3.3.5a: Northrend (sky-type-2 zones) draws NO sun/moon -- the client hard-gates the celestial
+        // draw off (Wow335.exe FUN_004f7020 case 2 zeroes the DAT_00d38ccc gate; the Icecrown apitrace
+        // shows zero celestial draws, any time of day). WotLK Northrend (map 571) only; 1.12 keeps its
+        // sun/moon. See docs/client_re/29 + memory noggit-335a-sun-moon-gate-sky-type2.
+        bool const celestial_off = []{
+          auto const* p = Noggit::Project::CurrentProject::get();
+          return p && p->projectVersion != Noggit::Project::ProjectVersion::CLASSIC;
+        }() && _world->mapIndex._map_id == 571;
+        if (!celestial_off && to_sun.y > -0.05f && day_factor > 0.02f
             && _world->_settings->value("render/draw_sun", true).toBool())
         {
           float const align = glm::clamp(glm::dot(glm::normalize(fwd), to_sun), 0.0f, 1.0f);
@@ -1162,7 +1170,7 @@ void WorldRender::draw (glm::mat4x4 const& model_view
 
         // ===== MOONS (night): White Lady (moon.blp disc + moonGlare halo) and the smaller Blue Child
         // (moon02.blp, no halo). The white moon's HALO grows in size + opacity with aim, disc fixed. =====
-        if (moon_factor > 0.02f && _world->_settings->value("render/draw_moon", true).toBool())
+        if (!celestial_off && moon_factor > 0.02f && _world->_settings->value("render/draw_moon", true).toBool())
         {
           float const disc_half = 0.07f;
           if (to_moon.y > -0.05f) // shader horizon clip handles the below-horizon part
@@ -1454,6 +1462,7 @@ void WorldRender::draw (glm::mat4x4 const& model_view
     }
     _world->collect_fog_volumes(_env_fog_volumes);
   }
+
   // Client unit interior lighting (RE_notes/15): a unit standing in a WMO indoor group is lit from the
   // baked MOCV floor colour under its feet -- NOT the sun, NOT MOHD ambient, and (for classic WMOs with
   // attenEnd=0) not MOLT either. Returns (C.rgb, 1) with C = the sampled floor colour; the shader splits
@@ -1474,11 +1483,16 @@ void WorldRender::draw (glm::mat4x4 const& model_view
     return key;
   };
 
-  // Per-object ZONE tint (client-canon, trace: wow_cap_timbermaw): outdoor entities are lit by the
-  // zone light at THEIR position, not the camera's. Encoded in the same vec4 as the interior light:
-  // a == 0 with rgb = light_at(object)/light_at(camera); rgb == 0 is the legacy no-tint sentinel.
-  // NOGGIT_NO_ZONE_TINT=1 restores camera-only zone lighting for A/B.
-  static bool const s_no_zone_tint = std::getenv("NOGGIT_NO_ZONE_TINT") != nullptr;
+  // Camera-only zone lighting is the client-faithful DEFAULT. The retail client (1.12 and 3.3.5a)
+  // computes ONE outdoor light per frame from the CAMERA position and lights every outdoor doodad
+  // with it -- there is no per-doodad zone lookup in the render loop. The earlier per-object ZONE tint
+  // (encoded here as a==0, rgb = light_at(object)/light_at(camera)) came from a wow_cap_timbermaw
+  // reading that was actually the camera moving THROUGH the zone (which shifts the global light for
+  // terrain + doodads together), misread as per-object tinting. Left on, it renders doodads near a
+  // zone-light boundary toward the neighbouring zone's colour relative to the camera -- e.g. blue
+  // Duskwood-edge trees while the camera sits in green Elwynn, snapping neutral only once the camera
+  // enters that light. NOGGIT_ZONE_TINT=1 re-enables the experimental per-object tint for A/B.
+  static bool const s_no_zone_tint = std::getenv("NOGGIT_ZONE_TINT") == nullptr;
   glm::vec3 const cam_light_sum = glm::vec3(_lighting_ubo_data.DiffuseColor_FogStart)
                                 + glm::vec3(_lighting_ubo_data.AmbientColor_FogEnd);
   int const zone_tint_time = static_cast<int>(_world->time);
@@ -1509,8 +1523,31 @@ void WorldRender::draw (glm::mat4x4 const& model_view
         glm::vec3 const local = glm::vec3(v.inv_transform * glm::vec4(pos, 1.f));
         glm::vec3 sample;
         float spill = 0.f;
-        if (v.wmo->groups[v.group_index].sample_ground_color(local, &sample, &spill))
+        float floor_local_y = 0.f;
+        if (v.wmo->groups[v.group_index].sample_ground_color(local, &sample, &spill, &floor_local_y))
         {
+          // Terrain-separation gate (fixes Moonbrook doodads lit orange by the Deadmines beneath them).
+          // CLIENT-TRUE (LIGHT_FOG_SELECTION_RE, FUN_0069e4c0/FUN_006a4cc0): an entity is interior ONLY
+          // if it raycasts into an interior WMO group it is linked to; a terrain doodad standing on the
+          // surface ABOVE an underground WMO is outdoor-lit ALWAYS -- regardless of the camera, even when
+          // the camera itself is underground (the warm bottom you see in the cave is the torch POINT
+          // LIGHTS on the exposed geometry, not an interior reclassification). Noggit lacks per-object
+          // WMO linkage, so approximate: reject the interior sample whenever solid terrain lies between
+          // the object and the sampled floor -- object at/above the outdoor terrain surface AND the
+          // interior floor below it. Genuine interiors are untouched: a surface building's floor sits
+          // at/above terrain (2nd test fails), and an object truly inside an underground WMO is itself
+          // below the terrain (1st test fails). Yaw-only WMO transforms preserve vertical, so
+          // floor_world_y = floor_local_y + (pos.y - local.y).
+          glm::vec3 const ground = _world->get_ground_height(pos);
+          if (ground != glm::vec3(0.f)) // (0,0,0) == no terrain there (hole/cave) -> keep interior
+          {
+            constexpr float kSep = 2.0f;
+            float const floor_world_y = floor_local_y + (pos.y - local.y);
+            if (pos.y > ground.y - kSep && floor_world_y < ground.y - kSep)
+            {
+              continue; // terrain separates object from this interior floor -> outdoor
+            }
+          }
           // GAP B (checklist 8.7): encode the doorway spill in a. a in [0.5,1.0]: 0.5 = deep interior
           // (spill 0, > 0.25 -> interior, m2 shader mix is a no-op = byte-identical), ramping to 1.0 at
           // an opening where the m2 shader lerps the room light toward the outdoor day/night light.
@@ -1544,6 +1581,7 @@ void WorldRender::draw (glm::mat4x4 const& model_view
     _interior_light_cache.emplace(key, light);
     return light;
   };
+
 
   // Live diagnosis for "doodads sunlit indoors" reports: prints the interior classification of the
   // CAMERA position (stand next to the mis-lit doodad) + how many indoor volumes exist.
@@ -5891,6 +5929,16 @@ void WorldRender::updateLightingUniformBlock(bool draw_fog, glm::vec3 const& cam
   glm::vec3 diffuse = _skies->color_set[LIGHT_GLOBAL_DIFFUSE];
   glm::vec3 ambient = _skies->color_set[LIGHT_GLOBAL_AMBIENT];
   glm::vec3 fog_color = _skies->color_set[FOG_COLOR];
+  // NORTHREND FOG = neutral grey, not the DBC band's saturated cyan. The 3.3.5a client forces sky-type-2
+  // zones (Northrend outdoor) to grey; noggit's param-569 FOG band is bright cyan RGB(86,178,211) = the
+  // blue/purple fog. Client trace wow_cap_icecrown_sky: D3DRS_FOGCOLOR = 0xFF808080 = RGB(128,128,128).
+  // Gate on WotLK + Northrend continent (map 571). WotLK/other continents untouched. See docs/client_re/30.
+  {
+    bool const wotlk_fog = []{ auto const* p = Noggit::Project::CurrentProject::get();
+      return p && p->projectVersion != Noggit::Project::ProjectVersion::CLASSIC; }();
+    if (wotlk_fog && _world->mapIndex._map_id == 571)
+      fog_color = glm::vec3(72.0f / 255.0f, 72.0f / 255.0f, 76.0f / 255.0f); // dark neutral grey (gloomy)
+  }
   glm::vec3 ocean_color_light = _skies->color_set[OCEAN_COLOR_LIGHT];
   glm::vec3 ocean_color_dark = _skies->color_set[OCEAN_COLOR_DARK];
   glm::vec3 river_color_light = _skies->color_set[RIVER_COLOR_LIGHT];

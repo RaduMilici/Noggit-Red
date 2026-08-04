@@ -241,6 +241,7 @@ public:
   std::vector<glm::vec3> color_set = std::vector<glm::vec3>(NUM_SkyColorNames);
 
   explicit Skies(unsigned int mapid, Noggit::NoggitRenderContext context);
+  unsigned int _map_id = 0; // continent id (571 = Northrend); gates the gloomy Northrend sky-dome override
 
   Sky* findSkyWeights(glm::vec3 pos);
 

@@ -256,7 +256,11 @@ public:
   // the ENTIRE base light of a unit standing indoors (MOHD ambient and the sun play no part).
   // out_alpha (optional): the face's PRISTINE baked MOCV floor ALPHA barycentric-interpolated into [0..1]
   // (GAP B / checklist 8.7 doorway spill) -- ~0 deep inside a room, ramping to 1 near a portal/window.
-  bool sample_ground_color(glm::vec3 const& local_pos, glm::vec3* out, float* out_alpha = nullptr) const;
+  // out_floor_y (optional): the GROUP-LOCAL y of the hit floor face (the highest floor within the
+  // client's [pos.y-12, pos.y+1] down-ray). Lets the caller reject an outdoor object sitting on the
+  // terrain above an underground WMO whose floor is far below it (terrain-separation test).
+  bool sample_ground_color(glm::vec3 const& local_pos, glm::vec3* out, float* out_alpha = nullptr,
+                           float* out_floor_y = nullptr) const;
 
 private:
   void load_mocv(BlizzardArchive::ClientFile& f, uint32_t size);

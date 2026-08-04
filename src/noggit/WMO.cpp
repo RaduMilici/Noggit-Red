@@ -1207,7 +1207,8 @@ void WMOGroup::load()
   _renderer.initRenderBatches();
 }
 
-bool WMOGroup::sample_ground_color(glm::vec3 const& local_pos, glm::vec3* out, float* out_alpha) const
+bool WMOGroup::sample_ground_color(glm::vec3 const& local_pos, glm::vec3* out, float* out_alpha,
+                                   float* out_floor_y) const
 {
   // Client CWorldEntity::SampleGroundColor (wow.exe 0x69E4C0 -> 0x6B9A50, RE_notes/15): ray from
   // entity+1.0 down 12.0 units, barycentric-interpolate the hit face's MOCV. Group verts are stored in
@@ -1274,6 +1275,10 @@ bool WMOGroup::sample_ground_color(glm::vec3 const& local_pos, glm::vec3* out, f
     found = true;
   }
 
+  if (found && out_floor_y)
+  {
+    *out_floor_y = best_y;
+  }
   return found;
 }
 
