@@ -17,14 +17,17 @@ layout(location = 5) in uvec4 bones_indices;
 
 #ifdef instanced
   layout(location = 6) in mat4 transform;   // model->world (a mat4 attribute spans locations 6..9)
+  layout(location = 10) in vec4 interior;  // PER-INSTANCE interior room light (perf 2026-08-05); name matches attrib("interior")
 #else
   uniform mat4 transform;
 #endif
 
 // Interior light for this draw: rgb = WMO room ambient; a in [0.5,1.0] indoors (carries GAP B doorway
-// spill = baked MOCV floor alpha), 0 outdoors. A uniform in
-// BOTH variants -- the instanced path partitions its instances by interior value into per-value sub-draws
-// so one uniform covers each sub-batch (avoids a per-instance attribute + shared-VAO location fragility).
+// spill = baked MOCV floor alpha), 0 outdoors. [perf 2026-08-05] The INSTANCED path now carries this
+// PER INSTANCE in interior_attr (location 10, divisor 1) so instances with different room colours batch
+// in ONE draw -- it used to partition instances by interior value into per-value sub-draws (WMO doodads
+// in a city split ~6 ways = the dominant SubmitInst cost). The NON-instanced (individual creature/GO)
+// path still feeds it as a uniform.
 uniform vec4 instance_interior;
 
 uniform samplerBuffer bone_matrices;
@@ -174,6 +177,10 @@ void main()
   // shorter off-axis, so doodads/creatures fogged by a different amount than the ground and "stuck
   // out" of the fog. Matching Euclidean puts M2 objects on the identical fog ramp as the terrain.
   camera_dist = length(vertex.xyz);
-  v_interior = instance_interior;
+#ifdef instanced
+  v_interior = interior;             // per-instance room light (batches mixed-interior instances in one draw)
+#else
+  v_interior = instance_interior;    // individual path: uniform
+#endif
   gl_Position = projection * vertex;
 }

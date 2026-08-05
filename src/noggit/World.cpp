@@ -1,6 +1,7 @@
 // This file is part of Noggit3, licensed under GNU General Public License (version 3).
 
 #include <noggit/World.h>
+#include <noggit/frame_profiler.hpp>
 #include <noggit/World.inl>
 
 #include <math/frustum.hpp>
@@ -3651,6 +3652,7 @@ void World::ensureCreatureSpawnsLoaded()
 {
   if (!_creature_spawns_loaded && !_creature_spawns_load_attempted)
   {
+    noggit::perf::Scoped _prof_spawn(noggit::perf::Phase::SpawnLoad); // M2 spike hunt: creature spawn load
     reloadCreatureSpawns();
   }
 }
@@ -3725,6 +3727,7 @@ void World::ensureGameObjectSpawnsLoaded()
   // GameObjects are loaded together with creatures, so just make sure that load has run.
   if (!_creature_spawns_loaded && !_creature_spawns_load_attempted)
   {
+    noggit::perf::Scoped _prof_spawn(noggit::perf::Phase::SpawnLoad); // M2 spike hunt: GO/creature spawn load
     reloadCreatureSpawns();
   }
 }

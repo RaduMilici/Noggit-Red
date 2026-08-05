@@ -2,6 +2,7 @@
 #include <noggit/TextureManager.h>
 #include <atomic> // [TEXARRAYDBG] temporary
 #include <noggit/Log.h> // LogDebug
+#include <noggit/frame_profiler.hpp>
 #include <noggit/application/NoggitApplication.hpp>
 #include <ClientFile.hpp>
 
@@ -328,6 +329,7 @@ void blp_texture::bind()
 
 void blp_texture::uploadToArray(unsigned layer)
 {
+  noggit::perf::Scoped _prof_tex(noggit::perf::Phase::TexUpload); // M2 spike hunt: BLP texture upload
   if (!finished)
   {
     try
@@ -387,6 +389,7 @@ void blp_texture::uploadToArray(unsigned layer)
 
 void blp_texture::upload()
 {
+  noggit::perf::Scoped _prof_tex(noggit::perf::Phase::TexUpload); // M2 spike hunt: BLP texture upload
   if (!finished || loading_failed())
   {
     return;

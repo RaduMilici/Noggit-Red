@@ -15,6 +15,7 @@
 #include <noggit/MySqlSettings.hpp>
 #include <noggit/uid_storage.hpp>
 #include <noggit/application/NoggitApplication.hpp>
+#include <noggit/frame_profiler.hpp>
 #include <ClientFile.hpp>
 
 #include <QtCore/QSettings>
@@ -406,6 +407,14 @@ MapTile* MapIndex::loadTile(const TileIndex& tile, bool reloading, bool load_mod
   AsyncLoader::instance().queue_for_load(adt);
   _n_loaded_tiles++;
 
+  // [TILE] streaming trace (NOGGIT_FRAME_PROFILE): pair with the [FRAME-SPIKE]/TileStream numbers to see
+  // whether a hitch lines up with a tile being queued (main-thread MapTile ctor above) or, a few frames
+  // later, its first-draw GPU upload. loaded=count lets you watch the working set grow/shrink.
+  if (noggit::perf::FrameProfiler::get().on)
+  {
+    LogError << "[TILE] queue " << tile.x << "_" << tile.z << "  loaded=" << _n_loaded_tiles << std::endl;
+  }
+
   return adt;
 }
 
@@ -422,16 +431,49 @@ void MapIndex::unloadTiles(const TileIndex& tile)
 {
   if (((clock() / CLOCKS_PER_SEC) - _last_unload_time) > _unload_interval)
   {
+    // [CRASH FIX 2026-08-04] Collect the tiles to unload FIRST, then unload them AFTER the loop.
+    // unloadTile() sets mTiles[..].tile = nullptr, which mutates the very container loaded_tiles()
+    // iterates -> iterator invalidation / use-after-free (0xC0000005 in unloadTile). Latent for years
+    // because with unload_dist large nothing ever crossed the threshold; it fires the moment tiles
+    // actually unload (sane unload_dist + fast movement) -> "it crashes when it goes too fast".
+    unsigned resident = 0, far_count = 0, far_blocked_changed = 0;
+    std::vector<TileIndex> to_unload;
     for (MapTile* adt : loaded_tiles())
     {
+      ++resident;
       if (tile.dist(adt->index) > _unload_dist)
       {
+        ++far_count;
         //Only unload adts not marked to save
         if (!adt->changed.load())
         {
-          unloadTile(adt->index);
+          to_unload.push_back(adt->index);
+        }
+        else
+        {
+          ++far_blocked_changed;
         }
       }
+    }
+    if (!to_unload.empty())
+    {
+      // [CRASH FIX 2026-08-04] Freeing a tile tears down its WMOs/M2s and erases their models/textures
+      // through the async loader. If the loader thread is mid-flight on any of those objects, the
+      // destructor races it -> UAF in ~WMO / ModelInstance::~ModelInstance / AsyncLoader::ensure_deletable
+      // (0xC0000005 under fast movement). Latent for years -- only reachable once tiles actually unload.
+      // Make the loader quiescent first (the same guard reloadCreatureSpawns already uses before freeing).
+      AsyncLoader::instance().wait_until_idle();
+      for (TileIndex const& idx : to_unload) // iteration over loaded_tiles() is finished; loader is idle
+      {
+        unloadTile(idx);
+      }
+    }
+    if (noggit::perf::FrameProfiler::get().on)
+    {
+      LogError << "[UNLOAD] resident=" << resident << " far=" << far_count
+               << " far_blocked_changed=" << far_blocked_changed << " unloaded=" << to_unload.size()
+               << " unload_dist=" << _unload_dist
+               << " loading_radius=" << QSettings().value("loading_radius", 1).toInt() << std::endl;
     }
 
     _last_unload_time = clock() / CLOCKS_PER_SEC;
@@ -446,6 +488,10 @@ void MapIndex::unloadTile(const TileIndex& tile)
     Log << "Unload Tile " << tile.x << "-" << tile.z << std::endl;
     mTiles[tile.z][tile.x].tile = nullptr;
     _n_loaded_tiles--;
+    if (noggit::perf::FrameProfiler::get().on)
+    {
+      LogError << "[TILE] unload " << tile.x << "_" << tile.z << "  loaded=" << _n_loaded_tiles << std::endl;
+    }
   }
 }
 

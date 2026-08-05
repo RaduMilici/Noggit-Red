@@ -1397,6 +1397,13 @@ void WorldRender::draw (glm::mat4x4 const& model_view
   // Parallel per-instance cull-fade alphas (same push order as models_to_draw / creature_instanced).
   // Sites that don't fade (WMO doodads, ground clutter) push 1.0 to keep the vectors aligned.
   tsl::robin_map<Model*, std::vector<float>> models_to_draw_fades;
+  // [perf 2026-08-04] Parallel per-instance INTERIOR light (same push order as models_to_draw). Assigned
+  // at injection like fades, so the draw loop never recomputes it. CLIENT-TRUE (docs/client_re/31): only
+  // WMO-linked doodads (MODD) + gameobjects get the interior sample; terrain/tile doodads (MDDF) and
+  // ground clutter are OUTDOOR by construction and push (0,0,0,0) -- the client never runs an interior
+  // test on them, which is why it never spikes here (noggit's old per-instance interior_light_at over the
+  // whole doodad flood every frame was the 1300ms M2 hitch).
+  tsl::robin_map<Model*, std::vector<glm::vec4>> models_to_draw_interior;
   std::map<std::pair<Model*, std::uint32_t>, std::vector<float>> creature_instanced_fades;
   // Instanced creature batches keyed by (model, display_id): each batch is ONE skin, so the representative
   // instance's replaceable creature textures + geoset selection apply to the whole draw. Molten Giant /
@@ -1435,23 +1442,25 @@ void WorldRender::draw (glm::mat4x4 const& model_view
   // NOGGIT_NO_INTERIOR_OBJECT_LIGHT=1 disables (objects indoors then get the outdoor sun like before).
   static bool const s_no_interior_object_light = std::getenv("NOGGIT_NO_INTERIOR_OBJECT_LIGHT") != nullptr;
   static bool const s_interior_light_debug = std::getenv("NOGGIT_LIGHT_DEBUG") != nullptr;
-  // Refresh on the 60-frame epoch OR the moment the loaded-WMO set changes: with only the epoch,
-  // an object could fade in fully and THEN visibly re-light ~a second later when its room's volumes
-  // finally got gathered. The fingerprint walk is cheap (no extents math).
+  // [perf 2026-08-04] Refresh ONLY when the loaded-WMO set changes (fingerprint delta), NOT on a fixed
+  // 60-frame epoch. interior_light_at is now time-independent (zone tint is off), so its result only
+  // changes when a WMO streams in/out -- exactly what the fingerprint catches (getGroupExtents forces
+  // current extents at collect time, so there is no "volumes gathered a second late" race the epoch used
+  // to cover). The periodic epoch was wiping _interior_light_cache every ~1s, forcing EVERY visible
+  // doodad to re-run its volume test that frame = the periodic DoodadDraw hitch. Fingerprint-only makes
+  // the steady state (no WMO streaming) do zero interior-light recompute.
   std::uint64_t const wmo_fingerprint = _world->loaded_wmo_fingerprint();
-  if ((_interior_light_epoch++ % 60u) == 0u || wmo_fingerprint != _last_wmo_fingerprint)
+  ++_interior_light_epoch;
+  if (wmo_fingerprint != _last_wmo_fingerprint)
   {
-    // Invalidate the per-instance WMO-doodad copy cache ONLY on a genuine WMO-set change (load/unload/
-    // move/rotate/doodadset edit -> fingerprint delta), NOT on the 60-frame interior-light epoch: the
-    // cached copies are the expensive part, so a periodic wipe would re-incur ~25ms once a second. This
-    // guard is evaluated BEFORE _last_wmo_fingerprint is updated on the next line. (The enclosing `if`
-    // also fires on the epoch tick; that path leaves _pi_doodad_cache untouched.)
-    if (wmo_fingerprint != _last_wmo_fingerprint)
-    {
-      _pi_doodad_cache.clear();
-    }
+    // WMO-set change (load/unload/move/rotate/doodadset edit -> fingerprint delta): rebuild the copy cache
+    // and the volume list. But do NOT wipe the interior-LIGHT cache: a WMO doodad's interior light depends
+    // ONLY on its own (static) WMO, so a DIFFERENT WMO streaming in must not force every already-computed
+    // doodad to recompute -- that whole-cache wipe on every stream was the 1300ms GatherMerge spike. Cache
+    // entries are keyed by world cell; a doodad that MOVES lands in a new cell -> fresh sample (so edits
+    // self-heal), and a newly-streamed WMO's doodads simply miss once and compute. [perf 2026-08-04]
+    _pi_doodad_cache.clear();
     _last_wmo_fingerprint = wmo_fingerprint;
-    _interior_light_cache.clear();
     if (!s_no_interior_object_light)
     {
       _world->collect_interior_volumes(_interior_volumes);
@@ -1461,6 +1470,18 @@ void WorldRender::draw (glm::mat4x4 const& model_view
       _interior_volumes.clear(); // empty -> interior_light_at returns outdoor for everything
     }
     _world->collect_fog_volumes(_env_fog_volumes);
+  }
+
+  // Cold-cache interior computes allowed this frame (see interior_light_at). Kept modest so a streamed
+  // WMO's doodads fill in over a few frames while capping the per-frame cost well under the 10ms target.
+  _interior_miss_budget = 48;
+
+  // Hard cap on the (now persistent) interior-light cache so a long session can never blow up RAM. Only
+  // STATIC objects populate it, so this bounds at a few MB (~40 B/entry); on overflow, drop it and let the
+  // miss budget refill -- rare, and gradual. (Moving objects use cache=false and never grow it.)
+  if (_interior_light_cache.size() > 262144u)
+  {
+    _interior_light_cache.clear();
   }
 
   // Client unit interior lighting (RE_notes/15): a unit standing in a WMO indoor group is lit from the
@@ -1502,7 +1523,12 @@ void WorldRender::draw (glm::mat4x4 const& model_view
   // reads it without capturing.
   static bool const s_no_interior_spill = std::getenv("NOGGIT_NO_INTERIOR_SPILL") != nullptr;
 
-  auto interior_light_at = [this, &camera_pos, cam_light_sum, zone_tint_time](glm::vec3 const& pos) -> glm::vec4
+  // cache=true for STATIC objects (WMO doodads, gameobjects) -- their cell is stable so the value is
+  // stored and reused. cache=false for MOVING objects (creatures/mounts/attachments): they land in a new
+  // grid cell every frame, so storing would grow the cache without bound (the RAM blowup, 2026-08-04) --
+  // they compute fresh each frame and are NOT budget-gated (they need their light every frame).
+  auto interior_light_at = [this, &camera_pos, cam_light_sum, zone_tint_time]
+    (glm::vec3 const& pos, bool cache = true) -> glm::vec4
   {
     std::int64_t const kx = static_cast<std::int64_t>(std::floor(pos.x));
     std::int64_t const ky = static_cast<std::int64_t>(std::floor(pos.y));
@@ -1512,6 +1538,19 @@ void WorldRender::draw (glm::mat4x4 const& model_view
     if (it != _interior_light_cache.end())
     {
       return it->second;
+    }
+    if (cache)
+    {
+      // [perf 2026-08-04] STATIC-object cold-cache MISS budget: when a WMO streams in, all its doodads miss
+      // at once. The client bakes interior light at load; we spread the cold computes over frames -- once
+      // the budget is spent, defer the rest (draw outdoor this frame, retry next) so a streamed WMO fills
+      // in over a few frames instead of one 500ms GatherMerge hitch. Moving objects (cache=false) skip this
+      // -- they must light every frame. (interior_light_at is only ever called serially -> race-free.)
+      if (_interior_miss_budget <= 0)
+      {
+        return glm::vec4(0.0f); // deferred: not cached, so it retries next frame
+      }
+      --_interior_miss_budget;
     }
     glm::vec4 light(0.f);
     for (auto const& v : _interior_volumes)
@@ -1523,31 +1562,15 @@ void WorldRender::draw (glm::mat4x4 const& model_view
         glm::vec3 const local = glm::vec3(v.inv_transform * glm::vec4(pos, 1.f));
         glm::vec3 sample;
         float spill = 0.f;
-        float floor_local_y = 0.f;
-        if (v.wmo->groups[v.group_index].sample_ground_color(local, &sample, &spill, &floor_local_y))
+        if (v.wmo->groups[v.group_index].sample_ground_color(local, &sample, &spill))
         {
-          // Terrain-separation gate (fixes Moonbrook doodads lit orange by the Deadmines beneath them).
-          // CLIENT-TRUE (LIGHT_FOG_SELECTION_RE, FUN_0069e4c0/FUN_006a4cc0): an entity is interior ONLY
-          // if it raycasts into an interior WMO group it is linked to; a terrain doodad standing on the
-          // surface ABOVE an underground WMO is outdoor-lit ALWAYS -- regardless of the camera, even when
-          // the camera itself is underground (the warm bottom you see in the cave is the torch POINT
-          // LIGHTS on the exposed geometry, not an interior reclassification). Noggit lacks per-object
-          // WMO linkage, so approximate: reject the interior sample whenever solid terrain lies between
-          // the object and the sampled floor -- object at/above the outdoor terrain surface AND the
-          // interior floor below it. Genuine interiors are untouched: a surface building's floor sits
-          // at/above terrain (2nd test fails), and an object truly inside an underground WMO is itself
-          // below the terrain (1st test fails). Yaw-only WMO transforms preserve vertical, so
-          // floor_world_y = floor_local_y + (pos.y - local.y).
-          glm::vec3 const ground = _world->get_ground_height(pos);
-          if (ground != glm::vec3(0.f)) // (0,0,0) == no terrain there (hole/cave) -> keep interior
-          {
-            constexpr float kSep = 2.0f;
-            float const floor_world_y = floor_local_y + (pos.y - local.y);
-            if (pos.y > ground.y - kSep && floor_world_y < ground.y - kSep)
-            {
-              continue; // terrain separates object from this interior floor -> outdoor
-            }
-          }
+          // [perf 2026-08-04] The old terrain-separation gate (a get_ground_height RAYCAST per miss) was
+          // added for the Moonbrook pulley -- a TERRAIN doodad above the underground Deadmines. Terrain
+          // doodads no longer call interior_light_at at all (they're outdoor by construction at injection,
+          // client-true), so the only callers left are WMO doodads (genuinely inside their own WMO, where
+          // the gate never triggered) + gameobjects/creatures. The raycast was ~0.7ms/miss = the residual
+          // GatherMerge stream spike. Removed. (A gameobject directly above an underground WMO is the only
+          // regression -- rare; if it matters, gate on the object's own WMO linkage, not a terrain probe.)
           // GAP B (checklist 8.7): encode the doorway spill in a. a in [0.5,1.0]: 0.5 = deep interior
           // (spill 0, > 0.25 -> interior, m2 shader mix is a no-op = byte-identical), ramping to 1.0 at
           // an opening where the m2 shader lerps the room light toward the outdoor day/night light.
@@ -1578,7 +1601,10 @@ void WorldRender::draw (glm::mat4x4 const& model_view
       }
     }
 
-    _interior_light_cache.emplace(key, light);
+    if (cache) // moving objects never populate the cache (would grow it unbounded per frame)
+    {
+      _interior_light_cache.emplace(key, light);
+    }
     return light;
   };
 
@@ -1802,6 +1828,7 @@ void WorldRender::draw (glm::mat4x4 const& model_view
             {
               models_to_draw[reinterpret_cast<Model*>(obj)].push_back(m2_instance->transformMatrix());
               models_to_draw_fades[reinterpret_cast<Model*>(obj)].push_back(1.0f);
+              models_to_draw_interior[reinterpret_cast<Model*>(obj)].push_back(glm::vec4(0.0f)); // tile doodad = outdoor (client MDDF)
             }
           }
           else if (instance->which() == eWMO)
@@ -1835,6 +1862,7 @@ void WorldRender::draw (glm::mat4x4 const& model_view
 
         auto& instances = models_to_draw[reinterpret_cast<Model*>(pair.first)];
         auto& fades = models_to_draw_fades[reinterpret_cast<Model*>(pair.first)];
+        auto& interiors = models_to_draw_interior[reinterpret_cast<Model*>(pair.first)];
 
         // memory allocation heuristic. all objects will pass if tile is entirely in frustum.
         // otherwise we only allocate for a half
@@ -1876,6 +1904,7 @@ void WorldRender::draw (glm::mat4x4 const& model_view
           {
             instances.push_back(m2_instance->transformMatrix());
             fades.push_back(1.0f);
+            interiors.push_back(glm::vec4(0.0f)); // tile doodad = outdoor (client MDDF)
           }
 
         }
@@ -2199,6 +2228,7 @@ void WorldRender::draw (glm::mat4x4 const& model_view
       }
 
       ZoneScopedN("World::draw() : Inject visible WMO doodads");
+      noggit::perf::Scoped _prof_gather(noggit::perf::Phase::M2Gather); // M2 spike hunt: whole WMO-doodad gather
 
       // Parallelized WMO-doodad gather (was ~35ms single-threaded per frame in Ironforge). Behaviour is
       // IDENTICAL to the old serial loop -- same instances routed the same way, same order after the merge.
@@ -2263,6 +2293,7 @@ void WorldRender::draw (glm::mat4x4 const& model_view
       {
         models_to_draw[m].push_back(mat);
         models_to_draw_fades[m].push_back(1.0f); // WMO doodads cull with their group
+        models_to_draw_interior[m].push_back(interior_light_at(glm::vec3(mat[3]))); // WMO doodad = interior (client MODD)
       };
       // Per-instance sink shared by ALL THREE gather paths (parallel Phase-C merge, the <256 serial gate,
       // and the NOGGIT_SERIAL_GATHER baseline). It resolves the doodad to its persistent cache entry,
@@ -2433,6 +2464,7 @@ void WorldRender::draw (glm::mat4x4 const& model_view
               {
                 models_to_draw[entry.first].push_back(entry.second);
                 models_to_draw_fades[entry.first].push_back(1.0f); // WMO doodads cull with their group
+                models_to_draw_interior[entry.first].push_back(interior_light_at(glm::vec3(entry.second[3]))); // WMO doodad = interior
               }
               for (auto* p : out.per_instance_ptrs)
               {
@@ -2460,6 +2492,7 @@ void WorldRender::draw (glm::mat4x4 const& model_view
     {
       _world->ensureCreatureSpawnsLoaded();
       ZoneScopedN("World::draw() : Inject creature spawn models");
+      noggit::perf::Scoped _prof_cinject(noggit::perf::Phase::CreatureInject); // M2 spike hunt: per-frame spawn iterate
       std::size_t models_created_this_frame = 0;
       std::size_t const model_create_budget = creature_spawn_model_create_budget();
       // Live-tunable near/far split for hybrid creature instancing (see below). Set very high to disable
@@ -2772,6 +2805,7 @@ void WorldRender::draw (glm::mat4x4 const& model_view
         {
           models_to_draw[mi.model.get()].push_back(mi.transformMatrix());
           models_to_draw_fades[mi.model.get()].push_back(1.0f);
+          models_to_draw_interior[mi.model.get()].push_back(interior_light_at(glm::vec3(mi.transformMatrix()[3]))); // GO can be indoors
           go_bucket_models.insert(mi.model.get());
         }
         trace_gameobject_spawn("draw-queued", spawn, gameobject_distance, nullptr, &mi);
@@ -2806,6 +2840,7 @@ void WorldRender::draw (glm::mat4x4 const& model_view
 
       if (draw_ground_clutter && clutter_density > 0.0f && draw_models && !minimap_render)
       {
+        noggit::perf::Scoped _prof_clutter(noggit::perf::Phase::Clutter); // M2 spike hunt: ground-clutter inject
         float const clutter_dist2 = clutter_dist * clutter_dist;
         // Density-parity diagnostics (Westfall tile 30_52 ground truth = ~426 instances/chunk,
         // simulated from the ADT+DBC): log the funnel every ~5s so instance loss is attributable.
@@ -2939,6 +2974,7 @@ void WorldRender::draw (glm::mat4x4 const& model_view
                 }
                 models_to_draw[m].push_back(dd.transform);
                 models_to_draw_fades[m].push_back(fade_alpha); // client edge fade (last 25% of radius)
+                models_to_draw_interior[m].push_back(glm::vec4(0.0f)); // ground clutter = outdoor
                 ++dbg_submitted;
               }
             }
@@ -3008,6 +3044,8 @@ void WorldRender::draw (glm::mat4x4 const& model_view
         // discarded in the fragment shader, slicing models in/out like the far plane does terrain.
         m2_shader.uniform("slice_dist", s_no_dist_fade ? 0.0f : _cull_distance);
 
+        {
+        noggit::perf::Scoped _prof_ddraw(noggit::perf::Phase::DoodadDraw); // M2 spike hunt: instanced doodad buckets only
         for (auto& pair : models_to_draw)
         {
           bool is_inclusion_filtered = false;
@@ -3111,21 +3149,15 @@ void WorldRender::draw (glm::mat4x4 const& model_view
             }
 
             // INDOOR doodads/gameobjects: the baked MOCV floor colour as FLAT EVEN room light deep inside
-            // (matching the live client's even dark-all-around barrel look; RE_notes/15 section 4+11),
-            // now with GAP B (checklist 8.7) doorway spill: interior_light_at encodes the baked MOCV floor
-            // ALPHA in the a channel (a in [0.5,1.0]) and the m2 shader lerps the room light toward the
-            // outdoor day/night light by it, so props near a portal/window catch the outdoor colour
-            // (client FUN_0069e4c0). Deep interior (alpha 0 -> a 0.5) is unchanged. Candle MOLT points
-            // still apply. Outdoor instances get (0,0,0,0) -> normal sun path.
-            std::vector<glm::vec4> bucket_interior;
-            bucket_interior.reserve(pair.second.size());
-            for (auto const& tr : pair.second)
-            {
-              // Pass the spill-encoded interior light straight through: indoors carries a in [0.5,1.0]
-              // (its a MUST survive or the doorway spill is discarded), outdoors carries a==0 (+ zone
-              // tint rgb). No a=0.5 override here anymore.
-              bucket_interior.push_back(interior_light_at(glm::vec3(tr[3])));
-            }
+            // (matching the live client's even dark-all-around barrel look; RE_notes/15 section 4+11), with
+            // GAP B doorway spill in a (a in [0.5,1.0]); outdoor instances carry (0,0,0,0) -> sun path.
+            // [perf 2026-08-04] The interior light is now ASSIGNED AT INJECTION (models_to_draw_interior, in
+            // lockstep with models_to_draw) -- CLIENT-TRUE: only WMO doodads + gameobjects sampled it;
+            // terrain/tile doodads + clutter are outdoor by construction (the client runs NO interior test
+            // on them). The old per-instance interior_light_at loop HERE, over the whole doodad flood every
+            // frame, was the 1300ms M2 spike. Just read the parallel vector now (defensive size pad).
+            std::vector<glm::vec4>& bucket_interior = models_to_draw_interior[pair.first];
+            bucket_interior.resize(pair.second.size(), glm::vec4(0.0f));
             // Per-instance cull-fade alphas gathered in lockstep with the transforms (defensive pad
             // with 1.0 if a push site missed the parallel vector).
             std::vector<float>& bucket_fades = models_to_draw_fades[pair.first];
@@ -3173,6 +3205,12 @@ void WorldRender::draw (glm::mat4x4 const& model_view
             }
           }
         }
+        } // end DoodadDraw scope (instanced doodad buckets)
+
+        // Everything below in the M2 phase is INDIVIDUAL / non-instanced draws (creatures, per-instance
+        // billboard doodads, mounts, attachments, gameobjects) -- the suspected CPU-bound draw-submission
+        // storm. IndivDraw times it as one bucket; the nested M2Creatures/M2Particles split it further.
+        noggit::perf::Scoped _prof_indiv(noggit::perf::Phase::IndivDraw);
 
         // A grass bucket may have left alpha-to-coverage enabled; clear it before the rest of the
         // draws so it can't affect creatures / other passes.
@@ -3204,7 +3242,7 @@ void WorldRender::draw (glm::mat4x4 const& model_view
           creature_interior.reserve(transforms.size());
           for (auto const& tr : transforms)
           {
-            creature_interior.push_back(interior_light_at(glm::vec3(tr[3])));
+            creature_interior.push_back(interior_light_at(glm::vec3(tr[3]), false)); // creatures move -> no cache
           }
           std::vector<float>& creature_fades = creature_instanced_fades[entry.first];
           creature_fades.resize(transforms.size(), 1.0f);
@@ -3848,7 +3886,7 @@ void WorldRender::draw (glm::mat4x4 const& model_view
               }
               mount_model->renderer()->draw(model_view, mount, m2_shader, model_render_state, frustum,
                 _cull_distance, camera_pos, creature_animtime, display, /*no_cull*/ false,
-                /*bloom_mask_only*/ false, interior_light_at(mount.get_pos()), creature_fade);
+                /*bloom_mask_only*/ false, interior_light_at(mount.get_pos(), false), creature_fade);
               ++_world->_n_rendered_objects;
 
               // World seat = mount transform * (mount bone matrix * fixCoordSystem(attachment.pos)).
@@ -3887,7 +3925,7 @@ void WorldRender::draw (glm::mat4x4 const& model_view
             , display
             , /*no_cull*/ false
             , /*bloom_mask_only*/ false
-            , interior_light_at(instance->get_pos())
+            , interior_light_at(instance->get_pos(), false) // moving (creature/attachment) -> no cache
             , creature_fade
             , /*skip_animate*/ use_precomputed_bones
           );
@@ -4047,7 +4085,7 @@ void WorldRender::draw (glm::mat4x4 const& model_view
                 , /*bloom_mask_only*/ false
                 // Attachments (weapons, shoulders, helmets) share their OWNER's light: without this they
                 // defaulted to the outdoor sun and glowed on a dark interior body (visible by day only).
-                , interior_light_at(instance->get_pos())
+                , interior_light_at(instance->get_pos(), false) // moving (creature/attachment) -> no cache
                 // ...and their OWNER's cull fade capped by their OWN stream-in fade: item models
                 // load async AFTER the body, and without their own 2 s ramp they popped in at the
                 // body's current mid-fade alpha instead of fading in from zero.

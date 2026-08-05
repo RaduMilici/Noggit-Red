@@ -22,6 +22,7 @@ public:
   static void unload_all(Noggit::NoggitRenderContext context);
 
   static void report();
+  static std::size_t loaded_count() { return _.size(); } // [mem-diag]
 
 private:
   friend struct scoped_model_reference;

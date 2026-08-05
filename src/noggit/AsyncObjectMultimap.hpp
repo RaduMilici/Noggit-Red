@@ -129,6 +129,8 @@ namespace Noggit
         }
       }
     }
+    std::size_t size() const { std::scoped_lock lock(_mutex); return _elements.size(); } // [mem-diag]
+
     void apply (std::function<void (BlizzardArchive::Listfile::FileKey const&, T&)> fun)
     {
       std::scoped_lock lock(_mutex);

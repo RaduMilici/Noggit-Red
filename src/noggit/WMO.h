@@ -487,6 +487,7 @@ public:
   static void report();
   static void clear_hidden_wmos();
   static void unload_all(Noggit::NoggitRenderContext context);
+  static std::size_t loaded_count() { return _.size(); } // [mem-diag]
 private:
   friend struct scoped_wmo_reference;
   static Noggit::AsyncObjectMultimap<WMO> _;

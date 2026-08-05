@@ -5,7 +5,12 @@
 #include <noggit/Misc.h>
 #include <noggit/ModelManager.h> // ModelManager
 #include <noggit/TextureManager.h> // TextureManager, Texture
+#include <noggit/WMO.h> // WMOManager (mem-diag)
 #include <noggit/WMOInstance.h> // WMOInstance
+#ifdef _WIN32
+#include <windows.h>
+#include <psapi.h> // GetProcessMemoryInfo (mem-diag)
+#endif
 #include <noggit/World.h>
 #include <noggit/map_index.hpp>
 #include <noggit/uid_storage.hpp>
@@ -8028,6 +8033,32 @@ void MapView::paintGL()
     s_prof_last = _prof_now;
     s_prof_have = true;
     _prof.end_frame();
+
+    // [mem-diag 2026-08-04] Once/sec, log process working set + loaded-asset counts so a memory climb can
+    // be attributed: models/textures/wmos growing = assets not freeing; working set climbing while those
+    // stay flat = a GPU/loader-side leak. NOGGIT_FRAME_PROFILE gate (already on in the launcher).
+    if (_prof.on)
+    {
+      static std::chrono::steady_clock::time_point s_mem_last;
+      static bool s_mem_have = false;
+      if (!s_mem_have || std::chrono::duration<double, std::milli>(_prof_now - s_mem_last).count() > 1000.0)
+      {
+        s_mem_last = _prof_now;
+        s_mem_have = true;
+        std::size_t ws_mb = 0;
+#ifdef _WIN32
+        PROCESS_MEMORY_COUNTERS pmc{};
+        if (K32GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc))) // kernel32-exported, no psapi.lib
+          ws_mb = pmc.WorkingSetSize / (1024u * 1024u);
+#endif
+        LogError << "[MEM] workingSet=" << ws_mb << "MB"
+                 << " models=" << ModelManager::loaded_count()
+                 << " textures=" << TextureManager::loaded_count()
+                 << " wmos=" << WMOManager::loaded_count()
+                 << " tiles=" << (_world ? _world->mapIndex.getNLoadedTiles() : 0u)
+                 << std::endl;
+      }
+    }
   }
 
   if (!saving_minimap)

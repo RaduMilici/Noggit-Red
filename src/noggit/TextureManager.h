@@ -112,6 +112,7 @@ public:
   // Live-apply the render/anisotropic_filtering setting to every already-uploaded array (models,
   // particles, tilesets). Needs a current GL context; called from WorldRender::draw on a change.
   static void reapply_anisotropy();
+  static std::size_t loaded_count() { return _.size(); } // [mem-diag]
 
 private:
   friend struct scoped_blp_texture_reference;

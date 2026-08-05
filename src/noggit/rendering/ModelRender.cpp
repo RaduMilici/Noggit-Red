@@ -246,6 +246,7 @@ ModelRender::~ModelRender()
 
 void ModelRender::upload()
 {
+  noggit::perf::Scoped _prof_up(noggit::perf::Phase::ModelUpload); // M2 spike hunt: model VBO/index upload
   _vertex_box_points = math::box_points(
       misc::transform_model_box_coords(_model->header.bounding_box_min)
       , misc::transform_model_box_coords(_model->header.bounding_box_max));
@@ -717,8 +718,17 @@ void ModelRender::draw(glm::mat4x4 const& model_view
       // e.g. Timbermaw). Re-assert the divisor-1 transform attribute under THIS (instanced) program; it's a
       // harmless no-op for VAOs already set up instanced (the models_to_draw tree/prop buckets).
       OpenGL::Scoped::vao_binder const _v(_vao);
-      OpenGL::Scoped::buffer_binder<GL_ARRAY_BUFFER> const _tb(_transform_buffer);
-      m2_shader.attrib("transform", 0, 1);
+      {
+        OpenGL::Scoped::buffer_binder<GL_ARRAY_BUFFER> const _tb(_transform_buffer);
+        m2_shader.attrib("transform", 0, 1);
+      }
+      // Re-assert the per-instance interior attribute for the same reason (the individual path may have
+      // left the shared VAO pointing pos/normal at _vertices_buffer; interior stays bound to _interior_buffer).
+      {
+        OpenGL::Scoped::buffer_binder<GL_ARRAY_BUFFER> const _ib(_interior_buffer);
+        m2_shader.attrib("interior", 4, GL_FLOAT, GL_FALSE, sizeof(::glm::vec4), nullptr);
+        m2_shader.attrib_divisor("interior", 1, 1);
+      }
     }
 
     if (capture_debug_enabled())
@@ -793,7 +803,12 @@ void ModelRender::draw(glm::mat4x4 const& model_view
     // (~31 ms per step of the 2 s fade -- imperceptible; the old 1/16 stepped visibly on fading
     // GAMEOBJECTS next to smoothly-fading individual creatures). Group count stays bounded: only
     // instances actually mid-fade split off extra sub-draws.
-    struct InteriorGroup { glm::vec4 interior; float fade; std::vector<glm::mat4x4> transforms; std::vector<glm::mat4x4> bones; };
+    // [perf 2026-08-05] Interior is now carried PER INSTANCE (interiors[], uploaded to _interior_buffer as a
+    // divisor-1 vertex attribute) instead of a per-group uniform, so mixed-interior instances batch in ONE
+    // draw. Grouping is therefore by FADE ONLY (fade still drives per-group GL blend promotion + the depth
+    // prepass -- it can't move to an attribute without per-instance blend state). This collapsed WMO-doodad
+    // buckets in a city from ~6 sub-draws (one per distinct room colour) to 1.
+    struct InteriorGroup { float fade; std::vector<glm::mat4x4> transforms; std::vector<glm::vec4> interiors; std::vector<glm::mat4x4> bones; };
     std::vector<InteriorGroup> interior_groups;
     for (std::size_t i = 0; i < instances.size(); ++i)
     {
@@ -819,10 +834,11 @@ void ModelRender::draw(glm::mat4x4 const& model_view
       InteriorGroup* grp = nullptr;
       for (auto& cand : interior_groups)
       {
-        if (cand.interior == inter && cand.fade == fade) { grp = &cand; break; }
+        if (cand.fade == fade) { grp = &cand; break; }
       }
-      if (!grp) { interior_groups.push_back({inter, fade, {}, {}}); grp = &interior_groups.back(); }
+      if (!grp) { interior_groups.push_back({fade, {}, {}, {}}); grp = &interior_groups.back(); }
       grp->transforms.push_back(instances[i]);
+      grp->interiors.push_back(inter); // per-instance room light (uploaded to _interior_buffer below)
       if (pib && pib_bone_count > 0)
       {
         // Gather THIS instance's bone slice into the group (parallel to transforms) so the group's bones
@@ -898,6 +914,7 @@ void ModelRender::draw(glm::mat4x4 const& model_view
     static bool const s_inst_dbg = std::getenv("NOGGIT_INSTANCE_DEBUG") != nullptr;
     int passes_drawn = 0;
     int passes_total = 0;
+    int inst_drawcalls_local = 0; // [SubmitInst breakdown] total drawElementsInstanced (prepass + main) this model
 
     for (auto const& group : interior_groups)
     {
@@ -908,9 +925,13 @@ void ModelRender::draw(glm::mat4x4 const& model_view
 
       {
         // Upload only this group's transforms so index 0 is the group start (no glDraw*BaseInstance in
-        // GL 3.3), then set the room light this whole group shares.
+        // GL 3.3). The per-instance interior room light rides alongside in _interior_buffer (same order).
         OpenGL::Scoped::buffer_binder<GL_ARRAY_BUFFER> const transform_binder (_transform_buffer);
         gl.bufferData(GL_ARRAY_BUFFER, group.transforms.size() * sizeof(::glm::mat4x4), group.transforms.data(), GL_DYNAMIC_DRAW);
+      }
+      {
+        OpenGL::Scoped::buffer_binder<GL_ARRAY_BUFFER> const interior_binder (_interior_buffer);
+        gl.bufferData(GL_ARRAY_BUFFER, group.interiors.size() * sizeof(::glm::vec4), group.interiors.data(), GL_DYNAMIC_DRAW);
       }
       if (pib && pib_bone_count > 0 && _bone_matrices_buf_tex != 0 && !group.bones.empty())
       {
@@ -922,7 +943,7 @@ void ModelRender::draw(glm::mat4x4 const& model_view
         gl.bindTexture(GL_TEXTURE_BUFFER, _bone_matrices_buf_tex);
         gl.texBuffer(GL_TEXTURE_BUFFER, GL_RGBA32F, _bone_matrices_buffer);
       }
-      m2_shader.uniform("instance_interior", group.interior);
+      // interior room light is now a per-instance attribute (uploaded above), no per-group uniform
 
       // FADING group (cull fade < 1): prepareDraw promotes its opaque batches to alpha blending,
       // which needs a depth prepass or internal/far-side geometry ghosts through during the fade --
@@ -939,6 +960,7 @@ void ModelRender::draw(glm::mat4x4 const& model_view
           if (p.prepareDraw(m2_shader, _model, representative, model_render_state, group.fade))
           {
             gl.drawElementsInstanced(GL_TRIANGLES, p.index_count, GL_UNSIGNED_SHORT, reinterpret_cast<void*>(p.index_start * sizeof(GLushort)), static_cast<GLsizei>(group.transforms.size()));
+            ++inst_drawcalls_local;
             p.afterDraw();
           }
         }
@@ -954,10 +976,16 @@ void ModelRender::draw(glm::mat4x4 const& model_view
         {
           ++passes_drawn;
           gl.drawElementsInstanced(GL_TRIANGLES, p.index_count, GL_UNSIGNED_SHORT, reinterpret_cast<void*>(p.index_start * sizeof(GLushort)), static_cast<GLsizei>(group.transforms.size()));
+          ++inst_drawcalls_local;
           p.afterDraw();
         }
       }
     }
+
+    // [SubmitInst breakdown 2026-08-05] record this model's instanced-draw shape (groups / total
+    // drawElementsInstanced / instances) so the per-second profile report shows where the cost lives.
+    noggit::perf::FrameProfiler::get().inst_add(
+        static_cast<int>(interior_groups.size()), inst_drawcalls_local, instances.size());
 
     // Match the individual draw path's end-of-draw GL reset (single-instance overload, ~line 614): this
     // overload runs ONCE PER MODEL in a loop that SHARES one M2RenderState, so restore the caller's
@@ -975,6 +1003,11 @@ void ModelRender::draw(glm::mat4x4 const& model_view
 
     // Leave the FULL instance set in the transform buffer for the particle/ribbon draws that follow
     // (they instance-count off it). Interior partitioning only affects the mesh passes above.
+    // [perf 2026-08-05] ONLY re-upload when this model actually HAS particles/ribbons -- the vast majority
+    // of instanced doodads (trees, rocks, grass) have neither, and this full bufferData ran unconditionally
+    // once per model per frame (~1000+ redundant buffer orphans/frame). The mesh passes above already left
+    // the buffer in a valid state; nothing downstream reads it when there are no emitters.
+    if (!_model->_particles.empty() || !_model->_ribbons.empty())
     {
       OpenGL::Scoped::buffer_binder<GL_ARRAY_BUFFER> const transform_binder (_transform_buffer);
       gl.bufferData(GL_ARRAY_BUFFER, instances.size() * sizeof(::glm::mat4x4), instances.data(), GL_DYNAMIC_DRAW);
@@ -1123,6 +1156,15 @@ void ModelRender::setupVAO(OpenGL::Scoped::use_program& m2_shader)
     OpenGL::Scoped::buffer_binder<GL_ARRAY_BUFFER> const transform_binder (_transform_buffer);
     gl.bufferData(GL_ARRAY_BUFFER, 10 * sizeof(::glm::mat4x4), nullptr, GL_DYNAMIC_DRAW);
     m2_shader.attrib("transform", 0, 1);
+  }
+
+  {
+    // [perf 2026-08-05] Per-instance interior room-light attribute (divisor 1), parallel to transform.
+    // Lets mixed-interior instances draw in ONE call instead of one sub-draw per distinct interior value.
+    OpenGL::Scoped::buffer_binder<GL_ARRAY_BUFFER> const interior_binder (_interior_buffer);
+    gl.bufferData(GL_ARRAY_BUFFER, 10 * sizeof(::glm::vec4), nullptr, GL_DYNAMIC_DRAW);
+    m2_shader.attrib("interior", 4, GL_FLOAT, GL_FALSE, sizeof(::glm::vec4), nullptr);
+    m2_shader.attrib_divisor("interior", 1, 1);
   }
 
   _vao_setup = true;

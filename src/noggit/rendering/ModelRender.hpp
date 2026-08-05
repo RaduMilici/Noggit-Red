@@ -226,7 +226,7 @@ namespace Noggit::Rendering
     Model* _model;
 
     // buffers
-    OpenGL::Scoped::deferred_upload_buffers<6> _buffers;
+    OpenGL::Scoped::deferred_upload_buffers<7> _buffers;
     OpenGL::Scoped::deferred_upload_vertex_arrays<2> _vertex_arrays;
 
     std::vector<uint16_t> const _box_indices = {5, 7, 3, 2, 0, 1, 3, 1, 5, 4, 0, 4, 6, 2, 6, 7};
@@ -237,6 +237,11 @@ namespace Noggit::Rendering
     GLuint const& _indices_buffer = _buffers[3];
     GLuint const& _box_indices_buffer = _buffers[4];
     GLuint const& _bone_matrices_buffer = _buffers[5];
+    // [perf 2026-08-05] per-instance INTERIOR light attribute (divisor 1), parallel to _transform_buffer.
+    // Moving interior off the per-draw uniform onto a vertex attribute lets instances with DIFFERENT room
+    // colours batch in ONE instanced draw -- previously each distinct interior value forced its own sub-draw
+    // group (WMO doodads in a city split ~6 ways -> groups/model=6.1, the dominant SubmitInst cost).
+    GLuint const& _interior_buffer = _buffers[6];
 
     GLuint const& _box_vao = _vertex_arrays[1];
     GLuint const& _box_vbo = _buffers[2];

@@ -274,6 +274,9 @@ namespace Noggit::Rendering
     // interior tests are then cheap AABB checks against this list.
     std::vector<InteriorVolume> _interior_volumes;
     unsigned _interior_light_epoch = 0;
+    // Per-frame budget for cold-cache interior-light computes, so a WMO streaming in spreads its doodads'
+    // interior sampling over frames instead of one hitch. Reset each frame in updateLightingUniformBlock.
+    int _interior_miss_budget = 0;
     // The client's unit shadow decal texture (Textures\ShadowBlob.blp), lazily acquired on first
     // blob-shadow draw. 32x32 grayscale oval, drawn modulate (see blob_shadow_frag).
     std::unique_ptr<scoped_blp_texture_reference> _shadow_blob_texture;

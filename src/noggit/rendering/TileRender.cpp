@@ -4,6 +4,7 @@
 #include <noggit/MapTile.h>
 #include <noggit/MapChunk.h>
 #include <noggit/ui/TexturingGUI.h>
+#include <noggit/frame_profiler.hpp>
 #include <external/tracy/Tracy.hpp>
 
 #include <algorithm>
@@ -95,6 +96,9 @@ void TileRender::draw (OpenGL::Scoped::use_program& mcnk_shader
   if (!_uploaded)
   [[unlikely]]
   {
+    // First draw of a freshly-streamed tile: allocate its GPU buffers/textures on the MAIN thread. This
+    // + the 256-chunk update block below are the "chunk load" spike; attribute both to TileStream.
+    noggit::perf::Scoped _prof_upload(noggit::perf::Phase::TileStream);
     upload();
   }
 
@@ -133,6 +137,10 @@ void TileRender::draw (OpenGL::Scoped::use_program& mcnk_shader
   // run chunk updates. running this when splitdraw call detected unused sampler configuration as well.
   if (_map_tile->_chunk_update_flags || is_selected != _selected || need_paintability_update || _requires_sampler_reset || _texture_not_loaded)
   {
+    // Per-chunk texture/vertex uploads (texSubImage). A freshly-uploaded tile flags ALL 256 chunks at
+    // once here -> the dominant part of the "chunk load" spike. Attributed to TileStream (nested in
+    // Terrain). Incremental paint edits also pass through, but those touch few chunks and stay cheap.
+    noggit::perf::Scoped _prof_chunk_upd(noggit::perf::Phase::TileStream);
 
     gl.bindBuffer(GL_UNIFORM_BUFFER, _chunk_instance_data_ubo);
 
