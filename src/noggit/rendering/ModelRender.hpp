@@ -191,6 +191,12 @@ namespace Noggit::Rendering
         , int animtime
     );
 
+    // True iff drawPersistent() would actually render this model. The persistent buffer build MUST gate on
+    // this exact predicate: a model put in the buffer but skipped by drawPersistent gets skipped in the
+    // dynamic gather too (it's "persistent") and then renders NOWHERE -> missing pieces of multi-model
+    // structures (the fragmented-building bug). Mirrors drawPersistent's early-returns + the emitter exclusion.
+    [[nodiscard]] bool eligibleForPersistentDraw() const;
+
     void drawParticles(glm::mat4x4 const& model_view
         , OpenGL::Scoped::use_program& particles_shader
         , std::size_t instance_count

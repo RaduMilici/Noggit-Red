@@ -1041,6 +1041,17 @@ void ModelRender::draw(glm::mat4x4 const& model_view
 
 }
 
+bool ModelRender::eligibleForPersistentDraw() const
+{
+  // MUST match drawPersistent's early-returns exactly, plus the emitter exclusion (particle/ribbon models
+  // need the per-frame dynamic transform buffer). A model that fails this stays on the DYNAMIC path.
+  return _model->finishedLoading()
+      && !_model->loading_failed()
+      && !is_classic_effect_shell_model(_model)
+      && _model->_particles.empty()
+      && _model->_ribbons.empty();
+}
+
 void ModelRender::drawPersistent(glm::mat4x4 const& model_view
     , GLuint transform_vbo
     , GLuint interior_vbo
@@ -1054,6 +1065,20 @@ void ModelRender::drawPersistent(glm::mat4x4 const& model_view
 
   if (!_model->finishedLoading() || _model->loading_failed() || is_classic_effect_shell_model(_model))
   {
+    // [diag] This should NEVER fire: the buffer build gates on eligibleForPersistentDraw() (same predicate),
+    // so a buffered model is always drawable here. If it logs, the build/draw eligibility diverged and this
+    // model's instances render nowhere (skipped in the gather AND here) = missing pieces.
+    if (instance_count > 0 && noggit::perf::FrameProfiler::get().on && _model->file_key().hasFilepath())
+    {
+      static std::set<std::string> logged;
+      auto const& fp = _model->file_key().filepath();
+      if (logged.insert(fp).second)
+      {
+        LogError << "[PDRAW-SKIP] buffered-but-not-drawable model='" << fp
+                 << "' finished=" << _model->finishedLoading() << " failed=" << _model->loading_failed()
+                 << " classicShell=" << is_classic_effect_shell_model(_model) << " count=" << instance_count << std::endl;
+      }
+    }
     return;
   }
   if (instance_count <= 0 || transform_vbo == 0)

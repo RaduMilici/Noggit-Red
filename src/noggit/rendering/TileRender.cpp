@@ -99,7 +99,23 @@ void TileRender::rebuildDoodadInstanceBuffers()
 {
   freeDoodadInstanceBuffers();
 
-  bool all_loaded = true;
+  // [fix 2026-08-05] ALL-OR-NOTHING: build the persistent buffers only once EVERY eligible model on the tile
+  // has finished loading. Until then leave the map EMPTY + the flag dirty, so the renderer skips nothing and
+  // draws the tile via the DYNAMIC path -- which handles a partially-streamed tile gracefully (each instance
+  // is drawn iff its model is ready). The old per-model build showed a multi-model structure in FRAGMENTS
+  // while it streamed in (only the already-loaded pieces appeared). The switch to persistent is a clean
+  // one-shot once the whole tile is up.
+  for (auto const& pair : _map_tile->getObjectInstances())
+  {
+    if (pair.second.empty() || pair.second[0]->which() != eMODEL)
+    {
+      continue;
+    }
+    if (!reinterpret_cast<Model*>(pair.first)->finishedLoading())
+    {
+      return; // still streaming -- stay dirty, dynamic path draws it, retry next frame
+    }
+  }
 
   for (auto const& pair : _map_tile->getObjectInstances())
   {
@@ -110,17 +126,11 @@ void TileRender::rebuildDoodadInstanceBuffers()
 
     Model* const model = reinterpret_cast<Model*>(pair.first);
 
-    // Not loaded yet -> leave dirty so we rebuild next frame once its geometry is up (self-healing).
-    if (!model->finishedLoading())
-    {
-      all_loaded = false;
-      continue;
-    }
-
-    // Models with particles/ribbons stay on the DYNAMIC path: the particle pass instance-counts off the
-    // per-frame transform buffer, which the persistent path never populates. Tile doodads with emitters
-    // are rare (torches/braziers are usually gameobjects or WMO doodads), so the loss is negligible.
-    if (!model->_particles.empty() || !model->_ribbons.empty())
+    // Include ONLY models drawPersistent() will actually render (finished + not failed + not a classic-effect
+    // shell + no particle/ribbon emitters). A model buffered here is SKIPPED in the dynamic gather, so if
+    // drawPersistent then skipped it too the instances would render nowhere = the fragmented-building bug.
+    // Non-eligible models fall through to the dynamic path (not added to the buffer -> not skipped there).
+    if (!model->renderer()->eligibleForPersistentDraw())
     {
       continue;
     }
@@ -156,11 +166,9 @@ void TileRender::rebuildDoodadInstanceBuffers()
 
   gl.bindBuffer(GL_ARRAY_BUFFER, 0);
 
-  // Only clear the dirty flag once every model was loaded; otherwise rebuild next frame (self-healing).
-  if (all_loaded)
-  {
-    _map_tile->clearDoodadBuffersDirty();
-  }
+  // We only reach here once every eligible model was loaded (early-return above otherwise), so the buffers
+  // are complete -- clear the dirty flag; rebuilds happen only on the next object-set change.
+  _map_tile->clearDoodadBuffersDirty();
 }
 
 void TileRender::freeDoodadInstanceBuffers()
