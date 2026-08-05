@@ -579,6 +579,16 @@ void OpenGL::context::drawElements (GLenum mode, GLsizei count, GLenum type, GLv
 #endif
   return _current_context->functions()->glDrawElements (mode, count, type, indices);
 }
+// [perf 2026-08-05] Draw-call batching. `indirect` is a byte offset into the currently-bound
+// GL_DRAW_INDIRECT_BUFFER; each command is a DrawElementsIndirectCommand {count, instanceCount, firstIndex,
+// baseVertex, baseInstance}. Caller must check hasMultiDrawIndirect() first (null on a <4.3 context).
+void OpenGL::context::multiDrawElementsIndirect (GLenum mode, GLenum type, const void* indirect, GLsizei drawcount, GLsizei stride)
+{
+#ifndef NOGGIT_DO_NOT_CHECK_FOR_OPENGL_ERRORS
+  verify_context_and_check_for_gl_errors const _ (_current_context, NOGGIT_CURRENT_FUNCTION);
+#endif
+  return _4_3_core_func->glMultiDrawElementsIndirect (mode, type, indirect, drawcount, stride);
+}
 void OpenGL::context::drawElementsInstanced (GLenum mode, GLsizei count, GLenum type, GLvoid const* indices, GLsizei instancecount)
 {
 #ifndef NOGGIT_DO_NOT_CHECK_FOR_OPENGL_ERRORS

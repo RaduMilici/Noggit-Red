@@ -84,7 +84,11 @@ namespace Noggit::Application
 
 	  QSurfaceFormat format;
 	  format.setRenderableType(QSurfaceFormat::OpenGL);
-	  format.setVersion(4, 1);
+	  // [perf 2026-08-05] 4.3 core (was 4.1) for glMultiDrawElementsIndirect + SSBO -- the draw-call-batching
+	  // path (collapse ~2000 per-doodad draws into a few MDI calls). 4.3 is a strict superset, so the existing
+	  // QOpenGLFunctions_4_1_Core wrapper still resolves (4.1 subset). If a machine can't give a 4.3 core
+	  // context this would fail to start -- revert to (4,1) then (batching stays off on that GPU).
+	  format.setVersion(4, 3);
 	  format.setProfile(QSurfaceFormat::CoreProfile);
 	  format.setSwapBehavior(applicationConfiguration.GraphicsConfiguration.SwapChainDepth);
 	  format.setSwapInterval(applicationConfiguration.GraphicsConfiguration.SwapChainInternal);
@@ -102,9 +106,10 @@ namespace Noggit::Application
 
 	  OpenGL::context::scoped_setter const _(::gl, &context);
 
-	  LogDebug << "GL: Version: " << gl.getString(GL_VERSION) << std::endl;
-	  LogDebug << "GL: Vendor: " << gl.getString(GL_VENDOR) << std::endl;
-	  LogDebug << "GL: Renderer: " << gl.getString(GL_RENDERER) << std::endl;
+	  LogError << "GL: Version: " << gl.getString(GL_VERSION) << std::endl;  // [perf] confirm 4.3 context obtained
+	  LogError << "GL: Vendor: " << gl.getString(GL_VENDOR) << std::endl;
+	  LogError << "GL: Renderer: " << gl.getString(GL_RENDERER) << std::endl;
+	  LogError << "GL: MultiDrawIndirect=" << gl.hasMultiDrawIndirect() << std::endl;  // [perf] batching enabler
 
 
     _application_configuration = std::make_shared<Noggit::Application::NoggitApplicationConfiguration>(applicationConfiguration);
