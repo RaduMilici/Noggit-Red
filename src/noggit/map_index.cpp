@@ -25,6 +25,8 @@
 #include <QFile>
 
 #include <algorithm>
+#include <chrono>
+#include <vector>
 #include <forward_list>
 #include <cstdlib>
 
@@ -298,16 +300,58 @@ void MapIndex::enterTile(const TileIndex& tile)
   // earlier (smoother as you move) but keeps more tiles resident -> more terrain/objects/WMOs to draw
   // every frame -> lower fps. Read live so the slider takes effect on the next tile crossing.
   int const radius = std::max(0, QSettings().value("loading_radius", 1).toInt());
+
+  // [perf 2026-08-05] BUDGET main-thread MapTile creation. Each new tile costs a MapTile ctor + an MPQ
+  // exists() on the MAIN thread; with loading_radius=4 (81-tile grid) a fast fly crosses a ~9-tile edge per
+  // boundary, so creating them all in one frame stalled `tick` ~110ms (measured [TICK-STALL]). Cap NEW
+  // creations per call and take the NEAREST first (content appears where the camera is heading); the rest
+  // are created over the next frames -- the async loader still streams their heavy data in the background,
+  // and already-resident tiles are untouched. NOGGIT_TILE_LOAD_BUDGET overrides (0 = unlimited = old).
+  static int const s_load_budget = []
+  {
+    char const* v = std::getenv("NOGGIT_TILE_LOAD_BUDGET");
+    return v ? std::atoi(v) : 3;
+  }();
+
+  // Collect only the tiles that still need CREATING (skip resident / awaiting / failed / absent -- those
+  // are cheap no-ops in loadTile anyway), nearest-first.
+  std::vector<std::pair<float, TileIndex>> pending;
   for (int pz = std::max(cz - radius, 0); pz <= std::min(cz + radius, 63); ++pz)
   {
     for (int px = std::max(cx - radius, 0); px <= std::min(cx + radius, 63); ++px)
     {
-      loadTile(TileIndex(static_cast<std::size_t>(px), static_cast<std::size_t>(pz)));
+      TileIndex const t(static_cast<std::size_t>(px), static_cast<std::size_t>(pz));
+      if (!hasTile(t) || tileLoaded(t) || tileAwaitingLoading(t) || tileLoadFailed(t))
+      {
+        continue;
+      }
+      pending.emplace_back(tile.dist(t), t);
     }
+  }
+
+  if (s_load_budget > 0 && static_cast<int>(pending.size()) > s_load_budget)
+  {
+    std::partial_sort(pending.begin(), pending.begin() + s_load_budget, pending.end(),
+                      [](auto const& a, auto const& b) { return a.first < b.first; });
+  }
+  else
+  {
+    std::sort(pending.begin(), pending.end(), [](auto const& a, auto const& b) { return a.first < b.first; });
+  }
+
+  int created = 0;
+  for (auto const& p : pending)
+  {
+    if (s_load_budget > 0 && created >= s_load_budget)
+    {
+      break;
+    }
+    loadTile(p.second);
+    ++created;
   }
 }
 
-void MapIndex::update_model_tile(const TileIndex& tile, model_update type, SceneObject* instance)
+void MapIndex::update_model_tile(const TileIndex& tile, model_update type, SceneObject* instance, bool mark_changed)
 {
   MapTile* adt = loadTile(tile);
 
@@ -315,7 +359,13 @@ void MapIndex::update_model_tile(const TileIndex& tile, model_update type, Scene
     return;
 
   adt->wait_until_loaded();
-  adt->changed = true;
+  // [perf 2026-08-05] Only flag the tile dirty for REAL edits. The load-time path (UID-collision reassignment
+  // / tile reload) passes mark_changed=false so streamed-in tiles are NOT pinned resident (changed tiles never
+  // unload -> unbounded memory growth on a long fly = the original "eats RAM & crashes"). See queue_update.
+  if (mark_changed)
+  {
+    adt->changed = true;
+  }
 
   if (type == model_update::add)
   {
@@ -393,11 +443,13 @@ MapTile* MapIndex::loadTile(const TileIndex& tile, bool reloading, bool load_mod
   std::stringstream filename;
   filename << "World\\Maps\\" << basename << "\\" << basename << "_" << tile.x << "_" << tile.z << ".adt";
 
-  if (!Noggit::Application::NoggitApplication::instance()->clientData()->exists(filename.str()))
-  {
-    LogError << "The requested tile \"" << filename.str() << "\" does not exist! Oo" << std::endl;
-    return nullptr;
-  }
+  // [perf 2026-08-05] The MPQ clientData()->exists() check that used to be here was measured at 4-9ms per
+  // tile ([LOADTILE] split) -- the ENTIRE enterTile main-thread stall (the ctor is ~0.03ms). It is
+  // REDUNDANT: loadTile already returned above unless hasTile(tile) is true, and hasTile is the WDT
+  // tile-present flag (mTiles[..].flags & 1) -- the map's own authoritative record of which ADTs exist. A
+  // WDT-present-but-file-missing tile (corrupt custom data) is handled downstream: MapTile::finishLoading on
+  // the loader thread throws FileReadFailedError -> AsyncLoader marks it loading_failed (tileLoadFailed),
+  // exactly as a failed exists() would have rejected it, just off the main thread. So skip the scan.
 
   mTiles[tile.z][tile.x].tile = std::make_unique<MapTile> (static_cast<int>(tile.x), static_cast<int>(tile.z), filename.str(),
      mBigAlpha, load_models, use_mclq_green_lava(), reloading, _world, _context, tile_mode::edit, load_textures);
@@ -455,23 +507,54 @@ void MapIndex::unloadTiles(const TileIndex& tile)
         }
       }
     }
-    if (!to_unload.empty())
+    // [perf 2026-08-05] Free at most N tiles per pass. Freeing needs the loader quiescent for crash-safety (a
+    // loader finishing a model/WMO writes tile-owned state -> feeds SceneObject instances into MapTile::
+    // object_instances -> freeing that tile mid-load = UAF in AsyncLoader::process -> finishLoading, confirmed
+    // in the VEH callstack; the AsyncObjectMultimap::erase re-check closes the refcount-revive race but NOT
+    // this one). ScopedPause gives that quiescence BOUNDED (waits only for the in-flight loads). But the FREE
+    // ITSELF is O(tiles): each tile tears down hundreds of instances, so freeing a big backlog at once = a ~1s
+    // stall (a prior "defer then batch-free 46-52 tiles" attempt hit 1152ms). So cap the free per pass and let
+    // a backlog drain over the next passes. NOGGIT_MAX_UNLOAD_PER_PASS overrides (0 = unlimited).
+    static unsigned const s_max_unload_per_pass = []
     {
-      // [CRASH FIX 2026-08-04] Freeing a tile tears down its WMOs/M2s and erases their models/textures
-      // through the async loader. If the loader thread is mid-flight on any of those objects, the
-      // destructor races it -> UAF in ~WMO / ModelInstance::~ModelInstance / AsyncLoader::ensure_deletable
-      // (0xC0000005 under fast movement). Latent for years -- only reachable once tiles actually unload.
-      // Make the loader quiescent first (the same guard reloadCreatureSpawns already uses before freeing).
-      AsyncLoader::instance().wait_until_idle();
-      for (TileIndex const& idx : to_unload) // iteration over loaded_tiles() is finished; loader is idle
+      char const* v = std::getenv("NOGGIT_MAX_UNLOAD_PER_PASS");
+      return v ? static_cast<unsigned>(std::max(0, std::atoi(v))) : 6u;
+    }();
+    // DEFER while the loader streams AND the reclaimable backlog (non-changed far tiles) is still modest: the
+    // ScopedPause returns instantly only when the loader is idle, so freeing mid-stream pays the in-flight
+    // wait. Skip then -- free on the loader's next lull, or once the backlog grows past the threshold so
+    // memory can't run away (then still capped per pass so we drain gradually, never batch-free a big pile).
+    static unsigned const s_defer_backlog = []
+    {
+      char const* v = std::getenv("NOGGIT_UNLOAD_DEFER_BACKLOG");
+      return v ? static_cast<unsigned>(std::max(0, std::atoi(v))) : 40u;
+    }();
+    bool const defer = !to_unload.empty() && s_defer_backlog > 0
+                    && to_unload.size() <= s_defer_backlog
+                    && AsyncLoader::instance().is_loading();
+    unsigned unloaded = 0;
+    if (!to_unload.empty() && !defer)
+    {
+      // Collect-first still required (unloadTile nulls mTiles[..] mid-iteration of loaded_tiles() -> iterator
+      // invalidation). ScopedPause = the bounded loader quiescence for a race-free free (see above).
+      AsyncLoader::ScopedPause const loader_pause;
+      for (TileIndex const& idx : to_unload)
       {
+        if (s_max_unload_per_pass > 0 && unloaded >= s_max_unload_per_pass)
+        {
+          break;
+        }
         unloadTile(idx);
+        ++unloaded;
       }
     }
     if (noggit::perf::FrameProfiler::get().on)
     {
       LogError << "[UNLOAD] resident=" << resident << " far=" << far_count
-               << " far_blocked_changed=" << far_blocked_changed << " unloaded=" << to_unload.size()
+               << " far_blocked_changed=" << far_blocked_changed
+               << " unloaded=" << unloaded << "/" << to_unload.size()
+               << (defer ? " DEFERRED(loader busy)" : "")
+               << " maxPerPass=" << s_max_unload_per_pass << " deferBacklog=" << s_defer_backlog
                << " unload_dist=" << _unload_dist
                << " loading_radius=" << QSettings().value("loading_radius", 1).toInt() << std::endl;
     }

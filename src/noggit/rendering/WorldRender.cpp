@@ -1744,6 +1744,17 @@ void WorldRender::draw (glm::mat4x4 const& model_view
   // legacy-doodad overlap test below is an O(1) lookup instead of an O(instances x spawns) walk.
   rebuildLegacySuppressIndex();
 
+  // [perf 2026-08-05] PERSISTENT tile-doodad path (NOGGIT_PERSISTENT_DOODADS=1). Static tile M2 doodads are
+  // drawn from tile-owned GPU buffers (uploaded once) with TILE-level cull + shader slice_dist clip, instead
+  // of the per-instance gather + per-frame upload below. Eligible (model, tile) buckets are skipped in the
+  // gather and collected here to draw in the instanced-doodad section. Off = unchanged behaviour.
+  static bool const s_persistent_doodads = []
+  {
+    char const* v = std::getenv("NOGGIT_PERSISTENT_DOODADS");
+    return v && *v && *v != '0';
+  }();
+  std::vector<std::pair<Model*, Noggit::Rendering::TileRender::DoodadInstanceBuffer>> persistent_doodad_draws;
+
   for (auto& pair : _world->_loaded_tiles_buffer)
   {
     MapTile* tile = pair.second;
@@ -1775,6 +1786,25 @@ void WorldRender::draw (glm::mat4x4 const& model_view
     // tile. Minimap render forces the test to >=1 so it draws everything.
     if (!minimap_render && tile->renderer()->objectsFrustumCullTest() == 0)
       continue;
+
+    // [perf 2026-08-05] Persistent tile-doodad buckets for THIS (visible) tile. Fetch once (rebuilds lazily
+    // if the tile's object set changed), collect them for the draw phase, and skip their models in the
+    // per-instance gather below so they aren't drawn twice. NB cross-tile-referenced doodads can appear in
+    // two tiles' buffers -> drawn twice, but tile doodads are opaque / alpha-key so the second draw is
+    // pixel-identical (no double-blend) -- harmless overdraw on a handful of border objects.
+    tsl::robin_map<Model*, Noggit::Rendering::TileRender::DoodadInstanceBuffer> const* tile_pbuf = nullptr;
+    if (s_persistent_doodads && !minimap_render && draw_models)
+    {
+      auto const& b = tile->renderer()->doodadInstanceBuffers();
+      if (!b.empty())
+      {
+        tile_pbuf = &b;
+        for (auto const& kv : b)
+        {
+          persistent_doodad_draws.emplace_back(kv.first, kv.second);
+        }
+      }
+    }
 
 
     // Per-chunk object gather (client MCRF semantics, checklist D1): on a PARTIALLY visible tile,
@@ -1813,6 +1843,12 @@ void WorldRender::draw (glm::mat4x4 const& model_view
 
             instance->frame = frame;
             auto m2_instance = static_cast<ModelInstance*>(instance);
+
+            // Drawn from the tile's persistent buffer instead (skip the per-frame gather for this model).
+            if (tile_pbuf && tile_pbuf->count(reinterpret_cast<Model*>(obj)))
+            {
+              continue;
+            }
 
             if (should_suppress_legacy_creature_instance(_world, *m2_instance, _legacy_suppress_index))
             {
@@ -1858,6 +1894,10 @@ void WorldRender::draw (glm::mat4x4 const& model_view
       if (pair.second[0]->which() == eMODEL)
       {
         if (!draw_models && !(minimap_render && minimap_render_settings->use_filters))
+          continue;
+
+        // Whole bucket drawn from the tile's persistent buffer -> skip the per-frame gather for it.
+        if (tile_pbuf && tile_pbuf->count(reinterpret_cast<Model*>(pair.first)))
           continue;
 
         auto& instances = models_to_draw[reinterpret_cast<Model*>(pair.first)];
@@ -3203,6 +3243,29 @@ void WorldRender::draw (glm::mat4x4 const& model_view
                        << pair.first->file_key().stringRepr()
                        << "'" << std::endl;
             }
+          }
+        }
+
+        // [perf 2026-08-05] PERSISTENT tile-doodad buckets: drawn straight from tile-owned GPU buffers (no
+        // gather, no per-frame transform upload, no per-instance cull -- tile-level cull + shader slice_dist
+        // clip). Same instanced program + shared M2RenderState as the models_to_draw loop above. Tile doodads
+        // slice at the object cull distance like terrain. (Pure-additive light doodads draw here rather than
+        // deferring past the water -- rare for tile MDDF, so the water-occlusion nicety is skipped.)
+        if (s_persistent_doodads && !persistent_doodad_draws.empty())
+        {
+          m2_shader.uniform("slice_dist", s_no_dist_fade ? 0.0f : _cull_distance);
+          noggit::perf::Scoped _prof_submit(noggit::perf::Phase::SubmitInst);
+          for (auto const& pd : persistent_doodad_draws)
+          {
+            Model* const m = pd.first;
+            if (!draw_hidden_models && m->is_hidden())
+            {
+              continue;
+            }
+            m->renderer()->drawPersistent(model_view, pd.second.transform_vbo, pd.second.interior_vbo,
+                                          static_cast<int>(pd.second.count), m2_shader, model_render_state,
+                                          _world->model_animtime);
+            _world->_n_rendered_objects += pd.second.count;
           }
         }
         } // end DoodadDraw scope (instanced doodad buckets)

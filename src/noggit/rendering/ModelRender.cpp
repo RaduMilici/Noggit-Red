@@ -1041,6 +1041,101 @@ void ModelRender::draw(glm::mat4x4 const& model_view
 
 }
 
+void ModelRender::drawPersistent(glm::mat4x4 const& model_view
+    , GLuint transform_vbo
+    , GLuint interior_vbo
+    , int instance_count
+    , OpenGL::Scoped::use_program& m2_shader
+    , OpenGL::M2RenderState& model_render_state
+    , int animtime
+)
+{
+  ZoneScopedN(NOGGIT_CURRENT_FUNCTION);
+
+  if (!_model->finishedLoading() || _model->loading_failed() || is_classic_effect_shell_model(_model))
+  {
+    return;
+  }
+  if (instance_count <= 0 || transform_vbo == 0)
+  {
+    return;
+  }
+
+  if (!_uploaded)
+  {
+    upload();
+  }
+  if (!_vao_setup)
+  {
+    setupVAO(m2_shader);
+  }
+
+  // Shared pose (no per-instance bones on tile doodads) -- identical to the batched instanced path: one
+  // animate() advances the model's bones + uploads its bone TBO (upload_bones defaults true).
+  if (_model->animated && (!_model->animcalc || _model->_per_instance_animation))
+  {
+    _model->animate(model_view, 0, animtime);
+    _model->animcalc = true;
+  }
+
+  OpenGL::Scoped::vao_binder const _(_vao);
+
+  // Point the shared VAO's per-instance attributes at THIS tile-model's persistent buffers (divisor 1).
+  // The dynamic path re-asserts transform+interior before its own draws, so leaving them pointed here is
+  // safe. model_origin stays 0: the persistent transforms already carry each instance's full world matrix.
+  {
+    OpenGL::Scoped::buffer_binder<GL_ARRAY_BUFFER> const tb(transform_vbo);
+    m2_shader.attrib("transform", 0, 1);
+  }
+  if (interior_vbo != 0)
+  {
+    OpenGL::Scoped::buffer_binder<GL_ARRAY_BUFFER> const ib(interior_vbo);
+    m2_shader.attrib("interior", 4, GL_FLOAT, GL_FALSE, sizeof(::glm::vec4), nullptr);
+    m2_shader.attrib_divisor("interior", 1, 1);
+  }
+
+  // Shared-bone uniforms (mirrors the batched instanced path's non-pib branch).
+  if (_model->animBones && _bone_matrices_buf_tex != 0 && _bone_matrices_buffer_size > 0
+      && !_model->bone_matrices.empty())
+  {
+    gl.activeTexture(GL_TEXTURE0);
+    gl.bindTexture(GL_TEXTURE_BUFFER, _bone_matrices_buf_tex);
+    m2_shader.uniform("anim_bones", true);
+    m2_shader.uniform("bone_matrix_count", static_cast<int>(_model->bone_matrices.size()));
+    m2_shader.uniform("per_instance_bone_stride", 0);
+  }
+  else
+  {
+    m2_shader.uniform("anim_bones", false);
+    m2_shader.uniform("bone_matrix_count", 0);
+    m2_shader.uniform("per_instance_bone_stride", 0);
+  }
+
+  OpenGL::Scoped::buffer_binder<GL_ELEMENT_ARRAY_BUFFER> indices_binder(_indices_buffer);
+
+  // One instanced draw per pass over the whole bucket, full alpha (fade=1 -> no blend promotion, no depth
+  // prepass). representative=nullptr: doodads have no per-instance skin/geoset resolves.
+  for (ModelRenderPass& p : _render_passes)
+  {
+    if (p.prepareDraw(m2_shader, _model, nullptr, model_render_state, 1.0f))
+    {
+      gl.drawElementsInstanced(GL_TRIANGLES, p.index_count, GL_UNSIGNED_SHORT,
+                               reinterpret_cast<void*>(p.index_start * sizeof(GLushort)),
+                               static_cast<GLsizei>(instance_count));
+      p.afterDraw();
+    }
+  }
+
+  // Same end-of-draw GL/state reset as the batched instanced path (this runs once per model in a loop that
+  // SHARES one M2RenderState) so an additive-glow bucket can't leak blend state into the next model.
+  gl.disable(GL_BLEND);
+  gl.enable(GL_CULL_FACE);
+  gl.depthMask(GL_TRUE);
+  model_render_state.blend = 0xFFFF;
+  model_render_state.backface_cull = true;
+  model_render_state.z_buffered = false;
+}
+
 void ModelRender::drawParticles(glm::mat4x4 const& model_view
     , OpenGL::Scoped::use_program& particles_shader
     , std::size_t instance_count

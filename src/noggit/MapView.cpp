@@ -123,6 +123,8 @@
 #include <QTextStream>
 
 #include <algorithm>
+#include <sstream>
+#include <cctype>
 #include <cmath>
 #include <cstdlib>
 #include <functional>
@@ -8051,11 +8053,55 @@ void MapView::paintGL()
         if (K32GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc))) // kernel32-exported, no psapi.lib
           ws_mb = pmc.WorkingSetSize / (1024u * 1024u);
 #endif
+        // VRAM readout (NVIDIA GL_NVX_gpu_memory_info / AMD GL_ATI_meminfo). Vendor-gated so we never issue
+        // an unsupported enum (that would trip the once-per-frame GL error check). used=dedicated-available.
+        // evict/s (NVIDIA) = the driver paging VRAM<->RAM over PCIe -- the direct signal for a VRAM-pressure
+        // loading STUTTER: if it climbs while flying into new tiles, we're VRAM-capacity-bound.
+        static int s_vram_vendor = -2; // -2 uninit, -1 none/unknown, 0 nvidia, 1 amd
+        if (s_vram_vendor == -2)
+        {
+          s_vram_vendor = -1;
+          if (GLubyte const* v = gl.getString(GL_VENDOR))
+          {
+            std::string vs(reinterpret_cast<char const*>(v));
+            std::transform(vs.begin(), vs.end(), vs.begin(), [](unsigned char c){ return (char)std::tolower(c); });
+            if (vs.find("nvidia") != std::string::npos) s_vram_vendor = 0;
+            else if (vs.find("ati") != std::string::npos || vs.find("amd") != std::string::npos
+                     || vs.find("radeon") != std::string::npos) s_vram_vendor = 1;
+          }
+        }
+        std::string vram;
+        if (s_vram_vendor == 0)
+        {
+          constexpr GLenum NVX_DEDICATED = 0x9047, NVX_AVAILABLE = 0x9049, NVX_EVICTION_COUNT = 0x904A, NVX_EVICTED = 0x904B;
+          GLint ded = 0, avail = 0, evc = 0, evm = 0;
+          gl.getIntegerv(NVX_DEDICATED, &ded);
+          gl.getIntegerv(NVX_AVAILABLE, &avail);
+          gl.getIntegerv(NVX_EVICTION_COUNT, &evc);
+          gl.getIntegerv(NVX_EVICTED, &evm);
+          static GLint s_prev_evc = 0;
+          GLint const evc_delta = (s_prev_evc == 0) ? 0 : (evc - s_prev_evc); // per-report evictions = stutter rate
+          s_prev_evc = evc;
+          std::ostringstream os;
+          os << " vram=" << ((ded - avail) / 1024) << "/" << (ded / 1024) << "MB"
+             << " evict/s=" << evc_delta << " evictedNow=" << (evm / 1024) << "MB";
+          vram = os.str();
+        }
+        else if (s_vram_vendor == 1)
+        {
+          constexpr GLenum ATI_TEXTURE_FREE_MEMORY = 0x87FC;
+          GLint info[4] = {0, 0, 0, 0}; // [total_free, largest_free_block, total_aux_free, largest_aux_free] KB
+          gl.getIntegerv(ATI_TEXTURE_FREE_MEMORY, info);
+          std::ostringstream os;
+          os << " vramFree=" << (info[0] / 1024) << "MB";
+          vram = os.str();
+        }
         LogError << "[MEM] workingSet=" << ws_mb << "MB"
                  << " models=" << ModelManager::loaded_count()
                  << " textures=" << TextureManager::loaded_count()
                  << " wmos=" << WMOManager::loaded_count()
                  << " tiles=" << (_world ? _world->mapIndex.getNLoadedTiles() : 0u)
+                 << vram
                  << std::endl;
       }
     }
@@ -8295,8 +8341,27 @@ void MapView::tick (float dt)
   NOGGIT_ACTION_MGR->endActionOnModalityMismatch(action_modality);
 
   // start unloading tiles
-  _world->mapIndex.enterTile (TileIndex (_camera.position));
-  _world->mapIndex.unloadTiles (TileIndex (_camera.position));
+  // [perf 2026-08-05] Pinpoint the tick (Overlays) stall: time enterTile (loadTile ctor+queue) vs
+  // unloadTiles (tile free -> ~MapTile -> ensure_deletable waits on in-flight loads) separately.
+  if (noggit::perf::FrameProfiler::get().on)
+  {
+    auto const t0 = std::chrono::steady_clock::now();
+    _world->mapIndex.enterTile (TileIndex (_camera.position));
+    auto const t1 = std::chrono::steady_clock::now();
+    _world->mapIndex.unloadTiles (TileIndex (_camera.position));
+    auto const t2 = std::chrono::steady_clock::now();
+    double const enter_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    double const unload_ms = std::chrono::duration<double, std::milli>(t2 - t1).count();
+    if (enter_ms > 15.0 || unload_ms > 15.0)
+    {
+      LogError << "[TICK-STALL] enterTile=" << enter_ms << "ms unloadTiles=" << unload_ms << "ms" << std::endl;
+    }
+  }
+  else
+  {
+    _world->mapIndex.enterTile (TileIndex (_camera.position));
+    _world->mapIndex.unloadTiles (TileIndex (_camera.position));
+  }
 
   dt = std::min(dt, 1.0f);
 

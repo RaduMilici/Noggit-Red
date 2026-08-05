@@ -513,8 +513,10 @@ public:
 
   void updateTilesEntry(selection_type const& entry, model_update type);
   void updateTilesEntry(SceneObject* entry, model_update type);
-  void updateTilesWMO(WMOInstance* wmo, model_update type);
-  void updateTilesModel(ModelInstance* m2, model_update type);
+  // mark_changed=false: register into tiles without flagging them dirty (load-time UID-reassign / reload;
+  // see world_tile_update_queue::queue_update). Real edits use the default so their changes still persist.
+  void updateTilesWMO(WMOInstance* wmo, model_update type, bool mark_changed = true);
+  void updateTilesModel(ModelInstance* m2, model_update type, bool mark_changed = true);
   void wait_for_all_tile_updates();
 
   void deleteModelInstance(int uid);

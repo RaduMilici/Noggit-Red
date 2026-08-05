@@ -8,8 +8,12 @@
 #include <opengl/shader.hpp>
 #include <array>
 
+#include <external/tsl/robin_map.h>
+#include <glm/mat4x4.hpp>
+
 class MapTile;
 class MapChunk;
+class Model;
 
 namespace Noggit::Rendering
 {
@@ -61,6 +65,20 @@ namespace Noggit::Rendering
     bool isOverridingOcclusionCulling() const { return _tile_occlusion_cull_override; };
     void setOverrideOcclusionCulling(bool state) { _tile_occlusion_cull_override = state; };
 
+    // [perf 2026-08-05] Persistent per-model doodad instance buffers. A tile's static (non-per-instance-
+    // animated) M2 doodads are uploaded ONCE per model to a GPU buffer here and reused every frame -- the
+    // renderer draws the whole bucket (tile-level cull + shader slice_dist clip) instead of re-culling +
+    // re-uploading every instance per frame. Rebuilt lazily from MapTile::object_instances whenever the
+    // tile's object set changes (MapTile::doodadBuffersDirty()); freed in unload().
+    struct DoodadInstanceBuffer
+    {
+      GLuint transform_vbo = 0;
+      GLuint interior_vbo = 0;   // per-instance interior (all-zero for outdoor tile doodads; kept for WMO reuse)
+      GLsizei count = 0;
+    };
+    // Rebuilds if the tile's object set changed since the last build; returns the current per-model buffers.
+    [[nodiscard]] tsl::robin_map<Model*, DoodadInstanceBuffer> const& doodadInstanceBuffers();
+
   private:
 
     void uploadTextures();
@@ -97,6 +115,11 @@ namespace Noggit::Rendering
 
     GLuint const& _chunk_instance_data_ubo = _buffers[0];
     OpenGL::ChunkInstanceDataUniformBlock _chunk_instance_data[256];
+
+    // persistent per-model doodad instance buffers (raw GL names -- lifetime managed by rebuild/free below)
+    tsl::robin_map<Model*, DoodadInstanceBuffer> _doodad_instance_buffers;
+    void rebuildDoodadInstanceBuffers();
+    void freeDoodadInstanceBuffers();
 
   };
 }

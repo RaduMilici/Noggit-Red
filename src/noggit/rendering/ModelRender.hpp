@@ -175,6 +175,22 @@ namespace Noggit::Rendering
         , std::vector<glm::mat4x4> const& per_instance_bones = {}
     );
 
+    // [perf 2026-08-05] Draw a whole persistent doodad bucket from an EXTERNAL, tile-owned instance buffer
+    // (TileRender::DoodadInstanceBuffer) -- no per-frame gather, no transform upload, no per-instance cull.
+    // The caller frustum-culls at TILE granularity and the fragment shader distance-clips (slice_dist); this
+    // just binds the external transform + interior buffers to the shared VAO's instance attributes and draws
+    // every pass once at full alpha (fade=1). For static tile M2 doodads only (outdoor, no per-instance
+    // bones / no emitters). transform_vbo carries each instance's full world matrix; interior_vbo the
+    // per-instance room light (all-zero for tile doodads). representative=nullptr (doodads).
+    void drawPersistent(glm::mat4x4 const& model_view
+        , GLuint transform_vbo
+        , GLuint interior_vbo
+        , int instance_count
+        , OpenGL::Scoped::use_program& m2_shader
+        , OpenGL::M2RenderState& model_render_state
+        , int animtime
+    );
+
     void drawParticles(glm::mat4x4 const& model_view
         , OpenGL::Scoped::use_program& particles_shader
         , std::size_t instance_count

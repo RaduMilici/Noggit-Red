@@ -33,6 +33,7 @@ namespace Noggit::Rendering
   class ModelRender;
   struct ModelRenderPass;
   class WorldRender;
+  class TileRender;
 }
 
 
@@ -175,6 +176,7 @@ struct ModelLight {
 class Model : public AsyncObject
 {
   friend class Noggit::Rendering::ModelRender;
+  friend class Noggit::Rendering::TileRender;
   friend struct Noggit::Rendering::ModelRenderPass;
   friend class Noggit::Rendering::WorldRender;
   friend class ParticleSystem;

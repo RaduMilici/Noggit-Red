@@ -66,6 +66,25 @@ void AsyncLoader::wait_until_idle()
   });
 }
 
+void AsyncLoader::pause()
+{
+  std::unique_lock<std::mutex> lock(_guard);
+  _paused = true;
+  // Wait ONLY for the in-flight loads to finish (<= worker count), NOT the whole _to_load backlog. Workers
+  // that finish park in the wake-condition above (paused) instead of grabbing more, so _currently_loading
+  // drains and stays empty until resume(). The loader is then quiescent -> freeing tiles is race-free.
+  _state_changed.wait(lock, [&] { return _currently_loading.empty(); });
+}
+
+void AsyncLoader::resume()
+{
+  {
+    std::unique_lock<std::mutex> lock(_guard);
+    _paused = false;
+  }
+  _state_changed.notify_all(); // wake the parked workers to resume streaming
+}
+
 void AsyncLoader::process()
 {
 #if defined(_WIN32)
@@ -118,13 +137,16 @@ void AsyncLoader::process()
     {    
       std::unique_lock<std::mutex> lock (_guard);
 
-      _state_changed.wait 
+      _state_changed.wait
       ( lock
       , [&]
         {
-          return !!_stop || std::any_of ( _to_load.begin(), _to_load.end()
+          // While paused, don't pick up new work (a tile unload is freeing objects race-free). A worker
+          // already mid-load isn't affected -- it finishes, removes itself from _currently_loading, then
+          // parks here until resume(). That bounds pause()'s wait to the in-flight loads only.
+          return !!_stop || (!_paused && std::any_of ( _to_load.begin(), _to_load.end()
                                         , [](auto const& to_load) { return !to_load.empty(); }
-                                        );
+                                        ));
         }
       );
 

@@ -175,6 +175,13 @@ public:
 
   std::array<ObjectBucket, 256> const& getObjectBuckets();
 
+  // [perf 2026-08-05] Persistent per-model doodad instance buffers (TileRender). This dirty flag rides the
+  // SAME add/remove/move signal as _object_buckets_dirty (moves = remove+add through updateTilesEntry), so
+  // an edit that invalidates the cull buckets also invalidates the persistent GPU buffers -- TileRender
+  // rebuilds them lazily on next draw. No new invalidation surface.
+  bool doodadBuffersDirty() const { return _doodad_instance_buffers_dirty; }
+  void clearDoodadBuffersDirty() { _doodad_instance_buffers_dirty = false; }
+
   float camDist() { return _cam_dist; }
   void calcCamDist(glm::vec3 const& camera);
   void markExtentsDirty() { _extents_dirty = true; }
@@ -219,6 +226,7 @@ private:
 
   std::array<ObjectBucket, 256> _object_buckets;
   bool _object_buckets_dirty = true;
+  bool _doodad_instance_buffers_dirty = true; // persistent per-model doodad buffers (TileRender); see doodadBuffersDirty()
   void rebuildObjectBuckets();
 
   std::unique_ptr<MapChunk> mChunks[16][16];

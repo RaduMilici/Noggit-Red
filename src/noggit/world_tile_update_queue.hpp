@@ -32,7 +32,11 @@ namespace Noggit
 
     void wait_for_all_update();
 
-    void queue_update(SceneObject* instance, model_update type);
+    // mark_changed=false: register the instance into its tiles WITHOUT flagging them dirty/unsaved. Used by
+    // the load-time path (UID-collision reassignment / tile reload) so streamed-in tiles stay UNLOADABLE --
+    // flagging them changed pinned them resident forever = unbounded memory growth on a long fly. Real user
+    // edits keep the default true so their changes still persist/flag for save. [perf 2026-08-05]
+    void queue_update(SceneObject* instance, model_update type, bool mark_changed = true);
 
   private:
     void process_queue();

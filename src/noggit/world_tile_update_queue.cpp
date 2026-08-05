@@ -20,9 +20,10 @@ namespace Noggit
     instance_update& operator= (instance_update const&) = delete;
     instance_update& operator= (instance_update&&) = default;
 
-    instance_update(SceneObject* obj, model_update type)
+    instance_update(SceneObject* obj, model_update type, bool mark_changed_)
       : instance(obj)
       , update_type(type)
+      , mark_changed(mark_changed_)
     {
 
     }
@@ -48,13 +49,14 @@ namespace Noggit
       {
         for (size_t x = x0; x <= x1; ++x)
         {
-          world->mapIndex.update_model_tile(TileIndex(x, z), update_type, instance);
+          world->mapIndex.update_model_tile(TileIndex(x, z), update_type, instance, mark_changed);
         }
       }
     }
 
     SceneObject* instance;
     model_update update_type;
+    bool mark_changed;
   };
 
   world_tile_update_queue::world_tile_update_queue(World* world)
@@ -89,12 +91,12 @@ namespace Noggit
     );
   }
 
-  void world_tile_update_queue::queue_update(SceneObject* instance, model_update type)
+  void world_tile_update_queue::queue_update(SceneObject* instance, model_update type, bool mark_changed)
   {
     {
       std::lock_guard<std::mutex> const lock(_mutex);
 
-      _update_queue.emplace(new instance_update(instance, type));
+      _update_queue.emplace(new instance_update(instance, type, mark_changed));
       _state_changed.notify_one();
     }
     // make sure deletion are done here

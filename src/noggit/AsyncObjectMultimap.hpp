@@ -124,8 +124,20 @@ namespace Noggit
 
         {
           std::scoped_lock lock(_mutex);
-          _elements.erase(pair);
-          _counts.erase(pair);
+          // [CRASH FIX 2026-08-05] RE-CHECK the count under the lock before deleting. Between dropping the
+          // lock above (after --count hit 0) and here, a CONCURRENT emplace on the loader thread -- loading
+          // another tile that references this same shared model/texture -- can revive the count (0 -> 1) and
+          // hand a LIVE instance a pointer to this very object (unordered_map keeps element addresses stable
+          // across rehash, so `obj` stays valid). Erasing it then would delete an object a live instance
+          // still references -> UAF (the tile-unload crash that MapIndex::unloadTiles previously masked by
+          // stalling the whole loader quiescent). Only erase if it's STILL unreferenced. If it was revived,
+          // ensure_deletable() above merely cancelled a redundant reload of an already-loaded object -- harmless.
+          auto const count_it = _counts.find(pair);
+          if (count_it != _counts.end() && count_it->second == 0)
+          {
+            _elements.erase(pair);
+            _counts.erase(pair);
+          }
         }
       }
     }

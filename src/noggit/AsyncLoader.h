@@ -36,6 +36,24 @@ public:
   bool is_loading();
   void wait_until_idle();
 
+  // [perf 2026-08-05] Bounded alternative to wait_until_idle for the tile-unload race. pause() stops workers
+  // picking up NEW loads and blocks only until the IN-FLIGHT loads finish (<= worker count, ~ms) -- vs
+  // wait_until_idle which drains the whole _to_load backlog (hundreds of items during a fast fly = a
+  // multi-hundred-ms main-thread stall = the streaming lag spike). While paused the loader is quiescent, so
+  // freeing tiles is race-free exactly as under wait_until_idle. resume() MUST be called after (use the RAII
+  // LoaderPause guard). Re-entrant pause is not supported -- one pause/resume pair at a time.
+  void pause();
+  void resume();
+
+  // RAII: pause the loader for the scope, resume on exit (even on exception).
+  struct ScopedPause
+  {
+    ScopedPause() { AsyncLoader::instance().pause(); }
+    ~ScopedPause() { AsyncLoader::instance().resume(); }
+    ScopedPause(ScopedPause const&) = delete;
+    ScopedPause& operator=(ScopedPause const&) = delete;
+  };
+
   AsyncLoader(int numThreads);
   ~AsyncLoader();
 
@@ -52,4 +70,5 @@ private:
   std::list<AsyncObject*> _currently_loading;
   std::list<std::thread> _threads;
   bool _important_object_failed_loading = false;
+  bool _paused = false; // when set, workers finish their current object then stop picking up new loads
 };

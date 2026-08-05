@@ -1255,6 +1255,7 @@ void MapTile::remove_model(uint32_t uid)
     instance->derefTile(this);
     _requires_object_extents_recalc = true;
     _object_buckets_dirty = true;
+    _doodad_instance_buffers_dirty = true;
   }
 }
 
@@ -1284,6 +1285,7 @@ void MapTile::remove_model(SceneObject* instance)
 
     _requires_object_extents_recalc = true;
     _object_buckets_dirty = true;
+    _doodad_instance_buffers_dirty = true;
   }
 }
 
@@ -1319,6 +1321,8 @@ void MapTile::add_model(uint32_t uid)
     }
 
     _object_buckets_dirty = true;
+
+    _doodad_instance_buffers_dirty = true;
     instance->refTile(this);
   }
 }
@@ -1353,6 +1357,8 @@ void MapTile::add_model(SceneObject* instance)
     }
 
     _object_buckets_dirty = true;
+
+    _doodad_instance_buffers_dirty = true;
     instance->refTile(this);
   }
 }

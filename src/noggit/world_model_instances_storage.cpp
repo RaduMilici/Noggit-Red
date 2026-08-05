@@ -2,6 +2,7 @@
 
 #include <noggit/world_model_instances_storage.hpp>
 #include <noggit/World.h>
+#include <noggit/MapTile.h>
 #include <noggit/ActionManager.hpp>
 #include <noggit/Action.hpp>
 
@@ -25,7 +26,11 @@ namespace Noggit
 
     if (from_reloading || uid_after != uid)
     {
-      _world->updateTilesModel(&_m2s.at(uid_after), model_update::add);
+      // [perf 2026-08-05] mark_changed=FALSE: this fires on LOAD (a UID-collision reassignment, common in
+      // custom/Turtle maps, or a tile reload) -- NOT a user edit. Flagging the tiles changed pinned them
+      // resident forever (changed tiles never unload) -> unbounded RAM on a long fly. User adds/moves flag
+      // changed via updateTilesEntry separately.
+      _world->updateTilesModel(&_m2s.at(uid_after), model_update::add, /*mark_changed*/ false);
     }
 
     return uid_after;
@@ -73,7 +78,9 @@ namespace Noggit
 
     if (from_reloading || uid_after != uid)
     {
-      _world->updateTilesWMO(&_wmos.at(uid_after), model_update::add);
+      // [perf 2026-08-05] mark_changed=FALSE on LOAD (UID reassignment / reload), not a user edit -- see the
+      // M2 path above. Keeps streamed-in WMO tiles unloadable so RAM stays bounded on a long fly.
+      _world->updateTilesWMO(&_wmos.at(uid_after), model_update::add, /*mark_changed*/ false);
     }
 
     return uid_after;
@@ -210,18 +217,53 @@ namespace Noggit
 
   void world_model_instances_storage::unload_instance_and_remove_from_selection_if_necessary(std::uint32_t uid)
   {
-    std::unique_lock<std::mutex> const lock (_mutex);
-
-    if (!unsafe_uid_is_used(uid))
+    // [CRASH FIX 2026-08-05] A cross-tile instance (spans >1 ADT) gets registered into neighbour tiles'
+    // object_instances (via the tile-update queue on reload / UID-collision reassignment) but the storage
+    // refcount only ever counted its OWNING tile -- so the owning tile's unload dropped the count to 0 and
+    // freed it while neighbour tiles still held the pointer -> dangling read in MapTile::rebuildObjectBuckets
+    // (0xC0000005, exposed once tiles actually unload). So when the count hits 0, scrub it from every tile
+    // that still references it BEFORE destroying it. getTiles() already excludes the unloading tile (~MapTile
+    // derefTile'd it before calling here), so this only touches SURVIVING neighbours.
+    SceneObject* to_free = nullptr;
+    std::vector<MapTile*> tiles;
     {
-      LogError << "Trying to unload an instance that wasn't stored" << std::endl;
-      return;
-    }
+      std::unique_lock<std::mutex> const lock (_mutex);
 
-    if (--_instance_count_per_uid.at(uid) == 0)
-    {
+      if (!unsafe_uid_is_used(uid))
+      {
+        LogError << "Trying to unload an instance that wasn't stored" << std::endl;
+        return;
+      }
+
+      if (--_instance_count_per_uid.at(uid) != 0)
+      {
+        return; // still referenced by another tile -- keep it
+      }
+
       _world->remove_from_selection(uid);
 
+      if (auto m2it = _m2s.find(uid); m2it != _m2s.end())      { to_free = &m2it->second; }
+      else if (auto wit = _wmos.find(uid); wit != _wmos.end()) { to_free = &wit->second; }
+      if (to_free)
+      {
+        tiles = to_free->getTiles();
+      }
+    }
+
+    // Storage lock RELEASED before touching tiles: t->remove_model locks the tile mutex, and never the
+    // storage mutex, so releasing here keeps the lock order one-way (no storage<->tile cycle -> no deadlock
+    // even if a tile->storage path runs concurrently). The instance object itself is not erased until below,
+    // so `to_free` stays valid; unload runs under ScopedPause so nothing rehashes _m2s/_wmos meanwhile.
+    for (MapTile* t : tiles)
+    {
+      if (t)
+      {
+        t->remove_model(to_free);
+      }
+    }
+
+    {
+      std::unique_lock<std::mutex> const lock (_mutex);
       _instance_count_per_uid.erase(uid);
       _m2s.erase(uid);
       _wmos.erase(uid);

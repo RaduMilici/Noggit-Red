@@ -3,9 +3,13 @@
 #include <noggit/rendering/TileRender.hpp>
 #include <noggit/MapTile.h>
 #include <noggit/MapChunk.h>
+#include <noggit/Model.h>
+#include <noggit/SceneObject.hpp>
 #include <noggit/ui/TexturingGUI.h>
 #include <noggit/frame_profiler.hpp>
 #include <external/tracy/Tracy.hpp>
+
+#include <glm/vec4.hpp>
 
 #include <algorithm>
 #include <vector>
@@ -69,10 +73,113 @@ void TileRender::unload()
   }
 
 
+  freeDoodadInstanceBuffers();
+
   _map_tile->_chunk_update_flags = ChunkUpdateFlags::VERTEX | ChunkUpdateFlags::ALPHAMAP
                                   | ChunkUpdateFlags::SHADOW | ChunkUpdateFlags::MCCV
                                   | ChunkUpdateFlags::NORMALS| ChunkUpdateFlags::HOLES
                                   | ChunkUpdateFlags::AREA_ID| ChunkUpdateFlags::FLAGS;
+}
+
+
+// [perf 2026-08-05] Persistent per-model doodad instance buffers. Static tile M2 doodads are uploaded once
+// per model (world transforms + a zero interior attribute -- tile doodads are outdoor, client MDDF) and the
+// renderer draws the whole bucket every frame with tile-level cull + shader slice_dist clip, instead of
+// re-culling + re-uploading each instance per frame. Rebuilt lazily when the tile's object set changes.
+tsl::robin_map<Model*, TileRender::DoodadInstanceBuffer> const& TileRender::doodadInstanceBuffers()
+{
+  if (_map_tile->doodadBuffersDirty())
+  {
+    rebuildDoodadInstanceBuffers();
+  }
+  return _doodad_instance_buffers;
+}
+
+void TileRender::rebuildDoodadInstanceBuffers()
+{
+  freeDoodadInstanceBuffers();
+
+  bool all_loaded = true;
+
+  for (auto const& pair : _map_tile->getObjectInstances())
+  {
+    if (pair.second.empty() || pair.second[0]->which() != eMODEL)
+    {
+      continue;
+    }
+
+    Model* const model = reinterpret_cast<Model*>(pair.first);
+
+    // Not loaded yet -> leave dirty so we rebuild next frame once its geometry is up (self-healing).
+    if (!model->finishedLoading())
+    {
+      all_loaded = false;
+      continue;
+    }
+
+    // Models with particles/ribbons stay on the DYNAMIC path: the particle pass instance-counts off the
+    // per-frame transform buffer, which the persistent path never populates. Tile doodads with emitters
+    // are rare (torches/braziers are usually gameobjects or WMO doodads), so the loss is negligible.
+    if (!model->_particles.empty() || !model->_ribbons.empty())
+    {
+      continue;
+    }
+
+    std::vector<glm::mat4x4> transforms;
+    transforms.reserve(pair.second.size());
+    for (auto* instance : pair.second)
+    {
+      transforms.push_back(instance->transformMatrix());
+    }
+    if (transforms.empty())
+    {
+      continue;
+    }
+    // Interior is a per-instance attribute in the m2 instanced shader; tile doodads are outdoor so it is
+    // all-zero. A dedicated (static) buffer keeps the same VAO attribute wiring the dynamic path uses and
+    // is reused verbatim when this machinery is extended to WMO doodads (which carry real room colours).
+    std::vector<glm::vec4> const interiors(transforms.size(), glm::vec4(0.0f));
+
+    DoodadInstanceBuffer buf;
+    buf.count = static_cast<GLsizei>(transforms.size());
+
+    gl.genBuffers(1, &buf.transform_vbo);
+    gl.bindBuffer(GL_ARRAY_BUFFER, buf.transform_vbo);
+    gl.bufferData(GL_ARRAY_BUFFER, transforms.size() * sizeof(glm::mat4x4), transforms.data(), GL_STATIC_DRAW);
+
+    gl.genBuffers(1, &buf.interior_vbo);
+    gl.bindBuffer(GL_ARRAY_BUFFER, buf.interior_vbo);
+    gl.bufferData(GL_ARRAY_BUFFER, interiors.size() * sizeof(glm::vec4), interiors.data(), GL_STATIC_DRAW);
+
+    _doodad_instance_buffers.emplace(model, buf);
+  }
+
+  gl.bindBuffer(GL_ARRAY_BUFFER, 0);
+
+  // Only clear the dirty flag once every model was loaded; otherwise rebuild next frame (self-healing).
+  if (all_loaded)
+  {
+    _map_tile->clearDoodadBuffersDirty();
+  }
+}
+
+void TileRender::freeDoodadInstanceBuffers()
+{
+  for (auto& kv : _doodad_instance_buffers)
+  {
+    // Local copies: the map's mapped value is const through this iterator, and deleteBuffers wants GLuint*.
+    GLuint t = kv.second.transform_vbo;
+    GLuint i = kv.second.interior_vbo;
+    if (t)
+    {
+      gl.deleteBuffers(1, &t);
+    }
+    if (i)
+    {
+      gl.deleteBuffers(1, &i);
+    }
+  }
+  _doodad_instance_buffers.clear();
 }
 
 

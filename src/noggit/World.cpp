@@ -6466,16 +6466,16 @@ void World::updateTilesEntry(SceneObject* entry, model_update type)
 
 }
 
-void World::updateTilesWMO(WMOInstance* wmo, model_update type)
+void World::updateTilesWMO(WMOInstance* wmo, model_update type, bool mark_changed)
 {
   ZoneScoped;
-  _tile_update_queue.queue_update(wmo, type);
+  _tile_update_queue.queue_update(wmo, type, mark_changed);
 }
 
-void World::updateTilesModel(ModelInstance* m2, model_update type)
+void World::updateTilesModel(ModelInstance* m2, model_update type, bool mark_changed)
 {
   ZoneScoped;
-  _tile_update_queue.queue_update(m2, type);
+  _tile_update_queue.queue_update(m2, type, mark_changed);
 }
 
 void World::wait_for_all_tile_updates()
