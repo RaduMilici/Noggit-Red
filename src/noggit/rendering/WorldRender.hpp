@@ -232,6 +232,7 @@ namespace Noggit::Rendering
     GLsizeiptr _mdi_arena_vbo_cap = 0, _mdi_arena_ibo_cap = 0;
     GLsizei _mdi_arena_vtx = 0, _mdi_arena_idx = 0;
     GLsizeiptr _mdi_inst_cap = 0, _mdi_indirect_cap = 0;          // current instance/indirect buffer byte capacities
+    std::vector<std::pair<Model*, TileRender::DoodadInstanceBuffer const*>> _mdi_all_loaded; // GPU-driven P1: ALL loaded tiles' doodads (camera-independent) -> batch rebuilds only on tile load/unload
     std::vector<glm::mat4x4> _mdi_scratch_tf;                     // per-frame scratch (retained to avoid re-alloc)
     std::vector<glm::vec4>   _mdi_scratch_interior;
     std::vector<glm::ivec4>  _mdi_scratch_tex;

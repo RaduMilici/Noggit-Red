@@ -76,7 +76,10 @@ namespace
 		// with MySQL DISABLED but a stale/unreachable host (e.g. Ascension: enabled=false, server=
 		// 192.168.1.28) blocks the main thread in mysql_real_connect on every map open and freezes the
 		// editor. If the user turned MySQL off for this project, do not connect at all.
-		if (!Noggit::mysqlSetting("enabled", true).toBool())
+		// DEFAULT FALSE: MySQL stays OFF unless the project has EXPLICITLY enabled it. Every other call site
+		// (MapView, map_index, NoggitWindow) already defaults to false; this one defaulted to TRUE, so a
+		// project that never configured MySQL would try to connect (and freeze / break the user's setup).
+		if (!Noggit::mysqlSetting("enabled", false).toBool())
 		{
 			if (error)
 			{

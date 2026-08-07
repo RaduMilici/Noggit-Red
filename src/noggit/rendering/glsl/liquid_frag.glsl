@@ -208,13 +208,28 @@ void main()
     //    the dark deep "fatigue" color far out (the shore lightening the in-game ocean has).
     //  - alpha_depth: a STEEPER ramp to opaque so the per-tile seafloor terrain stays hidden in
     //    deeper water (no "tile" seams) while shallow water near shore still shows the bottom.
-    float color_depth = clamp(depth_ * 0.012, 0.0, 1.0); // ~light -> dark over ~80 units
+    // color_depth: shallow (shore/edge, LIGHT colour) -> deep (DARK colour). The OCEAN is genuinely deep and
+    // wants a BROAD ~80-unit gradient (light shore fading to the deep "fatigue" blue far out). RIVERS/canals
+    // are SHALLOW (~5-20 units), so the 80-unit ramp never reaches their deep colour -> the whole river reads
+    // shallow-GREEN (user report: "rivers all green, should be blue in the middle / green on the sides", and
+    // Stormwind canal green up close). Give rivers a MUCH steeper ramp so the deep (blue) river colour shows
+    // in the channel middle by ~20 units while the shallow edges stay on the green LIGHT colour.
+    float ocean_color_depth = clamp(depth_ * 0.012, 0.0, 1.0); // ocean: light -> dark over ~80 units
+    float river_color_depth = clamp(depth_ * 0.05,  0.0, 1.0); // river: reaches the deep (blue) colour by ~20 units
     float alpha_depth = clamp(depth_ * 0.08,  0.0, 1.0); // ~opaque by ~12 units
 
+    // Rivers/canals: the in-game city water is a fairly UNIFORM muted dark teal -- its depth colour gradient
+    // is barely visible. So use ONE dark-teal base (clean ocean deep-water blue nudged ~25% toward the zone's
+    // green, then DARKENED to the client's muted look) with only a SUBTLE depth darkening on top, instead of a
+    // strong shallow->deep colour ramp. The bright foam flecks come from the additive water-texture shine. The
+    // river ALPHA still depth-ramps for transparency. Ocean branch unchanged. Knobs: green 0.25, dark 0.72,
+    // depth-darken 0.22.
+    vec3 river_base = mix(OceanColorLight.rgb, RiverColorLight.rgb, 0.25) * 0.72;
+    float cd = (type == 1) ? ocean_color_depth : river_color_depth;
     vec4 lerp = (type == 1)
-              ? mix (OceanColorLight, OceanColorDark, color_depth)
-              : mix (RiverColorLight, RiverColorDark, color_depth)
-              ;
+              ? mix (OceanColorLight, OceanColorDark, cd)
+              : vec4(river_base * (1.0 - 0.22 * river_color_depth),
+                     mix(RiverColorLight.a, RiverColorDark.a, cd));
 
     // (A4 authored-alpha RESOLVED 2026-07-13: the earlier "too transparent" was the LightParams
     // OFF-BY-ONE, not zero endpoints -- the classic branch read river_shallow from the glow column

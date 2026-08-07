@@ -221,10 +221,29 @@ void WMOInstance::updateDetails(Noggit::Ui::detail_infos* detail_widget)
 
 void WMOInstance::recalcExtents()
 {
-  // todo: keep track of whether the extents need to be recalculated or not
   // keep the old extents since they are saved in the adt
   if (wmo->loading_failed() || !wmo->finishedLoading())
   {
+    return;
+  }
+
+  // [perf 2026-08-07] Self-invalidating cache: the full rebuild below (matrix-transform 8 corners per group,
+  // heap allocs, update_doodads) ran on EVERY call, and camera_is_inside_wmo/collect_camera_fog/the WMO pass
+  // call this for all ~236 loaded WMOs every frame = ~5.45ms/frame recomputing values that never change
+  // (WMOs are static after load). Skip the rebuild when the transform is unchanged and the requested group
+  // extents are already built. Change is detected on pos/dir/scale, which the editor mutates on any move/
+  // rotate/scale -> no edit path can leave a stale AABB, and no per-edit bookkeeping is needed.
+  bool const transform_changed = !(_extents_cache_scale == scale
+                                   && _extents_cache_pos == pos
+                                   && _extents_cache_dir == dir);
+  if (transform_changed)
+  {
+    _group_extents_computed = false; // any cached group AABBs are now stale
+  }
+  bool const need_groups = _update_group_extents && !_group_extents_computed;
+  if (!transform_changed && !need_groups)
+  {
+    _update_group_extents = false; // request satisfied from the cache
     return;
   }
 
@@ -268,12 +287,21 @@ void WMOInstance::recalcExtents()
       group_extents[i] = {group_aabb.min, group_aabb.max};
     }
   }
+  if (_update_group_extents)
+  {
+    _group_extents_computed = true; // this pass filled ALL group AABBs, not just skybox groups
+  }
   _update_group_extents = false;
 
   math::aabb const wmo_aabb(points);
 
   extents[0] = wmo_aabb.min;
   extents[1] = wmo_aabb.max;
+
+  // Remember the transform we just built for; the next call with an unchanged transform is a cache hit.
+  _extents_cache_pos = pos;
+  _extents_cache_dir = dir;
+  _extents_cache_scale = scale;
 }
 
 void WMOInstance::change_nameset(uint16_t name_set)

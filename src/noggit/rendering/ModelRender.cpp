@@ -1059,6 +1059,7 @@ void ModelRender::drawPersistent(glm::mat4x4 const& model_view
     , OpenGL::Scoped::use_program& m2_shader
     , OpenGL::M2RenderState& model_render_state
     , int animtime
+    , float extra_alpha
 )
 {
   ZoneScopedN(NOGGIT_CURRENT_FUNCTION);
@@ -1138,11 +1139,13 @@ void ModelRender::drawPersistent(glm::mat4x4 const& model_view
 
   OpenGL::Scoped::buffer_binder<GL_ELEMENT_ARRAY_BUFFER> indices_binder(_indices_buffer);
 
-  // One instanced draw per pass over the whole bucket, full alpha (fade=1 -> no blend promotion, no depth
-  // prepass). representative=nullptr: doodads have no per-instance skin/geoset resolves.
+  // One instanced draw per pass over the whole bucket. extra_alpha < 1 (distance fade) promotes the opaque/
+  // alpha-key passes to alpha blend via prepareDraw's translucent path -> the whole tile-bucket fades out
+  // SMOOTHLY and stays fully lit (authored_translucent keys off model_alpha, not extra_alpha), and additive
+  // glow passes dim with it (mesh_color.w *= inst_alpha). No dither/shimmer. representative=nullptr.
   for (ModelRenderPass& p : _render_passes)
   {
-    if (p.prepareDraw(m2_shader, _model, nullptr, model_render_state, 1.0f))
+    if (p.prepareDraw(m2_shader, _model, nullptr, model_render_state, extra_alpha))
     {
       gl.drawElementsInstanced(GL_TRIANGLES, p.index_count, GL_UNSIGNED_SHORT,
                                reinterpret_cast<void*>(p.index_start * sizeof(GLushort)),

@@ -225,6 +225,7 @@ namespace Noggit::Rendering
         , OpenGL::Scoped::use_program& m2_shader
         , OpenGL::M2RenderState& model_render_state
         , int animtime
+        , float extra_alpha = 1.0f // <1 => distance fade: alpha-blend the whole bucket (still lit)
     );
 
     // True iff drawPersistent() would actually render this model. The persistent buffer build MUST gate on

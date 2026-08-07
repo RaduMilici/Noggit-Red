@@ -8021,6 +8021,12 @@ void MapView::paintGL()
     LogDebug << "MapView::paintGL before clear" << std::endl;
   }
 
+  // [unaccounted bisect 2026-08-07] PaintBody = this makeCurrent..paintGL-return span (function scope, RAII
+  // handles early returns). Frame is start..start; Frame-PaintBody = time Qt spends BETWEEN paintGL calls
+  // (buffer swap, QOpenGLWidget compositor blit, event-loop processing, any loader/GPU-upload callback).
+  // The spike line prints betweenFrame vs inPaintUnprof so a 500ms hitch is localized to one side in one run.
+  noggit::perf::Scoped _prof_paint_body(noggit::perf::Phase::PaintBody);
+
   gl.clear (GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
   {

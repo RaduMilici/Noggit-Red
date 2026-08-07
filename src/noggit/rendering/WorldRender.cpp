@@ -821,17 +821,25 @@ void WorldRender::drawDoodadsBatched(
   // becomes batchable on texture-load invalidates). Unchanged since the last rebuild => the cached groups AND
   // the GPU instance/indirect buffers are still valid, so skip ALL classify/gather/upload and just re-issue.
   // Stationary + loaded (the common editing case) => a pure cache hit every frame = the amortization win.
+  // [perf 2026-08-07] GPU-driven P1: `draws` is now ALL LOADED tiles' doodads (camera-independent), so this
+  // signature changes ONLY on tile load/unload / doodad edit / texture-load -- NOT on camera movement. Result:
+  // the batch stays cached even while flying (the old visible-set signature rebuilt every camera move). The
+  // per-entry contribution is XORed (order-independent) since loaded_tiles() iteration order may vary.
   unsigned long long sig = 1469598103934665603ull;
   auto mix = [&](unsigned long long v) { sig = (sig ^ v) * 1099511628211ull; };
   mix(draws.size());
   mix(draw_hidden_models ? 1ull : 0ull);
+  mix(g_texture_upload_epoch.load(std::memory_order_relaxed));
+  unsigned long long set_hash = 0;
   for (auto const& pd : draws)
   {
-    mix(static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(pd.first)));
-    mix(static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(pd.second)));
-    mix(static_cast<unsigned long long>(pd.second->count));
+    unsigned long long h = 1469598103934665603ull;
+    h = (h ^ static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(pd.first))) * 1099511628211ull;
+    h = (h ^ static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(pd.second))) * 1099511628211ull;
+    h = (h ^ static_cast<unsigned long long>(pd.second->count)) * 1099511628211ull;
+    set_hash ^= h; // XOR = order-independent
   }
-  mix(g_texture_upload_epoch.load(std::memory_order_relaxed));
+  mix(set_hash);
 
   if (_mdi_cache_valid && sig == _mdi_last_sig)
   {
@@ -1110,6 +1118,12 @@ void WorldRender::draw (glm::mat4x4 const& model_view
   ZoneScoped;
   noggit::perf::Scoped _prof_world(noggit::perf::Phase::WorldDraw);
 
+  // [localize the ~12ms unprofiled-in-WorldDraw 2026-08-07] time everything from here up to the Terrain
+  // block (frustum-cull loop, tile sort, camera-volume walks, lighting/bloom setup, clears). Manual timer
+  // (not RAII) because the region declares mvp/frustum/buffers used by the later draw phases -- can't wrap
+  // it in a scope. Added into FrameSetup just before the Terrain Scoped fires.
+  auto const _setup_t0 = std::chrono::steady_clock::now();
+
   // GL-API-error safety net (2026-07-23): the per-call glGetError() is dropped by default for perf
   // (context.inl -- it was ~half the dense frame and caught nothing once the instanced path was off). This
   // ONE glGetError/frame drains any GL error the previous frame produced, so a future regression can't
@@ -1168,6 +1182,7 @@ void WorldRender::draw (glm::mat4x4 const& model_view
   _camera_inside_wmo = false;
   if (!minimap_render)
   {
+    noggit::perf::Scoped _prof_camvol(noggit::perf::Phase::CamVolume); // localize: per-frame WMO-containment walk
     try { _camera_inside_wmo = _world->camera_is_inside_wmo(camera_pos); }
     catch (...) { _camera_inside_wmo = false; }
   }
@@ -1642,6 +1657,12 @@ void WorldRender::draw (glm::mat4x4 const& model_view
 
   _world->_n_rendered_tiles = 0;
   _world->_n_rendered_objects = 0;
+
+  // [localize 2026-08-07] close the FrameSetup window (everything above, minus the separately-timed
+  // LightCollect/CamVolume that overlap it). FrameSetup - LightCollect - CamVolume = the pure setup cost
+  // (cull loop + tile sort + horizon + GL state/query round-trips) inside the ~12ms unprofiled-in-WorldDraw.
+  noggit::perf::FrameProfiler::get().add(noggit::perf::Phase::FrameSetup,
+    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _setup_t0).count());
 
   if (draw_terrain)
   {
@@ -2166,6 +2187,9 @@ void WorldRender::draw (glm::mat4x4 const& model_view
   // Pointers into the tiles' own robin_maps (stable for the frame -- no tile is rebuilt/unloaded between the
   // gather here and the draw), so no per-frame copy of the buffer struct (which now carries cpu_transforms).
   std::vector<std::pair<Model*, Noggit::Rendering::TileRender::DoodadInstanceBuffer const*>> persistent_doodad_draws;
+  // [doodad distance fade 2026-08-07] parallel to persistent_doodad_draws: per-bucket fade (1=solid ..
+  // 0=gone) by TILE distance. Drives extra_alpha in the draw loop -> smooth alpha-blend fade (still lit).
+  std::vector<float> persistent_doodad_fades;
 
   for (auto& pair : _world->_loaded_tiles_buffer)
   {
@@ -2233,11 +2257,21 @@ void WorldRender::draw (glm::mat4x4 const& model_view
         float const tile_dist = tile->camDist();
         for (auto const& kv : b)
         {
-          float const model_cull = _cull_distance * std::min(1.0f, s_cull_base + kv.first->rad * s_cull_per_rad);
-          if (tile_dist <= model_cull)
+          // Size-weighted HARD cap (fully gone), pushed ~1.5x so doodads reach further; SOFT cap = 90% of it.
+          // The bucket fades by TILE distance over [soft, hard] (fade -> extra_alpha -> smooth alpha blend in
+          // the draw loop). Keep it collected until past hard + a tile-edge margin (a tile is culled by its
+          // CENTRE, its near instances sit ~half a diagonal closer), so it's already invisible before it drops.
+          float const weighted = std::min(1.0f, s_cull_base + kv.first->rad * s_cull_per_rad);
+          float const hard = std::min(_cull_distance, _cull_distance * weighted * 1.5f);
+          float const soft = hard * 0.9f;
+          if (tile_dist > hard + 380.0f)
           {
-            persistent_doodad_draws.emplace_back(kv.first, &kv.second);
+            continue; // fully faded and past the tile-edge margin -> drop
           }
+          float const fade = (hard <= soft) ? 1.0f
+            : std::clamp((hard - tile_dist) / (hard - soft), 0.0f, 1.0f);
+          persistent_doodad_draws.emplace_back(kv.first, &kv.second);
+          persistent_doodad_fades.push_back(fade);
         }
       }
     }
@@ -3491,10 +3525,23 @@ void WorldRender::draw (glm::mat4x4 const& model_view
         // (so program scopes don't nest); draws every batchable static doodad in a few glMultiDrawElements-
         // Indirect calls and records them in _mdi_batched_models so the persistent loop below skips them.
         // Non-batchable doodads still draw via drawPersistent. Needs persistent doodads (its instance source).
-        if (s_doodad_mdi && s_persistent_doodads && !minimap_render && draw_models && !persistent_doodad_draws.empty())
+        if (s_doodad_mdi && s_persistent_doodads && !minimap_render && draw_models)
         {
           noggit::perf::Scoped _prof_mdi(noggit::perf::Phase::SubmitInst);
-          drawDoodadsBatched(persistent_doodad_draws, model_view, draw_hidden_models);
+          // [perf 2026-08-07] GPU-driven P1: collect ALL LOADED tiles' doodads (camera-independent) so the batch
+          // caches across camera movement and rebuilds ONLY on tile load/unload -- killing the per-frame assembly
+          // that made the old visible-set MDI net-flat. Draw all -> the idle GPU frustum-clips the off-screen
+          // ones. _mdi_batched_models still makes the persistent loop below skip these models (no double-draw).
+          _mdi_all_loaded.clear();
+          for (MapTile* t : _world->mapIndex.loaded_tiles())
+          {
+            if (!t)
+              continue;
+            auto const& b = t->renderer()->doodadInstanceBuffers();
+            for (auto const& kv : b)
+              _mdi_all_loaded.emplace_back(kv.first, &kv.second);
+          }
+          drawDoodadsBatched(_mdi_all_loaded, model_view, draw_hidden_models);
         }
 
         if (capture_debug_enabled())
@@ -3699,10 +3746,17 @@ void WorldRender::draw (glm::mat4x4 const& model_view
         // deferring past the water -- rare for tile MDDF, so the water-occlusion nicety is skipped.)
         if (s_persistent_doodads && !persistent_doodad_draws.empty())
         {
-          m2_shader.uniform("slice_dist", s_no_dist_fade ? 0.0f : _cull_distance);
+          // Distance fade is now a smooth alpha blend via extra_alpha (below), not the hard pixel slice.
+          m2_shader.uniform("slice_dist", 0.0f);
           noggit::perf::Scoped _prof_submit(noggit::perf::Phase::SubmitInst);
-          for (auto const& pd : persistent_doodad_draws)
+          for (std::size_t pdi = 0; pdi < persistent_doodad_draws.size(); ++pdi)
           {
+            auto const& pd = persistent_doodad_draws[pdi];
+            float const pd_fade = s_no_dist_fade ? 1.0f : persistent_doodad_fades[pdi];
+            if (pd_fade <= 0.0f)
+            {
+              continue; // fully faded (kept collected only so nothing pops when the tile drops)
+            }
             Model* const m = pd.first;
             if (!draw_hidden_models && m->is_hidden())
             {
@@ -3716,7 +3770,7 @@ void WorldRender::draw (glm::mat4x4 const& model_view
             }
             m->renderer()->drawPersistent(model_view, pd.second->transform_vbo, pd.second->interior_vbo,
                                           static_cast<int>(pd.second->count), m2_shader, model_render_state,
-                                          _world->model_animtime);
+                                          _world->model_animtime, pd_fade);
             _world->_n_rendered_objects += pd.second->count;
           }
         }

@@ -1,5 +1,10 @@
 // This file is part of Noggit3, licensed under GNU General Public License (version 3).
 #version 330 core
+#ifdef batched
+// [animated MDI 2026-08-07] the batched variant reads bones from an SSBO; SSBOs need GLSL 430, so enable the
+// ARB extension under 330 (the context is 4.3, so it's supported). Only the batched program pays this.
+#extension GL_ARB_shader_storage_buffer_object : require
+#endif
 
 // CORRECTNESS (2026-07-22): PIN attribute locations. This shader is compiled TWICE -- as _m2_program
 // (transform = uniform) and _m2_instanced_program (transform = per-instance attribute) -- and BOTH share the
@@ -108,8 +113,26 @@ vec2 get_texture_uv(int tex_unit_lookup, vec3 vert, vec3 norm, mat4 tex_matrix)
   }
 }
 
+#ifdef batched
+// [animated MDI 2026-08-07] Batched (cross-model MDI) bones live in ONE shared SSBO -- every batched model's
+// bone_matrices concatenated. A single glMultiDrawElementsIndirect draws many DIFFERENT models, so bones can't
+// ride the per-model bone_matrices texture; instead each instance carries, in its inst_tex stream, the base
+// offset of its model's bone block (inst_tex.z, in mat4 units) and that model's bone count (inst_tex.w). w==0
+// means a static/bind-pose model. All instances of one model share one block (unison sway, as the per-model
+// animate() already produces), so z/w are constant across a command.
+layout(std430, binding = 0) readonly buffer BatchedBones { mat4 b_batched_bones[]; };
+#endif
+
 mat4 get_bone_matrix(uint bone_index)
 {
+#ifdef batched
+  // Batched path: read from the shared SSBO at this model's block base. w<=0 (static) or out-of-range -> bind pose.
+  if (inst_tex.w <= 0 || bone_index >= uint(inst_tex.w))
+  {
+    return mat4(1.0);
+  }
+  return b_batched_bones[uint(inst_tex.z) + bone_index];
+#else
   if (bone_matrix_count <= 0 || bone_index >= uint(bone_matrix_count))
   {
     return mat4(1.0);
@@ -126,13 +149,19 @@ mat4 get_bone_matrix(uint bone_index)
   matrix[3] = texelFetch(bone_matrices, pixel_start + 3).rgba;
 
   return matrix;
+#endif
 }
 
 void main()
 {
   mat4 boneTransformMat = mat4(0);
 
-  if (anim_bones)
+#ifdef batched
+  bool do_bones = (inst_tex.w > 0); // batched: per-instance bone count drives deform (SSBO); 0 = static bind pose
+#else
+  bool do_bones = anim_bones;
+#endif
+  if (do_bones)
   {
     float total_weight = float(bones_weight.x + bones_weight.y + bones_weight.z + bones_weight.w);
     if (total_weight > 0.0)
