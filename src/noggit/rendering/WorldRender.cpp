@@ -1436,6 +1436,259 @@ void WorldRender::drawPibBatched(std::vector<PibGroup>& groups)
   gl.enable(GL_CULL_FACE);
 }
 
+// [dyn-MDI 2026-08-07] The last big per-model draw loop: the DYNAMIC instanced pool (per-frame gathered WMO
+// doodads + gameobjects, ~17ms of SubmitInst/DoodadDraw in dense areas) through the per-frame MDI machinery
+// proven by the pib pass. SHARED-pose bone block per model (one animate per model per frame -- identical to
+// what the classic loop's instanced draw did), every instance points at it via inst_tex.z/w. Runs BEFORE the
+// classic models_to_draw loop; consumed buckets go in _dyn_batched_models and the loop keeps all its
+// side-effects (additive-light deferral, particle collection) but skips their draws. Exclusions -> fallback:
+// GO buckets (own fade/slice semantics), ground clutter (_force_unlit: needs the detail_doodad day/night +
+// A2C path), deferred pure-additive light effects (must draw after water), any bucket mid-distance-fade
+// (fade < 1 needs the per-instance translucent promote), and anything resolveStaticBatch rejects.
+void WorldRender::drawDynamicBatched(tsl::robin_map<Model*, std::vector<glm::mat4x4>> const& buckets,
+                                     tsl::robin_map<Model*, std::vector<glm::vec4>>& interiors,
+                                     tsl::robin_map<Model*, std::vector<float>>& fades,
+                                     std::set<Model*> const& go_buckets,
+                                     glm::mat4x4 const& model_view, int animtime, bool draw_hidden_models)
+{
+  _dyn_batched_models.clear();
+  if (buckets.empty())
+    return;
+
+  ensureMdiArena();
+  ensurePibMdi();
+
+  _pib_scratch_tf.clear();
+  _pib_scratch_interior.clear();
+  _pib_scratch_tex.clear();
+  _pib_scratch_cmds.clear();
+  _pib_scratch_bones.clear();
+
+  std::map<StaticBatchKey, std::vector<OpenGL::DrawElementsIndirectCommand>> keyed;
+
+  for (auto const& bucket : buckets)
+  {
+    Model* const m = bucket.first;
+    auto const& transforms = bucket.second;
+    if (!m || transforms.empty())
+      continue;
+    if (!m->finishedLoading() || m->loading_failed())
+      continue;
+    if (!draw_hidden_models && m->is_hidden())
+      continue;
+    if (go_buckets.count(m))
+      continue; // gameobject buckets keep their own fade/slice semantics
+    if (m->_force_unlit)
+      continue; // ground clutter: needs the detail_doodad (day/night + A2C) path
+    if (is_pure_additive_light_effect(m) && m->_particles.empty() && m->_ribbons.empty())
+      continue; // deferred past the water by the classic loop
+    // any instance mid-distance-fade -> whole bucket falls back (fade needs the translucent promote)
+    {
+      auto const fit = fades.find(m);
+      if (fit != fades.end())
+      {
+        bool fading = false;
+        for (float f : fit->second)
+          if (f < 0.999f) { fading = true; break; }
+        if (fading)
+          continue;
+      }
+    }
+    if (!mdiEnsureModelInArena(m))
+      continue;
+    auto const& passes = m->renderer()->renderPasses();
+    if (passes.empty())
+      continue;
+    std::vector<StaticBatchKey> keys;
+    keys.reserve(passes.size());
+    bool all_ok = true;
+    for (auto const& p : passes)
+    {
+      StaticBatchKey k;
+      if (!p.resolveStaticBatch(m, k, /*for_pib=*/ true)) { all_ok = false; break; }
+      keys.push_back(k);
+    }
+    if (!all_ok)
+      continue;
+
+    auto const slot_it = _mdi_slots.find(m->file_key().stringRepr());
+    if (slot_it == _mdi_slots.end() || !slot_it->second.ok)
+      continue;
+    MdiArenaSlot const& slot = slot_it->second;
+
+    // SHARED pose: animate once per model per frame (upload_bones stays true so unbatched copies of the same
+    // Model elsewhere keep a live TBO), then one bone block all instances share.
+    std::uint32_t bone_base = 0, bone_count = 0;
+    if (m->animBones)
+    {
+      if (!m->animcalc)
+      {
+        m->animate(model_view, 0, animtime);
+        m->animcalc = true;
+      }
+      if (!m->bone_matrices.empty())
+      {
+        bone_count = static_cast<std::uint32_t>(m->bone_matrices.size());
+        bone_base = static_cast<std::uint32_t>(_pib_scratch_bones.size());
+        _pib_scratch_bones.insert(_pib_scratch_bones.end(), m->bone_matrices.begin(), m->bone_matrices.end());
+      }
+    }
+
+    auto const int_it = interiors.find(m);
+    std::vector<glm::vec4> const* const inter = int_it != interiors.end() ? &int_it->second : nullptr;
+
+    for (std::uint32_t pi = 0; pi < keys.size(); ++pi)
+    {
+      ModelRenderPass const& pass = m->renderer()->renderPasses()[pi];
+      OpenGL::DrawElementsIndirectCommand cmd;
+      cmd.count = pass.index_count;
+      cmd.instanceCount = static_cast<GLuint>(transforms.size());
+      cmd.firstIndex = slot.index_base + pass.index_start;
+      cmd.baseVertex = slot.base_vertex;
+      cmd.baseInstance = static_cast<GLuint>(_pib_scratch_tf.size());
+      keyed[keys[pi]].push_back(cmd);
+
+      glm::ivec4 const tex(keys[pi].layer0, keys[pi].layer1,
+                           static_cast<int>(bone_base), static_cast<int>(bone_count));
+      for (std::size_t i = 0; i < transforms.size(); ++i)
+      {
+        _pib_scratch_tf.push_back(transforms[i]);
+        _pib_scratch_interior.push_back(inter && inter->size() > i ? (*inter)[i] : glm::vec4(0.0f));
+        _pib_scratch_tex.push_back(tex);
+      }
+    }
+    _dyn_batched_models.emplace(m, static_cast<std::uint8_t>(1));
+    _world->_n_rendered_objects += transforms.size();
+  }
+
+  if (keyed.empty())
+    return;
+
+  // Command layout: opaque/alpha-key groups first, then blended.
+  struct DynDrawGroup { StaticBatchKey key; std::uint32_t first_cmd; std::uint32_t cmd_count; };
+  std::vector<DynDrawGroup> draw_groups;
+  draw_groups.reserve(keyed.size());
+  for (int blended = 0; blended <= 1; ++blended)
+  {
+    for (auto const& kv : keyed)
+    {
+      bool const is_blended = kv.first.blend_mode >= 2;
+      if (static_cast<int>(is_blended) != blended)
+        continue;
+      DynDrawGroup dg;
+      dg.key = kv.first;
+      dg.first_cmd = static_cast<std::uint32_t>(_pib_scratch_cmds.size());
+      _pib_scratch_cmds.insert(_pib_scratch_cmds.end(), kv.second.begin(), kv.second.end());
+      dg.cmd_count = static_cast<std::uint32_t>(kv.second.size());
+      draw_groups.push_back(dg);
+    }
+  }
+
+  // Upload (bufferData orphaning -> safe to reuse the pib buffers; the later pib pass re-orphans them).
+  gl.bindBuffer(GL_ARRAY_BUFFER, _pib_buffers[0]);
+  gl.bufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(_pib_scratch_tf.size() * sizeof(glm::mat4x4)), _pib_scratch_tf.data(), GL_STREAM_DRAW);
+  gl.bindBuffer(GL_ARRAY_BUFFER, _pib_buffers[1]);
+  gl.bufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(_pib_scratch_interior.size() * sizeof(glm::vec4)), _pib_scratch_interior.data(), GL_STREAM_DRAW);
+  gl.bindBuffer(GL_ARRAY_BUFFER, _pib_buffers[2]);
+  gl.bufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(_pib_scratch_tex.size() * sizeof(glm::ivec4)), _pib_scratch_tex.data(), GL_STREAM_DRAW);
+  gl.bindBuffer(GL_ARRAY_BUFFER, 0);
+  gl.bindBuffer(GL_DRAW_INDIRECT_BUFFER, _pib_buffers[3]);
+  gl.bufferData(GL_DRAW_INDIRECT_BUFFER, static_cast<GLsizeiptr>(_pib_scratch_cmds.size() * sizeof(OpenGL::DrawElementsIndirectCommand)), _pib_scratch_cmds.data(), GL_STREAM_DRAW);
+
+  constexpr GLenum SSBO_TARGET = 0x90D2;
+  if (!_pib_scratch_bones.empty())
+  {
+    GLsizeiptr const bone_bytes = static_cast<GLsizeiptr>(_pib_scratch_bones.size() * sizeof(glm::mat4x4));
+    gl.bindBuffer(SSBO_TARGET, _pib_buffers[4]);
+    gl.bufferData(SSBO_TARGET, bone_bytes, _pib_scratch_bones.data(), GL_STREAM_DRAW);
+    gl.bindBuffer(SSBO_TARGET, 0);
+    gl.bindBufferRange(SSBO_TARGET, 0, _pib_buffers[4], 0, bone_bytes);
+  }
+
+  OpenGL::Scoped::use_program batched {*_m2_batched_program.get()};
+  static bool const s_no_dist_fade = std::getenv("NOGGIT_NO_DIST_FADE") != nullptr;
+  batched.uniform("model_origin", glm::vec3(0.0f));
+  batched.uniform("slice_dist", s_no_dist_fade ? 0.0f : _cull_distance); // dynamic doodads slice like the loop
+  batched.uniform("masked_additive", 0);
+  batched.uniform("detail_doodad", -1);
+  batched.uniform("water_surface_effect", -1);
+  batched.uniform("creature_bloom", -1);
+  batched.uniform("mesh_color", glm::vec4(1.0f));
+  batched.uniform("anim_bones", false);
+  batched.uniform("bone_matrix_count", 0);
+  batched.uniform("per_instance_bone_stride", 0);
+  batched.uniform("tex_matrix_1", glm::mat4x4(1.0f));
+  batched.uniform("tex_matrix_2", glm::mat4x4(1.0f));
+
+  gl.depthMask(GL_TRUE);
+
+  gl.bindVertexArray(_pib_vao_arr[0]);
+  gl.bindBuffer(GL_DRAW_INDIRECT_BUFFER, _pib_buffers[3]);
+
+  int last_cull = -1, last_blend = -1, last_ps = -1, last_tu0 = -1, last_tu1 = -1, last_c0 = -1, last_c1 = -1;
+  int last_unfogged = -1, last_unlit = -1;
+  GLuint last_a0 = 0xFFFFFFFFu, last_a1 = 0xFFFFFFFFu;
+  for (DynDrawGroup const& gr : draw_groups)
+  {
+    int const want_cull = gr.key.backface_cull ? 1 : 0;
+    if (want_cull != last_cull)
+    {
+      if (want_cull) gl.enable(GL_CULL_FACE); else gl.disable(GL_CULL_FACE);
+      last_cull = want_cull;
+    }
+    if (static_cast<int>(gr.key.blend_mode) != last_blend)
+    {
+      switch (static_cast<M2Blend>(gr.key.blend_mode))
+      {
+        default:
+        case M2Blend::Opaque:
+        case M2Blend::Alpha_Key:
+          gl.disable(GL_BLEND);
+          break;
+        case M2Blend::Alpha:
+          gl.enable(GL_BLEND);
+          gl.blendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+          break;
+        case M2Blend::No_Add_Alpha:
+        case M2Blend::Add:
+          gl.enable(GL_BLEND);
+          gl.blendFunc(GL_ONE, GL_ONE);
+          break;
+      }
+      batched.uniform("blend_mode", static_cast<int>(gr.key.blend_mode));
+      last_blend = static_cast<int>(gr.key.blend_mode);
+    }
+    if (static_cast<int>(gr.key.unfogged) != last_unfogged)
+    { batched.uniform("unfogged", static_cast<int>(gr.key.unfogged)); last_unfogged = static_cast<int>(gr.key.unfogged); }
+    if (static_cast<int>(gr.key.unlit) != last_unlit)
+    { batched.uniform("unlit", static_cast<int>(gr.key.unlit)); last_unlit = static_cast<int>(gr.key.unlit); }
+    if (gr.key.pixel_shader != last_ps)
+    { batched.uniform("pixel_shader", gr.key.pixel_shader); last_ps = gr.key.pixel_shader; }
+    if (gr.key.tu_lookup0 != last_tu0)
+    { batched.uniform("tex_unit_lookup_1", gr.key.tu_lookup0); last_tu0 = gr.key.tu_lookup0; }
+    if (gr.key.tu_lookup1 != last_tu1)
+    { batched.uniform("tex_unit_lookup_2", gr.key.tu_lookup1); last_tu1 = gr.key.tu_lookup1; }
+    if (gr.key.tex_clamp0 != last_c0)
+    { batched.uniform("tex1_clamp", gr.key.tex_clamp0); last_c0 = gr.key.tex_clamp0; }
+    if (gr.key.tex_clamp1 != last_c1)
+    { batched.uniform("tex2_clamp", gr.key.tex_clamp1); last_c1 = gr.key.tex_clamp1; }
+    if (gr.key.tex_array0 != last_a0)
+    { gl.activeTexture(static_cast<GLenum>(GL_TEXTURE0 + 1)); gl.bindTexture(GL_TEXTURE_2D_ARRAY, gr.key.tex_array0); last_a0 = gr.key.tex_array0; }
+    if (gr.key.tex_array1 && gr.key.tex_array1 != last_a1)
+    { gl.activeTexture(static_cast<GLenum>(GL_TEXTURE0 + 2)); gl.bindTexture(GL_TEXTURE_2D_ARRAY, gr.key.tex_array1); last_a1 = gr.key.tex_array1; }
+
+    gl.multiDrawElementsIndirect(GL_TRIANGLES, GL_UNSIGNED_SHORT,
+        reinterpret_cast<void*>(static_cast<std::size_t>(gr.first_cmd) * sizeof(OpenGL::DrawElementsIndirectCommand)),
+        static_cast<GLsizei>(gr.cmd_count), 0);
+  }
+
+  gl.bindVertexArray(0);
+  gl.bindBuffer(GL_DRAW_INDIRECT_BUFFER, 0);
+  gl.disable(GL_BLEND);
+  gl.depthMask(GL_TRUE);
+  gl.enable(GL_CULL_FACE);
+}
+
 void WorldRender::draw (glm::mat4x4 const& model_view
     , glm::mat4x4 const& projection
     , glm::vec3 const& cursor_pos
@@ -3920,6 +4173,13 @@ void WorldRender::draw (glm::mat4x4 const& model_view
                    << std::endl;
         }
 
+        // [dyn-MDI 2026-08-07] batch the dynamic instanced pool FIRST (before this program scope opens);
+        // the loop below keeps every side-effect (additive-light deferral, particle collection) and just
+        // skips the draws of consumed buckets (_dyn_batched_models).
+        drawDynamicBatched(models_to_draw, models_to_draw_interior, models_to_draw_fades,
+                           go_bucket_models, model_view, static_cast<int>(_world->model_animtime),
+                           draw_hidden_models);
+
         OpenGL::Scoped::use_program m2_shader {*_m2_instanced_program.get()};
 
         OpenGL::M2RenderState model_render_state;
@@ -4060,6 +4320,10 @@ void WorldRender::draw (glm::mat4x4 const& model_view
             std::vector<float>& bucket_fades = models_to_draw_fades[pair.first];
             bucket_fades.resize(pair.second.size(), 1.0f);
 
+            // [dyn-MDI 2026-08-07] consumed by drawDynamicBatched -> already drawn via MDI; keep every
+            // side-effect around this point (deferral above, particle collection below), skip only the draw.
+            if (!_dyn_batched_models.count(pair.first))
+            {
             // Gameobject buckets fade (creature mechanic) instead of slicing: slice off for them.
             // (A model shared by tile doodads AND a GO spawn loses the slice for its doodads too --
             // acceptable, the bucket is drawn in one call.)
@@ -4086,6 +4350,7 @@ void WorldRender::draw (glm::mat4x4 const& model_view
               );
             }
             _world->_n_rendered_objects += pair.second.size();
+            }
 
             // Collect particle/ribbon models regardless of the animation toggle: when off we still
             // draw them, just frozen in place (their simulation isn't advanced), instead of hiding them.

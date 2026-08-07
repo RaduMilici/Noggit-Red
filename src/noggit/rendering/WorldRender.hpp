@@ -8,6 +8,8 @@
 #include <external/glm/glm.hpp>
 #include <math/trig.hpp>
 
+#include <set>
+
 namespace math { class frustum; } // referenced by the animated-MDI batching (drawDoodadsBatched/fillMdiBones)
 
 #include <noggit/tool_enums.hpp>
@@ -276,6 +278,18 @@ namespace Noggit::Rendering
     std::vector<glm::mat4x4> _pib_scratch_bones;
     void ensurePibMdi();                                // VAO over the shared arena + the pib instance buffers
     void drawPibBatched(std::vector<PibGroup>& groups); // classify + build + MDI-draw; marks consumed groups
+
+    // [dyn-MDI 2026-08-07] the DYNAMIC instanced pool (per-frame gathered WMO doodads + GOs, models_to_draw)
+    // through the same per-frame MDI machinery (shares the pib buffers/VAO -- bufferData orphaning makes the
+    // sequential reuse safe). Consumed buckets land in _dyn_batched_models; the classic loop keeps ALL its
+    // side-effects (deferral, particle collection) and just skips the draw for them. Shared-pose bone block
+    // per model (one animate per model, all its instances point at it).
+    std::unordered_map<Model*, std::uint8_t> _dyn_batched_models;
+    void drawDynamicBatched(tsl::robin_map<Model*, std::vector<glm::mat4x4>> const& buckets,
+                            tsl::robin_map<Model*, std::vector<glm::vec4>>& interiors,
+                            tsl::robin_map<Model*, std::vector<float>>& fades,
+                            std::set<Model*> const& go_buckets,
+                            glm::mat4x4 const& model_view, int animtime, bool draw_hidden_models);
 
     // [perf 2026-08-06] AMORTIZATION: the assembled batch is cached across frames and rebuilt ONLY when the
     // visible doodad set changes (cheap per-frame signature over persistent_doodad_draws + the texture-upload
