@@ -18,6 +18,8 @@
 #include <noggit/frame_profiler.hpp>
 #include <ClientFile.hpp>
 
+#include <chrono>
+
 #include <QtCore/QSettings>
 #include <QByteArray>
 #include <QTextStream>
@@ -481,7 +483,18 @@ void MapIndex::reloadTile(const TileIndex& tile)
 
 void MapIndex::unloadTiles(const TileIndex& tile)
 {
-  if (((clock() / CLOCKS_PER_SEC) - _last_unload_time) > _unload_interval)
+  // [perf 2026-08-06] Fine (ms) unload cadence -- was a ~1s clock()-seconds gate, which then dumped a whole
+  // batch of tile teardowns (~8ms/tile) at once = a ~48ms hitch once a second. Running often + freeing few per
+  // pass SPREADS that O(instances) teardown across frames. NOGGIT_UNLOAD_INTERVAL_MS tunes it (default 16 ~= per
+  // frame @60fps); pairs with the low NOGGIT_MAX_UNLOAD_PER_PASS below.
+  static int const s_unload_interval_ms = []
+  {
+    char const* v = std::getenv("NOGGIT_UNLOAD_INTERVAL_MS");
+    int const m = v ? std::atoi(v) : 16;
+    return m > 0 ? m : 16;
+  }();
+  static std::chrono::steady_clock::time_point s_last_unload_pass{};
+  if (std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - s_last_unload_pass).count() >= s_unload_interval_ms)
   {
     // [CRASH FIX 2026-08-04] Collect the tiles to unload FIRST, then unload them AFTER the loop.
     // unloadTile() sets mTiles[..].tile = nullptr, which mutates the very container loaded_tiles()
@@ -526,26 +539,36 @@ void MapIndex::unloadTiles(const TileIndex& tile)
     static unsigned const s_max_unload_per_pass = []
     {
       char const* v = std::getenv("NOGGIT_MAX_UNLOAD_PER_PASS");
-      return v ? static_cast<unsigned>(std::max(0, std::atoi(v))) : 6u;
+      return v ? static_cast<unsigned>(std::max(0, std::atoi(v))) : 1u; // [2026-08-06] 6->1: teardown ~8ms/tile,
+      // so free ONE per (now per-frame) pass to spread it; raise via env if the far-tile backlog can't keep up.
     }();
-    // DEFER while the loader streams AND the reclaimable backlog (non-changed far tiles) is still modest: the
-    // ScopedPause returns instantly only when the loader is idle, so freeing mid-stream pays the in-flight
-    // wait. Skip then -- free on the loader's next lull, or once the backlog grows past the threshold so
-    // memory can't run away (then still capped per pass so we drain gradually, never batch-free a big pile).
-    static unsigned const s_defer_backlog = []
+    // [perf 2026-08-06] STUTTER FIX: never pause a BUSY loader just to unload. The ScopedPause below waits for
+    // the loader's in-flight model/WMO load to finish; while you fly the loader is ALWAYS busy, so freeing every
+    // pass paid a 15-35ms wait = the recurring Overlays/tick hitch seen in [TICK-STALL]. Now: free ONLY when the
+    // loader is IDLE (the pause is then instant -> zero wait), deferring far tiles to the loader's next lull (you
+    // slow / stop). Force a capped free ONLY when the reclaimable backlog grows past a HARD cap, so memory stays
+    // bounded -- a RARE forced stall instead of one every pass. Free is still capped per pass (teardown is
+    // O(instances) per tile). NOGGIT_UNLOAD_HARD_BACKLOG tunes the memory cap (0 = never force).
+    static unsigned const s_hard_backlog = []
     {
-      char const* v = std::getenv("NOGGIT_UNLOAD_DEFER_BACKLOG");
-      return v ? static_cast<unsigned>(std::max(0, std::atoi(v))) : 40u;
+      char const* v = std::getenv("NOGGIT_UNLOAD_HARD_BACKLOG");
+      return v ? static_cast<unsigned>(std::max(0, std::atoi(v))) : 64u;
     }();
-    bool const defer = !to_unload.empty() && s_defer_backlog > 0
-                    && to_unload.size() <= s_defer_backlog
-                    && AsyncLoader::instance().is_loading();
+    bool const loader_busy = AsyncLoader::instance().is_loading();
+    bool const force_free = s_hard_backlog > 0 && to_unload.size() > s_hard_backlog;
+    bool const do_free = !to_unload.empty() && (!loader_busy || force_free);
+    bool const deferred = !to_unload.empty() && !do_free;
     unsigned unloaded = 0;
-    if (!to_unload.empty() && !defer)
+    double pause_ms = 0.0, free_ms = 0.0; // split diagnostic: pause-wait vs O(instances) teardown
+    if (do_free)
     {
       // Collect-first still required (unloadTile nulls mTiles[..] mid-iteration of loaded_tiles() -> iterator
-      // invalidation). ScopedPause = the bounded loader quiescence for a race-free free (see above).
+      // invalidation). ScopedPause = loader quiescence for a race-free free -- INSTANT when the loader is idle
+      // (the common path now); only the rare forced free (busy + huge backlog) actually waits on an in-flight load.
+      auto const _t0 = std::chrono::steady_clock::now();
       AsyncLoader::ScopedPause const loader_pause;
+      auto const _t1 = std::chrono::steady_clock::now();
+      pause_ms = std::chrono::duration<double, std::milli>(_t1 - _t0).count();
       for (TileIndex const& idx : to_unload)
       {
         if (s_max_unload_per_pass > 0 && unloaded >= s_max_unload_per_pass)
@@ -555,6 +578,7 @@ void MapIndex::unloadTiles(const TileIndex& tile)
         unloadTile(idx);
         ++unloaded;
       }
+      free_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _t1).count();
     }
     if (noggit::perf::FrameProfiler::get().on)
     {
@@ -562,13 +586,15 @@ void MapIndex::unloadTiles(const TileIndex& tile)
                << " far_blocked_changed=" << far_blocked_changed
                << " far_kept_visible=" << far_kept_visible
                << " unloaded=" << unloaded << "/" << to_unload.size()
-               << (defer ? " DEFERRED(loader busy)" : "")
-               << " maxPerPass=" << s_max_unload_per_pass << " deferBacklog=" << s_defer_backlog
+               << (deferred ? " DEFERRED(loader busy)" : "")
+               << (force_free ? " FORCED(backlog>cap)" : "")
+               << " pause_ms=" << pause_ms << " free_ms=" << free_ms
+               << " maxPerPass=" << s_max_unload_per_pass << " hardBacklog=" << s_hard_backlog
                << " unload_dist=" << _unload_dist
                << " loading_radius=" << QSettings().value("loading_radius", 1).toInt() << std::endl;
     }
 
-    _last_unload_time = clock() / CLOCKS_PER_SEC;
+    s_last_unload_pass = std::chrono::steady_clock::now();
   }
 }
 

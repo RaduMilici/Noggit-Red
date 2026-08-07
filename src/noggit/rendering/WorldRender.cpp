@@ -2211,9 +2211,33 @@ void WorldRender::draw (glm::mat4x4 const& model_view
       if (!b.empty())
       {
         tile_pbuf = &b;
+        // [perf 2026-08-06] SIZE-WEIGHTED doodad distance cull (client-like). Cull distance scales with each
+        // model's bounding radius: small clutter (rocks/bushes) drops out at a SHORT distance where it's
+        // imperceptible, while large landmarks (trees) stay out to the terrain horizon so nothing prominent
+        // "pops in bunches". Per (tile,model), so it's free (no extra per-instance work). tile_pbuf stays set
+        // regardless, so a culled model is dropped from BOTH draw paths (never redrawn dynamically), cutting
+        // the per-(tile,model) draws in DoodadDraw/SubmitInst. NOGGIT_DOODAD_CULL_BASE (frac at radius 0) +
+        // NOGGIT_DOODAD_CULL_PER_RAD tune it; BASE>=1 draws everything (old behaviour).
+        static float const s_cull_base = []
+        {
+          char const* v = std::getenv("NOGGIT_DOODAD_CULL_BASE");
+          float const f = v ? static_cast<float>(std::atof(v)) : 0.4f;
+          return f > 0.0f ? f : 0.4f;
+        }();
+        static float const s_cull_per_rad = []
+        {
+          char const* v = std::getenv("NOGGIT_DOODAD_CULL_PER_RAD");
+          float const f = v ? static_cast<float>(std::atof(v)) : 0.03f;
+          return f >= 0.0f ? f : 0.03f;
+        }();
+        float const tile_dist = tile->camDist();
         for (auto const& kv : b)
         {
-          persistent_doodad_draws.emplace_back(kv.first, &kv.second);
+          float const model_cull = _cull_distance * std::min(1.0f, s_cull_base + kv.first->rad * s_cull_per_rad);
+          if (tile_dist <= model_cull)
+          {
+            persistent_doodad_draws.emplace_back(kv.first, &kv.second);
+          }
         }
       }
     }
