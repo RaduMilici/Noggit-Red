@@ -2645,8 +2645,18 @@ bool ModelRenderPass::resolveStaticBatch(Model* m, StaticBatchKey& out) const
     return rej(9);
   if (m->_water_surface_effect)
     return rej(10);
-  if (m->animBones)
-    return rej(11); // batched program runs anim_bones=false -> would draw an animated model in bind pose
+  // [animated MDI 2026-08-07] SHARED-pose animated models (animBones) are now BATCHABLE: their per-model bone
+  // matrices ride the batched bone SSBO, indexed per-instance by inst_tex.z (block base) / inst_tex.w (count)
+  // -- drawDoodadsBatched fills them each frame. Only PER-INSTANCE animation (billboards) is still rejected:
+  // each instance would need its own bone block, which one per-model slot can't represent.
+  // _per_instance_animation (billboard-boned trees -- the vast majority of animated doodads, 97% of the
+  // reject histogram) is deliberately NOT rejected: the persistent tile-doodad path this batch replaces
+  // ALREADY draws them with the SHARED pose (one animate per model per frame; the per-instance billboard
+  // refinement only exists in the individual WMO-doodad path, which still runs unbatched). One shared bone
+  // block per model in the SSBO reproduces today's user-accepted look exactly.
+  if (m->animBones && m->bone_matrices.empty())
+    return rej(11); // bones not computed yet (fresh load) -> batching now would lock it to bind pose; the
+                    // unbatched fallback animates it and a later rebuild picks it up with a real bone block
 
   // BASE-texture resolution per unit (instance-independent). ret: 1 ok, 0 unit unused, -1 reject/defer.
   auto resolve_unit = [&](std::size_t index, GLuint& arr, int& layer, int& clamp) -> int

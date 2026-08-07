@@ -8,6 +8,8 @@
 #include <external/glm/glm.hpp>
 #include <math/trig.hpp>
 
+namespace math { class frustum; } // referenced by the animated-MDI batching (drawDoodadsBatched/fillMdiBones)
+
 #include <noggit/tool_enums.hpp>
 #include <noggit/rendering/CursorRender.hpp>
 #include <noggit/rendering/LiquidTextureManager.hpp>
@@ -226,7 +228,7 @@ namespace Noggit::Rendering
     // so file-keying is both correct and deduplicating.
     std::unordered_map<std::string, MdiArenaSlot> _mdi_slots;     // arena location per model FILE (append-only)
     std::unordered_map<Model*, std::uint8_t> _mdi_batched_models; // per-frame: models the MDI pass drew (skip elsewhere)
-    OpenGL::Scoped::deferred_upload_buffers<6> _mdi_buffers;      // 0 arena_vbo 1 arena_ibo 2 inst_tf 3 inst_interior 4 inst_tex 5 indirect
+    OpenGL::Scoped::deferred_upload_buffers<7> _mdi_buffers;      // 0 arena_vbo 1 arena_ibo 2 inst_tf 3 inst_interior 4 inst_tex 5 indirect 6 bone_ssbo
     OpenGL::Scoped::deferred_upload_vertex_arrays<1> _mdi_vao_arr;
     bool _mdi_ready = false;
     GLsizeiptr _mdi_arena_vbo_cap = 0, _mdi_arena_ibo_cap = 0;
@@ -237,6 +239,16 @@ namespace Noggit::Rendering
     std::vector<glm::vec4>   _mdi_scratch_interior;
     std::vector<glm::ivec4>  _mdi_scratch_tex;
     std::vector<OpenGL::DrawElementsIndirectCommand> _mdi_scratch_cmds;
+    // [animated MDI 2026-08-07] SHARED-pose animated batched models: each gets a FIXED bone-block slot in the
+    // batched bone SSBO (buffer 6), so inst_tex.z (block base) / inst_tex.w (bone count) are STABLE across
+    // frames (cached with the structure). Each frame fillMdiBones() re-animates the VISIBLE ones (bbox frustum
+    // cull) into _mdi_scratch_bones at their base and uploads it; off-screen models keep last pose (they're
+    // GPU frustum-culled anyway). This keeps the draw-call collapse without an "animate everything" regression.
+    struct MdiBoneModel { Model* model; std::uint32_t bone_base; std::uint32_t bone_count; glm::vec3 bbox_min; glm::vec3 bbox_max; };
+    std::vector<MdiBoneModel> _mdi_bone_models;    // cached with the structure (rebuilt on cache miss)
+    std::vector<glm::mat4x4>  _mdi_scratch_bones;  // per-frame bone matrices for ALL batched animated models
+    std::size_t _mdi_bone_total = 0;               // total mat4 slots in the bone SSBO
+    bool _mdi_bones_uploaded_once = false;         // first upload must happen even if nothing is visible yet
 
     // [perf 2026-08-06] AMORTIZATION: the assembled batch is cached across frames and rebuilt ONLY when the
     // visible doodad set changes (cheap per-frame signature over persistent_doodad_draws + the texture-upload
@@ -252,8 +264,10 @@ namespace Noggit::Rendering
     bool mdiEnsureModelInArena(Model* m); // lazily append a model's geometry to the arena; false if it can't batch
     void drawDoodadsBatched(
         std::vector<std::pair<Model*, TileRender::DoodadInstanceBuffer const*>> const& persistent_doodad_draws,
-        glm::mat4x4 const& model_view, bool draw_hidden_models); // fills _mdi_batched_models + MDI-draws them
+        glm::mat4x4 const& model_view, bool draw_hidden_models,
+        math::frustum const& frustum, int animtime); // fills _mdi_batched_models + bone SSBO + MDI-draws them
     void drawMdiGroups();           // issue the cached groups (constant uniforms + per-group check-before-set + MDI)
+    void fillMdiBones(glm::mat4x4 const& model_view, math::frustum const& frustum, int animtime); // per-frame: animate VISIBLE batched models into the bone SSBO + upload
 
     // bloom post-process
     std::unique_ptr<OpenGL::program> _bloom_bright_program;

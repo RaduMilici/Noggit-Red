@@ -806,7 +806,8 @@ extern std::atomic<unsigned long long> g_texture_upload_epoch;
 
 void WorldRender::drawDoodadsBatched(
     std::vector<std::pair<Model*, TileRender::DoodadInstanceBuffer const*>> const& draws,
-    glm::mat4x4 const& /*model_view*/, bool draw_hidden_models)
+    glm::mat4x4 const& model_view, bool draw_hidden_models,
+    math::frustum const& frustum, int animtime)
 {
   if (draws.empty())
   {
@@ -847,6 +848,7 @@ void WorldRender::drawDoodadsBatched(
     if ((s_hit_dbg++ % 240) == 0)
       LogError << "[MDI] cache HIT groups=" << _mdi_cached_groups.size()
                << " instances=" << _mdi_cached_instances << std::endl;
+    fillMdiBones(model_view, frustum, animtime); // refresh visible shared poses BEFORE the draws read the SSBO
     drawMdiGroups();
     return;
   }
@@ -906,6 +908,40 @@ void WorldRender::drawDoodadsBatched(
     return;
   }
 
+  // 2a) [animated MDI 2026-08-07] assign each SHARED-pose animated batched model a FIXED bone-block slot in
+  //     the batched bone SSBO, and compute its whole-instance-set WORLD bbox (for the per-frame "animate only
+  //     visible" cull in fillMdiBones). Both are cached with the structure (stable across cache hits), so
+  //     inst_tex.z/w in the instance stream stay valid; only the SSBO CONTENT refreshes per frame.
+  _mdi_bone_models.clear();
+  _mdi_bone_total = 0;
+  std::unordered_map<Model*, std::pair<std::uint32_t, std::uint32_t>> bone_block; // model -> (base, count)
+  for (auto const& mi : model_instances)
+  {
+    Model* const m = mi.first;
+    if (!m->animBones || m->bone_matrices.empty())
+      continue;
+    std::uint32_t const count = static_cast<std::uint32_t>(m->bone_matrices.size());
+    std::uint32_t const base = static_cast<std::uint32_t>(_mdi_bone_total);
+    bone_block.emplace(m, std::make_pair(base, count));
+    // World bounds over all instances, sphere-based: per instance take its origin +- (model rad x the
+    // transform's max axis scale). Model exposes only `rad` (no local AABB member), and a union-of-spheres
+    // AABB is plenty for the "any instance visible -> animate this model" cull.
+    glm::vec3 bb_min(std::numeric_limits<float>::max());
+    glm::vec3 bb_max(std::numeric_limits<float>::lowest());
+    for (glm::mat4x4 const& t : mi.second)
+    {
+      float const sx = glm::length(glm::vec3(t[0]));
+      float const sy = glm::length(glm::vec3(t[1]));
+      float const sz = glm::length(glm::vec3(t[2]));
+      float const r = m->rad * std::max(sx, std::max(sy, sz));
+      glm::vec3 const c(t[3]);
+      bb_min = glm::min(bb_min, c - glm::vec3(r));
+      bb_max = glm::max(bb_max, c + glm::vec3(r));
+    }
+    _mdi_bone_models.push_back(MdiBoneModel{ m, base, count, bb_min, bb_max });
+    _mdi_bone_total += count;
+  }
+
   // 2) group (model, pass) into commands by batch identity. A model's transforms are replicated per pass
   //    (transform + inst_tex are co-located divisor-1 streams selected together by each command's baseInstance).
   struct CmdSpec { Model* model; std::uint32_t pass; int layer0; int layer1; };
@@ -950,7 +986,12 @@ void WorldRender::drawDoodadsBatched(
       cmd.baseInstance = static_cast<GLuint>(_mdi_scratch_tf.size());
       _mdi_scratch_cmds.push_back(cmd);
 
-      glm::ivec4 const tex(c.layer0, c.layer1, 0, 0);
+      // inst_tex.z/w = this model's bone block (base, count) in the batched bone SSBO; (0,0) = static ->
+      // the batched vertex shader keeps the bind pose for it.
+      auto const bb_it = bone_block.find(c.model);
+      glm::ivec4 const tex(c.layer0, c.layer1,
+                           bb_it != bone_block.end() ? static_cast<int>(bb_it->second.first) : 0,
+                           bb_it != bone_block.end() ? static_cast<int>(bb_it->second.second) : 0);
       for (glm::mat4x4 const& t : transforms)
       {
         _mdi_scratch_tf.push_back(t);
@@ -998,6 +1039,7 @@ void WorldRender::drawDoodadsBatched(
              << " arenaVtx=" << _mdi_arena_vtx << " arenaIdx=" << _mdi_arena_idx << std::endl;
   }
 
+  fillMdiBones(model_view, frustum, animtime); // fresh block layout -> upload the poses before the first draw
   drawMdiGroups();
 }
 
@@ -1070,6 +1112,56 @@ void WorldRender::drawMdiGroups()
   gl.bindBuffer(GL_DRAW_INDIRECT_BUFFER, 0);
 
   _world->_n_rendered_objects += _mdi_cached_instances;
+}
+
+// [animated MDI 2026-08-07] Per-frame bone refresh for the batched draw. Re-animates ONLY the batched
+// animated models whose instance-set world bounds intersect the frustum (an off-screen model keeps last
+// frame's pose -- all its instances are GPU-frustum-culled anyway, so the stale pose is never visible),
+// writes each model's shared pose into its FIXED block in the scratch, and uploads the whole SSBO once,
+// bound at binding 0 = the batched vertex shader's BatchedBones. Bones are computed CPU-side WITHOUT the
+// per-model GL TBO upload (upload_bones=false) -- the batch reads only the SSBO. Called right before
+// drawDoodadsBatched each frame; cheap when nothing is visible.
+void WorldRender::fillMdiBones(glm::mat4x4 const& model_view, math::frustum const& frustum, int animtime)
+{
+  if (_mdi_bone_models.empty() || _mdi_bone_total == 0)
+    return;
+
+  _mdi_scratch_bones.resize(_mdi_bone_total, glm::mat4x4(1.0f));
+  bool any = false;
+  for (auto const& bm : _mdi_bone_models)
+  {
+    Model* const m = bm.model;
+    if (!m->finishedLoading() || m->loading_failed())
+      continue;
+    if (!frustum.intersects(bm.bbox_max, bm.bbox_min))
+      continue; // off-screen -> keep last pose (GPU-culled)
+    if (!m->animcalc)
+    {
+      // upload_bones stays TRUE: other draw paths (a WMO-doodad/GO copy of the SAME Model) see animcalc==true,
+      // skip their own animate, and bind the per-model bone TBO -- with false here that TBO would never update
+      // again and those copies would freeze. Cost matches the pre-MDI behaviour (one TBO upload per model).
+      m->animate(model_view, 0, animtime);
+      m->animcalc = true; // the shared pose is now current for this frame (other paths reuse it)
+    }
+    std::size_t const n = std::min<std::size_t>(bm.bone_count, m->bone_matrices.size());
+    if (n == 0)
+      continue;
+    std::copy_n(m->bone_matrices.begin(), n, _mdi_scratch_bones.begin() + bm.bone_base);
+    any = true;
+  }
+  if (!any && _mdi_bones_uploaded_once)
+    return; // nothing visible changed; the SSBO already holds valid (last) poses
+
+  constexpr GLenum SSBO_TARGET = 0x90D2; // GL_SHADER_STORAGE_BUFFER (header-independent)
+  GLuint const bone_ssbo = _mdi_buffers[6];
+  gl.bindBuffer(SSBO_TARGET, bone_ssbo);
+  gl.bufferData(SSBO_TARGET,
+                static_cast<GLsizeiptr>(_mdi_scratch_bones.size() * sizeof(glm::mat4x4)),
+                _mdi_scratch_bones.data(), GL_STREAM_DRAW);
+  gl.bindBufferRange(SSBO_TARGET, 0, bone_ssbo, 0,
+                     static_cast<GLsizeiptr>(_mdi_scratch_bones.size() * sizeof(glm::mat4x4)));
+  gl.bindBuffer(SSBO_TARGET, 0);
+  _mdi_bones_uploaded_once = true;
 }
 
 void WorldRender::draw (glm::mat4x4 const& model_view
@@ -3541,7 +3633,7 @@ void WorldRender::draw (glm::mat4x4 const& model_view
             for (auto const& kv : b)
               _mdi_all_loaded.emplace_back(kv.first, &kv.second);
           }
-          drawDoodadsBatched(_mdi_all_loaded, model_view, draw_hidden_models);
+          drawDoodadsBatched(_mdi_all_loaded, model_view, draw_hidden_models, frustum, _world->model_animtime);
         }
 
         if (capture_debug_enabled())
