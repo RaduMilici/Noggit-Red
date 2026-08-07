@@ -9,6 +9,7 @@
 #include <opengl/scoped.hpp>
 #include <opengl/shader.hpp>
 #include <math/frustum.hpp>
+#include <tuple>
 
 class Model;
 class ModelInstance;
@@ -61,6 +62,33 @@ namespace Noggit::Rendering
     none
   };
 
+  // [perf 2026-08-05] MDI batching group-key + per-instance texture layers for ONE static doodad render pass.
+  // Passes with an identical identity() can be collapsed into a single glMultiDrawElementsIndirect call. The
+  // texture-array LAYER (layer0/layer1) is deliberately NOT part of the identity -- it rides the per-instance
+  // inst_tex stream, so passes sampling different layers of the SAME array object still batch together.
+  struct StaticBatchKey
+  {
+    GLuint tex_array0 = 0;   // GL_TEXTURE_2D_ARRAY object on unit 1 (0 => pass not resolved)
+    GLuint tex_array1 = 0;   // unit 2 (0 => single-texture pass)
+    int    tu_lookup0 = 0;
+    int    tu_lookup1 = 0;
+    int    pixel_shader = 0;
+    int    tex_clamp0 = 0;
+    int    tex_clamp1 = 0;
+    uint16_t blend_mode = 0;
+    bool   backface_cull = true;
+    // per-instance (NOT identity)
+    int    layer0 = 0;
+    int    layer1 = 0;
+
+    auto identity() const
+    {
+      return std::tie(tex_array0, tex_array1, tu_lookup0, tu_lookup1, pixel_shader,
+                      tex_clamp0, tex_clamp1, blend_mode, backface_cull);
+    }
+    bool operator<(StaticBatchKey const& o) const { return identity() < o.identity(); }
+  };
+
 
   struct ModelRenderPass : ModelTexUnit
   {
@@ -92,6 +120,14 @@ namespace Noggit::Rendering
     void afterDraw();
     bool bindTexture(size_t index, Model* m, ModelInstance const* instance, OpenGL::M2RenderState& model_render_state, OpenGL::Scoped::use_program& m2_shader);
     void initUVTypes(Model* m);
+
+    // [perf 2026-08-05] MDI batching: fill `out` with this pass's group-key + per-instance texture layers,
+    // resolving only the model's BASE textures (no instance/special-texture path). Returns false when the pass
+    // is NOT batchable -> the caller must draw it the classic per-model way. Mirrors the batchable subset of
+    // prepareDraw/bindTexture: rejects special/replaceable textures, animated UV, animated bones, non-default
+    // colour/opacity/flags, non-Opaque/Alpha_Key blend, creature/character/lightray/water-effect models, and
+    // any texture not yet loaded+uploaded (deferred this frame). See StaticBatchKey.
+    [[nodiscard]] bool resolveStaticBatch(Model* m, StaticBatchKey& out) const;
 
     bool operator< (const ModelRenderPass &m) const
     {

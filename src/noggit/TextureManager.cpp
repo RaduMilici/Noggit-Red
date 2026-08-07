@@ -19,7 +19,25 @@ decltype (TextureManager::_tex_arrays) TextureManager::_tex_arrays;
 decltype (TextureManager::_raw_textures) TextureManager::_raw_textures;
 decltype (TextureManager::_raw_textures_mutex) TextureManager::_raw_textures_mutex;
 
-constexpr unsigned N_ARRAY_TEX = 1;
+// [perf 2026-08-06] Bumped once per successful blp_texture::upload(). The MDI doodad batcher folds this into
+// its per-frame cache signature so a model that only becomes batchable once its texture finishes uploading
+// forces a batch rebuild (its (model,count) signature is otherwise unchanged). External linkage; WorldRender
+// declares `extern` for it (no header dependency). Reads are approximate (relaxed) -- staleness just costs one
+// extra rebuild, never correctness.
+std::atomic<unsigned long long> g_texture_upload_epoch{0};
+
+// [perf 2026-08-05] Real multi-layer GL_TEXTURE_2D_ARRAYs (was 1 = every BLP its own single-layer array,
+// array_index() always 0). Now up to N BLPs of the SAME (compression,w,h,mips) class share one array object,
+// each on its own layer (index_x = n_used/N picks the array, layer = n_used%N). This is the PREREQ for
+// Step-3 MDI doodad batching: many doodads that used to force a distinct bind-per-draw can now share one
+// array bind + per-instance layer -> collapse into a single glMultiDrawElementsIndirect call.
+//   * NO perf gain on its own -- draw-call count is unchanged until Step 3. This bump is a correctness gate:
+//     the M2 shader samples texture(tex, vec3(uv, tex1_index)) and the WMO shader carries the layer per-vertex
+//     through the render-batch TBO, so both already sample the right layer; verify no cross-layer bleed.
+//   * VRAM: each class pre-allocates all N layers up front (immutable array size). ~11MB per 512^2-DXT1
+//     64-layer array; worst case ~1GB of tail waste across all loaded classes -- fine on the 24GB target GPU.
+//     Watch [MEM] vram= after the bump; dial back if it pressures the eviction path we just stabilised.
+constexpr unsigned N_ARRAY_TEX = 64;
 namespace
 {
   constexpr char const* fallback_texture_filename = "tileset/generic/black.blp";
@@ -464,26 +482,12 @@ void blp_texture::upload()
 
     params.n_used++;
 
-    // [TEXARRAYDBG 2026-07-30] temporary: which texture OWNS each (array, layer)? Cross-referenced against
-    // the layer a WMO batch actually samples, to find where green "junk texture" bleed comes from.
-    {
-      static std::atomic<int> dbg{0};
-      if (dbg.fetch_add(1) < 6000)
-      {
-        LogError << "[TEXARRAYDBG] upload fmt=" << _compression_format.value()
-                 << " " << _width << "x" << _height
-                 << " mips=" << _compressed_data.size()
-                 << " array=" << _texture_array << " layer=" << _array_index
-                 << " n_used=" << params.n_used
-                 << " file='" << _file_key.stringRepr() << "'" << std::endl;
-      }
-    }
-
     //LogDebug << "Mip level (compressed): " << std::to_string(_compressed_data.size()) << std::endl;
     _compressed_data.clear();
   }
 
   _uploaded = true;
+  g_texture_upload_epoch.fetch_add(1, std::memory_order_relaxed); // MDI batcher cache-invalidation signal
 }
 
 void blp_texture::unload()

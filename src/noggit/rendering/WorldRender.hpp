@@ -16,7 +16,10 @@
 #include <noggit/Sky.h>
 
 #include <opengl/shader.hpp>
+#include <opengl/types.hpp>                     // OpenGL::DrawElementsIndirectCommand (MDI doodad batching)
 #include <noggit/rendering/Primitives.hpp>
+#include <noggit/rendering/ModelRender.hpp>     // StaticBatchKey (MDI doodad batching)
+#include <noggit/rendering/TileRender.hpp>      // TileRender::DoodadInstanceBuffer (MDI doodad batching)
 #include <noggit/ModelInstance.h>
 #include <noggit/InteriorVolume.hpp>
 
@@ -201,6 +204,7 @@ namespace Noggit::Rendering
     std::unique_ptr<OpenGL::program> _mfbo_program;
     std::unique_ptr<OpenGL::program> _m2_program;
     std::unique_ptr<OpenGL::program> _m2_instanced_program;
+    std::unique_ptr<OpenGL::program> _m2_batched_program; // [perf 2026-08-05] MDI cross-model doodad batching (instanced+batched defines)
     std::unique_ptr<OpenGL::program> _m2_particles_program;
     std::unique_ptr<OpenGL::program> _m2_ribbons_program;
     std::unique_ptr<OpenGL::program> _blob_shadow_program; // unit (creature) ground blob shadows
@@ -209,6 +213,46 @@ namespace Noggit::Rendering
     std::unique_ptr<OpenGL::program> _liquid_program;
     std::unique_ptr<OpenGL::program> _wmo_liquid_program;
     std::unique_ptr<OpenGL::program> _occluder_program;
+
+    // [perf 2026-08-05] MDI cross-model doodad batching (NOGGIT_DOODAD_MDI). An append-only shared geometry
+    // arena holds every batchable doodad model's geometry (concatenated once at first use, never freed); each
+    // frame the visible batchable instances are assembled into one instance buffer + indirect-command buffer
+    // and drawn with one glMultiDrawElementsIndirect per (texture-array x state) group via _m2_batched_program.
+    // See ensureMdiArena / mdiEnsureModelInArena / drawDoodadsBatched in WorldRender.cpp.
+    struct MdiArenaSlot { GLint base_vertex = 0; GLuint index_base = 0; bool ok = false; };
+    // Keyed by the model's STABLE file identity, NOT Model* -- the arena is append-only/never cleared, but
+    // Model* addresses are reused after a model unloads (dense streaming), so a Model* key would map a new
+    // model to a DIFFERENT unloaded model's arena geometry -> exploded vertices. Same file == same geometry,
+    // so file-keying is both correct and deduplicating.
+    std::unordered_map<std::string, MdiArenaSlot> _mdi_slots;     // arena location per model FILE (append-only)
+    std::unordered_map<Model*, std::uint8_t> _mdi_batched_models; // per-frame: models the MDI pass drew (skip elsewhere)
+    OpenGL::Scoped::deferred_upload_buffers<6> _mdi_buffers;      // 0 arena_vbo 1 arena_ibo 2 inst_tf 3 inst_interior 4 inst_tex 5 indirect
+    OpenGL::Scoped::deferred_upload_vertex_arrays<1> _mdi_vao_arr;
+    bool _mdi_ready = false;
+    GLsizeiptr _mdi_arena_vbo_cap = 0, _mdi_arena_ibo_cap = 0;
+    GLsizei _mdi_arena_vtx = 0, _mdi_arena_idx = 0;
+    GLsizeiptr _mdi_inst_cap = 0, _mdi_indirect_cap = 0;          // current instance/indirect buffer byte capacities
+    std::vector<glm::mat4x4> _mdi_scratch_tf;                     // per-frame scratch (retained to avoid re-alloc)
+    std::vector<glm::vec4>   _mdi_scratch_interior;
+    std::vector<glm::ivec4>  _mdi_scratch_tex;
+    std::vector<OpenGL::DrawElementsIndirectCommand> _mdi_scratch_cmds;
+
+    // [perf 2026-08-06] AMORTIZATION: the assembled batch is cached across frames and rebuilt ONLY when the
+    // visible doodad set changes (cheap per-frame signature over persistent_doodad_draws + the texture-upload
+    // epoch). On a cache hit the GPU instance/indirect buffers still hold the last upload, so per-frame work
+    // collapses to re-issuing the cached groups. _mdi_batched_models is likewise kept across a hit.
+    struct MdiGroup { StaticBatchKey key; std::uint32_t first_cmd = 0; std::uint32_t cmd_count = 0; };
+    std::vector<MdiGroup> _mdi_cached_groups;
+    unsigned long long _mdi_last_sig = 0;
+    bool _mdi_cache_valid = false;
+    std::size_t _mdi_cached_instances = 0; // rendered-object count added each frame (hit or miss)
+
+    void ensureMdiArena();          // one-time arena/instance/indirect buffer + VAO setup
+    bool mdiEnsureModelInArena(Model* m); // lazily append a model's geometry to the arena; false if it can't batch
+    void drawDoodadsBatched(
+        std::vector<std::pair<Model*, TileRender::DoodadInstanceBuffer const*>> const& persistent_doodad_draws,
+        glm::mat4x4 const& model_view, bool draw_hidden_models); // fills _mdi_batched_models + MDI-draws them
+    void drawMdiGroups();           // issue the cached groups (constant uniforms + per-group check-before-set + MDI)
 
     // bloom post-process
     std::unique_ptr<OpenGL::program> _bloom_bright_program;

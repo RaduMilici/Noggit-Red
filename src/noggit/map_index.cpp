@@ -488,7 +488,7 @@ void MapIndex::unloadTiles(const TileIndex& tile)
     // iterates -> iterator invalidation / use-after-free (0xC0000005 in unloadTile). Latent for years
     // because with unload_dist large nothing ever crossed the threshold; it fires the moment tiles
     // actually unload (sane unload_dist + fast movement) -> "it crashes when it goes too fast".
-    unsigned resident = 0, far_count = 0, far_blocked_changed = 0;
+    unsigned resident = 0, far_count = 0, far_blocked_changed = 0, far_kept_visible = 0;
     std::vector<TileIndex> to_unload;
     for (MapTile* adt : loaded_tiles())
     {
@@ -496,8 +496,16 @@ void MapIndex::unloadTiles(const TileIndex& tile)
       if (tile.dist(adt->index) > _unload_dist)
       {
         ++far_count;
-        //Only unload adts not marked to save
-        if (!adt->changed.load())
+        // [2026-08-06] NEVER unload a tile that is still on screen. The renderer sets rendered_recently for
+        // every in-frustum tile each frame; exchange(false) reads AND clears it so a tile that has since LEFT
+        // the frustum (flag no longer re-set) unloads on a later pass. This keeps visible far tiles (ocean at
+        // render distance rendered as empty flat quads otherwise) resident, while residency stays bounded to
+        // ~frustum coverage -- the unload_dist band alone was smaller than the render distance.
+        if (adt->rendered_recently.exchange(false, std::memory_order_relaxed))
+        {
+          ++far_kept_visible;
+        }
+        else if (!adt->changed.load()) //Only unload adts not marked to save
         {
           to_unload.push_back(adt->index);
         }
@@ -552,6 +560,7 @@ void MapIndex::unloadTiles(const TileIndex& tile)
     {
       LogError << "[UNLOAD] resident=" << resident << " far=" << far_count
                << " far_blocked_changed=" << far_blocked_changed
+               << " far_kept_visible=" << far_kept_visible
                << " unloaded=" << unloaded << "/" << to_unload.size()
                << (defer ? " DEFERRED(loader busy)" : "")
                << " maxPerPass=" << s_max_unload_per_pass << " deferBacklog=" << s_defer_backlog

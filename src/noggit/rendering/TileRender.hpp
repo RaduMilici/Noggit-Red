@@ -75,6 +75,10 @@ namespace Noggit::Rendering
       GLuint transform_vbo = 0;
       GLuint interior_vbo = 0;   // per-instance interior (all-zero for outdoor tile doodads; kept for WMO reuse)
       GLsizei count = 0;
+      // [perf 2026-08-05] CPU copy of the same transforms (already computed during the rebuild) retained so the
+      // MDI doodad batcher can concatenate a model's instances across tiles into one indirect-draw instance
+      // buffer without a GPU readback or a per-frame transformMatrix() recompute. Unused when MDI is off.
+      std::vector<glm::mat4x4> cpu_transforms;
     };
     // Rebuilds if the tile's object set changed since the last build; returns the current per-model buffers.
     [[nodiscard]] tsl::robin_map<Model*, DoodadInstanceBuffer> const& doodadInstanceBuffers();
@@ -92,6 +96,13 @@ namespace Noggit::Rendering
     bool _requires_sampler_reset = false;
     bool _requires_paintability_recalc = true;
     bool _texture_not_loaded = false;
+
+    // [perf 2026-08-06] Lazy per-chunk terrain streaming (NOGGIT_LAZY_CHUNK_UPLOAD). A freshly-loaded tile
+    // uploads its 256 chunks a BUDGET at a time over several frames -- drawing only the ready prefix meanwhile
+    // -- instead of all 256 in one frame, spreading the ~30-80ms TileStream spike into small per-frame costs
+    // (client-like progressive fill). Falls back to all-at-once for split-sampler tiles / edits / special passes.
+    bool _lazy_streaming = false;
+    int  _lazy_cursor = 0; // chunks uploaded so far during the current lazy stream (0..256)
 
     // culling
     unsigned _objects_frustum_cull_test = 0;

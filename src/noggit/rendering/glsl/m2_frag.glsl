@@ -80,8 +80,18 @@ uniform int water_surface_effect; // 1 = fishing-pool wake geoset: grey out + lu
 
 uniform sampler2DArray tex1;
 uniform sampler2DArray tex2;
+#ifdef batched
+// [perf 2026-08-05] MDI batch: the texture-array LAYER is per-instance (differs per model within one
+// glMultiDrawElementsIndirect call), delivered as a flat vertex varying instead of a per-draw uniform. The
+// #define keeps every sampling site -- texture(tex1, vec3(uv, tex1_index)) etc. -- unchanged; under `batched`
+// the name resolves to the per-instance component. (Compiled with `instanced` also defined.)
+flat in ivec4 v_inst_tex;
+#define tex1_index (v_inst_tex.x)
+#define tex2_index (v_inst_tex.y)
+#else
 uniform int tex1_index;
 uniform int tex2_index;
+#endif
 // M2 texture wrap flags (0x1 wrap X, 0x2 wrap Y): an UNSET bit means the texture addresses CLAMP
 // on that axis (trace-verified: 1.12 sets D3DTADDRESS_CLAMP on most in-world M2 draws). Encoded
 // here inverted as a clamp mask (bit0 = clamp U, bit1 = clamp V) so an unset uniform (0) keeps the

@@ -143,5 +143,19 @@ namespace OpenGL
 
   };
 
+  // [perf 2026-08-05] glMultiDrawElementsIndirect command. Layout is fixed by the GL spec (must match exactly,
+  // 20 bytes, no padding): one per (model render-pass) in a batch. baseVertex is SIGNED per spec. baseInstance
+  // offsets the divisor-1 per-instance attribute fetches (transform loc6-9, interior loc10, inst_tex loc11) --
+  // that is how each command selects its own model's instances + texture layers without gl_DrawID (4.6).
+  struct DrawElementsIndirectCommand
+  {
+    GLuint count = 0;         // index count for this render pass
+    GLuint instanceCount = 0; // number of instances of this model
+    GLuint firstIndex = 0;    // start index in the shared arena IBO (= arena base + pass index_start)
+    GLint  baseVertex = 0;    // added to every index (= this model's base vertex in the shared arena VBO)
+    GLuint baseInstance = 0;  // first per-instance record for this command in the batch instance buffer
+  };
+  static_assert(sizeof(DrawElementsIndirectCommand) == 20, "DrawElementsIndirectCommand must be tightly packed for MDI");
+
 
 }

@@ -2569,6 +2569,131 @@ bool ModelRenderPass::bindTexture(size_t index, Model* m, ModelInstance const* i
   return true;
 }
 
+bool ModelRenderPass::resolveStaticBatch(Model* m, StaticBatchKey& out) const
+{
+  // [perf 2026-08-05] Conservative batchability gate. Everything rejected here falls back to the classic
+  // per-model persistent draw, so it is always safe to reject; coverage is widened later (3b). The batched
+  // program draws with CONSTANT unfogged=0/unlit=0/masked_additive=0/mesh_color=(1,1,1,1)/identity tex-matrix/
+  // anim_bones=false and blend OFF + depth-write ON, so any pass needing otherwise must be rejected here.
+  //
+  // [MDI-DIAG 2026-08-06] rejection histogram -- coverage came out zero, so tally WHICH gate rejects. Called
+  // only on the draw thread (single-threaded) so plain statics are fine; dumped cumulatively every 200k calls.
+  static unsigned long s_calls = 0, s_ok = 0, s_rej[16] = {0};
+  ++s_calls;
+  auto dump = [&]()
+  {
+    if (s_calls % 200000ul != 0ul) return;
+    LogError << "[MDI-REJECT] calls=" << s_calls << " ok=" << s_ok
+             << " renderflag=" << s_rej[1] << " no_ps=" << s_rej[2] << " blend=" << s_rej[3]
+             << " flags=" << s_rej[4] << " color=" << s_rej[5] << " transp=" << s_rej[6]
+             << " trans=" << s_rej[7] << " creature=" << s_rej[8] << " lightray=" << s_rej[9]
+             << " water=" << s_rej[10] << " bones=" << s_rej[11] << " tex0=" << s_rej[12]
+             << " tex1=" << s_rej[13] << " animuv=" << s_rej[14] << std::endl;
+  };
+  auto rej = [&](int code) -> bool { ++s_rej[code]; dump(); return false; };
+
+  if (renderflag_index >= m->_render_flags.size())
+    return rej(1);
+  auto const& renderflag = m->_render_flags[renderflag_index];
+
+  // effective pixel shader (mirror prepareDraw: classic layout derives a default from the blend)
+  std::optional<ModelPixelShader> ps = pixel_shader;
+  if (m->_uses_classic_layout && !ps)
+    ps = classic_default_pixel_shader_for_blend(renderflag.blend);
+  if (!ps)
+    return rej(2);
+
+  // Opaque / Alpha_Key only -- they share GL blend state (blend OFF); Alpha_Key differs by the in-shader
+  // alpha test keyed on the per-group blend_mode uniform. inst_alpha is 1 (doodads) so nothing promotes.
+  uint16_t const blend = renderflag.blend;
+  if (blend != static_cast<uint16_t>(M2Blend::Opaque) && blend != static_cast<uint16_t>(M2Blend::Alpha_Key))
+    return rej(3);
+
+  // require the batch-constant flags to hold (else the constant uniforms/state would be wrong)
+  if (renderflag.flags.unfogged || renderflag.flags.unlit || renderflag.flags.z_buffered)
+    return rej(4);
+
+  // require mesh_color == (1,1,1,1). RGB: no animated colour track (rare). Alpha: EVALUATE the transparency
+  // exactly as prepareDraw does and batch only when it is ~1 -- the common case is a CONSTANT-1 track (opaque
+  // prop), which IS batchable; only genuine fades (alpha < 1) fall back to the uniform path. Blanket-rejecting
+  // any transparency track killed ~96% of coverage (nearly every doodad has one). [MDI-DIAG 2026-08-06]
+  if (color_index != -1)
+    return rej(5);
+  float alpha = m->trans;
+  if (transparency_combo_index != 0xFFFF && transparency_combo_index < m->_transparency_lookup.size())
+  {
+    int const ti = m->_transparency_lookup[transparency_combo_index];
+    if (ti >= 0 && static_cast<std::size_t>(ti) < m->_transparency.size())
+    {
+      auto& tr = m->_transparency[static_cast<std::size_t>(ti)].trans;
+      if (tr.uses(m->_current_anim_seq))
+        alpha *= tr.getValue(m->_current_anim_seq, m->_anim_time, m->_global_animtime);
+      else if (tr.uses(0))
+        alpha *= tr.getValue(0, m->_anim_time, m->_global_animtime);
+    }
+  }
+  if (alpha < 0.999f)
+    return rej(7); // genuine fade -> real alpha needed, keep uniform path
+
+  // classes handled by other paths / not representable in the static batch
+  if (is_classic_creature_or_character_model(m))
+    return rej(8);
+  if (is_masked_lightray_model(m))
+    return rej(9);
+  if (m->_water_surface_effect)
+    return rej(10);
+  if (m->animBones)
+    return rej(11); // batched program runs anim_bones=false -> would draw an animated model in bind pose
+
+  // BASE-texture resolution per unit (instance-independent). ret: 1 ok, 0 unit unused, -1 reject/defer.
+  auto resolve_unit = [&](std::size_t index, GLuint& arr, int& layer, int& clamp) -> int
+  {
+    if (index >= texture_count) { arr = 0; layer = 0; clamp = 0; return 0; }
+    if (textures[index] >= m->_texture_lookup.size()) return -1;
+    uint16_t const tex = m->_texture_lookup[textures[index]];
+    if (tex >= m->_specialTextures.size() || tex >= m->_textures.size()) return -1;
+    if (m->_specialTextures[tex] != -1) return -1; // special/replaceable -> per-instance, not batchable
+    auto& t = m->_textures[tex];
+    if (t->loading_failed() || !t->finishedLoading()) return -1; // defer until loaded (retried next frame)
+    t->upload();
+    if (!t->is_uploaded()) return -1;
+    arr = t->texture_array();
+    layer = t->array_index();
+    uint32_t const wrap = tex < m->_texture_flags.size() ? m->_texture_flags[tex] : 0x3;
+    clamp = static_cast<int>((~wrap) & 0x3);
+    return 1;
+  };
+
+  int const r0 = resolve_unit(0, out.tex_array0, out.layer0, out.tex_clamp0);
+  if (r0 != 1)
+    return rej(12); // unit 0 must resolve
+  int const r1 = resolve_unit(1, out.tex_array1, out.layer1, out.tex_clamp1);
+  if (r1 == -1)
+    return rej(13); // unit 1 present but not batchable/deferred
+
+  // static UV only (no animated texture matrix) -- mirror the prepareDraw tex_anim_lookup resolution
+  auto static_uv = [&](std::size_t idx) -> bool
+  {
+    if (uv_animations[idx] < m->_texture_animation_lookups.size())
+      return m->_texture_animation_lookups[uv_animations[idx]] == -1;
+    return true; // no lookup -> not animated
+  };
+  if (!static_uv(0))
+    return rej(14);
+  if (r1 == 1 && !static_uv(1))
+    return rej(14);
+
+  out.tu_lookup0 = static_cast<int>(tu_lookups[0]);
+  out.tu_lookup1 = static_cast<int>(tu_lookups[1]);
+  out.pixel_shader = static_cast<int>(ps.value());
+  out.blend_mode = blend;
+  bool const classic_alpha_pass = m->_uses_classic_layout && blend != static_cast<uint16_t>(M2Blend::Opaque);
+  out.backface_cull = !renderflag.flags.two_sided && !classic_alpha_pass;
+  ++s_ok;
+  dump();
+  return true;
+}
+
 void ModelRenderPass::initUVTypes(Model* m)
 {
   tu_lookups[0] = texture_unit_lookup::none;

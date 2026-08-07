@@ -100,6 +100,13 @@ public:
 
   std::atomic<bool> changed;
 
+  // [perf 2026-08-06] Set by the renderer for every IN-FRUSTUM tile each frame; read by MapIndex::unloadTiles so
+  // a tile still on screen is NEVER unloaded even when it sits beyond unload_dist. Without this, visible far
+  // tiles (e.g. ocean at render distance) unload and render as empty flat quads -- the bug the pinned-changed
+  // memory leak used to mask. unloadTiles clears it each pass; the next frame's render re-sets it while the tile
+  // stays visible, so residency is bounded to ~frustum coverage (no unbounded growth).
+  std::atomic<bool> rendered_recently{false};
+
 
   bool intersect (math::ray const&, selection_result*) const;
 

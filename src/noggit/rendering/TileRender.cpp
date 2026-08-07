@@ -13,8 +13,34 @@
 
 #include <algorithm>
 #include <vector>
+#include <cstdlib>
 
 using namespace Noggit::Rendering;
+
+namespace
+{
+  // [perf 2026-08-06] Lazy per-chunk terrain streaming toggle + per-frame chunk budget. Dev A/B gate; OFF =
+  // today's all-at-once upload. See the update block in TileRender::draw.
+  bool lazy_chunk_upload_enabled()
+  {
+    static bool const on = []
+    {
+      char const* v = std::getenv("NOGGIT_LAZY_CHUNK_UPLOAD");
+      return v && *v && *v != '0';
+    }();
+    return on;
+  }
+  int lazy_chunk_budget()
+  {
+    static int const n = []
+    {
+      char const* v = std::getenv("NOGGIT_LAZY_CHUNK_BUDGET");
+      int const b = v ? std::atoi(v) : 32;
+      return b > 0 ? b : 32;
+    }();
+    return n;
+  }
+}
 
 
 TileRender::TileRender(MapTile* map_tile)
@@ -57,6 +83,11 @@ void TileRender::upload()
                                                     | ChunkUpdateFlags::AREA_ID | ChunkUpdateFlags::FLAGS);
     }
   }
+
+  // [perf 2026-08-06] Begin a lazy per-chunk stream (if enabled): the draw update block uploads the 256 chunks
+  // a budget at a time over several frames and draws only the ready prefix, instead of all-at-once.
+  _lazy_streaming = lazy_chunk_upload_enabled();
+  _lazy_cursor = 0;
 
   _uploaded = true;
 
@@ -161,7 +192,8 @@ void TileRender::rebuildDoodadInstanceBuffers()
     gl.bindBuffer(GL_ARRAY_BUFFER, buf.interior_vbo);
     gl.bufferData(GL_ARRAY_BUFFER, interiors.size() * sizeof(glm::vec4), interiors.data(), GL_STATIC_DRAW);
 
-    _doodad_instance_buffers.emplace(model, buf);
+    buf.cpu_transforms = std::move(transforms); // retained for the MDI batcher (see DoodadInstanceBuffer)
+    _doodad_instance_buffers.emplace(model, std::move(buf));
   }
 
   gl.bindBuffer(GL_ARRAY_BUFFER, 0);
@@ -271,7 +303,17 @@ void TileRender::draw (OpenGL::Scoped::use_program& mcnk_shader
 
     _selected = is_selected;
 
-    for (int i = 0; i < 256; ++i)
+    // [perf 2026-08-06] LAZY streaming: process only a budget of chunks (in raster order) per frame, draw the
+    // ready prefix, and defer clearing the tile update flag until all 256 are done -- spreading the TileStream
+    // spike across frames (client-like progressive fill). Falls back to all-at-once (0..256) when not streaming
+    // / split-sampler / paint edits / special passes. On a split detected mid-window we abort lazy and finish
+    // every remaining chunk this frame (rare, heavily-textured tiles only).
+    bool lazy_active = _lazy_streaming && !_split_drawcall && !_requires_sampler_reset
+                    && !_texture_not_loaded && !need_paintability_update;
+    int const win_start = lazy_active ? _lazy_cursor : 0;
+    int win_end = lazy_active ? std::min(_lazy_cursor + lazy_chunk_budget(), 256) : 256;
+
+    for (int i = win_start; i < win_end; ++i)
     {
       int chunk_x = i / 16;
       int chunk_y = i % 16;
@@ -295,6 +337,7 @@ void TileRender::draw (OpenGL::Scoped::use_program& mcnk_shader
         if (!_split_drawcall && !fillSamplers(chunk.get(), i, static_cast<unsigned int>(_draw_calls.size() - 1)))
         {
           _split_drawcall = true;
+          if (lazy_active) { lazy_active = false; win_end = 256; } // abort lazy -> finish every chunk this frame
         }
       }
 
@@ -413,7 +456,28 @@ void TileRender::draw (OpenGL::Scoped::use_program& mcnk_shader
       }
     }
 
-    _map_tile->endChunkUpdates();
+    // [perf 2026-08-06] LAZY: draw only the ready prefix [0, cursor) and keep the tile flag PENDING (chunks
+    // beyond the window are still flagged) so the update block resumes next frame; clear it only once fully
+    // streamed. Non-lazy / aborted paths processed every chunk this frame -> clear now.
+    if (lazy_active && !_split_drawcall)
+    {
+      _lazy_cursor = win_end;
+      if (!_draw_calls.empty())
+      {
+        _draw_calls[0].start_chunk = 0;
+        _draw_calls[0].n_chunks = static_cast<unsigned>(_lazy_cursor);
+      }
+      if (_lazy_cursor >= 256)
+      {
+        _lazy_streaming = false;
+        _map_tile->endChunkUpdates();
+      }
+    }
+    else
+    {
+      _lazy_streaming = false;
+      _map_tile->endChunkUpdates();
+    }
 
     if (_texture_not_loaded)
       _map_tile->registerChunkUpdate(ChunkUpdateFlags::ALPHAMAP);

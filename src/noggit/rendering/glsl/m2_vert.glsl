@@ -22,6 +22,16 @@ layout(location = 5) in uvec4 bones_indices;
   uniform mat4 transform;
 #endif
 
+#ifdef batched
+  // [perf 2026-08-05] MDI cross-model batch: the texture-array LAYER differs per model within a single
+  // glMultiDrawElementsIndirect call, so it rides the divisor-1 per-instance stream (selected by each draw
+  // command's baseInstance -- ARB_base_instance, no gl_DrawID/4.6 needed) instead of a per-draw uniform.
+  // z/w reserved to move pixel_shader/blend_mode per-instance later (widens batches); unused for now but the
+  // whole ivec4 stays live because .xy is read. The batched program is compiled with `instanced` ALSO defined.
+  layout(location = 11) in ivec4 inst_tex;   // x = tex1 layer, y = tex2 layer, z = pixel_shader (reserved), w = blend_mode (reserved)
+  flat out ivec4 v_inst_tex;
+#endif
+
 // Interior light for this draw: rgb = WMO room ambient; a in [0.5,1.0] indoors (carries GAP B doorway
 // spill = baked MOCV floor alpha), 0 outdoors. [perf 2026-08-05] The INSTANCED path now carries this
 // PER INSTANCE in interior_attr (location 10, divisor 1) so instances with different room colours batch
@@ -181,6 +191,9 @@ void main()
   v_interior = interior;             // per-instance room light (batches mixed-interior instances in one draw)
 #else
   v_interior = instance_interior;    // individual path: uniform
+#endif
+#ifdef batched
+  v_inst_tex = inst_tex;             // per-instance texture layers to the fragment shader
 #endif
   gl_Position = projection * vertex;
 }

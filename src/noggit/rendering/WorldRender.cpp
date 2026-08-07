@@ -14,6 +14,9 @@
 #include <noggit/project/CurrentProject.hpp>
 #include <noggit/frame_profiler.hpp>
 
+#include <atomic>   // g_texture_upload_epoch (MDI batcher cache signature)
+#include <cstdint>
+
 #include <QDir>
 #include <QBuffer>
 #include <QtCore/QElapsedTimer>
@@ -210,33 +213,49 @@ namespace
     return static_cast<float>(ht->height_17[gj][gi]);
   }
 
-  // True when the tile AABB [mn,mx] is fully hidden behind nearer WDL terrain from the camera. Tests
-  // the tile's TOP at its NEAREST horizontal point (the hardest point to hide -> if that's occluded
-  // the whole tile is). Marches the WDL along the camera->tile ray, tracking the max terrain
-  // elevation angle; the tile is occluded when even its top-angle is below that silhouette by a
-  // margin.
+  // True when the tile AABB [mn,mx] is fully hidden behind nearer WDL terrain from the camera.
+  // [2026-08-06] MULTI-RAY (was single-ray to the nearest point, which over-culled: a tile mostly in view
+  // but whose nearest edge alone was tucked behind a ridge got the WHOLE tile culled -> empty visible tiles).
+  // Now sample an NxN grid across the tile's TOP face and march a ray to EACH; the tile is occluded ONLY when
+  // EVERY sample is hidden. Early-out the instant one sample is visible, so a tile with any visible part is
+  // never culled. Each sample uses the AABB top (mx.y = the tile's highest point = hardest to hide) so the
+  // test stays conservative. Still whole-tile granularity (coarse WDL data can't drive per-chunk well).
   bool wdl_horizon_occluded(World* world, glm::vec3 const& cam, glm::vec3 const& mn, glm::vec3 const& mx)
   {
-    float const nx = std::clamp(cam.x, mn.x, mx.x);
-    float const nz = std::clamp(cam.z, mn.z, mx.z);
-    float const dx = nx - cam.x;
-    float const dz = nz - cam.z;
-    float const d = std::sqrt(dx * dx + dz * dz);
-    if (d < 2.0f * TILESIZE) return false;                      // never occlude nearby tiles
-    float const occludee_angle = std::atan2(mx.y - cam.y, d);   // tile TOP at nearest point
-    float const inv = 1.0f / d;
-    float const ux = dx * inv;
-    float const uz = dz * inv;
-    float const step = TILESIZE / 16.0f;                        // ~33yd (one WDL cell)
-    float max_terrain_angle = -3.15f;
-    for (float t = step; t < d - step; t += step)
+    constexpr float min_dist = 2.5f * TILESIZE;   // never occlude nearby tiles (raised from 2.0)
+    constexpr float margin = 0.03f;               // ~1.7deg safety (raised from 0.02) -- bias to NOT cull
+    constexpr int N = 3;                          // 3x3 = 9 sample points across the tile top
+    float const step = TILESIZE / 16.0f;          // ~33yd (one WDL cell)
+
+    for (int j = 0; j < N; ++j)
     {
-      float const h = wdl_height_at(world, cam.x + ux * t, cam.z + uz * t);
-      if (h <= -1.0e8f) continue;
-      float const a = std::atan2(h - cam.y, t);
-      if (a > max_terrain_angle) max_terrain_angle = a;
+      for (int i = 0; i < N; ++i)
+      {
+        float const px = mn.x + (mx.x - mn.x) * (static_cast<float>(i) / (N - 1));
+        float const pz = mn.z + (mx.z - mn.z) * (static_cast<float>(j) / (N - 1));
+        float const dx = px - cam.x;
+        float const dz = pz - cam.z;
+        float const d = std::sqrt(dx * dx + dz * dz);
+        if (d < min_dist)
+          return false;                           // any sample this close -> tile is near -> never cull
+
+        float const occludee_angle = std::atan2(mx.y - cam.y, d); // this sample at the tile TOP
+        float const inv = 1.0f / d;
+        float const ux = dx * inv;
+        float const uz = dz * inv;
+        float max_terrain_angle = -3.15f;
+        for (float t = step; t < d - step; t += step)
+        {
+          float const h = wdl_height_at(world, cam.x + ux * t, cam.z + uz * t);
+          if (h <= -1.0e8f) continue;
+          float const a = std::atan2(h - cam.y, t);
+          if (a > max_terrain_angle) max_terrain_angle = a;
+        }
+        if (occludee_angle + margin >= max_terrain_angle)
+          return false;                           // this sample is VISIBLE -> don't cull the tile
+      }
     }
-    return occludee_angle + 0.02f < max_terrain_angle;          // ~1.1deg conservative margin
+    return true;                                  // every sample hidden -> genuinely occluded, safe to cull
   }
 
   bool should_trace_creature_spawn(World::CreatureSpawnOverlay const& spawn, float distance)
@@ -664,6 +683,385 @@ WorldRender::WorldRender(World* world)
 , _cull_distance(0.f)
 , _terrain_cull_distance(0.f)
 {
+}
+
+void WorldRender::ensureMdiArena()
+{
+  if (_mdi_ready)
+    return;
+
+  _mdi_buffers.upload();
+  _mdi_vao_arr.upload();
+
+  GLuint const arena_vbo     = _mdi_buffers[0];
+  GLuint const arena_ibo     = _mdi_buffers[1];
+  GLuint const inst_tf       = _mdi_buffers[2];
+  GLuint const inst_interior = _mdi_buffers[3];
+  GLuint const inst_tex      = _mdi_buffers[4];
+  GLuint const vao           = _mdi_vao_arr[0];
+
+  // Fixed, generous append-only geometry arena (never freed/compacted). 128MB vtx (~2.7M ModelVertex) +
+  // 32MB idx (~16M uint16) holds all doodad geometry a session touches; overflow just draws unbatched.
+  _mdi_arena_vbo_cap = static_cast<GLsizeiptr>(128) * 1024 * 1024;
+  _mdi_arena_ibo_cap = static_cast<GLsizeiptr>(32) * 1024 * 1024;
+  gl.bindBuffer(GL_ARRAY_BUFFER, arena_vbo);
+  gl.bufferData(GL_ARRAY_BUFFER, _mdi_arena_vbo_cap, nullptr, GL_STATIC_DRAW);
+  gl.bindBuffer(GL_ELEMENT_ARRAY_BUFFER, arena_ibo);
+  gl.bufferData(GL_ELEMENT_ARRAY_BUFFER, _mdi_arena_ibo_cap, nullptr, GL_STATIC_DRAW);
+  _mdi_arena_vtx = 0;
+  _mdi_arena_idx = 0;
+
+  // Batched VAO: base ModelVertex attributes from the arena VBO (divisor 0) + the three per-instance streams
+  // (transform loc6-9, interior loc10, inst_tex loc11, divisor 1). Locations are pinned in m2_vert.glsl. The
+  // instance buffers are re-filled every frame -- the VAO keeps their name bindings, so orphaning is fine.
+  gl.bindVertexArray(vao);
+
+  gl.bindBuffer(GL_ARRAY_BUFFER, arena_vbo);
+  gl.enableVertexAttribArray(0); gl.vertexAttribPointer (0, 3, GL_FLOAT,         GL_FALSE, sizeof(ModelVertex), reinterpret_cast<void*>(0));
+  gl.enableVertexAttribArray(1); gl.vertexAttribPointer (1, 3, GL_FLOAT,         GL_FALSE, sizeof(ModelVertex), reinterpret_cast<void*>(20));
+  gl.enableVertexAttribArray(2); gl.vertexAttribPointer (2, 2, GL_FLOAT,         GL_FALSE, sizeof(ModelVertex), reinterpret_cast<void*>(32));
+  gl.enableVertexAttribArray(3); gl.vertexAttribPointer (3, 2, GL_FLOAT,         GL_FALSE, sizeof(ModelVertex), reinterpret_cast<void*>(40));
+  gl.enableVertexAttribArray(4); gl.vertexAttribIPointer(4, 4, GL_UNSIGNED_BYTE,           sizeof(ModelVertex), reinterpret_cast<void*>(12));
+  gl.enableVertexAttribArray(5); gl.vertexAttribIPointer(5, 4, GL_UNSIGNED_BYTE,           sizeof(ModelVertex), reinterpret_cast<void*>(16));
+
+  gl.bindBuffer(GL_ARRAY_BUFFER, inst_tf);
+  for (int i = 0; i < 4; ++i)
+  {
+    gl.enableVertexAttribArray(6 + i);
+    gl.vertexAttribPointer(6 + i, 4, GL_FLOAT, GL_FALSE, sizeof(glm::mat4x4),
+                           reinterpret_cast<void*>(static_cast<std::size_t>(i) * sizeof(glm::vec4)));
+    gl.vertexAttribDivisor(6 + i, 1);
+  }
+
+  gl.bindBuffer(GL_ARRAY_BUFFER, inst_interior);
+  gl.enableVertexAttribArray(10);
+  gl.vertexAttribPointer(10, 4, GL_FLOAT, GL_FALSE, sizeof(glm::vec4), reinterpret_cast<void*>(0));
+  gl.vertexAttribDivisor(10, 1);
+
+  gl.bindBuffer(GL_ARRAY_BUFFER, inst_tex);
+  gl.enableVertexAttribArray(11);
+  gl.vertexAttribIPointer(11, 4, GL_INT, sizeof(glm::ivec4), reinterpret_cast<void*>(0));
+  gl.vertexAttribDivisor(11, 1);
+
+  gl.bindBuffer(GL_ELEMENT_ARRAY_BUFFER, arena_ibo);
+  gl.bindVertexArray(0);
+  gl.bindBuffer(GL_ARRAY_BUFFER, 0);
+
+  _mdi_ready = true;
+}
+
+bool WorldRender::mdiEnsureModelInArena(Model* m)
+{
+  // STABLE key = the model's file path. Model* is reused after a model unloads, so a Model* key would alias a
+  // different (unloaded) model's arena geometry -> exploded vertices in dense streaming. Same file == same geom.
+  std::string const key = m->file_key().stringRepr();
+  if (key.empty())
+    return false; // no stable identity -> don't risk aliasing; draw it unbatched
+
+  auto const it = _mdi_slots.find(key);
+  if (it != _mdi_slots.end())
+    return it->second.ok;
+
+  MdiArenaSlot slot;
+  std::vector<ModelVertex> const& verts = m->_vertices;
+  std::vector<std::uint16_t> const& indices = m->_indices;
+  if (verts.empty() || indices.empty())
+  {
+    _mdi_slots.emplace(key, slot); // ok = false
+    return false;
+  }
+
+  GLsizeiptr const vbytes = static_cast<GLsizeiptr>(verts.size()) * sizeof(ModelVertex);
+  GLsizeiptr const ibytes = static_cast<GLsizeiptr>(indices.size()) * sizeof(std::uint16_t);
+  GLsizeiptr const voff = static_cast<GLsizeiptr>(_mdi_arena_vtx) * sizeof(ModelVertex);
+  GLsizeiptr const ioff = static_cast<GLsizeiptr>(_mdi_arena_idx) * sizeof(std::uint16_t);
+  if (voff + vbytes > _mdi_arena_vbo_cap || ioff + ibytes > _mdi_arena_ibo_cap)
+  {
+    static int s_overflow_logs = 0;
+    if (s_overflow_logs < 3)
+    {
+      ++s_overflow_logs;
+      LogError << "[MDI] geometry arena full -- model draws unbatched: " << m->file_key().stringRepr() << std::endl;
+    }
+    _mdi_slots.emplace(key, slot);
+    return false;
+  }
+
+  slot.base_vertex = _mdi_arena_vtx;
+  slot.index_base  = static_cast<GLuint>(_mdi_arena_idx);
+  gl.bindBuffer(GL_ARRAY_BUFFER, _mdi_buffers[0]);
+  gl.bufferSubData(GL_ARRAY_BUFFER, voff, vbytes, verts.data());
+  gl.bindBuffer(GL_ELEMENT_ARRAY_BUFFER, _mdi_buffers[1]);
+  gl.bufferSubData(GL_ELEMENT_ARRAY_BUFFER, ioff, ibytes, indices.data());
+  _mdi_arena_vtx += static_cast<GLsizei>(verts.size());
+  _mdi_arena_idx += static_cast<GLsizei>(indices.size());
+  slot.ok = true;
+  _mdi_slots.emplace(key, slot);
+  return true;
+}
+
+// [perf 2026-08-06] bumped per successful texture upload (TextureManager.cpp); folded into the batch cache
+// signature so a model that becomes batchable once its texture loads correctly forces a rebuild.
+extern std::atomic<unsigned long long> g_texture_upload_epoch;
+
+void WorldRender::drawDoodadsBatched(
+    std::vector<std::pair<Model*, TileRender::DoodadInstanceBuffer const*>> const& draws,
+    glm::mat4x4 const& /*model_view*/, bool draw_hidden_models)
+{
+  if (draws.empty())
+  {
+    _mdi_batched_models.clear();
+    _mdi_cache_valid = false;
+    return;
+  }
+
+  ensureMdiArena();
+
+  // AMORTIZATION: a cheap signature over the visible doodad set (+ the texture-upload epoch, so a model that
+  // becomes batchable on texture-load invalidates). Unchanged since the last rebuild => the cached groups AND
+  // the GPU instance/indirect buffers are still valid, so skip ALL classify/gather/upload and just re-issue.
+  // Stationary + loaded (the common editing case) => a pure cache hit every frame = the amortization win.
+  unsigned long long sig = 1469598103934665603ull;
+  auto mix = [&](unsigned long long v) { sig = (sig ^ v) * 1099511628211ull; };
+  mix(draws.size());
+  mix(draw_hidden_models ? 1ull : 0ull);
+  for (auto const& pd : draws)
+  {
+    mix(static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(pd.first)));
+    mix(static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(pd.second)));
+    mix(static_cast<unsigned long long>(pd.second->count));
+  }
+  mix(g_texture_upload_epoch.load(std::memory_order_relaxed));
+
+  if (_mdi_cache_valid && sig == _mdi_last_sig)
+  {
+    static int s_hit_dbg = 0;
+    if ((s_hit_dbg++ % 240) == 0)
+      LogError << "[MDI] cache HIT groups=" << _mdi_cached_groups.size()
+               << " instances=" << _mdi_cached_instances << std::endl;
+    drawMdiGroups();
+    return;
+  }
+
+  // ---- CACHE MISS: full rebuild of the batch ----
+  _mdi_batched_models.clear();
+
+  // 1) classify each UNIQUE model once (cached in `decision`) + gather its instances across all its tiles.
+  //    batchable = geometry fits the arena AND every render pass resolves as a static batch.
+  std::unordered_map<Model*, std::vector<glm::mat4x4>> model_instances; // batchable model -> all its transforms
+  std::unordered_map<Model*, std::vector<StaticBatchKey>> model_keys;   // batchable model -> per-pass batch keys
+  std::unordered_map<Model*, int> decision;                            // 0 unknown, 1 batchable, -1 not
+
+  for (auto const& pd : draws)
+  {
+    Model* const m = pd.first;
+    if (!draw_hidden_models && m->is_hidden())
+      continue;
+
+    int& d = decision[m];
+    if (d == 0)
+    {
+      d = -1;
+      auto const& passes = m->renderer()->renderPasses();
+      if (!passes.empty() && mdiEnsureModelInArena(m))
+      {
+        std::vector<StaticBatchKey> keys;
+        keys.reserve(passes.size());
+        bool all_ok = true;
+        for (auto const& p : passes)
+        {
+          StaticBatchKey k;
+          if (!p.resolveStaticBatch(m, k)) { all_ok = false; break; }
+          keys.push_back(k);
+        }
+        if (all_ok)
+        {
+          d = 1;
+          model_keys.emplace(m, std::move(keys));
+          model_instances.emplace(m, std::vector<glm::mat4x4>{});
+          _mdi_batched_models.emplace(m, static_cast<std::uint8_t>(1));
+        }
+      }
+    }
+
+    if (d == 1)
+    {
+      auto& dst = model_instances[m];
+      auto const& src = pd.second->cpu_transforms;
+      dst.insert(dst.end(), src.begin(), src.end());
+    }
+  }
+
+  if (model_instances.empty())
+  {
+    _mdi_cache_valid = false; // nothing batchable this frame; retry next (don't serve a stale cache)
+    return;
+  }
+
+  // 2) group (model, pass) into commands by batch identity. A model's transforms are replicated per pass
+  //    (transform + inst_tex are co-located divisor-1 streams selected together by each command's baseInstance).
+  struct CmdSpec { Model* model; std::uint32_t pass; int layer0; int layer1; };
+  std::map<StaticBatchKey, std::vector<CmdSpec>> groups;
+  for (auto const& mi : model_instances)
+  {
+    Model* const m = mi.first;
+    auto const& keys = model_keys[m];
+    for (std::uint32_t pi = 0; pi < keys.size(); ++pi)
+      groups[keys[pi]].push_back(CmdSpec{ m, pi, keys[pi].layer0, keys[pi].layer1 });
+  }
+
+  // 3) lay out the per-instance streams + indirect commands, grouped (group0 cmds, group1 cmds, ...).
+  _mdi_scratch_tf.clear();
+  _mdi_scratch_interior.clear();
+  _mdi_scratch_tex.clear();
+  _mdi_scratch_cmds.clear();
+  _mdi_cached_groups.clear();
+  _mdi_cached_groups.reserve(groups.size());
+
+  for (auto const& g : groups)
+  {
+    MdiGroup gr;
+    gr.key = g.first;
+    gr.first_cmd = static_cast<std::uint32_t>(_mdi_scratch_cmds.size());
+    for (CmdSpec const& c : g.second)
+    {
+      auto const& transforms = model_instances[c.model];
+      if (transforms.empty())
+        continue;
+      auto const slot_it = _mdi_slots.find(c.model->file_key().stringRepr());
+      if (slot_it == _mdi_slots.end() || !slot_it->second.ok)
+        continue; // arena entry gone/invalid -> skip (drawn unbatched via the persistent fallback)
+      MdiArenaSlot const& slot = slot_it->second;
+      ModelRenderPass const& pass = c.model->renderer()->renderPasses()[c.pass];
+
+      OpenGL::DrawElementsIndirectCommand cmd;
+      cmd.count = pass.index_count;
+      cmd.instanceCount = static_cast<GLuint>(transforms.size());
+      cmd.firstIndex = slot.index_base + pass.index_start;
+      cmd.baseVertex = slot.base_vertex;
+      cmd.baseInstance = static_cast<GLuint>(_mdi_scratch_tf.size());
+      _mdi_scratch_cmds.push_back(cmd);
+
+      glm::ivec4 const tex(c.layer0, c.layer1, 0, 0);
+      for (glm::mat4x4 const& t : transforms)
+      {
+        _mdi_scratch_tf.push_back(t);
+        _mdi_scratch_interior.emplace_back(0.0f);
+        _mdi_scratch_tex.push_back(tex);
+      }
+    }
+    gr.cmd_count = static_cast<std::uint32_t>(_mdi_scratch_cmds.size()) - gr.first_cmd;
+    if (gr.cmd_count)
+      _mdi_cached_groups.push_back(gr);
+  }
+
+  if (_mdi_scratch_cmds.empty())
+  {
+    _mdi_cache_valid = false;
+    return;
+  }
+
+  // 4) upload the per-instance streams + indirect command buffer (orphan + refill). These GPU buffers stay
+  //    valid across subsequent cache HITS (no re-upload) -- that is the whole point of the amortization.
+  GLuint const inst_tf = _mdi_buffers[2], inst_interior = _mdi_buffers[3], inst_tex = _mdi_buffers[4], indirect = _mdi_buffers[5];
+  gl.bindBuffer(GL_ARRAY_BUFFER, inst_tf);
+  gl.bufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(_mdi_scratch_tf.size() * sizeof(glm::mat4x4)), _mdi_scratch_tf.data(), GL_STREAM_DRAW);
+  gl.bindBuffer(GL_ARRAY_BUFFER, inst_interior);
+  gl.bufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(_mdi_scratch_interior.size() * sizeof(glm::vec4)), _mdi_scratch_interior.data(), GL_STREAM_DRAW);
+  gl.bindBuffer(GL_ARRAY_BUFFER, inst_tex);
+  gl.bufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(_mdi_scratch_tex.size() * sizeof(glm::ivec4)), _mdi_scratch_tex.data(), GL_STREAM_DRAW);
+  gl.bindBuffer(GL_DRAW_INDIRECT_BUFFER, indirect);
+  gl.bufferData(GL_DRAW_INDIRECT_BUFFER, static_cast<GLsizeiptr>(_mdi_scratch_cmds.size() * sizeof(OpenGL::DrawElementsIndirectCommand)), _mdi_scratch_cmds.data(), GL_STREAM_DRAW);
+
+  std::size_t total_instances = 0;
+  for (auto const& mi : model_instances)
+    total_instances += mi.second.size();
+  _mdi_cached_instances = total_instances;
+  _mdi_last_sig = sig;
+  _mdi_cache_valid = true;
+
+  static int s_mdi_dbg = 0;
+  if ((s_mdi_dbg++ % 60) == 0)
+  {
+    LogError << "[MDI] REBUILD batchedModels=" << model_instances.size()
+             << " groups(drawcalls)=" << _mdi_cached_groups.size()
+             << " commands=" << _mdi_scratch_cmds.size()
+             << " instances=" << total_instances
+             << " arenaVtx=" << _mdi_arena_vtx << " arenaIdx=" << _mdi_arena_idx << std::endl;
+  }
+
+  drawMdiGroups();
+}
+
+// Issue the cached groups: constant (batch-invariant) uniforms + GL state once, then one MDI call per group
+// with per-group state applied via CHECK-BEFORE-SET. The groups iterate in std::map key order (tex_array0
+// first), so consecutive groups usually share the bound array -> most rebinds/uniform sets collapse.
+void WorldRender::drawMdiGroups()
+{
+  if (_mdi_cached_groups.empty())
+    return;
+
+  static bool const s_no_dist_fade = std::getenv("NOGGIT_NO_DIST_FADE") != nullptr;
+  GLuint const indirect = _mdi_buffers[5];
+
+  OpenGL::Scoped::use_program batched {*_m2_batched_program.get()};
+  batched.uniform("model_origin", glm::vec3(0.0f));
+  batched.uniform("slice_dist", s_no_dist_fade ? 0.0f : _cull_distance);
+  batched.uniform("unfogged", 0);
+  batched.uniform("unlit", 0);
+  batched.uniform("masked_additive", 0);
+  batched.uniform("detail_doodad", -1);
+  batched.uniform("water_surface_effect", -1);
+  batched.uniform("creature_bloom", -1);
+  batched.uniform("mesh_color", glm::vec4(1.0f));
+  batched.uniform("anim_bones", false);
+  batched.uniform("bone_matrix_count", 0);
+  batched.uniform("per_instance_bone_stride", 0);
+  batched.uniform("tex_matrix_1", glm::mat4x4(1.0f));
+  batched.uniform("tex_matrix_2", glm::mat4x4(1.0f));
+
+  gl.disable(GL_BLEND);
+  gl.depthMask(GL_TRUE);
+
+  gl.bindVertexArray(_mdi_vao_arr[0]);
+  gl.bindBuffer(GL_DRAW_INDIRECT_BUFFER, indirect);
+
+  int last_cull = -1, last_blend = -1, last_ps = -1, last_tu0 = -1, last_tu1 = -1, last_c0 = -1, last_c1 = -1;
+  GLuint last_a0 = 0xFFFFFFFFu, last_a1 = 0xFFFFFFFFu;
+  for (MdiGroup const& gr : _mdi_cached_groups)
+  {
+    int const want_cull = gr.key.backface_cull ? 1 : 0;
+    if (want_cull != last_cull)
+    {
+      if (want_cull) gl.enable(GL_CULL_FACE); else gl.disable(GL_CULL_FACE);
+      last_cull = want_cull;
+    }
+    if (static_cast<int>(gr.key.blend_mode) != last_blend)
+    { batched.uniform("blend_mode", static_cast<int>(gr.key.blend_mode)); last_blend = static_cast<int>(gr.key.blend_mode); }
+    if (gr.key.pixel_shader != last_ps)
+    { batched.uniform("pixel_shader", gr.key.pixel_shader); last_ps = gr.key.pixel_shader; }
+    if (gr.key.tu_lookup0 != last_tu0)
+    { batched.uniform("tex_unit_lookup_1", gr.key.tu_lookup0); last_tu0 = gr.key.tu_lookup0; }
+    if (gr.key.tu_lookup1 != last_tu1)
+    { batched.uniform("tex_unit_lookup_2", gr.key.tu_lookup1); last_tu1 = gr.key.tu_lookup1; }
+    if (gr.key.tex_clamp0 != last_c0)
+    { batched.uniform("tex1_clamp", gr.key.tex_clamp0); last_c0 = gr.key.tex_clamp0; }
+    if (gr.key.tex_clamp1 != last_c1)
+    { batched.uniform("tex2_clamp", gr.key.tex_clamp1); last_c1 = gr.key.tex_clamp1; }
+    if (gr.key.tex_array0 != last_a0)
+    { gl.activeTexture(static_cast<GLenum>(GL_TEXTURE0 + 1)); gl.bindTexture(GL_TEXTURE_2D_ARRAY, gr.key.tex_array0); last_a0 = gr.key.tex_array0; }
+    if (gr.key.tex_array1 && gr.key.tex_array1 != last_a1)
+    { gl.activeTexture(static_cast<GLenum>(GL_TEXTURE0 + 2)); gl.bindTexture(GL_TEXTURE_2D_ARRAY, gr.key.tex_array1); last_a1 = gr.key.tex_array1; }
+
+    gl.multiDrawElementsIndirect(GL_TRIANGLES, GL_UNSIGNED_SHORT,
+        reinterpret_cast<void*>(static_cast<std::size_t>(gr.first_cmd) * sizeof(OpenGL::DrawElementsIndirectCommand)),
+        static_cast<GLsizei>(gr.cmd_count), 0);
+  }
+
+  gl.bindVertexArray(0);
+  gl.bindBuffer(GL_DRAW_INDIRECT_BUFFER, 0);
+
+  _world->_n_rendered_objects += _mdi_cached_instances;
 }
 
 void WorldRender::draw (glm::mat4x4 const& model_view
@@ -1315,6 +1713,11 @@ void WorldRender::draw (glm::mat4x4 const& model_view
         if (!minimap_render && tile->renderer()->objectsFrustumCullTest() == 0)
           continue;
 
+        // [perf 2026-08-06] This tile is in the frustum -> keep it loaded (MapIndex::unloadTiles won't drop it
+        // even beyond unload_dist). Mark BEFORE the occlusion cull so an occluded-but-in-frustum tile stays
+        // resident (avoids a reload pop when occlusion clears). Covers ocean tiles (no doodads) too.
+        tile->rendered_recently.store(true, std::memory_order_relaxed);
+
         if (tile->renderer()->isOccluded() && !tile->getChunkUpdateFlags() && !tile->renderer()->isOverridingOcclusionCulling())
           continue;
 
@@ -1753,7 +2156,16 @@ void WorldRender::draw (glm::mat4x4 const& model_view
     char const* v = std::getenv("NOGGIT_PERSISTENT_DOODADS");
     return v && *v && *v != '0';
   }();
-  std::vector<std::pair<Model*, Noggit::Rendering::TileRender::DoodadInstanceBuffer>> persistent_doodad_draws;
+  // [perf 2026-08-05] MDI cross-model doodad batching (needs persistent doodads: it consumes their per-tile
+  // instance buffers). Dev A/B toggle; make always-on once validated. See drawDoodadsBatched.
+  static bool const s_doodad_mdi = []
+  {
+    char const* v = std::getenv("NOGGIT_DOODAD_MDI");
+    return v && *v && *v != '0';
+  }();
+  // Pointers into the tiles' own robin_maps (stable for the frame -- no tile is rebuilt/unloaded between the
+  // gather here and the draw), so no per-frame copy of the buffer struct (which now carries cpu_transforms).
+  std::vector<std::pair<Model*, Noggit::Rendering::TileRender::DoodadInstanceBuffer const*>> persistent_doodad_draws;
 
   for (auto& pair : _world->_loaded_tiles_buffer)
   {
@@ -1801,7 +2213,7 @@ void WorldRender::draw (glm::mat4x4 const& model_view
         tile_pbuf = &b;
         for (auto const& kv : b)
         {
-          persistent_doodad_draws.emplace_back(kv.first, kv.second);
+          persistent_doodad_draws.emplace_back(kv.first, &kv.second);
         }
       }
     }
@@ -3051,6 +3463,16 @@ void WorldRender::draw (glm::mat4x4 const& model_view
     {
       if (draw_models || (minimap_render && minimap_render_settings->use_filters))
       {
+        // [perf 2026-08-05] MDI cross-model doodad batch pass. Runs BEFORE the instanced program scope below
+        // (so program scopes don't nest); draws every batchable static doodad in a few glMultiDrawElements-
+        // Indirect calls and records them in _mdi_batched_models so the persistent loop below skips them.
+        // Non-batchable doodads still draw via drawPersistent. Needs persistent doodads (its instance source).
+        if (s_doodad_mdi && s_persistent_doodads && !minimap_render && draw_models && !persistent_doodad_draws.empty())
+        {
+          noggit::perf::Scoped _prof_mdi(noggit::perf::Phase::SubmitInst);
+          drawDoodadsBatched(persistent_doodad_draws, model_view, draw_hidden_models);
+        }
+
         if (capture_debug_enabled())
         {
           std::size_t instanced_m2_count = 0;
@@ -3262,10 +3684,16 @@ void WorldRender::draw (glm::mat4x4 const& model_view
             {
               continue;
             }
-            m->renderer()->drawPersistent(model_view, pd.second.transform_vbo, pd.second.interior_vbo,
-                                          static_cast<int>(pd.second.count), m2_shader, model_render_state,
+            // [perf 2026-08-05] batchable models were already drawn by the MDI pass (drawDoodadsBatched, before
+            // this program's scope); skip them here so they aren't drawn twice.
+            if (s_doodad_mdi && _mdi_batched_models.count(m))
+            {
+              continue;
+            }
+            m->renderer()->drawPersistent(model_view, pd.second->transform_vbo, pd.second->interior_vbo,
+                                          static_cast<int>(pd.second->count), m2_shader, model_render_state,
                                           _world->model_animtime);
-            _world->_n_rendered_objects += pd.second.count;
+            _world->_n_rendered_objects += pd.second->count;
           }
         }
         } // end DoodadDraw scope (instanced doodad buckets)
@@ -5736,6 +6164,17 @@ void WorldRender::upload()
             }
       );
 
+  // [perf 2026-08-05] MDI cross-model batching variant. `instanced` = per-instance transform (loc6-9) +
+  // interior (loc10); `batched` = per-instance texture LAYER (loc11) so models sampling different layers of
+  // the SAME array object collapse into one glMultiDrawElementsIndirect call. The fragment shader needs
+  // `batched` too (tex1_index/tex2_index -> per-instance flat varying). Draws from the shared geometry arena.
+  _m2_batched_program.reset
+      ( new OpenGL::program
+            { { GL_VERTEX_SHADER,   OpenGL::shader::src_from_qrc("m2_vs", {"instanced", "batched"}) }
+                , { GL_FRAGMENT_SHADER, OpenGL::shader::src_from_qrc("m2_fs", {"batched"}) }
+            }
+      );
+
   _m2_box_program.reset
       ( new OpenGL::program
             { { GL_VERTEX_SHADER,   OpenGL::shader::src_from_qrc("m2_box_vs") }
@@ -5880,6 +6319,16 @@ void WorldRender::upload()
   }
 
   {
+    // [perf 2026-08-05] MDI batching program: same UBO blocks + sampler units as the instanced program.
+    OpenGL::Scoped::use_program m2_shader_batched {*_m2_batched_program.get()};
+    m2_shader_batched.bind_uniform_block("matrices", 0);
+    m2_shader_batched.bind_uniform_block("lighting", 1);
+    m2_shader_batched.uniform("bone_matrices", 0);
+    m2_shader_batched.uniform("tex1", 1);
+    m2_shader_batched.uniform("tex2", 2);
+  }
+
+  {
     // Particles read the lighting UBO for fog (so smoke/dust fades into the haze like other geometry).
     OpenGL::Scoped::use_program particles_shader {*_m2_particles_program.get()};
     particles_shader.bind_uniform_block("lighting", 1);
@@ -5949,6 +6398,7 @@ void WorldRender::unload()
   _mfbo_program.reset();
   _m2_program.reset();
   _m2_instanced_program.reset();
+  _m2_batched_program.reset();
   _m2_particles_program.reset();
   _m2_ribbons_program.reset();
   _m2_box_program.reset();
