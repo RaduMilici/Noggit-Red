@@ -5329,7 +5329,39 @@ bool World::camera_is_inside_wmo(glm::vec3 const& pos)
       return; // not even in the loose outer AABB
     }
 
-    for (auto const& [group_index, group_bounds] : wmo_instance.getGroupExtents())
+    auto const& group_extents = wmo_instance.getGroupExtents();
+
+    // Negative cache: the full walk found no room at (almost) this camera position already -> skip.
+    if (wmo_instance._no_room_cache_valid)
+    {
+      glm::vec3 const d = pos - wmo_instance._no_room_cache_pos;
+      if (glm::dot(d, d) < 0.0625f) // < 0.25yd since the cached full miss
+      {
+        return;
+      }
+    }
+
+    // [CamVolume cache 2026-08-07] Test the LAST containing room first. In a city the camera sits inside the
+    // big WMO's outer AABB every frame, so this walk used to test hundreds of room boxes per frame (2-5ms).
+    // With camera coherence the cached room hits immediately -> ~O(1). A miss just falls through to the full
+    // loop (pure accelerator, result unchanged).
+    if (wmo_instance._last_containing_group >= 0
+        && wmo_instance._last_containing_group < static_cast<int>(wmo_instance.wmo->groups.size()))
+    {
+      auto const cit = group_extents.find(wmo_instance._last_containing_group);
+      if (cit != group_extents.end())
+      {
+        auto const& group = wmo_instance.wmo->groups[wmo_instance._last_containing_group];
+        if (group.is_indoor() && !group.is_exterior_lit() && !group.is_exterior()
+            && contains(cit->second, pos))
+        {
+          inside = true;
+          return;
+        }
+      }
+    }
+
+    for (auto const& [group_index, group_bounds] : group_extents)
     {
       if (group_index < 0 || group_index >= static_cast<int>(wmo_instance.wmo->groups.size()))
       {
@@ -5342,10 +5374,15 @@ bool World::camera_is_inside_wmo(glm::vec3 const& pos)
       }
       if (contains(group_bounds, pos))
       {
+        wmo_instance._last_containing_group = group_index; // remember for next frame's fast path
+        wmo_instance._no_room_cache_valid = false;
         inside = true;
         return;
       }
     }
+    wmo_instance._last_containing_group = -1; // outer box contains the camera but no room does
+    wmo_instance._no_room_cache_pos = pos;    // negative cache: skip the walk while the camera hovers here
+    wmo_instance._no_room_cache_valid = true;
   }, [&]() { return inside; });
 
   return inside;

@@ -53,6 +53,19 @@ private:
   bool _group_extents_computed = false;
 
 public:
+  // [CamVolume cache 2026-08-07] last interior group whose bounds contained the camera (-1 = none). The
+  // per-frame camera_is_inside_wmo walk tests this group FIRST: with camera coherence (standing/walking
+  // inside a city WMO) that's an immediate hit, collapsing the hundreds-of-room-boxes walk to ~O(1).
+  // Pure accelerator -- a miss falls through to the full loop, so it can never change the result.
+  int _last_containing_group = -1;
+  // Negative cache: last camera position for which the FULL room walk found nothing. While the camera moves
+  // less than ~0.25yd (hovering/standing -- exactly the measured 2-5ms case above a city), skip the walk
+  // entirely. Any real movement invalidates by distance; worst case is one frame of stale "not inside" while
+  // crossing a doorway at speed, indistinguishable in practice.
+  glm::vec3 _no_room_cache_pos = glm::vec3(0.f);
+  bool _no_room_cache_valid = false;
+
+public:
   WMOInstance(BlizzardArchive::Listfile::FileKey const& file_key, ENTRY_MODF const* d, Noggit::NoggitRenderContext context);
 
   explicit WMOInstance(BlizzardArchive::Listfile::FileKey const& file_key, Noggit::NoggitRenderContext context);
