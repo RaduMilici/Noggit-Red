@@ -1150,19 +1150,290 @@ void WorldRender::fillMdiBones(glm::mat4x4 const& model_view, math::frustum cons
     std::copy_n(m->bone_matrices.begin(), n, _mdi_scratch_bones.begin() + bm.bone_base);
     any = true;
   }
-  if (!any && _mdi_bones_uploaded_once)
-    return; // nothing visible changed; the SSBO already holds valid (last) poses
-
   constexpr GLenum SSBO_TARGET = 0x90D2; // GL_SHADER_STORAGE_BUFFER (header-independent)
   GLuint const bone_ssbo = _mdi_buffers[6];
+  GLsizeiptr const bytes = static_cast<GLsizeiptr>(_mdi_scratch_bones.size() * sizeof(glm::mat4x4));
+  if (!any && _mdi_bones_uploaded_once)
+  {
+    // Nothing visible changed -- the SSBO content is still valid, but ALWAYS re-assert indexed binding 0:
+    // another pass (the pib-doodad batch) shares that binding point, and skipping the rebind here would leave
+    // the tile batch reading the pib bones on quiet frames.
+    gl.bindBufferRange(SSBO_TARGET, 0, bone_ssbo, 0, bytes);
+    return;
+  }
   gl.bindBuffer(SSBO_TARGET, bone_ssbo);
-  gl.bufferData(SSBO_TARGET,
-                static_cast<GLsizeiptr>(_mdi_scratch_bones.size() * sizeof(glm::mat4x4)),
-                _mdi_scratch_bones.data(), GL_STREAM_DRAW);
-  gl.bindBufferRange(SSBO_TARGET, 0, bone_ssbo, 0,
-                     static_cast<GLsizeiptr>(_mdi_scratch_bones.size() * sizeof(glm::mat4x4)));
+  gl.bufferData(SSBO_TARGET, bytes, _mdi_scratch_bones.data(), GL_STREAM_DRAW);
+  gl.bindBufferRange(SSBO_TARGET, 0, bone_ssbo, 0, bytes);
   gl.bindBuffer(SSBO_TARGET, 0);
   _mdi_bones_uploaded_once = true;
+}
+
+// [pib-MDI 2026-08-07] VAO for the billboard-doodad batch: SAME geometry arena (attribs 0-5 + element buffer)
+// as the tile batch, but the divisor-1 instance streams point at the pib-owned buffers, which re-upload every
+// frame (the visible pib set is per-frame; the tile batch's streams must stay cached, so they can't be shared).
+void WorldRender::ensurePibMdi()
+{
+  if (_pib_ready)
+    return;
+
+  _pib_buffers.upload();
+  _pib_vao_arr.upload();
+
+  GLuint const arena_vbo     = _mdi_buffers[0];
+  GLuint const arena_ibo     = _mdi_buffers[1];
+  GLuint const inst_tf       = _pib_buffers[0];
+  GLuint const inst_interior = _pib_buffers[1];
+  GLuint const inst_tex      = _pib_buffers[2];
+  GLuint const vao           = _pib_vao_arr[0];
+
+  gl.bindVertexArray(vao);
+
+  gl.bindBuffer(GL_ARRAY_BUFFER, arena_vbo);
+  gl.enableVertexAttribArray(0); gl.vertexAttribPointer (0, 3, GL_FLOAT,         GL_FALSE, sizeof(ModelVertex), reinterpret_cast<void*>(0));
+  gl.enableVertexAttribArray(1); gl.vertexAttribPointer (1, 3, GL_FLOAT,         GL_FALSE, sizeof(ModelVertex), reinterpret_cast<void*>(20));
+  gl.enableVertexAttribArray(2); gl.vertexAttribPointer (2, 2, GL_FLOAT,         GL_FALSE, sizeof(ModelVertex), reinterpret_cast<void*>(32));
+  gl.enableVertexAttribArray(3); gl.vertexAttribPointer (3, 2, GL_FLOAT,         GL_FALSE, sizeof(ModelVertex), reinterpret_cast<void*>(40));
+  gl.enableVertexAttribArray(4); gl.vertexAttribIPointer(4, 4, GL_UNSIGNED_BYTE,           sizeof(ModelVertex), reinterpret_cast<void*>(12));
+  gl.enableVertexAttribArray(5); gl.vertexAttribIPointer(5, 4, GL_UNSIGNED_BYTE,           sizeof(ModelVertex), reinterpret_cast<void*>(16));
+
+  gl.bindBuffer(GL_ARRAY_BUFFER, inst_tf);
+  for (int i = 0; i < 4; ++i)
+  {
+    gl.enableVertexAttribArray(6 + i);
+    gl.vertexAttribPointer(6 + i, 4, GL_FLOAT, GL_FALSE, sizeof(glm::mat4x4),
+                           reinterpret_cast<void*>(static_cast<std::size_t>(i) * sizeof(glm::vec4)));
+    gl.vertexAttribDivisor(6 + i, 1);
+  }
+
+  gl.bindBuffer(GL_ARRAY_BUFFER, inst_interior);
+  gl.enableVertexAttribArray(10);
+  gl.vertexAttribPointer(10, 4, GL_FLOAT, GL_FALSE, sizeof(glm::vec4), reinterpret_cast<void*>(0));
+  gl.vertexAttribDivisor(10, 1);
+
+  gl.bindBuffer(GL_ARRAY_BUFFER, inst_tex);
+  gl.enableVertexAttribArray(11);
+  gl.vertexAttribIPointer(11, 4, GL_INT, sizeof(glm::ivec4), reinterpret_cast<void*>(0));
+  gl.vertexAttribDivisor(11, 1);
+
+  gl.bindBuffer(GL_ELEMENT_ARRAY_BUFFER, arena_ibo);
+  gl.bindVertexArray(0);
+  gl.bindBuffer(GL_ARRAY_BUFFER, 0);
+
+  _pib_ready = true;
+}
+
+// [pib-MDI 2026-08-07] Collapse the billboard-doodad per-group instanced draws (PibDrawGL ~7.5ms) into a few
+// glMultiDrawElementsIndirect calls. Runs IN-PLACE of the old serial loop (same pipeline position -> same
+// ordering semantics vs the rest of the frame). Per group: classify every pass via resolveStaticBatch(for_pib)
+// (widened: additive/alpha blends + unlit/unfogged carried per-group in the key); consumed groups get
+// per-INSTANCE bone blocks in the pib SSBO (big_bones is already the per-instance concatenation, so each
+// instance's inst_tex.z = its own pose). Non-batchable groups keep the classic per-group fallback (caller
+// skips g.batched). Opaque/alpha-key groups draw before blended ones (strictly better ordering than the old
+// interleaved per-model loop); depth-write stays ON for every batched pass (z_buffered passes are rejected,
+// mirroring prepareDraw's flag-driven depthMask).
+void WorldRender::drawPibBatched(std::vector<PibGroup>& groups)
+{
+  if (groups.empty())
+    return;
+
+  ensureMdiArena();
+  ensurePibMdi();
+
+  _pib_scratch_tf.clear();
+  _pib_scratch_interior.clear();
+  _pib_scratch_tex.clear();
+  _pib_scratch_cmds.clear();
+  _pib_scratch_bones.clear();
+
+  std::map<StaticBatchKey, std::vector<OpenGL::DrawElementsIndirectCommand>> keyed;
+
+  for (PibGroup& g : groups)
+  {
+    Model* const m = g.pmodel;
+    if (g.transforms.empty() || !m)
+      continue;
+    if (!mdiEnsureModelInArena(m))
+      continue; // geometry not batchable -> fallback
+    auto const& passes = m->renderer()->renderPasses();
+    if (passes.empty())
+      continue;
+    std::vector<StaticBatchKey> keys;
+    keys.reserve(passes.size());
+    bool all_ok = true;
+    for (auto const& p : passes)
+    {
+      StaticBatchKey k;
+      if (!p.resolveStaticBatch(m, k, /*for_pib=*/ true)) { all_ok = false; break; }
+      keys.push_back(k);
+    }
+    if (!all_ok)
+      continue; // any non-batchable pass -> whole group falls back (no per-pass split)
+
+    auto const slot_it = _mdi_slots.find(m->file_key().stringRepr());
+    if (slot_it == _mdi_slots.end() || !slot_it->second.ok)
+      continue;
+    MdiArenaSlot const& slot = slot_it->second;
+
+    // per-instance bone blocks: big_bones = [inst0 bones..][inst1 bones..].. appended verbatim
+    std::uint32_t const bone_count = g.has_bones ? static_cast<std::uint32_t>(m->bone_matrices.size()) : 0u;
+    std::uint32_t const bone_base = static_cast<std::uint32_t>(_pib_scratch_bones.size());
+    if (g.has_bones && bone_count)
+    {
+      _pib_scratch_bones.insert(_pib_scratch_bones.end(), g.big_bones.begin(), g.big_bones.end());
+    }
+
+    for (std::uint32_t pi = 0; pi < keys.size(); ++pi)
+    {
+      ModelRenderPass const& pass = m->renderer()->renderPasses()[pi];
+      OpenGL::DrawElementsIndirectCommand cmd;
+      cmd.count = pass.index_count;
+      cmd.instanceCount = static_cast<GLuint>(g.transforms.size());
+      cmd.firstIndex = slot.index_base + pass.index_start;
+      cmd.baseVertex = slot.base_vertex;
+      cmd.baseInstance = static_cast<GLuint>(_pib_scratch_tf.size());
+      keyed[keys[pi]].push_back(cmd);
+
+      for (std::size_t i = 0; i < g.transforms.size(); ++i)
+      {
+        _pib_scratch_tf.push_back(g.transforms[i]);
+        _pib_scratch_interior.push_back(g.interiors.size() > i ? g.interiors[i] : glm::vec4(0.0f));
+        _pib_scratch_tex.push_back(glm::ivec4(keys[pi].layer0, keys[pi].layer1,
+                                              static_cast<int>(bone_base + static_cast<std::uint32_t>(i) * bone_count),
+                                              static_cast<int>(bone_count)));
+      }
+    }
+    g.batched = true;
+  }
+
+  if (keyed.empty())
+    return;
+
+  // Command layout: opaque/alpha-key groups first, then blended (additive glows composite over them).
+  struct PibDrawGroup { StaticBatchKey key; std::uint32_t first_cmd; std::uint32_t cmd_count; };
+  std::vector<PibDrawGroup> draw_groups;
+  draw_groups.reserve(keyed.size());
+  for (int blended = 0; blended <= 1; ++blended)
+  {
+    for (auto const& kv : keyed)
+    {
+      bool const is_blended = kv.first.blend_mode >= 2;
+      if (static_cast<int>(is_blended) != blended)
+        continue;
+      PibDrawGroup dg;
+      dg.key = kv.first;
+      dg.first_cmd = static_cast<std::uint32_t>(_pib_scratch_cmds.size());
+      _pib_scratch_cmds.insert(_pib_scratch_cmds.end(), kv.second.begin(), kv.second.end());
+      dg.cmd_count = static_cast<std::uint32_t>(kv.second.size());
+      draw_groups.push_back(dg);
+    }
+  }
+
+  // Upload the per-frame streams + commands + bone SSBO (all STREAM -- the visible pib set changes per frame).
+  gl.bindBuffer(GL_ARRAY_BUFFER, _pib_buffers[0]);
+  gl.bufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(_pib_scratch_tf.size() * sizeof(glm::mat4x4)), _pib_scratch_tf.data(), GL_STREAM_DRAW);
+  gl.bindBuffer(GL_ARRAY_BUFFER, _pib_buffers[1]);
+  gl.bufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(_pib_scratch_interior.size() * sizeof(glm::vec4)), _pib_scratch_interior.data(), GL_STREAM_DRAW);
+  gl.bindBuffer(GL_ARRAY_BUFFER, _pib_buffers[2]);
+  gl.bufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(_pib_scratch_tex.size() * sizeof(glm::ivec4)), _pib_scratch_tex.data(), GL_STREAM_DRAW);
+  gl.bindBuffer(GL_ARRAY_BUFFER, 0);
+  gl.bindBuffer(GL_DRAW_INDIRECT_BUFFER, _pib_buffers[3]);
+  gl.bufferData(GL_DRAW_INDIRECT_BUFFER, static_cast<GLsizeiptr>(_pib_scratch_cmds.size() * sizeof(OpenGL::DrawElementsIndirectCommand)), _pib_scratch_cmds.data(), GL_STREAM_DRAW);
+
+  constexpr GLenum SSBO_TARGET = 0x90D2; // GL_SHADER_STORAGE_BUFFER
+  if (!_pib_scratch_bones.empty())
+  {
+    // Upload + bind the PIB bone SSBO at binding 0 for these draws. fillMdiBones re-asserts the tile batch's
+    // SSBO every frame (including cache-hit frames), so this cannot leak into the tile draws. When NO pib
+    // model has bones, skip both -- every instance carries w=0 (bind pose) and never reads the SSBO, and
+    // bindBufferRange on a store-less buffer would raise GL_INVALID_VALUE.
+    GLsizeiptr const bone_bytes = static_cast<GLsizeiptr>(_pib_scratch_bones.size() * sizeof(glm::mat4x4));
+    gl.bindBuffer(SSBO_TARGET, _pib_buffers[4]);
+    gl.bufferData(SSBO_TARGET, bone_bytes, _pib_scratch_bones.data(), GL_STREAM_DRAW);
+    gl.bindBuffer(SSBO_TARGET, 0);
+    gl.bindBufferRange(SSBO_TARGET, 0, _pib_buffers[4], 0, bone_bytes);
+  }
+
+  OpenGL::Scoped::use_program batched {*_m2_batched_program.get()};
+  batched.uniform("model_origin", glm::vec3(0.0f));
+  batched.uniform("slice_dist", 0.0f); // WMO doodads: no distance slice (matches the old pib path)
+  batched.uniform("masked_additive", 0);
+  batched.uniform("detail_doodad", -1);
+  batched.uniform("water_surface_effect", -1);
+  batched.uniform("creature_bloom", -1);
+  batched.uniform("mesh_color", glm::vec4(1.0f));
+  batched.uniform("anim_bones", false);
+  batched.uniform("bone_matrix_count", 0);
+  batched.uniform("per_instance_bone_stride", 0);
+  batched.uniform("tex_matrix_1", glm::mat4x4(1.0f));
+  batched.uniform("tex_matrix_2", glm::mat4x4(1.0f));
+
+  gl.depthMask(GL_TRUE); // z_buffered passes rejected -> every batched pib pass writes depth (prepareDraw parity)
+
+  gl.bindVertexArray(_pib_vao_arr[0]);
+  gl.bindBuffer(GL_DRAW_INDIRECT_BUFFER, _pib_buffers[3]);
+
+  int last_cull = -1, last_blend = -1, last_ps = -1, last_tu0 = -1, last_tu1 = -1, last_c0 = -1, last_c1 = -1;
+  int last_unfogged = -1, last_unlit = -1;
+  GLuint last_a0 = 0xFFFFFFFFu, last_a1 = 0xFFFFFFFFu;
+  for (PibDrawGroup const& gr : draw_groups)
+  {
+    int const want_cull = gr.key.backface_cull ? 1 : 0;
+    if (want_cull != last_cull)
+    {
+      if (want_cull) gl.enable(GL_CULL_FACE); else gl.disable(GL_CULL_FACE);
+      last_cull = want_cull;
+    }
+    if (static_cast<int>(gr.key.blend_mode) != last_blend)
+    {
+      switch (static_cast<M2Blend>(gr.key.blend_mode))
+      {
+        default:
+        case M2Blend::Opaque:
+        case M2Blend::Alpha_Key:
+          gl.disable(GL_BLEND);
+          break;
+        case M2Blend::Alpha:
+          gl.enable(GL_BLEND);
+          gl.blendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+          break;
+        case M2Blend::No_Add_Alpha:
+        case M2Blend::Add: // premultiplied additive: m2_frag folds alpha into RGB for Add (prepareDraw parity)
+          gl.enable(GL_BLEND);
+          gl.blendFunc(GL_ONE, GL_ONE);
+          break;
+      }
+      batched.uniform("blend_mode", static_cast<int>(gr.key.blend_mode));
+      last_blend = static_cast<int>(gr.key.blend_mode);
+    }
+    if (static_cast<int>(gr.key.unfogged) != last_unfogged)
+    { batched.uniform("unfogged", static_cast<int>(gr.key.unfogged)); last_unfogged = static_cast<int>(gr.key.unfogged); }
+    if (static_cast<int>(gr.key.unlit) != last_unlit)
+    { batched.uniform("unlit", static_cast<int>(gr.key.unlit)); last_unlit = static_cast<int>(gr.key.unlit); }
+    if (gr.key.pixel_shader != last_ps)
+    { batched.uniform("pixel_shader", gr.key.pixel_shader); last_ps = gr.key.pixel_shader; }
+    if (gr.key.tu_lookup0 != last_tu0)
+    { batched.uniform("tex_unit_lookup_1", gr.key.tu_lookup0); last_tu0 = gr.key.tu_lookup0; }
+    if (gr.key.tu_lookup1 != last_tu1)
+    { batched.uniform("tex_unit_lookup_2", gr.key.tu_lookup1); last_tu1 = gr.key.tu_lookup1; }
+    if (gr.key.tex_clamp0 != last_c0)
+    { batched.uniform("tex1_clamp", gr.key.tex_clamp0); last_c0 = gr.key.tex_clamp0; }
+    if (gr.key.tex_clamp1 != last_c1)
+    { batched.uniform("tex2_clamp", gr.key.tex_clamp1); last_c1 = gr.key.tex_clamp1; }
+    if (gr.key.tex_array0 != last_a0)
+    { gl.activeTexture(static_cast<GLenum>(GL_TEXTURE0 + 1)); gl.bindTexture(GL_TEXTURE_2D_ARRAY, gr.key.tex_array0); last_a0 = gr.key.tex_array0; }
+    if (gr.key.tex_array1 && gr.key.tex_array1 != last_a1)
+    { gl.activeTexture(static_cast<GLenum>(GL_TEXTURE0 + 2)); gl.bindTexture(GL_TEXTURE_2D_ARRAY, gr.key.tex_array1); last_a1 = gr.key.tex_array1; }
+
+    gl.multiDrawElementsIndirect(GL_TRIANGLES, GL_UNSIGNED_SHORT,
+        reinterpret_cast<void*>(static_cast<std::size_t>(gr.first_cmd) * sizeof(OpenGL::DrawElementsIndirectCommand)),
+        static_cast<GLsizei>(gr.cmd_count), 0);
+  }
+
+  gl.bindVertexArray(0);
+  gl.bindBuffer(GL_DRAW_INDIRECT_BUFFER, 0);
+  gl.disable(GL_BLEND);
+  gl.depthMask(GL_TRUE);
+  gl.enable(GL_CULL_FACE);
 }
 
 void WorldRender::draw (glm::mat4x4 const& model_view
@@ -4086,16 +4357,7 @@ void WorldRender::draw (glm::mat4x4 const& model_view
           // own core, which the client's data model cannot. interior_light_at() writes a shared position
           // cache (the sole non-thread-safe call), so interiors + transforms are precomputed SERIALLY first;
           // the parallel phase then touches ONLY per-Model state. NOGGIT_SERIAL_PIB_ANIMATE=1 forces serial.
-          struct PibGroup
-          {
-            Model* pmodel = nullptr;
-            std::vector<ModelInstance*> const* doodads = nullptr;
-            bool has_bones = false;
-            std::vector<glm::mat4x4> transforms;
-            std::vector<glm::vec4> interiors;
-            std::vector<std::uint64_t> keys;
-            std::vector<glm::mat4x4> big_bones;
-          };
+          // PibGroup hoisted to WorldRender.hpp (shared with drawPibBatched -- the pib-MDI path).
           std::vector<PibGroup> pib_groups;
           pib_groups.reserve(pib_by_model.size());
           for (auto& mg : pib_by_model)
@@ -4185,14 +4447,15 @@ void WorldRender::draw (glm::mat4x4 const& model_view
             }
           }
 
-          // Serial GL draw of each computed group (GL is single-threaded). [IndivDraw split 2026-08-07]
-          // PibDrawGL times exactly these per-group instanced draws (big-bones TBO upload + state + draw) --
-          // the previously-unattributed remainder of IndivDraw.
+          // [pib-MDI 2026-08-07] Batch what classifies into a few MDI calls (per-instance bone blocks in the
+          // pib SSBO); the serial per-group fallback below draws only what didn't. PibDrawGL times BOTH, so
+          // the win shows directly in the same phase (was ~7.5ms of serial per-group draws).
           {
             noggit::perf::Scoped _prof_pdraw(noggit::perf::Phase::PibDrawGL);
+            drawPibBatched(pib_groups);
             for (auto& g : pib_groups)
             {
-              if (g.transforms.empty()) { continue; }
+              if (g.batched || g.transforms.empty()) { continue; }
               std::vector<float> const fades(g.transforms.size(), 1.0f);
               std::vector<glm::mat4x4> const no_bones;
               g.pmodel->renderer()->draw(model_view, g.transforms, m2_shader, doodad_render_state, frustum,

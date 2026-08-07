@@ -77,6 +77,10 @@ namespace Noggit::Rendering
     int    tex_clamp1 = 0;
     uint16_t blend_mode = 0;
     bool   backface_cull = true;
+    // [pib-MDI 2026-08-07] carried for the billboard-doodad batch only (glow cards are commonly unlit and/or
+    // unfogged; the tile-doodad batch always resolves these to false, so its grouping is unchanged).
+    bool   unfogged = false;
+    bool   unlit = false;
     // per-instance (NOT identity)
     int    layer0 = 0;
     int    layer1 = 0;
@@ -84,7 +88,7 @@ namespace Noggit::Rendering
     auto identity() const
     {
       return std::tie(tex_array0, tex_array1, tu_lookup0, tu_lookup1, pixel_shader,
-                      tex_clamp0, tex_clamp1, blend_mode, backface_cull);
+                      tex_clamp0, tex_clamp1, blend_mode, backface_cull, unfogged, unlit);
     }
     bool operator<(StaticBatchKey const& o) const { return identity() < o.identity(); }
   };
@@ -127,7 +131,10 @@ namespace Noggit::Rendering
     // prepareDraw/bindTexture: rejects special/replaceable textures, animated UV, animated bones, non-default
     // colour/opacity/flags, non-Opaque/Alpha_Key blend, creature/character/lightray/water-effect models, and
     // any texture not yet loaded+uploaded (deferred this frame). See StaticBatchKey.
-    [[nodiscard]] bool resolveStaticBatch(Model* m, StaticBatchKey& out) const;
+    // for_pib widens the gate for the billboard-doodad (per-instance-animation) batch: additive/alpha blends
+    // (2..4) and unfogged/unlit passes become batchable (carried per-group in the key). Default keeps the
+    // strict tile-doodad subset.
+    [[nodiscard]] bool resolveStaticBatch(Model* m, StaticBatchKey& out, bool for_pib = false) const;
 
     bool operator< (const ModelRenderPass &m) const
     {

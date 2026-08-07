@@ -2572,7 +2572,7 @@ bool ModelRenderPass::bindTexture(size_t index, Model* m, ModelInstance const* i
   return true;
 }
 
-bool ModelRenderPass::resolveStaticBatch(Model* m, StaticBatchKey& out) const
+bool ModelRenderPass::resolveStaticBatch(Model* m, StaticBatchKey& out, bool for_pib) const
 {
   // [perf 2026-08-05] Conservative batchability gate. Everything rejected here falls back to the classic
   // per-model persistent draw, so it is always safe to reject; coverage is widened later (3b). The batched
@@ -2606,14 +2606,23 @@ bool ModelRenderPass::resolveStaticBatch(Model* m, StaticBatchKey& out) const
   if (!ps)
     return rej(2);
 
-  // Opaque / Alpha_Key only -- they share GL blend state (blend OFF); Alpha_Key differs by the in-shader
-  // alpha test keyed on the per-group blend_mode uniform. inst_alpha is 1 (doodads) so nothing promotes.
+  // Tile batch: Opaque / Alpha_Key only -- they share GL blend state (blend OFF); Alpha_Key differs by the
+  // in-shader alpha test keyed on the per-group blend_mode uniform. inst_alpha is 1 (doodads) so nothing
+  // promotes. [pib-MDI 2026-08-07] for_pib additionally admits Alpha(2) / No_Add_Alpha(3) / Add(4) -- the
+  // dominant glow-card blends; the pib MDI draw sets GL blend + depthMask per group from key.blend_mode
+  // (opaque groups draw before blended ones). Mod/Mod2x (5/6) stay rejected (rare, dest-coupled).
   uint16_t const blend = renderflag.blend;
-  if (blend != static_cast<uint16_t>(M2Blend::Opaque) && blend != static_cast<uint16_t>(M2Blend::Alpha_Key))
+  uint16_t const max_blend = for_pib ? static_cast<uint16_t>(M2Blend::Add)
+                                     : static_cast<uint16_t>(M2Blend::Alpha_Key);
+  if (blend > max_blend)
     return rej(3);
 
-  // require the batch-constant flags to hold (else the constant uniforms/state would be wrong)
-  if (renderflag.flags.unfogged || renderflag.flags.unlit || renderflag.flags.z_buffered)
+  // Batch-constant flags: z_buffered always rejects. unfogged/unlit reject in the tile batch (its draw uses
+  // constant 0/0 uniforms) but are ADMITTED per-group for the pib batch (carried in the key -- glow cards are
+  // commonly unlit and/or unfogged).
+  if (renderflag.flags.z_buffered)
+    return rej(4);
+  if (!for_pib && (renderflag.flags.unfogged || renderflag.flags.unlit))
     return rej(4);
 
   // require mesh_color == (1,1,1,1). RGB: no animated colour track (rare). Alpha: EVALUATE the transparency
@@ -2700,6 +2709,8 @@ bool ModelRenderPass::resolveStaticBatch(Model* m, StaticBatchKey& out) const
   out.tu_lookup1 = static_cast<int>(tu_lookups[1]);
   out.pixel_shader = static_cast<int>(ps.value());
   out.blend_mode = blend;
+  out.unfogged = for_pib && renderflag.flags.unfogged; // tile batch always resolves these false (gated above)
+  out.unlit = for_pib && renderflag.flags.unlit;
   bool const classic_alpha_pass = m->_uses_classic_layout && blend != static_cast<uint16_t>(M2Blend::Opaque);
   out.backface_cull = !renderflag.flags.two_sided && !classic_alpha_pass;
   ++s_ok;

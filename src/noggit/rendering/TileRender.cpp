@@ -479,7 +479,19 @@ void TileRender::draw (OpenGL::Scoped::use_program& mcnk_shader
       _map_tile->endChunkUpdates();
     }
 
+    // [wrong-texture fix 2026-08-07] Persist the retry across passes. _texture_not_loaded resets every pass,
+    // so a miss inside an early LAZY window used to be forgotten by the final window: endChunkUpdates() above
+    // cleared the tile flag with no re-arm, orphaning the affected chunks' re-registered ALPHAMAP retries --
+    // their sampler entries stayed the -1 sentinel, which renders as a real (WRONG) texture (sampler slot 0,
+    // non-specular layer 1) until a full reload. The latch keeps the tile-level flag armed every pass until a
+    // FULL (non-lazy) pass refills every pending chunk (they keep their per-chunk ALPHAMAP flags) without a
+    // single miss; only then does it release.
     if (_texture_not_loaded)
+      _pending_tex_retry = true;
+    else if (!lazy_active)
+      _pending_tex_retry = false; // full pass, all pending chunks refilled, nothing missing -> resolved
+
+    if (_texture_not_loaded || _pending_tex_retry)
       _map_tile->registerChunkUpdate(ChunkUpdateFlags::ALPHAMAP);
 
     gl.bufferSubData(GL_UNIFORM_BUFFER, 0, sizeof(OpenGL::ChunkInstanceDataUniformBlock) * 256,

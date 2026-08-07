@@ -96,6 +96,13 @@ namespace Noggit::Rendering
     bool _requires_sampler_reset = false;
     bool _requires_paintability_recalc = true;
     bool _texture_not_loaded = false;
+    // [wrong-texture fix 2026-08-07] PERSISTENT retry latch. _texture_not_loaded is a per-UPDATE-PASS working
+    // flag (reset each pass), so with LAZY streaming a texture miss in an early window was forgotten by the
+    // final window: the tile flag got cleared with no re-arm, orphaning the chunk's re-registered ALPHAMAP
+    // retry -> its sampler entry stayed the -1 sentinel, which the shader reads as a VALID "non-specular
+    // layer 1" of sampler slot 0 -> a whole section rendered the WRONG texture until reload. This latch stays
+    // set until a full (non-lazy) update pass resolves every pending chunk with no misses.
+    bool _pending_tex_retry = false;
 
     // [perf 2026-08-06] Lazy per-chunk terrain streaming (NOGGIT_LAZY_CHUNK_UPLOAD). A freshly-loaded tile
     // uploads its 256 chunks a BUDGET at a time over several frames -- drawing only the ready prefix meanwhile

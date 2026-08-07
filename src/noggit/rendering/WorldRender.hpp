@@ -250,6 +250,33 @@ namespace Noggit::Rendering
     std::size_t _mdi_bone_total = 0;               // total mat4 slots in the bone SSBO
     bool _mdi_bones_uploaded_once = false;         // first upload must happen even if nothing is visible yet
 
+    // [pib-MDI 2026-08-07] batch the per-instance-animation (billboard) WMO doodads through MDI, IN-PLACE at
+    // the same pipeline position as the old serial per-group draws (ordering semantics preserved). Own
+    // per-frame instance buffers + VAO (the tile batch's are cached across frames; these re-upload each
+    // frame) sharing the SAME geometry arena, and a bone SSBO with PER-INSTANCE blocks: each instance's
+    // inst_tex.z points at its own pose (big_bones is already the per-instance concatenation).
+    struct PibGroup
+    {
+      Model* pmodel = nullptr;
+      std::vector<ModelInstance*> const* doodads = nullptr;
+      bool has_bones = false;
+      bool batched = false; // consumed by drawPibBatched -> the serial fallback loop skips it
+      std::vector<glm::mat4x4> transforms;
+      std::vector<glm::vec4> interiors;
+      std::vector<std::uint64_t> keys;
+      std::vector<glm::mat4x4> big_bones;
+    };
+    OpenGL::Scoped::deferred_upload_buffers<5> _pib_buffers; // 0 inst_tf 1 inst_interior 2 inst_tex 3 indirect 4 bone_ssbo
+    OpenGL::Scoped::deferred_upload_vertex_arrays<1> _pib_vao_arr;
+    bool _pib_ready = false;
+    std::vector<glm::mat4x4> _pib_scratch_tf;
+    std::vector<glm::vec4>   _pib_scratch_interior;
+    std::vector<glm::ivec4>  _pib_scratch_tex;
+    std::vector<OpenGL::DrawElementsIndirectCommand> _pib_scratch_cmds;
+    std::vector<glm::mat4x4> _pib_scratch_bones;
+    void ensurePibMdi();                                // VAO over the shared arena + the pib instance buffers
+    void drawPibBatched(std::vector<PibGroup>& groups); // classify + build + MDI-draw; marks consumed groups
+
     // [perf 2026-08-06] AMORTIZATION: the assembled batch is cached across frames and rebuilt ONLY when the
     // visible doodad set changes (cheap per-frame signature over persistent_doodad_draws + the texture-upload
     // epoch). On a cache hit the GPU instance/indirect buffers still hold the last upload, so per-frame work
