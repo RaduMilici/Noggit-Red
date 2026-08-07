@@ -34,6 +34,7 @@ namespace noggit::perf
     M2Gather, CreatureInject, Clutter, DoodadDraw, IndivDraw, BucketInterior, // M2 spike hunt: WMO gather / creature inject / clutter inject / instanced doodad buckets / individual draws / per-instance bucket_interior (interior_light_at)
     WorldDraw, GpuWait, Selection,                         // coarse (MapView): 3D CPU render / glFinish GPU-wait probe / selection
     FrameSetup, CamVolume,                                 // localize the ~12ms unprofiled-in-WorldDraw: whole pre-Terrain block / just camera_is_inside_wmo volume walk
+    PibPrep, PibDrawGL,                                    // IndivDraw split (2026-08-07): billboard-doodad dedupe/group/interior gather vs the serial per-group instanced GL draws
     PaintBody, Frame,                                      // PaintBody = makeCurrent..doneCurrent (in-paint wall); Frame = start..start (whole period). Frame-PaintBody = between-frame (Qt swap/composite/loader).
     COUNT
   };
@@ -72,6 +73,8 @@ namespace noggit::perf
       case Phase::Selection:    return "Selection";
       case Phase::FrameSetup:   return "FrameSetup";
       case Phase::CamVolume:    return "CamVolume";
+      case Phase::PibPrep:      return "PibPrep";
+      case Phase::PibDrawGL:    return "PibDrawGL";
       case Phase::PaintBody:    return "PaintBody";
       case Phase::Frame:        return "Frame";
       default:                  return "?";

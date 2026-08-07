@@ -3,6 +3,7 @@
 #include "WorldRender.hpp"
 #include <external/tracy/Tracy.hpp>
 #include <math/frustum.hpp>
+#include <optional>
 #include <math/ray.hpp>
 #include <noggit/Log.h>
 #include <noggit/World.h>
@@ -4054,6 +4055,10 @@ void WorldRender::draw (glm::mat4x4 const& model_view
 
           // Group visible (deduped-by-placement) doodads by model.
           std::unordered_map<Model*, std::vector<ModelInstance*>> pib_by_model;
+          // [IndivDraw split 2026-08-07] PibPrep = dedupe/group + the serial interior/transform gather below
+          // (everything before the parallel bake). optional so it can close exactly there (Scoped is non-movable).
+          std::optional<noggit::perf::Scoped> _prof_pprep;
+          _prof_pprep.emplace(noggit::perf::Phase::PibPrep);
           {
             std::unordered_set<std::uint64_t> seen_doodad_keys;
             for (ModelInstance* _dptr : per_instance_wmo_doodads)
@@ -4117,6 +4122,7 @@ void WorldRender::draw (glm::mat4x4 const& model_view
             }
             _world->_n_rendered_objects += static_cast<int>(g.doodads->size());
           }
+          _prof_pprep.reset(); // PibPrep ends here; the bake below is SubmitIndiv, the draws PibDrawGL
 
           // Parallel across models: the expensive animate() + per-model particle sim. Each group is a UNIQUE
           // Model, so no two workers touch the same Model state, and nothing global is written here.
@@ -4179,16 +4185,21 @@ void WorldRender::draw (glm::mat4x4 const& model_view
             }
           }
 
-          // Serial GL draw of each computed group (GL is single-threaded).
-          for (auto& g : pib_groups)
+          // Serial GL draw of each computed group (GL is single-threaded). [IndivDraw split 2026-08-07]
+          // PibDrawGL times exactly these per-group instanced draws (big-bones TBO upload + state + draw) --
+          // the previously-unattributed remainder of IndivDraw.
           {
-            if (g.transforms.empty()) { continue; }
-            std::vector<float> const fades(g.transforms.size(), 1.0f);
-            std::vector<glm::mat4x4> const no_bones;
-            g.pmodel->renderer()->draw(model_view, g.transforms, m2_shader, doodad_render_state, frustum,
-                _cull_distance, camera_pos, static_cast<int>(_world->model_animtime), false, pib_boxes,
-                display, /*no_cull*/ false, /*representative*/ nullptr, g.interiors, fades,
-                g.has_bones ? g.big_bones : no_bones);
+            noggit::perf::Scoped _prof_pdraw(noggit::perf::Phase::PibDrawGL);
+            for (auto& g : pib_groups)
+            {
+              if (g.transforms.empty()) { continue; }
+              std::vector<float> const fades(g.transforms.size(), 1.0f);
+              std::vector<glm::mat4x4> const no_bones;
+              g.pmodel->renderer()->draw(model_view, g.transforms, m2_shader, doodad_render_state, frustum,
+                  _cull_distance, camera_pos, static_cast<int>(_world->model_animtime), false, pib_boxes,
+                  display, /*no_cull*/ false, /*representative*/ nullptr, g.interiors, fades,
+                  g.has_bones ? g.big_bones : no_bones);
+            }
           }
         }
 
