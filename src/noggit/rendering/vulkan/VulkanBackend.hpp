@@ -56,6 +56,12 @@ namespace Noggit::Rendering::VK
     bool createDevice();
     bool createSharedImage();
     bool createSemaphores();
+    // [VK-1 skeleton] real GRAPHICS PIPELINE over the shared image: image view + render pass + framebuffer,
+    // SPIR-V modules loaded from <exe dir>/vk_shaders (compiled at build by the vendored glslang), fullscreen
+    // pipeline with a push-constant clock. renderTestFrame draws through it (no more bare clears).
+    bool createRenderTarget();
+    bool createPipeline();
+    VkShaderModule loadShaderModule(char const* filename); // from <exe>/vk_shaders/
 
     bool _ready = false;
     void* _dll = nullptr; // HMODULE
@@ -80,6 +86,13 @@ namespace Noggit::Rendering::VK
     VkSemaphore _gl_done = VK_NULL_HANDLE;
     void* _vk_done_handle = nullptr;
     void* _gl_done_handle = nullptr;
+
+    // graphics pipeline over the shared image
+    VkImageView _view = VK_NULL_HANDLE;
+    VkRenderPass _render_pass = VK_NULL_HANDLE;
+    VkFramebuffer _framebuffer = VK_NULL_HANDLE;
+    VkPipelineLayout _pipe_layout = VK_NULL_HANDLE;
+    VkPipeline _pipeline = VK_NULL_HANDLE;
 
     // --- dynamically loaded entry points (driver's vulkan-1.dll; VK_NO_PROTOTYPES) ---
     PFN_vkGetInstanceProcAddr _vkGetInstanceProcAddr = nullptr;
@@ -117,6 +130,23 @@ namespace Noggit::Rendering::VK
     PFN_vkVoidFunction _pfn_vkGetSemaphoreWin32HandleKHR = nullptr;
     PFN_vkCmdPipelineBarrier vkCmdPipelineBarrier = nullptr;
     PFN_vkCmdClearColorImage vkCmdClearColorImage = nullptr;
+    PFN_vkCreateShaderModule vkCreateShaderModule = nullptr;
+    PFN_vkDestroyShaderModule vkDestroyShaderModule = nullptr;
+    PFN_vkCreateImageView vkCreateImageView = nullptr;
+    PFN_vkDestroyImageView vkDestroyImageView = nullptr;
+    PFN_vkCreateRenderPass vkCreateRenderPass = nullptr;
+    PFN_vkDestroyRenderPass vkDestroyRenderPass = nullptr;
+    PFN_vkCreateFramebuffer vkCreateFramebuffer = nullptr;
+    PFN_vkDestroyFramebuffer vkDestroyFramebuffer = nullptr;
+    PFN_vkCreatePipelineLayout vkCreatePipelineLayout = nullptr;
+    PFN_vkDestroyPipelineLayout vkDestroyPipelineLayout = nullptr;
+    PFN_vkCreateGraphicsPipelines vkCreateGraphicsPipelines = nullptr;
+    PFN_vkDestroyPipeline vkDestroyPipeline = nullptr;
+    PFN_vkCmdBeginRenderPass vkCmdBeginRenderPass = nullptr;
+    PFN_vkCmdEndRenderPass vkCmdEndRenderPass = nullptr;
+    PFN_vkCmdBindPipeline vkCmdBindPipeline = nullptr;
+    PFN_vkCmdPushConstants vkCmdPushConstants = nullptr;
+    PFN_vkCmdDraw vkCmdDraw = nullptr;
   };
 }
 

@@ -11,7 +11,9 @@
 #include <vulkan/vulkan_win32.h> // win32 platform structs/PFN types (header keeps core-only; see hpp note)
 
 #include <cmath>
+#include <cstdio>
 #include <cstring>
+#include <string>
 #include <vector>
 
 namespace Noggit::Rendering::VK
@@ -185,6 +187,23 @@ namespace Noggit::Rendering::VK
     _pfn_vkGetSemaphoreWin32HandleKHR = ld("vkGetSemaphoreWin32HandleKHR");
     vkCmdPipelineBarrier = reinterpret_cast<PFN_vkCmdPipelineBarrier>(ld("vkCmdPipelineBarrier"));
     vkCmdClearColorImage = reinterpret_cast<PFN_vkCmdClearColorImage>(ld("vkCmdClearColorImage"));
+    vkCreateShaderModule = reinterpret_cast<PFN_vkCreateShaderModule>(ld("vkCreateShaderModule"));
+    vkDestroyShaderModule = reinterpret_cast<PFN_vkDestroyShaderModule>(ld("vkDestroyShaderModule"));
+    vkCreateImageView = reinterpret_cast<PFN_vkCreateImageView>(ld("vkCreateImageView"));
+    vkDestroyImageView = reinterpret_cast<PFN_vkDestroyImageView>(ld("vkDestroyImageView"));
+    vkCreateRenderPass = reinterpret_cast<PFN_vkCreateRenderPass>(ld("vkCreateRenderPass"));
+    vkDestroyRenderPass = reinterpret_cast<PFN_vkDestroyRenderPass>(ld("vkDestroyRenderPass"));
+    vkCreateFramebuffer = reinterpret_cast<PFN_vkCreateFramebuffer>(ld("vkCreateFramebuffer"));
+    vkDestroyFramebuffer = reinterpret_cast<PFN_vkDestroyFramebuffer>(ld("vkDestroyFramebuffer"));
+    vkCreatePipelineLayout = reinterpret_cast<PFN_vkCreatePipelineLayout>(ld("vkCreatePipelineLayout"));
+    vkDestroyPipelineLayout = reinterpret_cast<PFN_vkDestroyPipelineLayout>(ld("vkDestroyPipelineLayout"));
+    vkCreateGraphicsPipelines = reinterpret_cast<PFN_vkCreateGraphicsPipelines>(ld("vkCreateGraphicsPipelines"));
+    vkDestroyPipeline = reinterpret_cast<PFN_vkDestroyPipeline>(ld("vkDestroyPipeline"));
+    vkCmdBeginRenderPass = reinterpret_cast<PFN_vkCmdBeginRenderPass>(ld("vkCmdBeginRenderPass"));
+    vkCmdEndRenderPass = reinterpret_cast<PFN_vkCmdEndRenderPass>(ld("vkCmdEndRenderPass"));
+    vkCmdBindPipeline = reinterpret_cast<PFN_vkCmdBindPipeline>(ld("vkCmdBindPipeline"));
+    vkCmdPushConstants = reinterpret_cast<PFN_vkCmdPushConstants>(ld("vkCmdPushConstants"));
+    vkCmdDraw = reinterpret_cast<PFN_vkCmdDraw>(ld("vkCmdDraw"));
 
     if (!_pfn_vkGetMemoryWin32HandleKHR || !_pfn_vkGetSemaphoreWin32HandleKHR)
     {
@@ -327,18 +346,211 @@ namespace Noggit::Rendering::VK
     return get(_vk_done, &_vk_done_handle) && get(_gl_done, &_gl_done_handle);
   }
 
+  VkShaderModule VulkanBackend::loadShaderModule(char const* filename)
+  {
+    // <exe dir>/vk_shaders/<filename> -- compiled at build time by the vendored glslang (CMake POST_BUILD).
+    char exe[MAX_PATH]{};
+    ::GetModuleFileNameA(nullptr, exe, MAX_PATH);
+    std::string path(exe);
+    auto const slash = path.find_last_of("\\/");
+    path = (slash == std::string::npos ? std::string() : path.substr(0, slash + 1)) + "vk_shaders\\" + filename;
+
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f)
+    {
+      LogError << "[VK] shader not found: " << path << std::endl;
+      return VK_NULL_HANDLE;
+    }
+    std::fseek(f, 0, SEEK_END);
+    long const size = std::ftell(f);
+    std::fseek(f, 0, SEEK_SET);
+    std::vector<char> data(static_cast<std::size_t>(size));
+    std::size_t const rd = std::fread(data.data(), 1, data.size(), f);
+    std::fclose(f);
+    if (rd != data.size() || data.size() < 4)
+    {
+      LogError << "[VK] shader read failed: " << path << std::endl;
+      return VK_NULL_HANDLE;
+    }
+
+    VkShaderModuleCreateInfo ci{};
+    ci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    ci.codeSize = data.size();
+    ci.pCode = reinterpret_cast<std::uint32_t const*>(data.data());
+    VkShaderModule mod = VK_NULL_HANDLE;
+    if (vkCreateShaderModule(_device, &ci, nullptr, &mod) != VK_SUCCESS)
+    {
+      LogError << "[VK] vkCreateShaderModule failed: " << path << std::endl;
+      return VK_NULL_HANDLE;
+    }
+    return mod;
+  }
+
+  bool VulkanBackend::createRenderTarget()
+  {
+    VkImageViewCreateInfo vci{};
+    vci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    vci.image = _image;
+    vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    vci.format = VK_FORMAT_R8G8B8A8_UNORM;
+    vci.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    vci.subresourceRange.levelCount = 1;
+    vci.subresourceRange.layerCount = 1;
+    if (vkCreateImageView(_device, &vci, nullptr, &_view) != VK_SUCCESS)
+      return false;
+
+    // One colour attachment. initialLayout UNDEFINED + loadOp CLEAR every frame (previous contents replaced),
+    // finalLayout GENERAL = the cross-API interop layout GL waits on. No explicit barriers needed.
+    VkAttachmentDescription att{};
+    att.format = VK_FORMAT_R8G8B8A8_UNORM;
+    att.samples = VK_SAMPLE_COUNT_1_BIT;
+    att.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    att.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    att.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    att.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    att.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    att.finalLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+    VkAttachmentReference ref{};
+    ref.attachment = 0;
+    ref.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+    VkSubpassDescription sub{};
+    sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    sub.colorAttachmentCount = 1;
+    sub.pColorAttachments = &ref;
+
+    VkRenderPassCreateInfo rci{};
+    rci.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+    rci.attachmentCount = 1;
+    rci.pAttachments = &att;
+    rci.subpassCount = 1;
+    rci.pSubpasses = &sub;
+    if (vkCreateRenderPass(_device, &rci, nullptr, &_render_pass) != VK_SUCCESS)
+      return false;
+
+    VkFramebufferCreateInfo fci{};
+    fci.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+    fci.renderPass = _render_pass;
+    fci.attachmentCount = 1;
+    fci.pAttachments = &_view;
+    fci.width = _width;
+    fci.height = _height;
+    fci.layers = 1;
+    return vkCreateFramebuffer(_device, &fci, nullptr, &_framebuffer) == VK_SUCCESS;
+  }
+
+  bool VulkanBackend::createPipeline()
+  {
+    VkShaderModule vs = loadShaderModule("test.vert.spv");
+    VkShaderModule fs = loadShaderModule("test.frag.spv");
+    if (!vs || !fs)
+    {
+      if (vs) vkDestroyShaderModule(_device, vs, nullptr);
+      if (fs) vkDestroyShaderModule(_device, fs, nullptr);
+      return false;
+    }
+
+    VkPipelineShaderStageCreateInfo stages[2]{};
+    stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+    stages[0].module = vs;
+    stages[0].pName = "main";
+    stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    stages[1].module = fs;
+    stages[1].pName = "main";
+
+    VkPipelineVertexInputStateCreateInfo vin{};
+    vin.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO; // no vertex buffers (gl_VertexIndex)
+
+    VkPipelineInputAssemblyStateCreateInfo ia{};
+    ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+    VkViewport vp{};
+    vp.width = static_cast<float>(_width);
+    vp.height = static_cast<float>(_height);
+    vp.maxDepth = 1.0f;
+    VkRect2D sc{};
+    sc.extent = { _width, _height };
+    VkPipelineViewportStateCreateInfo vps{};
+    vps.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+    vps.viewportCount = 1;
+    vps.pViewports = &vp;
+    vps.scissorCount = 1;
+    vps.pScissors = &sc;
+
+    VkPipelineRasterizationStateCreateInfo rs{};
+    rs.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+    rs.polygonMode = VK_POLYGON_MODE_FILL;
+    rs.cullMode = VK_CULL_MODE_NONE;
+    rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    rs.lineWidth = 1.0f;
+
+    VkPipelineMultisampleStateCreateInfo ms{};
+    ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+    VkPipelineColorBlendAttachmentState cba{};
+    cba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT
+                       | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    VkPipelineColorBlendStateCreateInfo cb{};
+    cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+    cb.attachmentCount = 1;
+    cb.pAttachments = &cba;
+
+    VkPushConstantRange push{};
+    push.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    push.size = 16; // float time (+ pad, room for resolution later)
+
+    VkPipelineLayoutCreateInfo lci{};
+    lci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    lci.pushConstantRangeCount = 1;
+    lci.pPushConstantRanges = &push;
+    if (vkCreatePipelineLayout(_device, &lci, nullptr, &_pipe_layout) != VK_SUCCESS)
+    {
+      vkDestroyShaderModule(_device, vs, nullptr);
+      vkDestroyShaderModule(_device, fs, nullptr);
+      return false;
+    }
+
+    VkGraphicsPipelineCreateInfo pci{};
+    pci.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    pci.stageCount = 2;
+    pci.pStages = stages;
+    pci.pVertexInputState = &vin;
+    pci.pInputAssemblyState = &ia;
+    pci.pViewportState = &vps;
+    pci.pRasterizationState = &rs;
+    pci.pMultisampleState = &ms;
+    pci.pColorBlendState = &cb;
+    pci.layout = _pipe_layout;
+    pci.renderPass = _render_pass;
+    VkResult const r = vkCreateGraphicsPipelines(_device, VK_NULL_HANDLE, 1, &pci, nullptr, &_pipeline);
+    vkDestroyShaderModule(_device, vs, nullptr);
+    vkDestroyShaderModule(_device, fs, nullptr);
+    if (r != VK_SUCCESS)
+    {
+      LogError << "[VK] graphics pipeline create failed: " << vkres(r) << std::endl;
+      return false;
+    }
+    return true;
+  }
+
   bool VulkanBackend::init(std::uint32_t width, std::uint32_t height)
   {
     _width = width;
     _height = height;
     if (!loadLoader() || !createInstance() || !pickDeviceAndQueue() || !createDevice()
-        || !createSharedImage() || !createSemaphores())
+        || !createSharedImage() || !createSemaphores() || !createRenderTarget() || !createPipeline())
     {
       LogError << "[VK] init failed -- staying on pure GL" << std::endl;
       return false;
     }
     LogError << "[VK] backend ready: " << _width << "x" << _height
-             << " shared image (" << (_image_mem_size / 1024) << " KB) + semaphores exported" << std::endl;
+             << " shared image (" << (_image_mem_size / 1024) << " KB) + semaphores + GRAPHICS PIPELINE (SPIR-V)"
+             << std::endl;
     _ready = true;
     return true;
   }
@@ -357,42 +569,25 @@ namespace Noggit::Rendering::VK
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(_cmd, &bi);
 
-    VkImageSubresourceRange range{};
-    range.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    range.levelCount = 1;
-    range.layerCount = 1;
-
-    auto barrier = [&](VkImageLayout from, VkImageLayout to, VkAccessFlags src, VkAccessFlags dst)
-    {
-      VkImageMemoryBarrier b{};
-      b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-      b.oldLayout = from;
-      b.newLayout = to;
-      b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-      b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-      b.image = _image;
-      b.subresourceRange = range;
-      b.srcAccessMask = src;
-      b.dstAccessMask = dst;
-      vkCmdPipelineBarrier(_cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                           0, 0, nullptr, 0, nullptr, 1, &b);
-    };
-
-    // GL samples in GENERAL (the interop layout); clear in TRANSFER_DST then return to GENERAL.
-    barrier(_image_initialized ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED,
-            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT);
+    // Full graphics pass: render pass handles UNDEFINED->attachment->GENERAL layouts; the fullscreen pipeline
+    // draws the animated pattern with the frame clock in push constants. This is the same skeleton the real
+    // scene passes (terrain, M2 batches) will extend with descriptors + geometry.
+    VkClearValue clear{};
+    clear.color.float32[3] = 1.0f;
+    VkRenderPassBeginInfo rbi{};
+    rbi.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+    rbi.renderPass = _render_pass;
+    rbi.framebuffer = _framebuffer;
+    rbi.renderArea.extent = { _width, _height };
+    rbi.clearValueCount = 1;
+    rbi.pClearValues = &clear;
+    vkCmdBeginRenderPass(_cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
+    vkCmdBindPipeline(_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, _pipeline);
+    float push[4] = { t, 0.f, 0.f, 0.f };
+    vkCmdPushConstants(_cmd, _pipe_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), push);
+    vkCmdDraw(_cmd, 3, 1, 0, 0); // fullscreen triangle
+    vkCmdEndRenderPass(_cmd);
     _image_initialized = true;
-
-    // Animated proof-of-life colour (teal <-> orange sweep, obviously synthetic).
-    VkClearColorValue col{};
-    col.float32[0] = 0.5f + 0.5f * std::sin(t * 2.0f);
-    col.float32[1] = 0.4f;
-    col.float32[2] = 0.5f + 0.5f * std::cos(t * 2.0f);
-    col.float32[3] = 1.0f;
-    vkCmdClearColorImage(_cmd, _image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &col, 1, &range);
-
-    barrier(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
-            VK_ACCESS_TRANSFER_WRITE_BIT, 0);
 
     vkEndCommandBuffer(_cmd);
 
@@ -425,6 +620,11 @@ namespace Noggit::Rendering::VK
       vkDeviceWaitIdle(_device);
     if (_device)
     {
+      if (_pipeline) vkDestroyPipeline(_device, _pipeline, nullptr);
+      if (_pipe_layout) vkDestroyPipelineLayout(_device, _pipe_layout, nullptr);
+      if (_framebuffer) vkDestroyFramebuffer(_device, _framebuffer, nullptr);
+      if (_render_pass) vkDestroyRenderPass(_device, _render_pass, nullptr);
+      if (_view) vkDestroyImageView(_device, _view, nullptr);
       if (_gl_done) vkDestroySemaphore(_device, _gl_done, nullptr);
       if (_vk_done) vkDestroySemaphore(_device, _vk_done, nullptr);
       if (_image) vkDestroyImage(_device, _image, nullptr);

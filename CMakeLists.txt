@@ -408,6 +408,14 @@ add_custom_command(TARGET noggit POST_BUILD
 IF(WIN32)
   include(windeployqt)
   windeployqt(noggit)
+
+  # [VULKAN] compile the VK shaders to SPIR-V next to the exe (vendored glslang -- no SDK dependency).
+  # The backend loads them from <exe dir>/vk_shaders/ at init. Unconditional (unlike the unity-build block).
+  add_custom_command(TARGET noggit POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:noggit>/vk_shaders"
+    COMMAND "${CMAKE_SOURCE_DIR}/src/external/glslang-bin/glslang.exe" -V "${CMAKE_SOURCE_DIR}/src/noggit/rendering/vulkan/shaders/test.vert" -o "$<TARGET_FILE_DIR:noggit>/vk_shaders/test.vert.spv"
+    COMMAND "${CMAKE_SOURCE_DIR}/src/external/glslang-bin/glslang.exe" -V "${CMAKE_SOURCE_DIR}/src/noggit/rendering/vulkan/shaders/test.frag" -o "$<TARGET_FILE_DIR:noggit>/vk_shaders/test.frag.spv"
+    COMMENT "Compiling Vulkan shaders (glslang -> SPIR-V)")
 ENDIF()
 
 SET_PROPERTY(TARGET noggit PROPERTY AUTOMOC ON)
