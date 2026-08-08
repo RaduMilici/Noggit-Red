@@ -21,6 +21,7 @@
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan.h>
 
+#include <cstddef>
 #include <cstdint>
 
 namespace Noggit::Rendering::VK
@@ -34,10 +35,17 @@ namespace Noggit::Rendering::VK
     void shutdown();
     [[nodiscard]] bool ready() const { return _ready; }
 
-    // Phase-0 frame: clear the shared image to an animated colour, signal vk_done. wait_gl_done: pass false
-    // on the very first frame (GL hasn't signalled yet), true afterwards.
-    // Returns false on submission failure (backend goes inert).
-    bool renderTestFrame(float time_seconds, bool wait_gl_done);
+    // Per-frame render into the shared image, signalling vk_done. wait_gl_done: false on the very first
+    // frame (GL hasn't signalled yet). mvp16: noggit's projection*model_view, column-major (GL clip
+    // conventions -- the vertex shader converts). With a terrain mesh uploaded this draws the REAL terrain
+    // (depth-tested); before any mesh it draws the ring-pattern skeleton test. False on submit failure.
+    bool renderFrame(float time_seconds, bool wait_gl_done, float const* mvp16);
+
+    // [VK-1b] upload/replace the terrain mesh (position-only vertices + uint32 indices). Host-visible
+    // one-shot upload; called from the GL side when the camera's tile changes. Waits the queue idle first
+    // (tiny mesh, editor cadence -- streaming-friendly staging comes with the real pass).
+    bool setTerrainMesh(float const* xyz, std::size_t vertex_count,
+                        std::uint32_t const* indices, std::size_t index_count);
 
     // Win32 HANDLEs for the GL import (opaque win32; ownership stays with VK).
     [[nodiscard]] void* imageMemoryHandle() const { return _image_mem_handle; }
@@ -62,6 +70,11 @@ namespace Noggit::Rendering::VK
     bool createRenderTarget();
     bool createPipeline();
     VkShaderModule loadShaderModule(char const* filename); // from <exe>/vk_shaders/
+    // [VK-1b]
+    bool createDepthTarget();   // D32 depth image/view for the terrain pass
+    bool createTerrainPipeline();
+    bool createHostBuffer(VkBufferUsageFlags usage, std::size_t bytes,
+                          VkBuffer& buf, VkDeviceMemory& mem, void const* data); // host-visible one-shot
 
     bool _ready = false;
     void* _dll = nullptr; // HMODULE
@@ -93,6 +106,18 @@ namespace Noggit::Rendering::VK
     VkFramebuffer _framebuffer = VK_NULL_HANDLE;
     VkPipelineLayout _pipe_layout = VK_NULL_HANDLE;
     VkPipeline _pipeline = VK_NULL_HANDLE;
+
+    // [VK-1b] depth target + terrain mesh + terrain pipeline
+    VkImage _depth_image = VK_NULL_HANDLE;
+    VkDeviceMemory _depth_mem = VK_NULL_HANDLE;
+    VkImageView _depth_view = VK_NULL_HANDLE;
+    VkPipelineLayout _terrain_layout = VK_NULL_HANDLE; // mat4 mvp (vert) + time (frag) push block
+    VkPipeline _terrain_pipeline = VK_NULL_HANDLE;
+    VkBuffer _terrain_vbo = VK_NULL_HANDLE;
+    VkDeviceMemory _terrain_vbo_mem = VK_NULL_HANDLE;
+    VkBuffer _terrain_ibo = VK_NULL_HANDLE;
+    VkDeviceMemory _terrain_ibo_mem = VK_NULL_HANDLE;
+    std::uint32_t _terrain_index_count = 0;
 
     // --- dynamically loaded entry points (driver's vulkan-1.dll; VK_NO_PROTOTYPES) ---
     PFN_vkGetInstanceProcAddr _vkGetInstanceProcAddr = nullptr;
@@ -147,6 +172,16 @@ namespace Noggit::Rendering::VK
     PFN_vkCmdBindPipeline vkCmdBindPipeline = nullptr;
     PFN_vkCmdPushConstants vkCmdPushConstants = nullptr;
     PFN_vkCmdDraw vkCmdDraw = nullptr;
+    PFN_vkCreateBuffer vkCreateBuffer = nullptr;
+    PFN_vkDestroyBuffer vkDestroyBuffer = nullptr;
+    PFN_vkGetBufferMemoryRequirements vkGetBufferMemoryRequirements = nullptr;
+    PFN_vkBindBufferMemory vkBindBufferMemory = nullptr;
+    PFN_vkMapMemory vkMapMemory = nullptr;
+    PFN_vkUnmapMemory vkUnmapMemory = nullptr;
+    PFN_vkCmdBindVertexBuffers vkCmdBindVertexBuffers = nullptr;
+    PFN_vkCmdBindIndexBuffer vkCmdBindIndexBuffer = nullptr;
+    PFN_vkCmdDrawIndexed vkCmdDrawIndexed = nullptr;
+    PFN_vkQueueWaitIdle vkQueueWaitIdle = nullptr;
   };
 }
 

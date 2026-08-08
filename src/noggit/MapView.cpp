@@ -9725,10 +9725,67 @@ void MapView::draw_map()
 
       if (s_vk.ok && s_vk.backend.ready())
       {
-        // self-contained clock (this function has no `now` local; only drives the proof-of-life colour sweep)
+        // [VK-1b] feed the REAL nearest tile's heightmap mesh to the backend (rebuilt on tile change).
+        // Chunk layout: 145 verts (9x9 outer + 8x8 centre, 17-stride interleave), 4 tris per cell.
+        static MapTile* s_vk_tile = nullptr;
+        MapTile* best = nullptr;
+        float bestd = std::numeric_limits<float>::max();
+        for (MapTile* t : _world->mapIndex.loaded_tiles())
+        {
+          if (t && t->finishedLoading() && t->camDist() < bestd)
+          {
+            bestd = t->camDist();
+            best = t;
+          }
+        }
+        if (best && best != s_vk_tile)
+        {
+          std::vector<float> vk_verts;
+          vk_verts.reserve(256u * 145u * 3u);
+          std::vector<std::uint32_t> vk_idx;
+          vk_idx.reserve(256u * 8u * 8u * 12u);
+          bool mesh_ok = true;
+          for (unsigned cz = 0; cz < 16 && mesh_ok; ++cz)
+          {
+            for (unsigned cx = 0; cx < 16 && mesh_ok; ++cx)
+            {
+              MapChunk* ch = best->getChunk(cx, cz);
+              glm::vec3 const* hm = ch ? ch->getHeightmap() : nullptr;
+              if (!hm) { mesh_ok = false; break; }
+              std::uint32_t const base = (cz * 16u + cx) * 145u;
+              for (unsigned i = 0; i < 145; ++i)
+              {
+                vk_verts.push_back(hm[i].x);
+                vk_verts.push_back(hm[i].y);
+                vk_verts.push_back(hm[i].z);
+              }
+              for (unsigned r = 0; r < 8; ++r)
+              {
+                for (unsigned c = 0; c < 8; ++c)
+                {
+                  std::uint32_t const o00 = base + 17u * r + c;
+                  std::uint32_t const o01 = o00 + 1u;
+                  std::uint32_t const o10 = base + 17u * (r + 1u) + c;
+                  std::uint32_t const o11 = o10 + 1u;
+                  std::uint32_t const ctr = base + 17u * r + 9u + c;
+                  std::uint32_t const quad[12] = { o00, o01, ctr, o01, o11, ctr, o11, o10, ctr, o10, o00, ctr };
+                  vk_idx.insert(vk_idx.end(), quad, quad + 12);
+                }
+              }
+            }
+          }
+          if (mesh_ok && s_vk.backend.setTerrainMesh(vk_verts.data(), vk_verts.size() / 3,
+                                                     vk_idx.data(), vk_idx.size()))
+          {
+            s_vk_tile = best;
+          }
+        }
+
+        // self-contained clock (this function has no `now` local)
         static auto const s_vk_t0 = std::chrono::steady_clock::now();
         float const vk_t = std::chrono::duration<float>(std::chrono::steady_clock::now() - s_vk_t0).count();
-        if (s_vk.backend.renderTestFrame(vk_t, !s_vk.first_frame))
+        glm::mat4x4 const vk_mvp = projection() * model_view();
+        if (s_vk.backend.renderFrame(vk_t, !s_vk.first_frame, &vk_mvp[0][0]))
         {
           GLenum const layout = GL_LAYOUT_GENERAL_EXT_;
           s_vk.pWaitSemaphore(s_vk.sem_vk_done, 0, nullptr, 1, &s_vk.tex, &layout);

@@ -415,6 +415,8 @@ IF(WIN32)
     COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:noggit>/vk_shaders"
     COMMAND "${CMAKE_SOURCE_DIR}/src/external/glslang-bin/glslang.exe" -V "${CMAKE_SOURCE_DIR}/src/noggit/rendering/vulkan/shaders/test.vert" -o "$<TARGET_FILE_DIR:noggit>/vk_shaders/test.vert.spv"
     COMMAND "${CMAKE_SOURCE_DIR}/src/external/glslang-bin/glslang.exe" -V "${CMAKE_SOURCE_DIR}/src/noggit/rendering/vulkan/shaders/test.frag" -o "$<TARGET_FILE_DIR:noggit>/vk_shaders/test.frag.spv"
+    COMMAND "${CMAKE_SOURCE_DIR}/src/external/glslang-bin/glslang.exe" -V "${CMAKE_SOURCE_DIR}/src/noggit/rendering/vulkan/shaders/terrain.vert" -o "$<TARGET_FILE_DIR:noggit>/vk_shaders/terrain.vert.spv"
+    COMMAND "${CMAKE_SOURCE_DIR}/src/external/glslang-bin/glslang.exe" -V "${CMAKE_SOURCE_DIR}/src/noggit/rendering/vulkan/shaders/terrain.frag" -o "$<TARGET_FILE_DIR:noggit>/vk_shaders/terrain.frag.spv"
     COMMENT "Compiling Vulkan shaders (glslang -> SPIR-V)")
 ENDIF()
 

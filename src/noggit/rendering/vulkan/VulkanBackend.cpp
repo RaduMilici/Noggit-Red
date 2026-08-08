@@ -204,6 +204,16 @@ namespace Noggit::Rendering::VK
     vkCmdBindPipeline = reinterpret_cast<PFN_vkCmdBindPipeline>(ld("vkCmdBindPipeline"));
     vkCmdPushConstants = reinterpret_cast<PFN_vkCmdPushConstants>(ld("vkCmdPushConstants"));
     vkCmdDraw = reinterpret_cast<PFN_vkCmdDraw>(ld("vkCmdDraw"));
+    vkCreateBuffer = reinterpret_cast<PFN_vkCreateBuffer>(ld("vkCreateBuffer"));
+    vkDestroyBuffer = reinterpret_cast<PFN_vkDestroyBuffer>(ld("vkDestroyBuffer"));
+    vkGetBufferMemoryRequirements = reinterpret_cast<PFN_vkGetBufferMemoryRequirements>(ld("vkGetBufferMemoryRequirements"));
+    vkBindBufferMemory = reinterpret_cast<PFN_vkBindBufferMemory>(ld("vkBindBufferMemory"));
+    vkMapMemory = reinterpret_cast<PFN_vkMapMemory>(ld("vkMapMemory"));
+    vkUnmapMemory = reinterpret_cast<PFN_vkUnmapMemory>(ld("vkUnmapMemory"));
+    vkCmdBindVertexBuffers = reinterpret_cast<PFN_vkCmdBindVertexBuffers>(ld("vkCmdBindVertexBuffers"));
+    vkCmdBindIndexBuffer = reinterpret_cast<PFN_vkCmdBindIndexBuffer>(ld("vkCmdBindIndexBuffer"));
+    vkCmdDrawIndexed = reinterpret_cast<PFN_vkCmdDrawIndexed>(ld("vkCmdDrawIndexed"));
+    vkQueueWaitIdle = reinterpret_cast<PFN_vkQueueWaitIdle>(ld("vkQueueWaitIdle"));
 
     if (!_pfn_vkGetMemoryWin32HandleKHR || !_pfn_vkGetSemaphoreWin32HandleKHR)
     {
@@ -386,6 +396,51 @@ namespace Noggit::Rendering::VK
     return mod;
   }
 
+  bool VulkanBackend::createDepthTarget()
+  {
+    VkImageCreateInfo ici{};
+    ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    ici.imageType = VK_IMAGE_TYPE_2D;
+    ici.format = VK_FORMAT_D32_SFLOAT;
+    ici.extent = { _width, _height, 1 };
+    ici.mipLevels = 1;
+    ici.arrayLayers = 1;
+    ici.samples = VK_SAMPLE_COUNT_1_BIT;
+    ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ici.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+    ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (vkCreateImage(_device, &ici, nullptr, &_depth_image) != VK_SUCCESS)
+      return false;
+
+    VkMemoryRequirements req{};
+    vkGetImageMemoryRequirements(_device, _depth_image, &req);
+    VkPhysicalDeviceMemoryProperties mp{};
+    vkGetPhysicalDeviceMemoryProperties(_phys, &mp);
+    std::uint32_t type = UINT32_MAX;
+    for (std::uint32_t i = 0; i < mp.memoryTypeCount; ++i)
+      if ((req.memoryTypeBits & (1u << i)) && (mp.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))
+      { type = i; break; }
+    if (type == UINT32_MAX)
+      return false;
+    VkMemoryAllocateInfo mai{};
+    mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    mai.allocationSize = req.size;
+    mai.memoryTypeIndex = type;
+    if (vkAllocateMemory(_device, &mai, nullptr, &_depth_mem) != VK_SUCCESS
+        || vkBindImageMemory(_device, _depth_image, _depth_mem, 0) != VK_SUCCESS)
+      return false;
+
+    VkImageViewCreateInfo vci{};
+    vci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    vci.image = _depth_image;
+    vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    vci.format = VK_FORMAT_D32_SFLOAT;
+    vci.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+    vci.subresourceRange.levelCount = 1;
+    vci.subresourceRange.layerCount = 1;
+    return vkCreateImageView(_device, &vci, nullptr, &_depth_view) == VK_SUCCESS;
+  }
+
   bool VulkanBackend::createRenderTarget()
   {
     VkImageViewCreateInfo vci{};
@@ -399,41 +454,57 @@ namespace Noggit::Rendering::VK
     if (vkCreateImageView(_device, &vci, nullptr, &_view) != VK_SUCCESS)
       return false;
 
-    // One colour attachment. initialLayout UNDEFINED + loadOp CLEAR every frame (previous contents replaced),
-    // finalLayout GENERAL = the cross-API interop layout GL waits on. No explicit barriers needed.
-    VkAttachmentDescription att{};
-    att.format = VK_FORMAT_R8G8B8A8_UNORM;
-    att.samples = VK_SAMPLE_COUNT_1_BIT;
-    att.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-    att.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-    att.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-    att.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-    att.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    att.finalLayout = VK_IMAGE_LAYOUT_GENERAL;
+    if (!createDepthTarget())
+      return false;
 
-    VkAttachmentReference ref{};
-    ref.attachment = 0;
-    ref.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    // Colour + depth. initialLayout UNDEFINED + loadOp CLEAR every frame (previous contents replaced);
+    // colour finalLayout GENERAL = the cross-API interop layout GL waits on. No explicit barriers needed.
+    VkAttachmentDescription atts[2]{};
+    atts[0].format = VK_FORMAT_R8G8B8A8_UNORM;
+    atts[0].samples = VK_SAMPLE_COUNT_1_BIT;
+    atts[0].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    atts[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    atts[0].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    atts[0].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    atts[0].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    atts[0].finalLayout = VK_IMAGE_LAYOUT_GENERAL;
+    atts[1].format = VK_FORMAT_D32_SFLOAT;
+    atts[1].samples = VK_SAMPLE_COUNT_1_BIT;
+    atts[1].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    atts[1].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    atts[1].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    atts[1].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    atts[1].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    atts[1].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+
+    VkAttachmentReference cref{};
+    cref.attachment = 0;
+    cref.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    VkAttachmentReference dref{};
+    dref.attachment = 1;
+    dref.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
 
     VkSubpassDescription sub{};
     sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
     sub.colorAttachmentCount = 1;
-    sub.pColorAttachments = &ref;
+    sub.pColorAttachments = &cref;
+    sub.pDepthStencilAttachment = &dref;
 
     VkRenderPassCreateInfo rci{};
     rci.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
-    rci.attachmentCount = 1;
-    rci.pAttachments = &att;
+    rci.attachmentCount = 2;
+    rci.pAttachments = atts;
     rci.subpassCount = 1;
     rci.pSubpasses = &sub;
     if (vkCreateRenderPass(_device, &rci, nullptr, &_render_pass) != VK_SUCCESS)
       return false;
 
+    VkImageView views[2] = { _view, _depth_view };
     VkFramebufferCreateInfo fci{};
     fci.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
     fci.renderPass = _render_pass;
-    fci.attachmentCount = 1;
-    fci.pAttachments = &_view;
+    fci.attachmentCount = 2;
+    fci.pAttachments = views;
     fci.width = _width;
     fci.height = _height;
     fci.layers = 1;
@@ -500,6 +571,11 @@ namespace Noggit::Rendering::VK
     cb.attachmentCount = 1;
     cb.pAttachments = &cba;
 
+    // the render pass now has a depth attachment -> a depth-stencil state is mandatory (disabled for the
+    // fullscreen test pattern)
+    VkPipelineDepthStencilStateCreateInfo ds{};
+    ds.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+
     VkPushConstantRange push{};
     push.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
     push.size = 16; // float time (+ pad, room for resolution later)
@@ -525,6 +601,7 @@ namespace Noggit::Rendering::VK
     pci.pRasterizationState = &rs;
     pci.pMultisampleState = &ms;
     pci.pColorBlendState = &cb;
+    pci.pDepthStencilState = &ds;
     pci.layout = _pipe_layout;
     pci.renderPass = _render_pass;
     VkResult const r = vkCreateGraphicsPipelines(_device, VK_NULL_HANDLE, 1, &pci, nullptr, &_pipeline);
@@ -538,12 +615,197 @@ namespace Noggit::Rendering::VK
     return true;
   }
 
+  // [VK-1b] terrain pipeline: position-only vertex stream, depth-tested, MVP + clock in push constants.
+  bool VulkanBackend::createTerrainPipeline()
+  {
+    VkShaderModule vs = loadShaderModule("terrain.vert.spv");
+    VkShaderModule fs = loadShaderModule("terrain.frag.spv");
+    if (!vs || !fs)
+    {
+      if (vs) vkDestroyShaderModule(_device, vs, nullptr);
+      if (fs) vkDestroyShaderModule(_device, fs, nullptr);
+      return false;
+    }
+
+    VkPipelineShaderStageCreateInfo stages[2]{};
+    stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+    stages[0].module = vs;
+    stages[0].pName = "main";
+    stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    stages[1].module = fs;
+    stages[1].pName = "main";
+
+    VkVertexInputBindingDescription bind{};
+    bind.binding = 0;
+    bind.stride = 12; // vec3 position
+    bind.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+    VkVertexInputAttributeDescription attr{};
+    attr.location = 0;
+    attr.binding = 0;
+    attr.format = VK_FORMAT_R32G32B32_SFLOAT;
+    VkPipelineVertexInputStateCreateInfo vin{};
+    vin.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+    vin.vertexBindingDescriptionCount = 1;
+    vin.pVertexBindingDescriptions = &bind;
+    vin.vertexAttributeDescriptionCount = 1;
+    vin.pVertexAttributeDescriptions = &attr;
+
+    VkPipelineInputAssemblyStateCreateInfo ia{};
+    ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+    VkViewport vp{};
+    vp.width = static_cast<float>(_width);
+    vp.height = static_cast<float>(_height);
+    vp.maxDepth = 1.0f;
+    VkRect2D sc{};
+    sc.extent = { _width, _height };
+    VkPipelineViewportStateCreateInfo vps{};
+    vps.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+    vps.viewportCount = 1;
+    vps.pViewports = &vp;
+    vps.scissorCount = 1;
+    vps.pScissors = &sc;
+
+    VkPipelineRasterizationStateCreateInfo rs{};
+    rs.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+    rs.polygonMode = VK_POLYGON_MODE_FILL;
+    rs.cullMode = VK_CULL_MODE_NONE; // orientation-agnostic while the mesh winding settles
+    rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    rs.lineWidth = 1.0f;
+
+    VkPipelineMultisampleStateCreateInfo ms{};
+    ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+    VkPipelineDepthStencilStateCreateInfo ds{};
+    ds.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+    ds.depthTestEnable = VK_TRUE;
+    ds.depthWriteEnable = VK_TRUE;
+    ds.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
+
+    VkPipelineColorBlendAttachmentState cba{};
+    cba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT
+                       | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    VkPipelineColorBlendStateCreateInfo cb{};
+    cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+    cb.attachmentCount = 1;
+    cb.pAttachments = &cba;
+
+    // one push block visible to BOTH stages: mat4 mvp (0..64) + float time (64..68), padded to 80
+    VkPushConstantRange push{};
+    push.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+    push.size = 80;
+    VkPipelineLayoutCreateInfo lci{};
+    lci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    lci.pushConstantRangeCount = 1;
+    lci.pPushConstantRanges = &push;
+    if (vkCreatePipelineLayout(_device, &lci, nullptr, &_terrain_layout) != VK_SUCCESS)
+    {
+      vkDestroyShaderModule(_device, vs, nullptr);
+      vkDestroyShaderModule(_device, fs, nullptr);
+      return false;
+    }
+
+    VkGraphicsPipelineCreateInfo pci{};
+    pci.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    pci.stageCount = 2;
+    pci.pStages = stages;
+    pci.pVertexInputState = &vin;
+    pci.pInputAssemblyState = &ia;
+    pci.pViewportState = &vps;
+    pci.pRasterizationState = &rs;
+    pci.pMultisampleState = &ms;
+    pci.pColorBlendState = &cb;
+    pci.pDepthStencilState = &ds;
+    pci.layout = _terrain_layout;
+    pci.renderPass = _render_pass;
+    VkResult const r = vkCreateGraphicsPipelines(_device, VK_NULL_HANDLE, 1, &pci, nullptr, &_terrain_pipeline);
+    vkDestroyShaderModule(_device, vs, nullptr);
+    vkDestroyShaderModule(_device, fs, nullptr);
+    if (r != VK_SUCCESS)
+    {
+      LogError << "[VK] terrain pipeline create failed: " << vkres(r) << std::endl;
+      return false;
+    }
+    return true;
+  }
+
+  bool VulkanBackend::createHostBuffer(VkBufferUsageFlags usage, std::size_t bytes,
+                                       VkBuffer& buf, VkDeviceMemory& mem, void const* data)
+  {
+    VkBufferCreateInfo bci{};
+    bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bci.size = bytes;
+    bci.usage = usage;
+    bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    if (vkCreateBuffer(_device, &bci, nullptr, &buf) != VK_SUCCESS)
+      return false;
+
+    VkMemoryRequirements req{};
+    vkGetBufferMemoryRequirements(_device, buf, &req);
+    VkPhysicalDeviceMemoryProperties mp{};
+    vkGetPhysicalDeviceMemoryProperties(_phys, &mp);
+    std::uint32_t type = UINT32_MAX;
+    for (std::uint32_t i = 0; i < mp.memoryTypeCount; ++i)
+      if ((req.memoryTypeBits & (1u << i))
+          && (mp.memoryTypes[i].propertyFlags
+              & (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))
+             == (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))
+      { type = i; break; }
+    if (type == UINT32_MAX)
+      return false;
+
+    VkMemoryAllocateInfo mai{};
+    mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    mai.allocationSize = req.size;
+    mai.memoryTypeIndex = type;
+    if (vkAllocateMemory(_device, &mai, nullptr, &mem) != VK_SUCCESS
+        || vkBindBufferMemory(_device, buf, mem, 0) != VK_SUCCESS)
+      return false;
+
+    void* mapped = nullptr;
+    if (vkMapMemory(_device, mem, 0, bytes, 0, &mapped) != VK_SUCCESS)
+      return false;
+    std::memcpy(mapped, data, bytes);
+    vkUnmapMemory(_device, mem);
+    return true;
+  }
+
+  bool VulkanBackend::setTerrainMesh(float const* xyz, std::size_t vertex_count,
+                                     std::uint32_t const* indices, std::size_t index_count)
+  {
+    if (!_ready || !vertex_count || !index_count)
+      return false;
+
+    // editor-cadence upload (tile change): safe to idle the queue and replace the buffers outright
+    vkQueueWaitIdle(_queue);
+    if (_terrain_vbo) { vkDestroyBuffer(_device, _terrain_vbo, nullptr); _terrain_vbo = VK_NULL_HANDLE; }
+    if (_terrain_vbo_mem) { vkFreeMemory(_device, _terrain_vbo_mem, nullptr); _terrain_vbo_mem = VK_NULL_HANDLE; }
+    if (_terrain_ibo) { vkDestroyBuffer(_device, _terrain_ibo, nullptr); _terrain_ibo = VK_NULL_HANDLE; }
+    if (_terrain_ibo_mem) { vkFreeMemory(_device, _terrain_ibo_mem, nullptr); _terrain_ibo_mem = VK_NULL_HANDLE; }
+    _terrain_index_count = 0;
+
+    if (!createHostBuffer(VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, vertex_count * 12, _terrain_vbo, _terrain_vbo_mem, xyz)
+        || !createHostBuffer(VK_BUFFER_USAGE_INDEX_BUFFER_BIT, index_count * 4, _terrain_ibo, _terrain_ibo_mem, indices))
+    {
+      LogError << "[VK] terrain mesh upload failed" << std::endl;
+      return false;
+    }
+    _terrain_index_count = static_cast<std::uint32_t>(index_count);
+    LogError << "[VK] terrain mesh: " << vertex_count << " verts / " << index_count << " indices" << std::endl;
+    return true;
+  }
+
   bool VulkanBackend::init(std::uint32_t width, std::uint32_t height)
   {
     _width = width;
     _height = height;
     if (!loadLoader() || !createInstance() || !pickDeviceAndQueue() || !createDevice()
-        || !createSharedImage() || !createSemaphores() || !createRenderTarget() || !createPipeline())
+        || !createSharedImage() || !createSemaphores() || !createRenderTarget() || !createPipeline()
+        || !createTerrainPipeline())
     {
       LogError << "[VK] init failed -- staying on pure GL" << std::endl;
       return false;
@@ -555,7 +817,7 @@ namespace Noggit::Rendering::VK
     return true;
   }
 
-  bool VulkanBackend::renderTestFrame(float t, bool wait_gl_done)
+  bool VulkanBackend::renderFrame(float t, bool wait_gl_done, float const* mvp16)
   {
     if (!_ready)
       return false;
@@ -569,23 +831,44 @@ namespace Noggit::Rendering::VK
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(_cmd, &bi);
 
-    // Full graphics pass: render pass handles UNDEFINED->attachment->GENERAL layouts; the fullscreen pipeline
-    // draws the animated pattern with the frame clock in push constants. This is the same skeleton the real
-    // scene passes (terrain, M2 batches) will extend with descriptors + geometry.
-    VkClearValue clear{};
-    clear.color.float32[3] = 1.0f;
+    // Render pass handles UNDEFINED->attachment->GENERAL layouts (colour) + the depth clear. With a terrain
+    // mesh uploaded this draws the REAL scene geometry depth-tested with the live camera MVP; before the
+    // first mesh, the fullscreen ring pattern proves the skeleton.
+    VkClearValue clears[2]{};
+    clears[0].color.float32[0] = 0.35f; // sky-ish backdrop behind the terrain
+    clears[0].color.float32[1] = 0.55f;
+    clears[0].color.float32[2] = 0.80f;
+    clears[0].color.float32[3] = 1.0f;
+    clears[1].depthStencil.depth = 1.0f;
     VkRenderPassBeginInfo rbi{};
     rbi.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
     rbi.renderPass = _render_pass;
     rbi.framebuffer = _framebuffer;
     rbi.renderArea.extent = { _width, _height };
-    rbi.clearValueCount = 1;
-    rbi.pClearValues = &clear;
+    rbi.clearValueCount = 2;
+    rbi.pClearValues = clears;
     vkCmdBeginRenderPass(_cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
-    vkCmdBindPipeline(_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, _pipeline);
-    float push[4] = { t, 0.f, 0.f, 0.f };
-    vkCmdPushConstants(_cmd, _pipe_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), push);
-    vkCmdDraw(_cmd, 3, 1, 0, 0); // fullscreen triangle
+    if (_terrain_index_count && mvp16)
+    {
+      vkCmdBindPipeline(_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, _terrain_pipeline);
+      float push[20]; // mat4 (16) + time + pad
+      std::memcpy(push, mvp16, 16 * sizeof(float));
+      push[16] = t;
+      push[17] = push[18] = push[19] = 0.f;
+      vkCmdPushConstants(_cmd, _terrain_layout,
+                         VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), push);
+      VkDeviceSize const zero = 0;
+      vkCmdBindVertexBuffers(_cmd, 0, 1, &_terrain_vbo, &zero);
+      vkCmdBindIndexBuffer(_cmd, _terrain_ibo, 0, VK_INDEX_TYPE_UINT32);
+      vkCmdDrawIndexed(_cmd, _terrain_index_count, 1, 0, 0, 0);
+    }
+    else
+    {
+      vkCmdBindPipeline(_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, _pipeline);
+      float push[4] = { t, 0.f, 0.f, 0.f };
+      vkCmdPushConstants(_cmd, _pipe_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), push);
+      vkCmdDraw(_cmd, 3, 1, 0, 0); // fullscreen triangle
+    }
     vkCmdEndRenderPass(_cmd);
     _image_initialized = true;
 
@@ -620,6 +903,15 @@ namespace Noggit::Rendering::VK
       vkDeviceWaitIdle(_device);
     if (_device)
     {
+      if (_terrain_vbo) vkDestroyBuffer(_device, _terrain_vbo, nullptr);
+      if (_terrain_vbo_mem) vkFreeMemory(_device, _terrain_vbo_mem, nullptr);
+      if (_terrain_ibo) vkDestroyBuffer(_device, _terrain_ibo, nullptr);
+      if (_terrain_ibo_mem) vkFreeMemory(_device, _terrain_ibo_mem, nullptr);
+      if (_terrain_pipeline) vkDestroyPipeline(_device, _terrain_pipeline, nullptr);
+      if (_terrain_layout) vkDestroyPipelineLayout(_device, _terrain_layout, nullptr);
+      if (_depth_view) vkDestroyImageView(_device, _depth_view, nullptr);
+      if (_depth_image) vkDestroyImage(_device, _depth_image, nullptr);
+      if (_depth_mem) vkFreeMemory(_device, _depth_mem, nullptr);
       if (_pipeline) vkDestroyPipeline(_device, _pipeline, nullptr);
       if (_pipe_layout) vkDestroyPipelineLayout(_device, _pipe_layout, nullptr);
       if (_framebuffer) vkDestroyFramebuffer(_device, _framebuffer, nullptr);
