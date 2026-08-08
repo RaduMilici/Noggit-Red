@@ -188,6 +188,9 @@ INCLUDE_DIRECTORIES(PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 
 # And do the job.
 INCLUDE_DIRECTORIES("${CMAKE_SOURCE_DIR}/src")
+# [VULKAN PHASE 0] vendored Khronos Vulkan headers (loader is the driver's vulkan-1.dll, loaded dynamically --
+# no SDK dependency). See src/noggit/rendering/vulkan/VulkanBackend.hpp.
+INCLUDE_DIRECTORIES(SYSTEM "${CMAKE_SOURCE_DIR}/${EXTERNAL_SOURCE_DIR}/vulkan-headers/include")
 INCLUDE_DIRECTORIES("${CMAKE_SOURCE_DIR}/${EXTERNAL_SOURCE_DIR}/PNG2BLP" )
 INCLUDE_DIRECTORIES("${CMAKE_SOURCE_DIR}/${EXTERNAL_SOURCE_DIR}/PNG2BLP/libimagequant")
 INCLUDE_DIRECTORIES("${CMAKE_SOURCE_DIR}/${EXTERNAL_SOURCE_DIR}/PNG2BLP/libpng")

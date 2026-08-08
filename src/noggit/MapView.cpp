@@ -12,6 +12,7 @@
 #include <psapi.h> // GetProcessMemoryInfo (mem-diag)
 #endif
 #include <noggit/World.h>
+#include <noggit/rendering/vulkan/VulkanBackend.hpp> // [VULKAN PHASE 0] interop proof of life (win32-gated inside)
 #include <noggit/map_index.hpp>
 #include <noggit/uid_storage.hpp>
 #include <noggit/ui/CurrentTexture.h>
@@ -9649,6 +9650,107 @@ void MapView::draw_map()
 
   // reset after each world::draw call
   _camera_moved_since_last_draw = false;
+
+#ifdef _WIN32
+  // [VULKAN PHASE 0 -- interop proof of life, 2026-08-07] NOGGIT_VK=1: bring up the Vulkan backend, share an
+  // image + semaphores with this GL context (EXT_memory_object_win32 / EXT_semaphore_win32), have VK clear it
+  // to an animated colour each frame and blit it into the viewport corner. Proves the whole VK->GL bridge the
+  // real scene passes will ride (VK renders, GL composites -- Qt UI untouched). Fails soft to pure GL.
+  {
+    static bool const s_vk_on = std::getenv("NOGGIT_VK") != nullptr;
+    if (s_vk_on)
+    {
+      struct VkInterop
+      {
+        Noggit::Rendering::VK::VulkanBackend backend;
+        GLuint memobj = 0, tex = 0, fbo = 0, sem_vk_done = 0, sem_gl_done = 0;
+        bool tried = false, ok = false, first_frame = true;
+        // EXT_memory_object / EXT_semaphore entry points (not in the gl wrapper)
+        void (QOPENGLF_APIENTRYP pCreateMemoryObjects)(GLsizei, GLuint*) = nullptr;
+        void (QOPENGLF_APIENTRYP pImportMemoryWin32Handle)(GLuint, GLuint64, GLenum, void*) = nullptr;
+        void (QOPENGLF_APIENTRYP pTexStorageMem2D)(GLenum, GLsizei, GLenum, GLsizei, GLsizei, GLuint, GLuint64) = nullptr;
+        void (QOPENGLF_APIENTRYP pGenSemaphores)(GLsizei, GLuint*) = nullptr;
+        void (QOPENGLF_APIENTRYP pImportSemaphoreWin32Handle)(GLuint, GLenum, void*) = nullptr;
+        void (QOPENGLF_APIENTRYP pWaitSemaphore)(GLuint, GLuint, const GLuint*, GLuint, const GLuint*, const GLenum*) = nullptr;
+        void (QOPENGLF_APIENTRYP pSignalSemaphore)(GLuint, GLuint, const GLuint*, GLuint, const GLuint*, const GLenum*) = nullptr;
+      };
+      static VkInterop s_vk;
+
+      constexpr GLenum GL_HANDLE_TYPE_OPAQUE_WIN32_EXT_ = 0x9587;
+      constexpr GLenum GL_LAYOUT_GENERAL_EXT_ = 0x958D;
+      constexpr std::uint32_t VK_W = 512, VK_H = 512;
+
+      if (!s_vk.tried)
+      {
+        s_vk.tried = true;
+        auto* ctx = QOpenGLContext::currentContext();
+        auto gp = [&](char const* n) { return ctx ? ctx->getProcAddress(n) : nullptr; };
+        s_vk.pCreateMemoryObjects = reinterpret_cast<decltype(s_vk.pCreateMemoryObjects)>(gp("glCreateMemoryObjectsEXT"));
+        s_vk.pImportMemoryWin32Handle = reinterpret_cast<decltype(s_vk.pImportMemoryWin32Handle)>(gp("glImportMemoryWin32HandleEXT"));
+        s_vk.pTexStorageMem2D = reinterpret_cast<decltype(s_vk.pTexStorageMem2D)>(gp("glTexStorageMem2DEXT"));
+        s_vk.pGenSemaphores = reinterpret_cast<decltype(s_vk.pGenSemaphores)>(gp("glGenSemaphoresEXT"));
+        s_vk.pImportSemaphoreWin32Handle = reinterpret_cast<decltype(s_vk.pImportSemaphoreWin32Handle)>(gp("glImportSemaphoreWin32HandleEXT"));
+        s_vk.pWaitSemaphore = reinterpret_cast<decltype(s_vk.pWaitSemaphore)>(gp("glWaitSemaphoreEXT"));
+        s_vk.pSignalSemaphore = reinterpret_cast<decltype(s_vk.pSignalSemaphore)>(gp("glSignalSemaphoreEXT"));
+
+        if (!s_vk.pCreateMemoryObjects || !s_vk.pImportMemoryWin32Handle || !s_vk.pTexStorageMem2D
+            || !s_vk.pGenSemaphores || !s_vk.pImportSemaphoreWin32Handle
+            || !s_vk.pWaitSemaphore || !s_vk.pSignalSemaphore)
+        {
+          LogError << "[VK] GL_EXT_memory_object_win32 / GL_EXT_semaphore_win32 not available -- interop off" << std::endl;
+        }
+        else if (s_vk.backend.init(VK_W, VK_H))
+        {
+          s_vk.pCreateMemoryObjects(1, &s_vk.memobj);
+          s_vk.pImportMemoryWin32Handle(s_vk.memobj, s_vk.backend.imageMemorySize(),
+                                        GL_HANDLE_TYPE_OPAQUE_WIN32_EXT_, s_vk.backend.imageMemoryHandle());
+          gl.genTextures(1, &s_vk.tex);
+          gl.bindTexture(GL_TEXTURE_2D, s_vk.tex);
+          s_vk.pTexStorageMem2D(GL_TEXTURE_2D, 1, GL_RGBA8, VK_W, VK_H, s_vk.memobj, 0);
+          gl.bindTexture(GL_TEXTURE_2D, 0);
+          s_vk.pGenSemaphores(1, &s_vk.sem_vk_done);
+          s_vk.pImportSemaphoreWin32Handle(s_vk.sem_vk_done, GL_HANDLE_TYPE_OPAQUE_WIN32_EXT_, s_vk.backend.vkDoneSemaphoreHandle());
+          s_vk.pGenSemaphores(1, &s_vk.sem_gl_done);
+          s_vk.pImportSemaphoreWin32Handle(s_vk.sem_gl_done, GL_HANDLE_TYPE_OPAQUE_WIN32_EXT_, s_vk.backend.glDoneSemaphoreHandle());
+          gl.genFramebuffers(1, &s_vk.fbo);
+          GLint prev_fbo = 0;
+          gl.getIntegerv(GL_FRAMEBUFFER_BINDING, &prev_fbo);
+          gl.bindFramebuffer(GL_FRAMEBUFFER, s_vk.fbo);
+          gl.framebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, s_vk.tex, 0);
+          gl.bindFramebuffer(GL_FRAMEBUFFER, static_cast<GLuint>(prev_fbo));
+          s_vk.ok = true;
+          LogError << "[VK] GL interop imported (memobj + texture + semaphores) -- proof-of-life overlay active" << std::endl;
+        }
+      }
+
+      if (s_vk.ok && s_vk.backend.ready())
+      {
+        // self-contained clock (this function has no `now` local; only drives the proof-of-life colour sweep)
+        static auto const s_vk_t0 = std::chrono::steady_clock::now();
+        float const vk_t = std::chrono::duration<float>(std::chrono::steady_clock::now() - s_vk_t0).count();
+        if (s_vk.backend.renderTestFrame(vk_t, !s_vk.first_frame))
+        {
+          GLenum const layout = GL_LAYOUT_GENERAL_EXT_;
+          s_vk.pWaitSemaphore(s_vk.sem_vk_done, 0, nullptr, 1, &s_vk.tex, &layout);
+
+          GLint prev_read = 0, prev_draw = 0, vp[4] = {0, 0, 0, 0};
+          gl.getIntegerv(GL_READ_FRAMEBUFFER_BINDING, &prev_read);
+          gl.getIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prev_draw);
+          gl.getIntegerv(GL_VIEWPORT, vp);
+          gl.bindFramebuffer(GL_READ_FRAMEBUFFER, s_vk.fbo);
+          // bottom-right corner overlay, 192px -- deliberately obvious and out of the way
+          gl.blitFramebuffer(0, 0, VK_W, VK_H, vp[2] - 200, 8, vp[2] - 8, 200,
+                             GL_COLOR_BUFFER_BIT, GL_LINEAR);
+          gl.bindFramebuffer(GL_READ_FRAMEBUFFER, static_cast<GLuint>(prev_read));
+          gl.bindFramebuffer(GL_DRAW_FRAMEBUFFER, static_cast<GLuint>(prev_draw));
+
+          s_vk.pSignalSemaphore(s_vk.sem_gl_done, 0, nullptr, 1, &s_vk.tex, &layout);
+          s_vk.first_frame = false;
+        }
+      }
+    }
+  }
+#endif
 }
 
 void MapView::setCameraForCapture(glm::vec3 const& position, math::degrees yaw, math::degrees pitch)
