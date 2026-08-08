@@ -9605,6 +9605,12 @@ void MapView::draw_map()
 
   bool classic_ui = _settings->value("classicUI", true).toBool();
   bool show_unpaintable = classic_ui ? texturingTool->show_unpaintable_chunks() : _left_sec_toolbar->showUnpaintableChunk();
+  // [VK-1c] NOGGIT_VK_FULL: preview mode where VULKAN renders the world -- skip the entire GL scene draw
+  // (the VK interop block below fills the viewport instead). Editor overlays/tools that live inside the GL
+  // draw are absent in this mode; it exists to fly the VK renderer and read its true frame cost.
+  static bool const s_vk_full_view = std::getenv("NOGGIT_VK") != nullptr
+                                  && std::getenv("NOGGIT_VK_FULL") != nullptr;
+  if (!s_vk_full_view)
   _world->renderer()->draw (
                  model_view()
                , projection()
@@ -9678,11 +9684,22 @@ void MapView::draw_map()
 
       constexpr GLenum GL_HANDLE_TYPE_OPAQUE_WIN32_EXT_ = 0x9587;
       constexpr GLenum GL_LAYOUT_GENERAL_EXT_ = 0x958D;
-      constexpr std::uint32_t VK_W = 512, VK_H = 512;
+      // [VK-1c] viewport-sized shared image (queried once at init; a later window resize keeps rendering at
+      // the init size and scales in the blit -- proper swap-on-resize comes with the real integration).
+      static std::uint32_t VK_W = 512, VK_H = 512;
 
       if (!s_vk.tried)
       {
         s_vk.tried = true;
+        {
+          GLint ivp[4] = {0, 0, 0, 0};
+          gl.getIntegerv(GL_VIEWPORT, ivp);
+          if (ivp[2] > 63 && ivp[3] > 63)
+          {
+            VK_W = static_cast<std::uint32_t>(ivp[2]);
+            VK_H = static_cast<std::uint32_t>(ivp[3]);
+          }
+        }
         auto* ctx = QOpenGLContext::currentContext();
         auto gp = [&](char const* n) { return ctx ? ctx->getProcAddress(n) : nullptr; };
         s_vk.pCreateMemoryObjects = reinterpret_cast<decltype(s_vk.pCreateMemoryObjects)>(gp("glCreateMemoryObjectsEXT"));
@@ -9725,59 +9742,95 @@ void MapView::draw_map()
 
       if (s_vk.ok && s_vk.backend.ready())
       {
-        // [VK-1b] feed the REAL nearest tile's heightmap mesh to the backend (rebuilt on tile change).
-        // Chunk layout: 145 verts (9x9 outer + 8x8 centre, 17-stride interleave), 4 tris per cell.
+        // [VK-1b/1c] feed the REAL terrain to the backend: the nearest tile + its loaded 3x3 neighbourhood
+        // (rebuilt when the nearest tile changes). Chunk layout: 145 verts (9x9 outer + 8x8 centre,
+        // 17-stride interleave), 4 tris per cell.
         static MapTile* s_vk_tile = nullptr;
         MapTile* best = nullptr;
         float bestd = std::numeric_limits<float>::max();
+        // distance computed HERE from the tile origin (xbase/zbase), NOT tile->camDist(): camDist is filled
+        // by the GL cull loop inside WorldRender::draw, which the VK_FULL mode skips entirely -- relying on
+        // it left every tile's distance frozen and picked a wrong/far tile (the "all blue" bug).
         for (MapTile* t : _world->mapIndex.loaded_tiles())
         {
-          if (t && t->finishedLoading() && t->camDist() < bestd)
+          if (!t || !t->finishedLoading())
+            continue;
+          float const cx = t->xbase + 266.6666f; // TILESIZE/2
+          float const cz = t->zbase + 266.6666f;
+          float const dx = _camera.position.x - cx;
+          float const dz = _camera.position.z - cz;
+          float const d2 = dx * dx + dz * dz;
+          if (d2 < bestd)
           {
-            bestd = t->camDist();
+            bestd = d2;
             best = t;
           }
         }
-        if (best && best != s_vk_tile)
+        // rebuild when the centre tile changes OR when more of its 3x3 neighbourhood finishes loading --
+        // building only on centre-change froze the mesh at ONE tile (built before the neighbours streamed
+        // in, never refreshed -> the world visibly ended at the tile border).
+        static std::size_t s_vk_tile_count = 0;
+        std::vector<MapTile*> vk_tiles;
+        vk_tiles.reserve(9);
+        if (best)
+        {
+          for (MapTile* t : _world->mapIndex.loaded_tiles())
+          {
+            if (t && t->finishedLoading()
+                && std::abs(static_cast<int>(t->index.x) - static_cast<int>(best->index.x)) <= 1
+                && std::abs(static_cast<int>(t->index.z) - static_cast<int>(best->index.z)) <= 1)
+            {
+              vk_tiles.push_back(t);
+            }
+          }
+        }
+        if (best && (best != s_vk_tile || vk_tiles.size() != s_vk_tile_count))
         {
           std::vector<float> vk_verts;
-          vk_verts.reserve(256u * 145u * 3u);
+          vk_verts.reserve(vk_tiles.size() * 256u * 145u * 3u);
           std::vector<std::uint32_t> vk_idx;
-          vk_idx.reserve(256u * 8u * 8u * 12u);
-          bool mesh_ok = true;
-          for (unsigned cz = 0; cz < 16 && mesh_ok; ++cz)
+          vk_idx.reserve(vk_tiles.size() * 256u * 8u * 8u * 12u);
+          std::uint32_t tile_base = 0;
+          bool mesh_ok = !vk_tiles.empty();
+          for (MapTile* t : vk_tiles)
           {
-            for (unsigned cx = 0; cx < 16 && mesh_ok; ++cx)
+            if (!mesh_ok) break;
+            for (unsigned cz = 0; cz < 16 && mesh_ok; ++cz)
             {
-              MapChunk* ch = best->getChunk(cx, cz);
-              glm::vec3 const* hm = ch ? ch->getHeightmap() : nullptr;
-              if (!hm) { mesh_ok = false; break; }
-              std::uint32_t const base = (cz * 16u + cx) * 145u;
-              for (unsigned i = 0; i < 145; ++i)
+              for (unsigned cx = 0; cx < 16 && mesh_ok; ++cx)
               {
-                vk_verts.push_back(hm[i].x);
-                vk_verts.push_back(hm[i].y);
-                vk_verts.push_back(hm[i].z);
-              }
-              for (unsigned r = 0; r < 8; ++r)
-              {
-                for (unsigned c = 0; c < 8; ++c)
+                MapChunk* ch = t->getChunk(cx, cz);
+                glm::vec3 const* hm = ch ? ch->getHeightmap() : nullptr;
+                if (!hm) { mesh_ok = false; break; }
+                std::uint32_t const base = tile_base + (cz * 16u + cx) * 145u;
+                for (unsigned i = 0; i < 145; ++i)
                 {
-                  std::uint32_t const o00 = base + 17u * r + c;
-                  std::uint32_t const o01 = o00 + 1u;
-                  std::uint32_t const o10 = base + 17u * (r + 1u) + c;
-                  std::uint32_t const o11 = o10 + 1u;
-                  std::uint32_t const ctr = base + 17u * r + 9u + c;
-                  std::uint32_t const quad[12] = { o00, o01, ctr, o01, o11, ctr, o11, o10, ctr, o10, o00, ctr };
-                  vk_idx.insert(vk_idx.end(), quad, quad + 12);
+                  vk_verts.push_back(hm[i].x);
+                  vk_verts.push_back(hm[i].y);
+                  vk_verts.push_back(hm[i].z);
+                }
+                for (unsigned r = 0; r < 8; ++r)
+                {
+                  for (unsigned c = 0; c < 8; ++c)
+                  {
+                    std::uint32_t const o00 = base + 17u * r + c;
+                    std::uint32_t const o01 = o00 + 1u;
+                    std::uint32_t const o10 = base + 17u * (r + 1u) + c;
+                    std::uint32_t const o11 = o10 + 1u;
+                    std::uint32_t const ctr = base + 17u * r + 9u + c;
+                    std::uint32_t const quad[12] = { o00, o01, ctr, o01, o11, ctr, o11, o10, ctr, o10, o00, ctr };
+                    vk_idx.insert(vk_idx.end(), quad, quad + 12);
+                  }
                 }
               }
             }
+            tile_base += 256u * 145u;
           }
           if (mesh_ok && s_vk.backend.setTerrainMesh(vk_verts.data(), vk_verts.size() / 3,
                                                      vk_idx.data(), vk_idx.size()))
           {
             s_vk_tile = best;
+            s_vk_tile_count = vk_tiles.size();
           }
         }
 
@@ -9795,9 +9848,18 @@ void MapView::draw_map()
           gl.getIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prev_draw);
           gl.getIntegerv(GL_VIEWPORT, vp);
           gl.bindFramebuffer(GL_READ_FRAMEBUFFER, s_vk.fbo);
-          // bottom-right corner overlay, 192px -- deliberately obvious and out of the way
-          gl.blitFramebuffer(0, 0, VK_W, VK_H, vp[2] - 200, 8, vp[2] - 8, 200,
-                             GL_COLOR_BUFFER_BIT, GL_LINEAR);
+          // [VK-1c] NOGGIT_VK_FULL: the VK image IS the viewport (the GL world draw is skipped in this mode);
+          // else the 192px bottom-right preview square.
+          static bool const s_vk_full_blit = std::getenv("NOGGIT_VK_FULL") != nullptr;
+          if (s_vk_full_blit)
+          {
+            gl.blitFramebuffer(0, 0, VK_W, VK_H, 0, 0, vp[2], vp[3], GL_COLOR_BUFFER_BIT, GL_LINEAR);
+          }
+          else
+          {
+            gl.blitFramebuffer(0, 0, VK_W, VK_H, vp[2] - 200, 8, vp[2] - 8, 200,
+                               GL_COLOR_BUFFER_BIT, GL_LINEAR);
+          }
           gl.bindFramebuffer(GL_READ_FRAMEBUFFER, static_cast<GLuint>(prev_read));
           gl.bindFramebuffer(GL_DRAW_FRAMEBUFFER, static_cast<GLuint>(prev_draw));
 

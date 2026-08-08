@@ -15,8 +15,10 @@ void main()
 {
   v_world = pos;
   vec4 clip = pc.mvp * vec4(pos, 1.0);
-  // GL -> Vulkan clip space: flip Y, remap Z from [-w,w] to [0,w]
-  clip.y = -clip.y;
+  // GL -> Vulkan: remap Z from [-w,w] to [0,w]. Y is deliberately NOT flipped here: VK renders y-down into
+  // the image (scene-top at the LAST row), and the GL blit (row0 = window bottom) un-flips it -- flipping in
+  // BOTH places rendered the world upside-down (the unrecognizable full-view bug). Winding flips too, but
+  // the terrain pipeline culls NONE.
   clip.z = (clip.z + clip.w) * 0.5;
   gl_Position = clip;
 }
