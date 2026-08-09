@@ -280,6 +280,7 @@ namespace Noggit::Rendering
     void updateBoneMatrices();
 
     void initRenderPasses(ModelView const* view, ModelTexUnit const* tex_unit, ModelGeoset const* model_geosets);
+    void hideEmitterPlaceholderCards();
 
   private:
 

@@ -423,6 +423,28 @@ void blp_texture::upload()
     return;
   }
 
+  // [wrong-texture root cause 2026-08-08] upload() runs LAZILY from inside the draw loop (bindTexture /
+  // resolveStaticBatch resolve textures on first sight) and binds ITS array on whatever texture unit is
+  // currently active to allocate/subimage. The draw paths cache "what's bound on unit N" CPU-side and
+  // skip redundant glBindTexture -- so an upload mid-draw silently clobbers the unit and every cached
+  // bind after it samples ANOTHER array (MC lavafalls turning catwalk-metal/molten-steel up close as
+  // nearby textures streamed in; same class as the terrain wrong-texture bug). Restore the exact
+  // binding we clobber. glGet is sync but uploads only happen on stream-in, never steady-state.
+  GLint prev_active = GL_TEXTURE0;
+  GLint prev_array = 0;
+  gl.getIntegerv(GL_ACTIVE_TEXTURE, &prev_active);
+  gl.getIntegerv(GL_TEXTURE_BINDING_2D_ARRAY, &prev_array);
+  struct RestoreBinding
+  {
+    GLint active;
+    GLint array;
+    ~RestoreBinding()
+    {
+      gl.activeTexture(static_cast<GLenum>(active));
+      gl.bindTexture(GL_TEXTURE_2D_ARRAY, static_cast<GLuint>(array));
+    }
+  } const _restore{prev_active, prev_array};
+
   int width = _width, height = _height;
 
   GLint n_layers = N_ARRAY_TEX;
@@ -453,6 +475,17 @@ void blp_texture::upload()
 
     params.n_used++;
 
+    {
+      static bool const s_texup_log = std::getenv("NOGGIT_TEXUP_LOG") != nullptr;
+      if (s_texup_log)
+      {
+        LogError << "[TEXUP] " << _file_key.stringRepr() << " " << _width << "x" << _height
+                 << " fmt=raw mips=" << _data.size()
+                 << " arr=" << _texture_array << " layer=" << _array_index
+                 << " ctx=" << static_cast<int>(_context) << std::endl;
+      }
+    }
+
     //LogDebug << "Mip level: " << std::to_string(_data.size()) << std::endl;
 
     _data.clear();
@@ -481,6 +514,19 @@ void blp_texture::upload()
     }
 
     params.n_used++;
+
+    // [FALLS-DIAG 2026-08-08] NOGGIT_TEXUP_LOG=1: name every array upload (file -> array/layer) so a
+    // layer collision or unexpected writer in a class is visible from one run. Diagnostic only.
+    {
+      static bool const s_texup_log = std::getenv("NOGGIT_TEXUP_LOG") != nullptr;
+      if (s_texup_log)
+      {
+        LogError << "[TEXUP] " << _file_key.stringRepr() << " " << _width << "x" << _height
+                 << " fmt=" << _compression_format.value() << " mips=" << _compressed_data.size()
+                 << " arr=" << _texture_array << " layer=" << _array_index
+                 << " ctx=" << static_cast<int>(_context) << std::endl;
+      }
+    }
 
     //LogDebug << "Mip level (compressed): " << std::to_string(_compressed_data.size()) << std::endl;
     _compressed_data.clear();

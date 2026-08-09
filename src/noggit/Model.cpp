@@ -2252,6 +2252,10 @@ void Model::initAnimated(const BlizzardArchive::ClientFile& f)
   
 
   
+  // Emitter placeholder cards (MC black-cone fix): must run AFTER _particles are populated (both
+  // layouts) and after initRenderPasses -- see the method comment.
+  _renderer.hideEmitterPlaceholderCards();
+
   // ribbons
   if (!_uses_classic_layout && header.nRibbonEmitters)
   {

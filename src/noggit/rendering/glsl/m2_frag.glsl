@@ -125,6 +125,11 @@ uniform int creature_bloom; // 1 = creature/character M2: bright body pixels fee
 
 uniform int pixel_shader;
 
+// [FALLS-DIAG 2026-08-08] raw-texture visualisation for the MC lavafalls hunt: 1 = output tex1 RGB
+// exactly as sampled (no combiner/lighting/fog/bloom), 2 = tex1 alpha as grayscale. Driven per-pass
+// from prepareDraw under NOGGIT_FALLS_RAWTEX; 0 everywhere else. Diagnostic only.
+uniform int debug_rawtex;
+
 // Per-pixel distance slice (terrain-parity object boundary): fragments beyond the object cull
 // distance are discarded, so a model straddling the boundary loses its far pixels first and
 // slices in/out of view exactly like terrain at the far plane -- no whole-model pops. 0 = off
@@ -140,6 +145,29 @@ void main()
 
   cuv1 = (tex1_clamp != 0) ? clamp_uv(uv1, tex1_clamp, vec2(textureSize(tex1, 0).xy)) : uv1;
   cuv2 = (tex2_clamp != 0) ? clamp_uv(uv2, tex2_clamp, vec2(textureSize(tex2, 0).xy)) : uv2;
+
+  if (debug_rawtex != 0)
+  {
+    if (debug_rawtex == 3)
+    {
+      // visualise the LAYER INDEX the sampler receives: 0=green, 1=blue, 2=red, >=3=white
+      vec3 lc = (tex1_index == 0) ? vec3(0.0, 1.0, 0.0)
+              : (tex1_index == 1) ? vec3(0.0, 0.0, 1.0)
+              : (tex1_index == 2) ? vec3(1.0, 0.0, 0.0)
+              : vec3(1.0);
+      out_color = vec4(lc, 1.0);
+      return;
+    }
+    if (debug_rawtex == 4)
+    {
+      // sample layer 0 EXPLICITLY -- bypasses the index entirely
+      out_color = vec4(texture(tex1, vec3(cuv1, 0.0)).rgb, 1.0);
+      return;
+    }
+    vec4 t = texture(tex1, vec3(cuv1, tex1_index));
+    out_color = (debug_rawtex == 2) ? vec4(vec3(t.a), 1.0) : vec4(t.rgb, 1.0);
+    return;
+  }
 
   float alpha_test;
   int fog_mode;

@@ -268,6 +268,13 @@ namespace Noggit::Rendering
       std::vector<std::uint64_t> keys;
       std::vector<glm::mat4x4> big_bones;
     };
+    // [GL perf 2026-08-08] PibPrep cache: the dedupe/group/transform/interior prep (~1.7ms) rebuilt only when
+    // the VISIBLE pib set changes (cheap pointer-XOR signature per frame; cache-node pointers are stable).
+    // The bake (bones) + draws stay per-frame; big_bones are cleared per bake since groups now persist.
+    std::vector<PibGroup> _pib_groups_cache;
+    unsigned long long _pib_groups_sig = 0;
+    bool _pib_groups_valid = false;
+
     OpenGL::Scoped::deferred_upload_buffers<5> _pib_buffers; // 0 inst_tf 1 inst_interior 2 inst_tex 3 indirect 4 bone_ssbo
     OpenGL::Scoped::deferred_upload_vertex_arrays<1> _pib_vao_arr;
     bool _pib_ready = false;
@@ -427,6 +434,12 @@ namespace Noggit::Rendering
     // World-space MFOG entries (rebuilt on the same epoch tick) for the per-frame ENTITY fog: the
     // camera's fog context written into the lighting UBO Env slots (see types.hpp).
     std::vector<WmoGroupFogVolume> _env_fog_volumes;
+    // [MC red fog 2026-08-08] sticky interior-group MFOG (held across group-AABB gaps while the camera
+    // stays inside a WMO -- prevents red<->zone fog snapping on bridges/doorways).
+    glm::vec3 _int_fog_color = glm::vec3(0.f);
+    float _int_fog_end = 0.f;
+    float _int_fog_start = 0.f;
+    bool _int_fog_valid = false;
 
     // buffers
     OpenGL::Scoped::deferred_upload_buffers<8> _buffers;

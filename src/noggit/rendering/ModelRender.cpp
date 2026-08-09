@@ -1848,6 +1848,33 @@ void ModelRender::initRenderPasses(ModelView const* view, ModelTexUnit const* te
   std::sort(_render_passes.begin(), _render_passes.end());
 }
 
+void ModelRender::hideEmitterPlaceholderCards()
+{
+  // [black-cone fix 2026-08-08] Particle-emitter doodads (LavaSmokeEmitterB/LavaSmokeEmitter/LavaSteam:
+  // the MC smoke/steam columns) carry a tiny OPAQUE billboard quad the client never draws -- only their
+  // particles render. Drawing it paints the smoke BLP's black background as a giant camera-facing card
+  // (the MC "black cone"). Signature is data-driven: model owns emitters + has a billboard bone, and the
+  // pass is opaque/alpha-key with <=2 triangles. Additive glow cards (blend>=2) and real meshes
+  // (campfire logs etc.) don't match. Runs after particles load; hides via showGeosets so both the
+  // individual path (prepareDraw) and the MDI batch classifier (resolveStaticBatch) skip it.
+  // MC set (both layouts, stock v264 and turtle v256 alike): LavaSmokeEmitter/B + LavaSplashParticle
+  // (4-vert quad), BlackrockStatueLavaSplash (9-vert fan), LavaSteam -- every one is a 1-pass model whose
+  // only mesh is a trivial opaque sheet; the particles are the visual. BlackRockLavaFalls01/02 (6-8
+  // passes, 183+ verts, real geometry) must stay -- hence the pass-count and vertex-span guards.
+  if (_model->_particles.empty() || _render_passes.size() > 2)
+    return;
+  for (auto const& pass : _render_passes)
+  {
+    if (pass.blend_mode <= 1
+        && pass.vertex_end > pass.vertex_start
+        && static_cast<int>(pass.vertex_end) - static_cast<int>(pass.vertex_start) <= 24
+        && pass.submesh < _model->showGeosets.size())
+    {
+      _model->showGeosets[pass.submesh] = false;
+    }
+  }
+}
+
 void ModelRender::updateBoneMatrices()
 {
   if (!_model->animBones || _model->bone_matrices.empty())
@@ -2402,6 +2429,64 @@ bool ModelRenderPass::prepareDraw(OpenGL::Scoped::use_program& m2_shader, Model 
     model_render_state.pixel_shader = ps;
   }
 
+  // [FALLS-DIAG 2026-08-08] NOGGIT_FALLS_RAWTEX=1|2: make the shader output the falls' RAW tex1 sample
+  // (1 = rgb, 2 = alpha) -- splits the hunt: red raw => array/upload fine, gold is post-sampling;
+  // gold raw => the array layer content itself is wrong. Set per-pass; 0 for every other model.
+  {
+    static int const s_falls_rawtex = [] { char const* e = std::getenv("NOGGIT_FALLS_RAWTEX");
+      return e ? std::atoi(e) : 0; }();
+    if (s_falls_rawtex != 0)
+    {
+      bool const is_falls = m->file_key().hasFilepath()
+        && m->file_key().filepath().find("lavafalls") != std::string::npos;
+      m2_shader.uniform("debug_rawtex", is_falls ? s_falls_rawtex : 0);
+    }
+  }
+
+  // [FALLS-DIAG 2026-08-08] NOGGIT_FALLS_DIAG=1: dump the exact per-pass state the MC lavafalls draw
+  // with (~once per 360 pass-draws, in bursts so one burst covers a whole model) -- chasing the
+  // view-dependent gold/red colour snap. Diagnostic only.
+  {
+    static bool const s_falls_diag = std::getenv("NOGGIT_FALLS_DIAG") != nullptr;
+    if (s_falls_diag && m->file_key().hasFilepath()
+        && m->file_key().filepath().find("lavafalls") != std::string::npos)
+    {
+      static int s_tick = 0;
+      if ((++s_tick % 360) < 8)
+      {
+        glm::mat4x4 const& tm = (tex_anim_lookup != -1
+                                 && static_cast<size_t>(tex_anim_lookup) < m->_texture_animations.size())
+                                ? m->_texture_animations[tex_anim_lookup].mat : unit;
+        LogError << "[FALLS] geoset=" << geoset_id << " blend=" << effective_blend
+                 << " ps=" << ps
+                 << " arr=" << model_render_state.tex_arrays[0] << "/" << model_render_state.tex_indices[0]
+                 << " clamp=" << model_render_state.tex_clamp[0]
+                 << " talookup=" << tex_anim_lookup
+                 << " tmat_t=(" << tm[3].x << "," << tm[3].y << ")"
+                 << " tmat_s=(" << tm[0].x << "," << tm[1].y << ")"
+                 << " color=(" << mesh_color.x << "," << mesh_color.y << ","
+                 << mesh_color.z << "," << mesh_color.w << ")"
+                 << " unlit=" << (renderflag.flags.unlit ? 1 : 0)
+                 << " seq=" << m->_current_anim_seq << " t=" << m->_anim_time
+                 << " gt=" << m->_global_animtime << std::endl;
+        // live texture resolution -- catches a stale/wrong array-layer bind (the texture the pass
+        // SHOULD sample vs what the cached uniforms bound)
+        if (textures[0] < m->_texture_lookup.size())
+        {
+          uint16_t const tex = m->_texture_lookup[textures[0]];
+          if (tex < m->_textures.size())
+          {
+            auto& t = m->_textures[tex];
+            LogError << "[FALLS-TEX] name=" << t->file_key().stringRepr()
+                     << " live_arr=" << t->texture_array()
+                     << " live_layer=" << t->array_index()
+                     << " uploaded=" << (t->is_uploaded() ? 1 : 0) << std::endl;
+          }
+        }
+      }
+    }
+  }
+
   // [perf 2026-07-23] check-before-set: most world doodads have a constant (1,1,1,trans) mesh_color, so
   // it repeats across a model's passes (and across instances whose alpha/tint match). A per-instance
   // alpha/tint difference correctly misses and re-uploads.
@@ -2543,21 +2628,17 @@ bool ModelRenderPass::bindTexture(size_t index, Model* m, ModelInstance const* i
   GLuint tex_array = resolved_texture->texture_array();
   int tex_index = resolved_texture->array_index();
 
-  // [perf 2026-07-23] check-before-set: the same GL_TEXTURE_2D_ARRAY object stays bound on this unit
-  // across consecutive passes of a model and across same-atlas models in a bucket, so re-binding it is
-  // pure CPU cost. 0 is never a valid GL texture name -> the {0,0}-initialised cache always misses the
-  // first bind of a draw call. activeTexture is coupled to the bind (only meaningful when we bind).
-  if (model_render_state.tex_arrays[index] != tex_array)
-  {
-    gl.activeTexture(static_cast<GLenum>(GL_TEXTURE0 + index + 1));
-    gl.bindTexture(GL_TEXTURE_2D_ARRAY, tex_array);
-    model_render_state.tex_arrays[index] = tex_array;
-  }
-  if (model_render_state.tex_indices[index] != static_cast<GLuint>(tex_index))
-  {
-    m2_shader.uniform(index ? "tex2_index" : "tex1_index", tex_index);
-    model_render_state.tex_indices[index] = static_cast<GLuint>(tex_index);
-  }
+  // [wrong-texture fix 2026-08-08] bind UNCONDITIONALLY, every pass -- the pre-texture-array behaviour.
+  // The check-before-set cache (perf 2026-07-23) assumed nothing else touches the unit's binding between
+  // passes; in practice lazy texture uploads (and anything else running GL mid-scope) rebind the active
+  // unit behind the cache's back, and every "skipped redundant bind" after that samples ANOTHER array --
+  // the MC lavafalls drawing catwalk-metal/molten-steel instead of lava, varying with camera because
+  // stream-in order varied. A redundant glBindTexture is nanoseconds; wrong-texture frames are not.
+  gl.activeTexture(static_cast<GLenum>(GL_TEXTURE0 + index + 1));
+  gl.bindTexture(GL_TEXTURE_2D_ARRAY, tex_array);
+  model_render_state.tex_arrays[index] = tex_array;
+  m2_shader.uniform(index ? "tex2_index" : "tex1_index", tex_index);
+  model_render_state.tex_indices[index] = static_cast<GLuint>(tex_index);
 
   // M2 texture wrap flags (0x1 wrap X, 0x2 wrap Y): an unset bit means CLAMP addressing on that
   // axis (trace-verified against the 1.12 client). Handed to the shader inverted, as a clamp mask,
@@ -2593,10 +2674,34 @@ bool ModelRenderPass::resolveStaticBatch(Model* m, StaticBatchKey& out, bool for
              << " water=" << s_rej[10] << " bones=" << s_rej[11] << " tex0=" << s_rej[12]
              << " tex1=" << s_rej[13] << " animuv=" << s_rej[14] << std::endl;
   };
-  auto rej = [&](int code) -> bool { ++s_rej[code]; dump(); return false; };
+  // [FALLS-DIAG 2026-08-08] name the falls' bake decisions -- the visible gold falls behave like a
+  // BATCHED draw (no scroll, no prepareDraw debug), so log whether/why the classifier admits them.
+  static bool const s_falls_bake_dbg = std::getenv("NOGGIT_FALLS_DIAG") != nullptr;
+  bool const falls_dbg = s_falls_bake_dbg && m->file_key().hasFilepath()
+    && m->file_key().filepath().find("lavafalls") != std::string::npos;
+  auto rej = [&](int code) -> bool
+  {
+    ++s_rej[code];
+    if (falls_dbg)
+    {
+      static int s_fb_tick = 0;
+      if ((++s_fb_tick % 120) < 4)
+      {
+        LogError << "[FALLS-BAKE] REJECT code=" << code << " for_pib=" << (for_pib ? 1 : 0)
+                 << " submesh=" << submesh << " model=" << m->file_key().stringRepr() << std::endl;
+      }
+    }
+    dump();
+    return false;
+  };
 
   if (renderflag_index >= m->_render_flags.size())
     return rej(1);
+  // [black-cone fix 2026-08-08] mirror prepareDraw's visible_geosets gate: submeshes hidden at load
+  // (emitter placeholder cards, elementalearth shells, centroid cores) must never enter an MDI batch.
+  // Rejecting drops the model to the individual path, which skips the hidden submesh.
+  if (submesh < m->showGeosets.size() && !m->showGeosets[submesh])
+    return rej(4);
   auto const& renderflag = m->_render_flags[renderflag_index];
 
   // effective pixel shader (mirror prepareDraw: classic layout derives a default from the blend)
@@ -2714,6 +2819,16 @@ bool ModelRenderPass::resolveStaticBatch(Model* m, StaticBatchKey& out, bool for
   bool const classic_alpha_pass = m->_uses_classic_layout && blend != static_cast<uint16_t>(M2Blend::Opaque);
   out.backface_cull = !renderflag.flags.two_sided && !classic_alpha_pass;
   ++s_ok;
+  if (falls_dbg)
+  {
+    static int s_fa_tick = 0;
+    if ((++s_fa_tick % 120) < 4)
+    {
+      LogError << "[FALLS-BAKE] ADMIT for_pib=" << (for_pib ? 1 : 0)
+               << " submesh=" << submesh << " blend=" << out.blend_mode
+               << " model=" << m->file_key().stringRepr() << std::endl;
+    }
+  }
   dump();
   return true;
 }

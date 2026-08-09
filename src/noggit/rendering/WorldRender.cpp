@@ -1249,6 +1249,7 @@ void WorldRender::drawPibBatched(std::vector<PibGroup>& groups)
 
   for (PibGroup& g : groups)
   {
+    g.batched = false; // groups persist across frames (PibPrep cache) -- re-classify every frame
     Model* const m = g.pmodel;
     if (g.transforms.empty() || !m)
       continue;
@@ -2501,6 +2502,10 @@ void WorldRender::draw (glm::mat4x4 const& model_view
     // entries are keyed by world cell; a doodad that MOVES lands in a new cell -> fresh sample (so edits
     // self-heal), and a newly-streamed WMO's doodads simply miss once and compute. [perf 2026-08-04]
     _pi_doodad_cache.clear();
+    // [GL perf 2026-08-08] the pib-group cache holds Model* whose lifetime rides the pi-doodad cache's scoped
+    // references -- hard-invalidate it with the cache (the signature alone could alias reused node addresses).
+    _pib_groups_cache.clear();
+    _pib_groups_valid = false;
     _last_wmo_fingerprint = wmo_fingerprint;
     if (!s_no_interior_object_light)
     {
@@ -4176,9 +4181,15 @@ void WorldRender::draw (glm::mat4x4 const& model_view
         // [dyn-MDI 2026-08-07] batch the dynamic instanced pool FIRST (before this program scope opens);
         // the loop below keeps every side-effect (additive-light deferral, particle collection) and just
         // skips the draws of consumed buckets (_dyn_batched_models).
-        drawDynamicBatched(models_to_draw, models_to_draw_interior, models_to_draw_fades,
-                           go_bucket_models, model_view, static_cast<int>(_world->model_animtime),
-                           draw_hidden_models);
+        // [FALLS-DIAG 2026-08-08] NOGGIT_NO_DYN_MDI=1 skips the dyn batch entirely -> every bucket
+        // draws via the instanced fallback (prepareDraw path). Path-isolation bisect switch.
+        static bool const s_no_dyn_mdi = std::getenv("NOGGIT_NO_DYN_MDI") != nullptr;
+        if (!s_no_dyn_mdi)
+        {
+          drawDynamicBatched(models_to_draw, models_to_draw_interior, models_to_draw_fades,
+                             go_bucket_models, model_view, static_cast<int>(_world->model_animtime),
+                             draw_hidden_models);
+        }
 
         OpenGL::Scoped::use_program m2_shader {*_m2_instanced_program.get()};
 
@@ -4589,66 +4600,75 @@ void WorldRender::draw (glm::mat4x4 const& model_view
           m2_shader.uniform("tex_unit_lookup_2", 0);
           m2_shader.uniform("pixel_shader", 0);
 
-          // Group visible (deduped-by-placement) doodads by model.
-          std::unordered_map<Model*, std::vector<ModelInstance*>> pib_by_model;
-          // [IndivDraw split 2026-08-07] PibPrep = dedupe/group + the serial interior/transform gather below
-          // (everything before the parallel bake). optional so it can close exactly there (Scoped is non-movable).
-          std::optional<noggit::perf::Scoped> _prof_pprep;
-          _prof_pprep.emplace(noggit::perf::Phase::PibPrep);
-          {
-            std::unordered_set<std::uint64_t> seen_doodad_keys;
-            for (ModelInstance* _dptr : per_instance_wmo_doodads)
-            {
-              if (!_dptr) { continue; }
-              ModelInstance& doodad = *_dptr;
-              Model* pmodel = doodad.model.get();
-              if (!pmodel || !pmodel->finishedLoading() || pmodel->loading_failed()
-                  || (!draw_hidden_models && pmodel->is_hidden()))
-              {
-                continue;
-              }
-              std::uint64_t const key = wmo_doodad_placement_key(doodad.get_pos());
-              if (!seen_doodad_keys.insert(key).second) { continue; }
-              pib_by_model[pmodel].push_back(_dptr);
-            }
-          }
-
           std::unordered_map<Model*, std::size_t> pib_boxes; // unused (all_boxes = false)
 
-          // [2026 MODERNIZATION -- parallel bone-animate across models] The 3.3.5a client (M2UseThreads)
-          // threads only its particle sim on ONE worker because its bone matrices are shared per model FILE.
-          // noggit's pib_by_model groups are DISTINCT Model objects with independent bones[]/bone_matrices/
-          // _instance_emitter_states, and the workers join before ANY GL -- so we animate every model on its
-          // own core, which the client's data model cannot. interior_light_at() writes a shared position
-          // cache (the sole non-thread-safe call), so interiors + transforms are precomputed SERIALLY first;
-          // the parallel phase then touches ONLY per-Model state. NOGGIT_SERIAL_PIB_ANIMATE=1 forces serial.
-          // PibGroup hoisted to WorldRender.hpp (shared with drawPibBatched -- the pib-MDI path).
-          std::vector<PibGroup> pib_groups;
-          pib_groups.reserve(pib_by_model.size());
-          for (auto& mg : pib_by_model)
+          // [GL perf 2026-08-08] PibPrep CACHE. The dedupe/group/transform/interior prep (~1.7ms) only
+          // changes when the VISIBLE pib set changes; a cheap pointer-XOR signature over the per-frame
+          // vector (stable cache-node pointers) detects that. Standing/editing = pure cache hits; flying
+          // rebuilds. Hard-invalidated with the pi-doodad cache on WMO-fingerprint change (Model* lifetime).
+          std::optional<noggit::perf::Scoped> _prof_pprep;
+          _prof_pprep.emplace(noggit::perf::Phase::PibPrep);
+          unsigned long long pib_sig = 1469598103934665603ull ^ per_instance_wmo_doodads.size();
+          for (ModelInstance* _dptr : per_instance_wmo_doodads)
+            pib_sig ^= (reinterpret_cast<std::uintptr_t>(_dptr) * 1099511628211ull);
+          pib_sig ^= draw_hidden_models ? 0x9E3779B97F4A7C15ull : 0ull;
+          // [2026-08-09 visual-first] cache OPT-IN via NOGGIT_PIB_PREP_CACHE: the signature can't see
+          // per-model STATE changes (a model finishing its async load, hidden-flag flips) -- the pointer
+          // set is unchanged, so a cached group built while a model was still loading excludes it
+          // FOREVER. Until the signature includes those, default to rebuilding every frame (the
+          // pre-cache behaviour, ~1.7ms in heavy city scenes).
+          static bool const s_pib_prep_cache = std::getenv("NOGGIT_PIB_PREP_CACHE") != nullptr;
+          if (!s_pib_prep_cache || !_pib_groups_valid || pib_sig != _pib_groups_sig)
           {
-            PibGroup g;
-            g.pmodel = mg.first;
-            g.doodads = &mg.second;
-            g.has_bones = mg.first->animBones && mg.first->bone_matrices.size() > 0;
-            pib_groups.push_back(std::move(g));
-          }
-
-          // Serial: interiors (writes the shared position cache) + transforms + particle keys. Cheap --
-          // interior_light_at is dominated by cache hits, transformMatrix() returns a cached matrix.
-          for (auto& g : pib_groups)
-          {
-            g.transforms.reserve(g.doodads->size());
-            g.interiors.reserve(g.doodads->size());
-            g.keys.reserve(g.doodads->size());
-            for (ModelInstance* _dptr : *g.doodads)
+            _pib_groups_cache.clear();
+            // Group visible (deduped-by-placement) doodads by model.
+            std::unordered_map<Model*, std::vector<ModelInstance*>> pib_by_model;
             {
-              g.transforms.push_back(_dptr->transformMatrix());
-              g.interiors.push_back(interior_light_at(_dptr->get_pos()));
-              g.keys.push_back(wmo_doodad_placement_key(_dptr->get_pos()));
+              std::unordered_set<std::uint64_t> seen_doodad_keys;
+              for (ModelInstance* _dptr : per_instance_wmo_doodads)
+              {
+                if (!_dptr) { continue; }
+                ModelInstance& doodad = *_dptr;
+                Model* pmodel = doodad.model.get();
+                if (!pmodel || !pmodel->finishedLoading() || pmodel->loading_failed()
+                    || (!draw_hidden_models && pmodel->is_hidden()))
+                {
+                  continue;
+                }
+                std::uint64_t const key = wmo_doodad_placement_key(doodad.get_pos());
+                if (!seen_doodad_keys.insert(key).second) { continue; }
+                pib_by_model[pmodel].push_back(_dptr);
+              }
             }
-            _world->_n_rendered_objects += static_cast<int>(g.doodads->size());
+
+            // [2026 MODERNIZATION -- parallel bone-animate across models] Distinct Model objects per group ->
+            // each animates on its own core (see the bake below). interior_light_at writes a shared position
+            // cache, so interiors + transforms are gathered SERIALLY here; results are POSITION-static, which
+            // is what makes this whole prep cacheable across frames.
+            _pib_groups_cache.reserve(pib_by_model.size());
+            for (auto& mg : pib_by_model)
+            {
+              PibGroup g;
+              g.pmodel = mg.first;
+              g.has_bones = mg.first->animBones && mg.first->bone_matrices.size() > 0;
+              g.transforms.reserve(mg.second.size());
+              g.interiors.reserve(mg.second.size());
+              g.keys.reserve(mg.second.size());
+              for (ModelInstance* _dptr : mg.second)
+              {
+                g.transforms.push_back(_dptr->transformMatrix());
+                g.interiors.push_back(interior_light_at(_dptr->get_pos()));
+                g.keys.push_back(wmo_doodad_placement_key(_dptr->get_pos()));
+              }
+              g.doodads = nullptr; // prep-only view; never dereferenced after this point
+              _pib_groups_cache.push_back(std::move(g));
+            }
+            _pib_groups_sig = pib_sig;
+            _pib_groups_valid = true;
           }
+          std::vector<PibGroup>& pib_groups = _pib_groups_cache; // downstream bake/draw code unchanged
+          for (auto const& g : pib_groups)
+            _world->_n_rendered_objects += static_cast<int>(g.transforms.size());
           _prof_pprep.reset(); // PibPrep ends here; the bake below is SubmitIndiv, the draws PibDrawGL
 
           // Parallel across models: the expensive animate() + per-model particle sim. Each group is a UNIQUE
@@ -4658,6 +4678,7 @@ void WorldRender::draw (glm::mat4x4 const& model_view
             auto const animate_group = [&](PibGroup& g)
             {
               Model* const pmodel = g.pmodel;
+              g.big_bones.clear(); // groups persist across frames now (PibPrep cache) -- bones are per-frame
               if (g.has_bones) { g.big_bones.reserve(g.transforms.size() * pmodel->bone_matrices.size()); }
               for (std::size_t di = 0; di < g.transforms.size(); ++di)
               {
@@ -4717,7 +4738,13 @@ void WorldRender::draw (glm::mat4x4 const& model_view
           // the win shows directly in the same phase (was ~7.5ms of serial per-group draws).
           {
             noggit::perf::Scoped _prof_pdraw(noggit::perf::Phase::PibDrawGL);
-            drawPibBatched(pib_groups);
+            // [FALLS-DIAG 2026-08-08] NOGGIT_NO_PIB_MDI=1 skips the pib batch -> every group draws via
+            // the per-group fallback below (prepareDraw path). Path-isolation bisect switch.
+            static bool const s_no_pib_mdi = std::getenv("NOGGIT_NO_PIB_MDI") != nullptr;
+            if (!s_no_pib_mdi)
+            {
+              drawPibBatched(pib_groups);
+            }
             for (auto& g : pib_groups)
             {
               if (g.batched || g.transforms.empty()) { continue; }
@@ -7256,6 +7283,75 @@ void WorldRender::updateLightingUniformBlock(bool draw_fog, glm::vec3 const& cam
       fog_color = cam_color;
       fog_end = std::min(cam_end, _view_distance);
       fog_start = (fog_end > 0.001f) ? (cam_start_abs / fog_end) : fog_start;
+    }
+  }
+
+  // [MC red fog 2026-08-08] TRUE-INTERIOR camera fog: when the camera stands in a genuinely interior
+  // WMO group (is_indoor and neither exterior nor exterior_lit -- the collect_interior_volumes
+  // predicate), the scene fog IS that group's blended MFOG. WMO-only maps (Molten Core) have no
+  // meaningful zone fog: noggit showed MC in default blue while all 10 authored MFOG entries are
+  // lava-red (255,37,8), which also washed the lavafall particles gold instead of the client's red.
+  // Entities inherit this automatically (the Env-UBO fog defaults to the scene fog), so M2s/particles
+  // and WMO geometry agree. The Karazhan entity-fog leak that made the old NOGGIT_M2_ENV_FOG path
+  // opt-out came from exterior/exterior_lit groups (open tower) -- excluded here by the predicate;
+  // outdoor scenes keep the zone + placed-sphere fog above.
+  if (draw_fog)
+  {
+    WmoGroupFogVolume const* cam_int_group = nullptr;
+    float best_vol = std::numeric_limits<float>::max();
+    for (auto const& v : _env_fog_volumes)
+    {
+      if (camera_pos.x < v.min.x || camera_pos.x > v.max.x
+       || camera_pos.y < v.min.y || camera_pos.y > v.max.y
+       || camera_pos.z < v.min.z || camera_pos.z > v.max.z)
+      {
+        continue;
+      }
+      if (!v.group->is_indoor() || v.group->is_exterior() || v.group->is_exterior_lit())
+      {
+        continue;
+      }
+      glm::vec3 const e = v.max - v.min;
+      float const vol = e.x * e.y * e.z;
+      if (vol < best_vol)
+      {
+        best_vol = vol;
+        cam_int_group = &v;
+      }
+    }
+    glm::vec3 mf_color;
+    float mf_end = 0.0f, mf_start = 0.0f;
+    if (cam_int_group
+        && cam_int_group->wmo->evaluate_camera_fog(*cam_int_group->group, cam_int_group->transform,
+                                                   camera_pos, /*camera_inside_wmo=*/ true,
+                                                   &mf_color, &mf_end, &mf_start))
+    {
+      fog_color = mf_color;
+      fog_end = std::min(mf_end * _active_fog_distance_scale, _view_distance);
+      fog_start = (fog_end > 0.001f) ? (mf_start * _active_fog_distance_scale / fog_end) : fog_start;
+      // sticky state: hold this fog over group-AABB gaps (below)
+      _int_fog_color = fog_color;
+      _int_fog_end = fog_end;
+      _int_fog_start = fog_start;
+      _int_fog_valid = true;
+    }
+    else if (_int_fog_valid && _camera_inside_wmo)
+    {
+      // STICKY HOLD: group AABBs don't tile the WMO seamlessly (bridge spans, doorways), so the
+      // containment test can miss for a few yards while the camera is still deep inside the WMO --
+      // without this the fog SNAPPED red<->blue with camera distance in MC. Keep the last interior
+      // fog until the camera actually leaves the WMO.
+      fog_color = _int_fog_color;
+      fog_end = _int_fog_end;
+      fog_start = _int_fog_start;
+    }
+    else if (!_camera_inside_wmo && !_world->mapIndex.hasAGlobalWMO())
+    {
+      // left the WMO -> zone fog again, and no stale hold on re-entry. EXCEPT on WMO-only maps
+      // (Molten Core): the client camera can never exist outside the global WMO, so stepping the
+      // editor camera through the shell must NOT flip the world to the meaningless zone fog
+      // (the "lava turns yellow outside the map" report) -- hold the interior fog for the map.
+      _int_fog_valid = false;
     }
   }
 
