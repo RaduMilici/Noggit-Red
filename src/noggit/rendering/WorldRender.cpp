@@ -7286,16 +7286,17 @@ void WorldRender::updateLightingUniformBlock(bool draw_fog, glm::vec3 const& cam
     }
   }
 
-  // [MC red fog 2026-08-08] TRUE-INTERIOR camera fog: when the camera stands in a genuinely interior
-  // WMO group (is_indoor and neither exterior nor exterior_lit -- the collect_interior_volumes
-  // predicate), the scene fog IS that group's blended MFOG. WMO-only maps (Molten Core) have no
-  // meaningful zone fog: noggit showed MC in default blue while all 10 authored MFOG entries are
-  // lava-red (255,37,8), which also washed the lavafall particles gold instead of the client's red.
-  // Entities inherit this automatically (the Env-UBO fog defaults to the scene fog), so M2s/particles
-  // and WMO geometry agree. The Karazhan entity-fog leak that made the old NOGGIT_M2_ENV_FOG path
-  // opt-out came from exterior/exterior_lit groups (open tower) -- excluded here by the predicate;
-  // outdoor scenes keep the zone + placed-sphere fog above.
-  if (draw_fog)
+  // [MC red fog 2026-08-08, scoped 2026-08-09] WMO-ONLY-MAP camera fog: on maps that are one global
+  // WMO (Molten Core -- no terrain, no meaningful zone fog to fall back to), the scene fog is the
+  // camera's interior group's blended MFOG. noggit showed MC in default blue while all 10 authored
+  // MFOG entries are lava-red (255,37,8), which also washed the lavafall particles gold. Entities
+  // inherit automatically (the Env-UBO fog defaults to the scene fog).
+  // SCOPED to hasAGlobalWMO after two field regressions: on NORMAL maps the client's scene fog stays
+  // the ZONE fog even with the camera inside a WMO (trace note above, wow_cap_kara_cull_fog) -- the
+  // unscoped override painted Karazhan's Malchezaar room heavy blue (the exact case the July RE said
+  // the live client never shows) and grabbed Stormwind streets from overhanging interior group AABBs.
+  // Normal maps keep zone fog + the placed-sphere composite; per-geometry WMO fog stays in WMORender.
+  if (draw_fog && _world->mapIndex.hasAGlobalWMO())
   {
     WmoGroupFogVolume const* cam_int_group = nullptr;
     float best_vol = std::numeric_limits<float>::max();
