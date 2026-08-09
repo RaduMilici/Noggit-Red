@@ -10,6 +10,12 @@
 
 struct ENTRY_MODF;
 
+namespace Noggit::Rendering
+{
+  class LiquidTextureManager;
+  class WorldRender;
+}
+
 class WMOInstance : public SceneObject
 {
 public:
@@ -33,6 +39,31 @@ private:
   std::map<uint32_t, std::vector<wmo_doodad_instance>> _doodads_per_group;
   bool _need_doodadset_update = true;
   bool _update_group_extents = false;
+
+  // Self-invalidating extents cache (perf 2026-08-07). recalcExtents() used to fully rebuild the world AABB
+  // + every group AABB on EVERY call, and it is called for all loaded WMOs every frame
+  // (camera_is_inside_wmo / collect_camera_fog / the WMO pass) -> ~5.45ms/frame recomputing static data.
+  // We now skip the rebuild when pos/dir/scale are unchanged since the last compute; any editor move/rotate/
+  // scale changes one of them, so the cache self-invalidates with no per-edit-path bookkeeping. scale=-1 is
+  // the "never computed" sentinel that forces the first real compute. _group_extents_computed tracks whether
+  // the FULL (all-group) extents pass has run, since getExtents() only rebuilds skybox groups.
+  glm::vec3 _extents_cache_pos = glm::vec3(0.f);
+  glm::vec3 _extents_cache_dir = glm::vec3(0.f);
+  float _extents_cache_scale = -1.f;
+  bool _group_extents_computed = false;
+
+public:
+  // [CamVolume cache 2026-08-07] last interior group whose bounds contained the camera (-1 = none). The
+  // per-frame camera_is_inside_wmo walk tests this group FIRST: with camera coherence (standing/walking
+  // inside a city WMO) that's an immediate hit, collapsing the hundreds-of-room-boxes walk to ~O(1).
+  // Pure accelerator -- a miss falls through to the full loop, so it can never change the result.
+  int _last_containing_group = -1;
+  // Negative cache: last camera position for which the FULL room walk found nothing. While the camera moves
+  // less than ~0.25yd (hovering/standing -- exactly the measured 2-5ms case above a city), skip the walk
+  // entirely. Any real movement invalidates by distance; worst case is one frame of stale "not inside" while
+  // crossing a doorway at speed, indistinguishable in practice.
+  glm::vec3 _no_room_cache_pos = glm::vec3(0.f);
+  bool _no_room_cache_valid = false;
 
 public:
   WMOInstance(BlizzardArchive::Listfile::FileKey const& file_key, ENTRY_MODF const* d, Noggit::NoggitRenderContext context);
@@ -84,6 +115,8 @@ public:
   }
 
   void draw ( OpenGL::Scoped::use_program& wmo_shader
+            , OpenGL::program* wmo_liquid_program
+            , Noggit::Rendering::LiquidTextureManager* liquid_texture_manager
             , glm::mat4x4 const& model_view
             , glm::mat4x4 const& projection
             , math::frustum const& frustum
@@ -98,9 +131,19 @@ public:
             , display_mode display
             , bool no_cull = false
             , bool draw_exterior = true
+            , Noggit::Rendering::WorldRender* world_renderer = nullptr // per-room (MOLR) light scoping
             );
 
   void intersect (math::ray const&, selection_result*, bool do_exterior = true);
+
+  // GAMEOBJECT-owned instances aren't registered with map tiles; skip the tile-visibility gate in
+  // draw() (they are frustum-culled by their gather loop instead).
+  bool skip_tile_culling = false;
+
+  // Per-frame portal visibility of this instance's groups, written by draw() (empty = all visible /
+  // portal culling off). get_visible_doodads reads it in the same frame so portal-culled rooms hide
+  // their doodads too, not just their geometry.
+  std::vector<uint8_t> portal_group_visibility;
 
   void recalcExtents() override;
   void change_nameset(uint16_t name_set);

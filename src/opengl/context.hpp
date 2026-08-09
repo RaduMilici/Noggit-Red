@@ -3,6 +3,7 @@
 #pragma once
 #include <opengl/types.hpp>
 #include <QtGui/QOpenGLFunctions_4_1_Core>
+#include <QtGui/QOpenGLFunctions_4_3_Core>  // [perf 2026-08-05] for glMultiDrawElementsIndirect (draw-call batching)
 
 // NOGGIT_FORCEINLINE ---------------------------------------------//
 // Macro to use in place of 'inline' to force a function to be inline
@@ -34,6 +35,7 @@ namespace OpenGL
       context& _context;
       QOpenGLContext* _old_context;
       QOpenGLFunctions_4_1_Core* _old_core_func;
+      QOpenGLFunctions_4_3_Core* _old_core_func_4_3;
     };
 
     struct save_current_context
@@ -54,16 +56,30 @@ namespace OpenGL
 
     QOpenGLContext* _current_context = nullptr;
     QOpenGLFunctions_4_1_Core* _4_1_core_func = nullptr;
+    // [perf 2026-08-05] 4.3 core functions for draw-call batching (glMultiDrawElementsIndirect). Null if the
+    // context is < 4.3 (batching disabled then; everything else runs through the 4.1 pointer as before).
+    QOpenGLFunctions_4_3_Core* _4_3_core_func = nullptr;
+    [[nodiscard]] bool hasMultiDrawIndirect() const { return _4_3_core_func != nullptr; }
+    NOGGIT_FORCEINLINE void multiDrawElementsIndirect (GLenum mode, GLenum type, const void* indirect, GLsizei drawcount, GLsizei stride);
 
     NOGGIT_FORCEINLINE void enable (GLenum);
     NOGGIT_FORCEINLINE void disable (GLenum);
     NOGGIT_FORCEINLINE GLboolean isEnabled (GLenum);
+
+    NOGGIT_FORCEINLINE void finish();
+    NOGGIT_FORCEINLINE void flush();
+
+    // Once-per-frame GL-API-error drain. Replaces the per-call glGetError() (dropped by default for perf,
+    // see context.inl): call once at frame start to flag any error the previous frame produced. Not FORCEINLINE
+    // (loops + logs). NOGGIT_GL_ERROR_CHECK_PER_CALL=1 restores per-call checking to pinpoint the exact call.
+    void check_gl_errors (char const* where);
 
     NOGGIT_FORCEINLINE void viewport (GLint x, GLint y, GLsizei width, GLsizei height);
 
     NOGGIT_FORCEINLINE void depthFunc (GLenum);
     NOGGIT_FORCEINLINE void depthMask (GLboolean);
     NOGGIT_FORCEINLINE void blendFunc (GLenum, GLenum);
+    NOGGIT_FORCEINLINE void blendFuncSeparate (GLenum, GLenum, GLenum, GLenum);
 
     NOGGIT_FORCEINLINE void clear (GLenum);
     NOGGIT_FORCEINLINE void clearColor (GLfloat, GLfloat, GLfloat, GLfloat);
@@ -222,6 +238,8 @@ namespace OpenGL
     NOGGIT_FORCEINLINE void genRenderbuffers (GLsizei n, GLuint* renderbuffers);
     NOGGIT_FORCEINLINE void bindRenderbuffer (GLenum target, GLuint renderbuffer);
     NOGGIT_FORCEINLINE void renderbufferStorage (GLenum target, GLenum internalformat, GLsizei width, GLsizei height);
+    NOGGIT_FORCEINLINE void renderbufferStorageMultisample (GLenum target, GLsizei samples, GLenum internalformat, GLsizei width, GLsizei height);
+    NOGGIT_FORCEINLINE void blitFramebuffer (GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1, GLint dstX0, GLint dstY0, GLint dstX1, GLint dstY1, GLbitfield mask, GLenum filter);
     NOGGIT_FORCEINLINE void framebufferRenderbuffer (GLenum target, GLenum attachment, GLenum renderbuffertarget, GLuint renderbuffer);
 
     NOGGIT_FORCEINLINE void genQueries(GLsizei n, GLuint* ids);

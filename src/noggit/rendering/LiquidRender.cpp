@@ -3,6 +3,8 @@
 #include "LiquidRender.hpp"
 #include <noggit/Log.h>
 #include <noggit/MapTile.h>
+#include <noggit/MapChunk.h>
+#include <noggit/ChunkWater.hpp>
 #include <noggit/rendering/TileRender.hpp>
 
 using namespace Noggit::Rendering;
@@ -151,10 +153,10 @@ void LiquidRender::updateLayerData(LiquidTextureManager* tex_manager)
             if (logged_missing_liquid_profiles < 40)
             {
               LogError << "Turtle water: missing liquid profile " << layer.liquidID()
-                       << ", using fallback profile " << tex_frames.begin()->first << std::endl;
+                       << ", skipping layer chunk" << std::endl;
               logged_missing_liquid_profiles++;
             }
-            tex_profile_it = tex_frames.begin();
+            continue;
           }
 
           std::tuple<GLuint, glm::vec2, int, unsigned> const& tex_profile = tex_profile_it->second;
@@ -188,6 +190,26 @@ void LiquidRender::updateLayerData(LiquidTextureManager* tex_manager)
 
           std::uint64_t subchunks = layer.getSubchunks();
 
+          // Overlapping water planes: where two liquid layers in this chunk cover the same
+          // 8x8 sub-tile, render ONLY the topmost one. Stacking translucent planes via alpha
+          // blending darkened the water (Timbermaw etc.). Mask out sub-tiles of this layer that
+          // a HIGHER layer also covers (ties broken by layer index so duplicates collapse to one).
+          {
+            auto& all_layers = *chunk->getLayers();
+            for (std::size_t li = 0; li < all_layers.size(); ++li)
+            {
+              if (li == layer_counter)
+                continue;
+
+              bool const other_is_above =
+                  all_layers[li].max() > layer.max()
+                  || (all_layers[li].max() == layer.max() && li < layer_counter);
+
+              if (other_is_above)
+                subchunks &= ~all_layers[li].getSubchunks();
+            }
+          }
+
           params_data.subchunks_1 = subchunks & 0xFF'FF'FF'FF;
           params_data.subchunks_2 = subchunks >> 32;
           params_data._pad1 = static_cast<unsigned>(x * 16 + z);
@@ -197,13 +219,34 @@ void LiquidRender::updateLayerData(LiquidTextureManager* tex_manager)
           auto& tex_coords = layer.getTexCoords();
           auto& depth = layer.getDepth();
 
+          // Derive a SEAMLESS render depth from the continuous terrain height under the water
+          // rather than the per-chunk MCLQ/MH2O depth bytes. Those file bytes are inconsistent
+          // at tile boundaries (adjacent chunks disagree at shared vertices -> hard color/alpha
+          // steps, and the semi-transparent water revealed the bumpy seafloor unevenly = the
+          // "tile" seams). Terrain is shared across chunks, so terrain-derived depth is
+          // continuous and tiles connect cleanly. Render-only: layer._depth (saved to the ADT)
+          // is untouched. We pack the RAW depth (world units of water above the bottom); the
+          // shader maps it to a BROAD color gradient (light shore -> dark deep "fatigue" water)
+          // and a STEEPER opacity (hides the per-tile seafloor) independently.
+          // Use the CURRENT terrain chunk from the tile (the stored MapChunk* in ChunkWater can
+          // be stale -> crash); this is the same fresh pointer the autoGen/opacity tools pass in.
+          MapChunk* terrain = _map_tile->getChunk(static_cast<unsigned>(x), static_cast<unsigned>(z));
+          glm::vec3 const* heightmap = terrain ? terrain->getHeightmap() : nullptr;
+
           for (int z_v = 0; z_v < 9; ++z_v)
           {
             for (int x_v = 0; x_v < 9; ++x_v)
             {
               const unsigned v_index = z_v * 9 + x_v;
               glm::vec2& tex_coord = tex_coords[v_index];
-              layer_params.vertex_data[n_chunks][v_index] = glm::vec4(vertices[v_index].y, depth[v_index], tex_coord.x, tex_coord.y);
+              // Fallback (no terrain): scale the normalized file depth into rough world units.
+              float render_depth = depth[v_index] * 100.f;
+              if (heightmap)
+              {
+                float const diff = vertices[v_index].y - heightmap[17 * z_v + x_v].y;
+                render_depth = std::max(0.f, diff);
+              }
+              layer_params.vertex_data[n_chunks][v_index] = glm::vec4(vertices[v_index].y, render_depth, tex_coord.x, tex_coord.y);
             }
           }
 

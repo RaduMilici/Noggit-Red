@@ -11,7 +11,7 @@ void World::for_all_chunks_on_tile (glm::vec3 const& pos, Fun&& fun)
 {
   MapTile* tile (mapIndex.getTile (pos));
 
-  if (tile && tile->finishedLoading())
+  if (tile && tile->finishedLoading() && !tile->loading_failed())
   {
     mapIndex.setChanged(tile);
 
@@ -28,7 +28,7 @@ void World::for_all_chunks_on_tile (glm::vec3 const& pos, Fun&& fun)
 template<typename Fun>
 void World::for_all_chunks_on_tile(MapTile* tile, Fun&& fun)
 {
-    if (tile && tile->finishedLoading())
+    if (tile && tile->finishedLoading() && !tile->loading_failed())
     {
         mapIndex.setChanged(tile);
 
@@ -47,7 +47,7 @@ void World::for_chunk_at(glm::vec3 const& pos, Fun&& fun)
 {
   MapTile* tile(mapIndex.getTile(pos));
 
-  if (tile && tile->finishedLoading())
+  if (tile && tile->finishedLoading() && !tile->loading_failed())
   {
     mapIndex.setChanged(tile);
     fun(tile->getChunk((pos.x - tile->xbase) / CHUNKSIZE, (pos.z - tile->zbase) / CHUNKSIZE));
@@ -58,7 +58,7 @@ template<typename Fun>
 auto World::for_maybe_chunk_at(glm::vec3 const& pos, Fun&& fun) -> std::optional<decltype (fun (nullptr))>
 {
   MapTile* tile (mapIndex.getTile (pos));
-  if (tile && tile->finishedLoading())
+  if (tile && tile->finishedLoading() && !tile->loading_failed())
   {
     return fun (tile->getChunk ((pos.x - tile->xbase) / CHUNKSIZE, (pos.z - tile->zbase) / CHUNKSIZE));
   }
@@ -72,7 +72,7 @@ template<typename Fun>
 void World::for_tile_at(TileIndex const& pos, Fun&& fun)
 {
   MapTile* tile(mapIndex.getTile(pos));
-  if (tile && tile->finishedLoading())
+  if (tile && tile->finishedLoading() && !tile->loading_failed())
   {
     mapIndex.setChanged(tile);
     fun(tile);
@@ -87,15 +87,21 @@ void World::for_tile_at_force(TileIndex const& pos, Fun&& fun)
     if (tile)
     {
         tile->wait_until_loaded();
-        mapIndex.setChanged(tile);
-        fun(tile);
+        if (!tile->loading_failed())
+        {
+            mapIndex.setChanged(tile);
+            fun(tile);
+        }
     }
 
     if (unload)
     {
         if (tile)
         {
-            tile->saveTile(this);
+            if (!tile->loading_failed())
+            {
+                tile->saveTile(this);
+            }
         }
         mapIndex.markOnDisc(pos, true);
         mapIndex.unsetChanged(pos);
@@ -110,7 +116,7 @@ bool World::for_all_chunks_in_range (glm::vec3 const& pos, float radius, Fun&& f
 
   for (MapTile* tile : mapIndex.tiles_in_range (pos, radius))
   {
-    if (!tile->finishedLoading())
+    if (!tile->finishedLoading() || tile->loading_failed())
     {
       continue;
     }
@@ -162,7 +168,7 @@ bool World::for_all_chunks_in_rect (glm::vec3 const& pos, float radius, Fun&& fu
 
   for (MapTile* tile : mapIndex.tiles_in_rect (pos, radius))
   {
-    if (!tile->finishedLoading())
+    if (!tile->finishedLoading() || tile->loading_failed())
     {
       continue;
     }

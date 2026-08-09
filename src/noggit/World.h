@@ -6,6 +6,7 @@
 #include <math/trig.hpp>
 #include <noggit/rendering/CursorRender.hpp>
 #include <noggit/Misc.h>
+#include <noggit/InteriorVolume.hpp>
 #include <noggit/Model.h> // ModelManager
 #include <noggit/ModelInstance.h>
 #include <noggit/Selection.h>
@@ -23,11 +24,14 @@
 #include <opengl/shader.fwd.hpp>
 #include <opengl/types.hpp>
 #include <noggit/rendering/LiquidTextureManager.hpp>
+#include <algorithm>
 #include <optional>
 #include <QtCore/QSettings>
 #include <map>
+#include <set>
 #include <string>
 #include <unordered_set>
+#include <unordered_map>
 #include <vector>
 #include <array>
 #include <noggit/project/ApplicationProject.h>
@@ -60,18 +64,95 @@ class World
 public:
   struct CreatureSpawnOverlay
   {
+    struct AttachmentModel
+    {
+      int attachment_id = -1;
+      std::optional<ModelInstance> model_instance;
+      // Transform the particle pass draws this attachment's emitters with. Set each frame in the body
+      // pass: the full animated attachment matrix when the model's emitters ride their parent (flag
+      // 0x10), else the BIND-pose placement so world-space particles (aura sparkles) don't get
+      // dragged around by the animated bone.
+      glm::mat4x4 particle_transform = glm::mat4x4(1.0f);
+    };
+
     std::uint32_t guid = 0;
     std::uint32_t entry = 0;
     std::uint32_t display_id = 0;
+    std::uint32_t faction = 0; // creature_template faction (FactionTemplate.dbc id) -> circle hostility color
+    // Seasonal game-event membership (game_event_creature.event). 0 = base world; >0 = only while that
+    // event is active; <0 = except while abs(event) is active. event_suppressed is the cached view-only
+    // "hidden by the Seasonal Events filter" flag (recomputed by World::recomputeEventSuppression);
+    // it never affects save/export -- only rendering and picking.
+    std::int32_t event = 0;
+    bool event_suppressed = false;
     std::string name;
     glm::vec3 pos = glm::vec3(0.0f);
     glm::vec3 original_pos = glm::vec3(0.0f);
     float orientation = 0.0f;
     float original_orientation = 0.0f;
+    int animation_time_offset = 0;
+    float template_scale = 1.0f;
+    float model_scale = 1.0f;
+    std::string model_path;
+    bool is_character_model = false;
+    std::uint32_t mainhand_display_id = 0;
+    std::uint32_t offhand_display_id = 0;
+    std::uint32_t ranged_display_id = 0;
+    std::uint32_t mainhand_inventory_type = 0;
+    std::uint32_t offhand_inventory_type = 0;
+    std::uint32_t ranged_inventory_type = 0;
+    // Space-separated permanent aura spell ids (creature_template.auras). Their state-kit visual
+    // effect models are attached to the spawn (e.g. the arcane elementals' chest sparkle).
+    std::string auras;
+    // The client's exact ground selection-circle radius: server bounding radius (per display id,
+    // creature_display_info_addon / creature_model_info) x RAW creature_template.scale (1 when
+    // unset) -- already multiplied at load. 0 when the schema/row is missing.
+    float bounding_radius = 0.0f;
+    bool model_create_failed = false;
     bool hovered = false;
     bool selected = false;
+    bool pending_create = false;
+    bool pending_delete = false; // marked for deletion (Del); exported as DELETE, undoable via Ctrl+Z
     bool dirty = false;
     std::optional<ModelInstance> model_instance;
+    std::vector<AttachmentModel> attachment_models;
+
+    // Mount (creature_addon.mount_display_id): mounted NPCs ride a mount model. The mount renders at
+    // the spawn's ground position and the rider (model_instance above) is re-seated onto the mount's
+    // MountMain attachment (id 0) at draw time. Built lazily by ensureCreatureSpawnModel.
+    std::uint32_t mount_display_id = 0;
+    std::string mount_model_path;
+    bool mount_create_failed = false;
+    std::optional<ModelInstance> mount_instance;
+
+    // NPC pose (creature_addon): UnitStandState (0 stand, 1 sit, 3 sleep, 4/5/6 chair-sit, 7 dead, 8 kneel)
+    // + emote_state (Emotes.dbc id). Drives the forced idle animation so the spawn sits/sleeps/kneels/emotes
+    // instead of standing. Mount pose (anim 91) takes priority when the NPC is also mounted.
+    std::uint8_t  stand_state = 0;
+    std::uint32_t emote_state = 0;
+
+    // World radius of the ground selection circle, EXACTLY like the live client (see
+    // bounding_radius above; the scale is already applied). Falls back to the model footprint
+    // estimate when the DB has no bounding radius for this display.
+    [[nodiscard]] float selectionRingWorldRadius() const
+    {
+      // Exact client formula: scale * sqrt( sqrt(dx^2+dy^2) * 0.5 ) on the stand-animation box
+      // (ModelInstance::selectionRingRadius / Model::selection_base_radius). No per-creature data.
+      if (model_instance.has_value())
+      {
+        float const radius = model_instance->selectionRingRadius();
+        if (radius > 0.01f)
+        {
+          return std::max(0.25f, radius);
+        }
+      }
+      // Fallback for spawns whose model has not loaded yet.
+      if (bounding_radius > 0.0f)
+      {
+        return std::max(0.25f, bounding_radius);
+      }
+      return 0.5f;
+    }
 
     CreatureSpawnOverlay() = default;
     CreatureSpawnOverlay(CreatureSpawnOverlay&&) noexcept = default;
@@ -80,7 +161,42 @@ public:
     CreatureSpawnOverlay& operator=(CreatureSpawnOverlay const&) = delete;
   };
 
+  struct GameObjectSpawnOverlay
+  {
+    std::uint32_t guid = 0;
+    std::uint32_t entry = 0;
+    std::uint32_t display_id = 0;
+    // Seasonal game-event membership (game_event_gameobject.event). See CreatureSpawnOverlay::event.
+    std::int32_t event = 0;
+    bool event_suppressed = false;
+    std::string name;
+    glm::vec3 pos = glm::vec3(0.0f);
+    glm::vec3 original_pos = glm::vec3(0.0f);
+    float orientation = 0.0f;
+    float original_orientation = 0.0f;
+    int animation_time_offset = 0;
+    float template_scale = 1.0f;
+    std::string model_path;
+    bool model_create_failed = false;
+    bool hovered = false;
+    bool selected = false;
+    bool pending_create = false;
+    bool pending_delete = false; // marked for deletion (Del); exported as DELETE, undoable via Ctrl+Z
+    bool dirty = false;
+    std::optional<ModelInstance> model_instance;
+    // WMO-model gameobjects (e.g. Turtle player housing: GameObjectDisplayInfo points at a .wmo):
+    // rendered through the WMO pipeline instead of the M2 spawn path.
+    std::optional<WMOInstance> wmo_instance;
+
+    GameObjectSpawnOverlay() = default;
+    GameObjectSpawnOverlay(GameObjectSpawnOverlay&&) noexcept = default;
+    GameObjectSpawnOverlay& operator=(GameObjectSpawnOverlay&&) noexcept = default;
+    GameObjectSpawnOverlay(GameObjectSpawnOverlay const&) = delete;
+    GameObjectSpawnOverlay& operator=(GameObjectSpawnOverlay const&) = delete;
+  };
+
 protected:
+  bool _unloading = false; // set true at the very start of ~World; see is_unloading()
   std::vector<selection_type> _current_selection;
   // std::unordered_map<std::string, std::vector<ModelInstance*>> _models_by_filename;
   Noggit::world_model_instances_storage _model_instance_storage;
@@ -99,12 +215,24 @@ public:
 
   // Time of the day.
   float animtime;
+  // Like animtime but only advances while model animations are enabled, so toggling animations off
+  // freezes (pauses) model/particle animation in place while liquid/terrain keep churning on animtime.
+  float model_animtime = 0.0f;
   float time;
+  float _models_emitter_dt = 0.0f;
 
   //! \brief Name of this map.
   std::string basename;
 
   explicit World(const std::string& name, int map_id, Noggit::NoggitRenderContext context, bool create_empty = false);
+  ~World();
+
+  // True once the World is being torn down (set first thing in ~World, before any member -- and thus any
+  // MapTile -- is destroyed). MapTile::~MapTile checks this to SKIP its per-tile instance unload: during
+  // full teardown the instance storage frees every M2/WMO instance at once, so the per-tile
+  // derefTile()/remove_models_if_needed() dance is both pointless and unsafe (it frees instances shared
+  // with other not-yet-destroyed tiles -> those tiles then deref a freed SceneObject = the map-exit crash).
+  bool is_unloading() const { return _unloading; }
 
   void LoadSavedSelectionGroups();
 
@@ -115,8 +243,57 @@ public:
   SceneObject* getObjectInstance(std::uint32_t uid);
 
   void update_models_emitters(float dt);
+  // Per-frame emitter dt captured by update_models_emitters, read by the render pass to advance each
+  // creature spawn's own per-instance particle state (see Model::swapInstanceEmitterState).
+  float models_emitter_dt() const { return _models_emitter_dt; }
 
   unsigned int getAreaID (glm::vec3 const&);
+  unsigned int getWMOAreaID(glm::vec3 const&);
+  // True when pos sits below a liquid surface (used to switch the sky to the underwater LightParams set).
+  bool camera_is_underwater(glm::vec3 const& pos);
+  // Top-level zone id for a position (walks AreaTable ParentAreaID up from getAreaID to the zone, e.g.
+  // a sub-area in Searing Gorge resolves to Searing Gorge). Returns -1 if the tile/area isn't loaded.
+  unsigned int getZoneId(glm::vec3 const&);
+  // ZoneMusic id for a position: WMOAreaTable.ZoneMusic when inside a WMO (dungeons/caves), else the
+  // AreaTable parent chain. 0 = no music authored. wmo_field selects the WMOAreaTable column
+  // (ZoneMusic vs IntroSound) so the same resolver serves looping music AND intro music.
+  unsigned int getWMOZoneMusic(glm::vec3 const&, size_t wmo_field);
+  int getZoneMusic(glm::vec3 const&);
+  // One-shot INTRO music id (ZoneIntroMusicTable) for a position -- same resolution as getZoneMusic
+  // but reads the IntroSound columns. 0 = no intro authored.
+  int getZoneIntroMusic(glm::vec3 const&);
+  // Shared resolver behind getZoneMusic/getZoneIntroMusic: wmo_field / area_field pick which
+  // WMOAreaTable / AreaTable column to read (ZoneMusic or IntroSound).
+  int getZoneMusicField(glm::vec3 const&, size_t wmo_field, size_t area_field);
+  // True if pos falls inside a loaded WMO's group AABB (i.e. the camera is standing inside a building/
+  // dungeon interior, not merely inside its loose outer AABB). Used to drop the client's outdoor
+  // FFXGlow floor when indoors (see renderBloomAndComposite).
+  bool camera_is_inside_wmo(glm::vec3 const& pos);
+  // Blend the map's authored WMO fog spheres (MOFG) the camera is inside over the given ZONE fog, so the
+  // one camera fog can be written to the MAIN UBO for terrain, doodads AND WMO geometry alike. color +
+  // absolute end/start in/out (start = the pre-multiplied absolute distance); scale = fog-distance scale.
+  void collect_camera_fog(glm::vec3 const& camera, float scale, glm::vec3& color, float& end, float& start_abs);
+  // Sticky interior-fog state (see getInteriorFog): once a WMO fog is chosen it HOLDS while the camera
+  // stays inside that instance's outer AABB -- room-AABB containment alone is gappy (Kara: one step and
+  // the fog dropped). Cleared on leaving the WMO or entering an exterior group.
+  unsigned _sticky_fog_uid = 0;
+  int _sticky_fog_id = -1;
+  // Gather every loaded indoor group's world AABB + room ambient (see InteriorVolume) once. Calls the
+  // EXPENSIVE getGroupExtents per WMO -- callers MUST throttle this, never per-object-per-frame -- so
+  // object interior tests become cheap AABB checks. Lights indoor objects by the room, not the sun.
+  void collect_interior_volumes(std::vector<InteriorVolume>& out);
+  // Cheap fingerprint of the LOADED WMO instance set (uids of finished instances). Changes the frame
+  // a WMO finishes streaming in (or is added/removed), so the interior/fog volume gathers can refresh
+  // IMMEDIATELY -- objects were visibly re-lit up to a second AFTER their room appeared (60-frame epoch).
+  std::uint64_t loaded_wmo_fingerprint();
+  // Gather every loaded WMO instance's MFOG entries in world space (see EnvFogVolume) for the
+  // per-frame entity fog (the camera's fog context). Throttle like collect_interior_volumes.
+  // Collects the group AABBs of every loaded WMO instance whose WMO has MORE than the default
+  // MFOG entry -- the camera-fog resolve picks its containing group from these (note 27).
+  void collect_fog_volumes(std::vector<WmoGroupFogVolume>& out);
+  // If the camera is inside a WMO group that has authored interior fog (MFOG), fills color/start/end
+  // and returns true. Used to apply that fog to the whole scene (terrain, doodads, light shafts).
+  bool getInteriorFog(glm::vec3 const& pos, glm::vec3& out_color, float& out_start, float& out_end);
   void setAreaID(glm::vec3 const& pos, int id, bool adt,  float radius = -1.0f);
 
   Noggit::NoggitRenderContext getRenderContext() { return _context; };
@@ -336,8 +513,10 @@ public:
 
   void updateTilesEntry(selection_type const& entry, model_update type);
   void updateTilesEntry(SceneObject* entry, model_update type);
-  void updateTilesWMO(WMOInstance* wmo, model_update type);
-  void updateTilesModel(ModelInstance* m2, model_update type);
+  // mark_changed=false: register into tiles without flagging them dirty (load-time UID-reassign / reload;
+  // see world_tile_update_queue::queue_update). Real edits use the default so their changes still persist.
+  void updateTilesWMO(WMOInstance* wmo, model_update type, bool mark_changed = true);
+  void updateTilesModel(ModelInstance* m2, model_update type, bool mark_changed = true);
   void wait_for_all_tile_updates();
 
   void deleteModelInstance(int uid);
@@ -431,8 +610,26 @@ public:
   bool reloadCreatureSpawns();
   void ensureCreatureSpawnsLoaded();
   void clearCreatureSpawns();
+  bool ensureCreatureSpawnModel(CreatureSpawnOverlay& spawn);
+  bool ensureGameObjectSpawnModel(GameObjectSpawnOverlay& spawn);
+  std::vector<std::pair<std::size_t, std::string>> applyCreatureSpawnModelAppearance(CreatureSpawnOverlay const& spawn,
+                                                                                     ModelInstance& model_instance,
+                                                                                     Noggit::NoggitRenderContext context) const;
   void setDrawCreatureSpawns(bool state) { _draw_creature_spawns = state; }
   bool drawCreatureSpawns() const { return _draw_creature_spawns; }
+  // Selection markers (the disc under a spawn) are only drawn while that spawn's editing tool is
+  // active, even if the spawn models themselves stay visible via the view toggle.
+  void setDrawCreatureMarkers(bool state) { _draw_creature_markers = state; }
+  bool drawCreatureMarkers() const { return _draw_creature_markers; }
+  void setDrawGameObjectMarkers(bool state) { _draw_gameobject_markers = state; }
+  bool drawGameObjectMarkers() const { return _draw_gameobject_markers; }
+  // Patrol-path overlay (creature waypoint lines). Loaded lazily from the DB the first time it's
+  // shown; toggled from the creature tool's top action bar.
+  void setDrawCreaturePatrolPaths(bool state) { _draw_creature_patrol_paths = state; }
+  bool drawCreaturePatrolPaths() const { return _draw_creature_patrol_paths; }
+  void ensureCreaturePatrolPathsLoaded();
+  // guid -> ordered waypoint positions in client space (does NOT include the spawn position itself).
+  std::unordered_map<std::uint32_t, std::vector<glm::vec3>> const& creaturePatrolPaths() const { return _creature_patrol_paths; }
   bool hasCreatureSpawnsLoaded() const { return _creature_spawns_loaded; }
   std::size_t creatureSpawnCount() const { return _creature_spawns.size(); }
   std::size_t creatureSpawnModelCount() const;
@@ -440,8 +637,49 @@ public:
   std::string const& creatureSpawnStatus() const { return _creature_spawn_status; }
   std::vector<CreatureSpawnOverlay>& creatureSpawns() { return _creature_spawns; }
   std::vector<CreatureSpawnOverlay> const& creatureSpawns() const { return _creature_spawns; }
+  std::vector<GameObjectSpawnOverlay>& gameObjectSpawns() { return _gameobject_spawns; }
+  std::vector<GameObjectSpawnOverlay> const& gameObjectSpawns() const { return _gameobject_spawns; }
   CreatureSpawnOverlay* findCreatureSpawn(std::uint32_t guid);
   CreatureSpawnOverlay const* findCreatureSpawn(std::uint32_t guid) const;
+
+  // Spell details for the spawned creatures' permanent auras (fetched once per spawn reload from the
+  // server's spell_template). Keyed by spell id; used for aura state-kit visuals and the creature-info
+  // UI (name/description/icon).
+  struct SpellInfo
+  {
+    std::uint32_t entry = 0;
+    std::uint32_t spell_visual = 0;
+    std::uint32_t icon_id = 0;
+    std::uint32_t school = 0;
+    std::string name;
+    std::string description;
+  };
+  std::map<std::uint32_t, SpellInfo> const& spellInfos() const { return _spell_infos; }
+
+  // GameObject editing (mirrors the creature equivalents). GameObjects are loaded alongside creatures
+  // by reloadCreatureSpawns(), so loading just ensures that ran.
+  void setDrawGameObjectSpawns(bool state) { _draw_gameobject_spawns = state; }
+  bool drawGameObjectSpawns() const { return _draw_gameobject_spawns; }
+  void ensureGameObjectSpawnsLoaded();
+  std::size_t gameObjectSpawnCount() const { return _gameobject_spawns.size(); }
+  std::size_t gameObjectSpawnModelCount() const;
+  std::size_t dirtyGameObjectSpawnCount() const;
+  GameObjectSpawnOverlay* findGameObjectSpawn(std::uint32_t guid);
+  GameObjectSpawnOverlay const* findGameObjectSpawn(std::uint32_t guid) const;
+
+  // --- Seasonal game-event visibility filter (view-only; never affects save/export) ---
+  // Populated from game_event + game_event_creature/_gameobject when spawns load. A spawn's `event` is
+  // 0 for base-world spawns (always shown). Marking an event "active" reveals its event>0 spawns and
+  // hides its event<0 ("spawn except during") spawns; recomputeEventSuppression() caches the result on
+  // each overlay's event_suppressed. Default: no events active => base world only.
+  void setEventActive(std::int32_t entry, bool active);
+  bool isEventActive(std::int32_t entry) const { return _active_events.count(entry) != 0; }
+  void clearActiveEvents();
+  void recomputeEventSuppression();
+  // game_event entry -> description for every event in the DB (labels for the Seasonal Events panel).
+  std::map<std::int32_t, std::string> const& gameEventNames() const { return _game_event_names; }
+  // Event entries (abs value, excluding 0) that actually have spawns on the currently loaded map.
+  std::set<std::int32_t> spawnedEventEntries() const;
 
 protected:
   // void update_models_by_filename();
@@ -460,10 +698,21 @@ protected:
 
   Noggit::NoggitRenderContext _context;
   bool _draw_creature_spawns = false;
+  bool _draw_creature_markers = false;
+  bool _draw_gameobject_spawns = false;
+  bool _draw_gameobject_markers = false;
+  bool _draw_creature_patrol_paths = false;
+  bool _patrol_paths_load_attempted = false;
+  std::unordered_map<std::uint32_t, std::vector<glm::vec3>> _creature_patrol_paths;
   bool _creature_spawns_loaded = false;
   bool _creature_spawns_load_attempted = false;
   std::string _creature_spawn_status;
   std::vector<CreatureSpawnOverlay> _creature_spawns;
+  std::vector<GameObjectSpawnOverlay> _gameobject_spawns;
+  std::map<std::uint32_t, SpellInfo> _spell_infos;
+  // Seasonal event filter state (see the accessors above).
+  std::unordered_set<std::int32_t> _active_events;
+  std::map<std::int32_t, std::string> _game_event_names;
 
   std::array<std::pair<std::pair<int, int>, MapTile*>, 64 * 64 > _loaded_tiles_buffer;
 

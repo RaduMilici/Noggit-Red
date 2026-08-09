@@ -3,6 +3,8 @@
 #include <glm/gtx/quaternion.hpp>
 #include <math/bounding_box.hpp>
 #include <math/frustum.hpp>
+
+#include <cmath>
 #include <glm/glm.hpp>
 #include <noggit/Log.h>
 #include <noggit/Misc.h> // checkinside
@@ -14,7 +16,50 @@
 #include <opengl/scoped.hpp>
 #include <opengl/shader.hpp>
 
+#include <algorithm>
+#include <cctype>
 #include <sstream>
+
+namespace
+{
+  bool is_null_texture_reference(std::string filename)
+  {
+    auto const is_trimmed_char = [](unsigned char character)
+    {
+      return character == '\0' || std::isspace(character);
+    };
+
+    filename.erase(filename.begin(),
+                   std::find_if(filename.begin(), filename.end(),
+                                [&](unsigned char character) { return !is_trimmed_char(character); }));
+    filename.erase(std::find_if(filename.rbegin(), filename.rend(),
+                                [&](unsigned char character) { return !is_trimmed_char(character); }).base(),
+                   filename.end());
+
+    std::transform(filename.begin(), filename.end(), filename.begin(), [](unsigned char character)
+    {
+      return static_cast<char>(std::tolower(character));
+    });
+
+    std::replace(filename.begin(), filename.end(), '\\', '/');
+
+    if (filename.empty() || filename == "0" || filename == "none" || filename == "null")
+    {
+      return true;
+    }
+
+    if (filename.find('/') == std::string::npos)
+    {
+      auto const extension_pos = filename.rfind('.');
+      if (extension_pos != std::string::npos && filename.substr(0, extension_pos) == "0")
+      {
+        return filename.substr(extension_pos) == ".blp";
+      }
+    }
+
+    return false;
+  }
+}
 
 ModelInstance::ModelInstance(BlizzardArchive::Listfile::FileKey const& file_key
                              , Noggit::NoggitRenderContext context)
@@ -45,6 +90,7 @@ ModelInstance& ModelInstance::operator=(ModelInstance const& other)
 
   model = other.model;
   light_color = other.light_color;
+  model_alpha = other.model_alpha;
   size_cat = other.size_cat;
   pos = other.pos;
   dir = other.dir;
@@ -58,6 +104,8 @@ ModelInstance& ModelInstance::operator=(ModelInstance const& other)
   _need_gpu_transform_update = other._need_gpu_transform_update;
   _gpu_transform_uid = other._gpu_transform_uid;
   _forced_anim_id = other._forced_anim_id;
+  _close_hand_main = other._close_hand_main;
+  _close_hand_off = other._close_hand_off;
 
   _replace_textures.clear();
   for (auto const& pair : other._replace_textures)
@@ -65,12 +113,37 @@ ModelInstance& ModelInstance::operator=(ModelInstance const& other)
     _replace_textures.emplace(pair.first, pair.second);
   }
 
+  _show_geosets = other._show_geosets;
+  _visible_geoset_ids = other._visible_geoset_ids;
+  _controlled_geoset_families = other._controlled_geoset_families;
+
   return *this;
+}
+
+float ModelInstance::selectionRingRadius() const
+{
+  if (!model.get() || !model->finishedLoading() || model->loading_failed())
+  {
+    return 0.5f * scale;
+  }
+  // EXACT client formula (reverse-engineered from wow.exe): ground selection circle radius =
+  // scale * sqrt( sqrt(dx^2 + dy^2) * 0.5 ), where dx,dy are the stand-animation bounding-box extents
+  // (Model::selection_base_radius). Byte-exact vs the live client. Falls back to the render footprint,
+  // then a fraction of the header bound, only when the stand-anim box is unavailable.
+  float r = model->selection_base_radius;
+  if (!(r > 0.01f)) { r = model->footprint_radius; }
+  if (!(r > 0.01f)) { r = model->header.bounding_box_radius * 0.35f; }
+  return r * scale;
 }
 
 void ModelInstance::setReplaceTexture(std::size_t texture_type, std::string const& filename)
 {
   _replace_textures.erase(texture_type);
+  if (is_null_texture_reference(filename))
+  {
+    return;
+  }
+
   _replace_textures.emplace(std::piecewise_construct,
                             std::forward_as_tuple(texture_type),
                             std::forward_as_tuple(filename, _context));
@@ -246,6 +319,23 @@ void ModelInstance::recalcExtents()
   extents[0] = bounding_of_rotated_points.min;
   extents[1] = bounding_of_rotated_points.max;
 
+  // Guard the "fuckported model" case the TODO above calls out: a header collision/bounding box of
+  // {inf,-inf} (or any min>max / non-finite value, common in custom/Turtle models) yields garbage
+  // world extents. Downstream, world_tile_update_queue::apply() derives a TileIndex range from these
+  // extents and loads EVERY tile in it -- a whole-map range means thousands of tiles get loaded ->
+  // gigabytes of RAM and a frozen client. Collapse a bad box to a point at pos (same as loading_failed).
+  bool const bad_extents =
+       !std::isfinite(extents[0].x) || !std::isfinite(extents[0].y) || !std::isfinite(extents[0].z)
+    || !std::isfinite(extents[1].x) || !std::isfinite(extents[1].y) || !std::isfinite(extents[1].z)
+    || extents[0].x > extents[1].x || extents[0].y > extents[1].y || extents[0].z > extents[1].z;
+  if (bad_extents)
+  {
+    extents[0] = extents[1] = pos;
+    size_cat = 0.f;
+    _need_recalc_extents = false;
+    return;
+  }
+
   size_cat = glm::distance(bounding_of_rotated_points.max, bounding_of_rotated_points.min);
 
   _need_recalc_extents = false;
@@ -366,4 +456,3 @@ void wmo_doodad_instance::update_transform_matrix_wmo(WMOInstance* wmo)
 
   _need_matrix_update = false;
 }
-

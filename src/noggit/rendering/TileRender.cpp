@@ -3,10 +3,44 @@
 #include <noggit/rendering/TileRender.hpp>
 #include <noggit/MapTile.h>
 #include <noggit/MapChunk.h>
+#include <noggit/Model.h>
+#include <noggit/SceneObject.hpp>
 #include <noggit/ui/TexturingGUI.h>
+#include <noggit/frame_profiler.hpp>
 #include <external/tracy/Tracy.hpp>
 
+#include <glm/vec4.hpp>
+
+#include <algorithm>
+#include <vector>
+#include <cstdlib>
+
 using namespace Noggit::Rendering;
+
+namespace
+{
+  // [perf 2026-08-06] Lazy per-chunk terrain streaming toggle + per-frame chunk budget. Dev A/B gate; OFF =
+  // today's all-at-once upload. See the update block in TileRender::draw.
+  bool lazy_chunk_upload_enabled()
+  {
+    static bool const on = []
+    {
+      char const* v = std::getenv("NOGGIT_LAZY_CHUNK_UPLOAD");
+      return v && *v && *v != '0';
+    }();
+    return on;
+  }
+  int lazy_chunk_budget()
+  {
+    static int const n = []
+    {
+      char const* v = std::getenv("NOGGIT_LAZY_CHUNK_BUDGET");
+      int const b = v ? std::atoi(v) : 32;
+      return b > 0 ? b : 32;
+    }();
+    return n;
+  }
+}
 
 
 TileRender::TileRender(MapTile* map_tile)
@@ -32,6 +66,29 @@ void TileRender::upload()
 
   gl.genQueries(1, &_tile_occlusion_query);
 
+  // The GPU textures were just (re)allocated, so every chunk row is empty -- re-register the full update set on
+  // ALL 256 chunks so the next draw definitely refills them. Without this the fill depends on whatever per-chunk
+  // flags happen to still be pending: MapChunk::endChunkUpdates() zeroes them once processed, and while VERTEX
+  // gets re-registered from many places during normal use (so a missed heightmap pass self-heals), MCCV is only
+  // ever re-registered by the MCCV paint tools -- so in a view-only session a missed MCCV pass left that row
+  // permanently unwritten (the EPL psychedelic weave: undefined texels multiplied into terrain colour).
+  // registerChunkUpdate propagates to the tile, which is what gates the update block in draw().
+  for (int z = 0; z < 16; ++z)
+  {
+    for (int x = 0; x < 16; ++x)
+    {
+      _map_tile->mChunks[z][x]->registerChunkUpdate(ChunkUpdateFlags::VERTEX | ChunkUpdateFlags::ALPHAMAP
+                                                    | ChunkUpdateFlags::SHADOW | ChunkUpdateFlags::MCCV
+                                                    | ChunkUpdateFlags::NORMALS | ChunkUpdateFlags::HOLES
+                                                    | ChunkUpdateFlags::AREA_ID | ChunkUpdateFlags::FLAGS);
+    }
+  }
+
+  // [perf 2026-08-06] Begin a lazy per-chunk stream (if enabled): the draw update block uploads the 256 chunks
+  // a budget at a time over several frames and draws only the ready prefix, instead of all-at-once.
+  _lazy_streaming = lazy_chunk_upload_enabled();
+  _lazy_cursor = 0;
+
   _uploaded = true;
 
 }
@@ -47,10 +104,122 @@ void TileRender::unload()
   }
 
 
+  freeDoodadInstanceBuffers();
+
   _map_tile->_chunk_update_flags = ChunkUpdateFlags::VERTEX | ChunkUpdateFlags::ALPHAMAP
                                   | ChunkUpdateFlags::SHADOW | ChunkUpdateFlags::MCCV
                                   | ChunkUpdateFlags::NORMALS| ChunkUpdateFlags::HOLES
                                   | ChunkUpdateFlags::AREA_ID| ChunkUpdateFlags::FLAGS;
+}
+
+
+// [perf 2026-08-05] Persistent per-model doodad instance buffers. Static tile M2 doodads are uploaded once
+// per model (world transforms + a zero interior attribute -- tile doodads are outdoor, client MDDF) and the
+// renderer draws the whole bucket every frame with tile-level cull + shader slice_dist clip, instead of
+// re-culling + re-uploading each instance per frame. Rebuilt lazily when the tile's object set changes.
+tsl::robin_map<Model*, TileRender::DoodadInstanceBuffer> const& TileRender::doodadInstanceBuffers()
+{
+  if (_map_tile->doodadBuffersDirty())
+  {
+    rebuildDoodadInstanceBuffers();
+  }
+  return _doodad_instance_buffers;
+}
+
+void TileRender::rebuildDoodadInstanceBuffers()
+{
+  freeDoodadInstanceBuffers();
+
+  // [fix 2026-08-05] ALL-OR-NOTHING: build the persistent buffers only once EVERY eligible model on the tile
+  // has finished loading. Until then leave the map EMPTY + the flag dirty, so the renderer skips nothing and
+  // draws the tile via the DYNAMIC path -- which handles a partially-streamed tile gracefully (each instance
+  // is drawn iff its model is ready). The old per-model build showed a multi-model structure in FRAGMENTS
+  // while it streamed in (only the already-loaded pieces appeared). The switch to persistent is a clean
+  // one-shot once the whole tile is up.
+  for (auto const& pair : _map_tile->getObjectInstances())
+  {
+    if (pair.second.empty() || pair.second[0]->which() != eMODEL)
+    {
+      continue;
+    }
+    if (!reinterpret_cast<Model*>(pair.first)->finishedLoading())
+    {
+      return; // still streaming -- stay dirty, dynamic path draws it, retry next frame
+    }
+  }
+
+  for (auto const& pair : _map_tile->getObjectInstances())
+  {
+    if (pair.second.empty() || pair.second[0]->which() != eMODEL)
+    {
+      continue;
+    }
+
+    Model* const model = reinterpret_cast<Model*>(pair.first);
+
+    // Include ONLY models drawPersistent() will actually render (finished + not failed + not a classic-effect
+    // shell + no particle/ribbon emitters). A model buffered here is SKIPPED in the dynamic gather, so if
+    // drawPersistent then skipped it too the instances would render nowhere = the fragmented-building bug.
+    // Non-eligible models fall through to the dynamic path (not added to the buffer -> not skipped there).
+    if (!model->renderer()->eligibleForPersistentDraw())
+    {
+      continue;
+    }
+
+    std::vector<glm::mat4x4> transforms;
+    transforms.reserve(pair.second.size());
+    for (auto* instance : pair.second)
+    {
+      transforms.push_back(instance->transformMatrix());
+    }
+    if (transforms.empty())
+    {
+      continue;
+    }
+    // Interior is a per-instance attribute in the m2 instanced shader; tile doodads are outdoor so it is
+    // all-zero. A dedicated (static) buffer keeps the same VAO attribute wiring the dynamic path uses and
+    // is reused verbatim when this machinery is extended to WMO doodads (which carry real room colours).
+    std::vector<glm::vec4> const interiors(transforms.size(), glm::vec4(0.0f));
+
+    DoodadInstanceBuffer buf;
+    buf.count = static_cast<GLsizei>(transforms.size());
+
+    gl.genBuffers(1, &buf.transform_vbo);
+    gl.bindBuffer(GL_ARRAY_BUFFER, buf.transform_vbo);
+    gl.bufferData(GL_ARRAY_BUFFER, transforms.size() * sizeof(glm::mat4x4), transforms.data(), GL_STATIC_DRAW);
+
+    gl.genBuffers(1, &buf.interior_vbo);
+    gl.bindBuffer(GL_ARRAY_BUFFER, buf.interior_vbo);
+    gl.bufferData(GL_ARRAY_BUFFER, interiors.size() * sizeof(glm::vec4), interiors.data(), GL_STATIC_DRAW);
+
+    buf.cpu_transforms = std::move(transforms); // retained for the MDI batcher (see DoodadInstanceBuffer)
+    _doodad_instance_buffers.emplace(model, std::move(buf));
+  }
+
+  gl.bindBuffer(GL_ARRAY_BUFFER, 0);
+
+  // We only reach here once every eligible model was loaded (early-return above otherwise), so the buffers
+  // are complete -- clear the dirty flag; rebuilds happen only on the next object-set change.
+  _map_tile->clearDoodadBuffersDirty();
+}
+
+void TileRender::freeDoodadInstanceBuffers()
+{
+  for (auto& kv : _doodad_instance_buffers)
+  {
+    // Local copies: the map's mapped value is const through this iterator, and deleteBuffers wants GLuint*.
+    GLuint t = kv.second.transform_vbo;
+    GLuint i = kv.second.interior_vbo;
+    if (t)
+    {
+      gl.deleteBuffers(1, &t);
+    }
+    if (i)
+    {
+      gl.deleteBuffers(1, &i);
+    }
+  }
+  _doodad_instance_buffers.clear();
 }
 
 
@@ -65,7 +234,7 @@ void TileRender::draw (OpenGL::Scoped::use_program& mcnk_shader
 
   static constexpr unsigned NUM_SAMPLERS = 11;
 
-  if (!_map_tile->finished.load())
+  if (!_map_tile || !_map_tile->finished.load() || _map_tile->loading_failed())
   [[unlikely]]
   {
     return;
@@ -74,6 +243,9 @@ void TileRender::draw (OpenGL::Scoped::use_program& mcnk_shader
   if (!_uploaded)
   [[unlikely]]
   {
+    // First draw of a freshly-streamed tile: allocate its GPU buffers/textures on the MAIN thread. This
+    // + the 256-chunk update block below are the "chunk load" spike; attribute both to TileStream.
+    noggit::perf::Scoped _prof_upload(noggit::perf::Phase::TileStream);
     upload();
   }
 
@@ -112,6 +284,10 @@ void TileRender::draw (OpenGL::Scoped::use_program& mcnk_shader
   // run chunk updates. running this when splitdraw call detected unused sampler configuration as well.
   if (_map_tile->_chunk_update_flags || is_selected != _selected || need_paintability_update || _requires_sampler_reset || _texture_not_loaded)
   {
+    // Per-chunk texture/vertex uploads (texSubImage). A freshly-uploaded tile flags ALL 256 chunks at
+    // once here -> the dominant part of the "chunk load" spike. Attributed to TileStream (nested in
+    // Terrain). Incremental paint edits also pass through, but those touch few chunks and stay cheap.
+    noggit::perf::Scoped _prof_chunk_upd(noggit::perf::Phase::TileStream);
 
     gl.bindBuffer(GL_UNIFORM_BUFFER, _chunk_instance_data_ubo);
 
@@ -127,7 +303,17 @@ void TileRender::draw (OpenGL::Scoped::use_program& mcnk_shader
 
     _selected = is_selected;
 
-    for (int i = 0; i < 256; ++i)
+    // [perf 2026-08-06] LAZY streaming: process only a budget of chunks (in raster order) per frame, draw the
+    // ready prefix, and defer clearing the tile update flag until all 256 are done -- spreading the TileStream
+    // spike across frames (client-like progressive fill). Falls back to all-at-once (0..256) when not streaming
+    // / split-sampler / paint edits / special passes. On a split detected mid-window we abort lazy and finish
+    // every remaining chunk this frame (rare, heavily-textured tiles only).
+    bool lazy_active = _lazy_streaming && !_split_drawcall && !_requires_sampler_reset
+                    && !_texture_not_loaded && !need_paintability_update;
+    int const win_start = lazy_active ? _lazy_cursor : 0;
+    int win_end = lazy_active ? std::min(_lazy_cursor + lazy_chunk_budget(), 256) : 256;
+
+    for (int i = win_start; i < win_end; ++i)
     {
       int chunk_x = i / 16;
       int chunk_y = i % 16;
@@ -151,6 +337,7 @@ void TileRender::draw (OpenGL::Scoped::use_program& mcnk_shader
         if (!_split_drawcall && !fillSamplers(chunk.get(), i, static_cast<unsigned int>(_draw_calls.size() - 1)))
         {
           _split_drawcall = true;
+          if (lazy_active) { lazy_active = false; win_end = 256; } // abort lazy -> finish every chunk this frame
         }
       }
 
@@ -201,12 +388,15 @@ void TileRender::draw (OpenGL::Scoped::use_program& mcnk_shader
           unsigned layer_flags = chunk->texture_set->flag(k);
           auto flag_view = reinterpret_cast<MCLYFlags*>(&layer_flags);
 
-          _chunk_instance_data[i].ChunkTexDoAnim[k] = flag_view->animation_enabled;
+          // bit 0 = UV animation enabled; bit 1 = MCLY 0x80 overbright ("way brighter, used for lava
+          // to make it glow" -- vanilla MCLY bit, audit RE_notes/21 A1). The frag shader applies x2.
+          _chunk_instance_data[i].ChunkTexDoAnim[k] = (flag_view->animation_enabled ? 1 : 0)
+                                                    | (flag_view->overbright ? 2 : 0);
           _chunk_instance_data[i].ChunkTexAnimSpeed[k] = flag_view->animation_speed;
           _chunk_instance_data[i].ChunkTexAnimDir[k] = flag_view->animation_rotation;
         }
-
-        _chunk_instance_data[i].ChunkTexDoAnim[1] = chunk->header_flags.flags.impass;
+        // (Removed a stray `ChunkTexDoAnim[1] = impass` that stomped layer 1's anim flag -- the impass
+        // overlay reads ChunkHoles_DrawImpass_TexLayerCount_CantPaint[1], set above.)
       }
 
       if (flags & ChunkUpdateFlags::AREA_ID)
@@ -266,9 +456,42 @@ void TileRender::draw (OpenGL::Scoped::use_program& mcnk_shader
       }
     }
 
-    _map_tile->endChunkUpdates();
+    // [perf 2026-08-06] LAZY: draw only the ready prefix [0, cursor) and keep the tile flag PENDING (chunks
+    // beyond the window are still flagged) so the update block resumes next frame; clear it only once fully
+    // streamed. Non-lazy / aborted paths processed every chunk this frame -> clear now.
+    if (lazy_active && !_split_drawcall)
+    {
+      _lazy_cursor = win_end;
+      if (!_draw_calls.empty())
+      {
+        _draw_calls[0].start_chunk = 0;
+        _draw_calls[0].n_chunks = static_cast<unsigned>(_lazy_cursor);
+      }
+      if (_lazy_cursor >= 256)
+      {
+        _lazy_streaming = false;
+        _map_tile->endChunkUpdates();
+      }
+    }
+    else
+    {
+      _lazy_streaming = false;
+      _map_tile->endChunkUpdates();
+    }
 
+    // [wrong-texture fix 2026-08-07] Persist the retry across passes. _texture_not_loaded resets every pass,
+    // so a miss inside an early LAZY window used to be forgotten by the final window: endChunkUpdates() above
+    // cleared the tile flag with no re-arm, orphaning the affected chunks' re-registered ALPHAMAP retries --
+    // their sampler entries stayed the -1 sentinel, which renders as a real (WRONG) texture (sampler slot 0,
+    // non-specular layer 1) until a full reload. The latch keeps the tile-level flag armed every pass until a
+    // FULL (non-lazy) pass refills every pending chunk (they keep their per-chunk ALPHAMAP flags) without a
+    // single miss; only then does it release.
     if (_texture_not_loaded)
+      _pending_tex_retry = true;
+    else if (!lazy_active)
+      _pending_tex_retry = false; // full pass, all pending chunks refilled, nothing missing -> resolved
+
+    if (_texture_not_loaded || _pending_tex_retry)
       _map_tile->registerChunkUpdate(ChunkUpdateFlags::ALPHAMAP);
 
     gl.bufferSubData(GL_UNIFORM_BUFFER, 0, sizeof(OpenGL::ChunkInstanceDataUniformBlock) * 256,
@@ -276,15 +499,6 @@ void TileRender::draw (OpenGL::Scoped::use_program& mcnk_shader
   }
 
   _map_tile->recalcExtents();
-
-  // do not draw anything when textures did not finish loading
-  if (_texture_not_loaded)
-  [[unlikely]]
-  {
-    gl.bindBufferRange(GL_UNIFORM_BUFFER, OpenGL::ubo_targets::CHUNK_INSTANCE_DATA,
-                       _chunk_instance_data_ubo, 0, sizeof(OpenGL::ChunkInstanceDataUniformBlock) * 256);
-    return;
-  }
 
   gl.bindBufferRange(GL_UNIFORM_BUFFER, OpenGL::ubo_targets::CHUNK_INSTANCE_DATA,
                      _chunk_instance_data_ubo, 0, sizeof(OpenGL::ChunkInstanceDataUniformBlock) * 256);
@@ -374,8 +588,17 @@ void TileRender::uploadTextures()
 
   gl.activeTexture(GL_TEXTURE0 + 2);
   gl.bindTexture(GL_TEXTURE_2D, _mccv_tex);
-  gl.texImage2D(GL_TEXTURE_2D, 0, GL_RGB32F, mapbufsize,
-                256, 0, GL_RGB, GL_FLOAT, nullptr);
+  // Initialize to WHITE (1,1,1 = the neutral vertex colour) instead of nullptr. With nullptr the contents are
+  // UNDEFINED, so any chunk row that never runs update_vertex_colors samples garbage floats, and the frag
+  // shader multiplies terrain by them (`out_color.rgb *= vary_mccv`) -> a psychedelic per-vertex weave. That is
+  // exactly the EPL bug: every EPL ADT's MCCV is a uniform 127,127,127 (= 1.0 neutral, verified against
+  // patch-3.mpq), so the file data can never tint anything -- the colour could only come from unwritten rows.
+  // Rows that DO upload overwrite this, so a legitimate MCCV is unaffected; unwritten rows now read neutral.
+  {
+    std::vector<float> white(static_cast<std::size_t>(mapbufsize) * 256 * 3, 1.0f);
+    gl.texImage2D(GL_TEXTURE_2D, 0, GL_RGB32F, mapbufsize,
+                  256, 0, GL_RGB, GL_FLOAT, white.data());
+  }
 
   gl.texParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
   //gl.texParameteri(GL_TEXTURE_1D_ARRAY, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
@@ -468,23 +691,21 @@ bool TileRender::fillSamplers(MapChunk* chunk, unsigned chunk_index,  unsigned i
 {
   MapTileDrawCall& draw_call = _draw_calls[draw_call_index];
 
-  _chunk_instance_data[chunk_index].ChunkHoles_DrawImpass_TexLayerCount_CantPaint[2] = static_cast<int>(chunk->texture_set->num());
-
+  static constexpr unsigned NUM_LAYERS = 4;
   static constexpr unsigned NUM_SAMPLERS = 11;
 
-  _chunk_instance_data[chunk_index].ChunkTextureSamplers[0] = 0;
-  _chunk_instance_data[chunk_index].ChunkTextureSamplers[1] = 0;
-  _chunk_instance_data[chunk_index].ChunkTextureSamplers[2] = 0;
-  _chunk_instance_data[chunk_index].ChunkTextureSamplers[3] = 0;
+  auto const n_render_layers = std::min<std::size_t>(chunk->texture_set->num(), NUM_LAYERS);
+  _chunk_instance_data[chunk_index].ChunkHoles_DrawImpass_TexLayerCount_CantPaint[2] = static_cast<int>(n_render_layers);
 
-  _chunk_instance_data[chunk_index].ChunkTextureArrayIDs[0] = -1;
-  _chunk_instance_data[chunk_index].ChunkTextureArrayIDs[1] = -1;
-  _chunk_instance_data[chunk_index].ChunkTextureArrayIDs[2] = -1;
-  _chunk_instance_data[chunk_index].ChunkTextureArrayIDs[3] = -1;
+  for (unsigned k = 0; k < NUM_LAYERS; ++k)
+  {
+    _chunk_instance_data[chunk_index].ChunkTextureSamplers[k] = 0;
+    _chunk_instance_data[chunk_index].ChunkTextureArrayIDs[k] = -1;
+  }
 
 
   auto& chunk_textures = (*chunk->texture_set->getTextures());
-  for (int k = 0; k < chunk->texture_set->num(); ++k)
+  for (std::size_t k = 0; k < n_render_layers; ++k)
   {
     chunk_textures[k]->upload();
 

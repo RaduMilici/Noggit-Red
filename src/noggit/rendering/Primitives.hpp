@@ -9,6 +9,9 @@
 
 #include <memory>
 #include <unordered_map>
+#include <vector>
+
+struct blp_texture;
 
 namespace math
 {
@@ -178,16 +181,78 @@ namespace Noggit::Rendering::Primitives
       std::unique_ptr<OpenGL::program> _program;
   };
 
+  // A polyline painted onto the terrain / WMO surface as a screen-space projected decal, using the
+  // same machinery as Circle::drawProjectedDecal. A plain 3D line between two waypoints cuts
+  // straight through every hill and building between them; this instead reconstructs each covered
+  // pixel's surface from the scene depth and paints the route onto it, so the whole path stays
+  // visible on top of the mesh. Width is specified in world units but clamped to a pixel range, so
+  // it thins with distance without ever disappearing or becoming a slab underfoot.
+  class PathDecal
+  {
+  public:
+    void draw(glm::mat4x4 const& mvp_rel          // camera-relative view-projection
+             , glm::mat4x4 const& inv_mvp_rel     // its inverse, for the per-pixel reconstruction
+             , glm::vec2 const& inv_viewport
+             , GLuint scene_depth_tex               // everything drawn so far, for occlusion
+             , GLuint world_depth_tex               // terrain + WMO only, the ground to paint on
+             , std::vector<glm::vec3> const& points // world space, at least 2
+             , glm::vec3 const& camera
+             , glm::vec3 const& view_axis         // camera forward, world space
+             , glm::vec4 const& color
+             , float world_width
+             , float min_pixels
+             , float max_pixels
+             , float px_scale                     // world units per pixel, per unit of view depth
+             );
+
+    void unload();
+
+  private:
+    bool _buffers_are_setup = false;
+    void setup_buffers();
+
+    std::vector<float> _segment_data; // scratch: (ax, ay, az, bx, by, bz) per instance
+
+    OpenGL::Scoped::deferred_upload_vertex_arrays<1> _vao;
+    OpenGL::Scoped::deferred_upload_buffers<1> _buffers;
+    GLuint const& _segments_vbo = _buffers[0];
+    std::unique_ptr<OpenGL::program> _program;
+  };
+
   // Flat thick ring drawn in the XZ plane.
   // Uses the same square_vs / square_fs shaders as Square.
   class Circle
   {
   public:
+    Circle();
+    ~Circle(); // out-of-line: unique_ptr<blp_texture> member with forward-declared type
+
     void draw(glm::mat4x4 const& mvp
              , glm::vec3 const& pos
              , glm::vec4 const& color
              , float radius
              );
+
+    // SCREEN-SPACE PROJECTED DECAL path (matches the blob shadow): paints the UnitSelectTexture ring
+    // onto the actual terrain/WMO ground under the unit by reconstructing world position from a
+    // pre-captured scene-depth texture -- wraps the existing mesh instead of a draped disc.
+    void drawProjectedDecal(glm::mat4x4 const& mvp
+                           , glm::mat4x4 const& inv_view_projection
+                           , glm::vec2 const& inv_viewport
+                           , GLuint scene_depth_tex
+                           , GLuint world_depth_tex // terrain + WMO only; models must occlude the ring
+                           , GLuint empty_vao
+                           , glm::vec3 const& center
+                           , glm::vec3 const& camera
+                           , float radius
+                           , glm::vec4 const& color
+                           , float uv_rotation
+                           // simple_ring = plain procedural outline instead of the client's
+                           // UnitSelectTexture. Used by the spawn-tool aim cursor, which is a UI
+                           // affordance and not a client selection circle.
+                           , bool simple_ring = false
+                           );
+
     void unload();
 
   private:
@@ -202,6 +267,11 @@ namespace Noggit::Rendering::Primitives
     GLuint const& _vertices_vbo = _buffers[0];
     GLuint const& _indices_vbo = _buffers[1];
     std::unique_ptr<OpenGL::program> _program;
+    std::unique_ptr<OpenGL::program> _decal_program; // projected-decal path
+
+    // The client's selection-circle texture (Textures\UnitSelectTexture.blp), loaded lazily.
+    std::unique_ptr<blp_texture> _select_texture;
+    bool _select_texture_failed = false;
   };
 
 }

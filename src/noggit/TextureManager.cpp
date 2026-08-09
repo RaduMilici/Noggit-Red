@@ -1,20 +1,138 @@
 // This file is part of Noggit3, licensed under GNU General Public License (version 3).
 #include <noggit/TextureManager.h>
+#include <atomic> // [TEXARRAYDBG] temporary
 #include <noggit/Log.h> // LogDebug
+#include <noggit/frame_profiler.hpp>
 #include <noggit/application/NoggitApplication.hpp>
 #include <ClientFile.hpp>
 
+#include <QtCore/QSettings>
 #include <QtCore/QString>
 #include <QtGui/QPixmap>
 
 #include <algorithm>
+#include <cctype>
 #include <glm/vec2.hpp>
 
 decltype (TextureManager::_) TextureManager::_;
 decltype (TextureManager::_tex_arrays) TextureManager::_tex_arrays;
 decltype (TextureManager::_raw_textures) TextureManager::_raw_textures;
+decltype (TextureManager::_raw_textures_mutex) TextureManager::_raw_textures_mutex;
 
-constexpr unsigned N_ARRAY_TEX = 1;
+// [perf 2026-08-06] Bumped once per successful blp_texture::upload(). The MDI doodad batcher folds this into
+// its per-frame cache signature so a model that only becomes batchable once its texture finishes uploading
+// forces a batch rebuild (its (model,count) signature is otherwise unchanged). External linkage; WorldRender
+// declares `extern` for it (no header dependency). Reads are approximate (relaxed) -- staleness just costs one
+// extra rebuild, never correctness.
+std::atomic<unsigned long long> g_texture_upload_epoch{0};
+
+// [perf 2026-08-05] Real multi-layer GL_TEXTURE_2D_ARRAYs (was 1 = every BLP its own single-layer array,
+// array_index() always 0). Now up to N BLPs of the SAME (compression,w,h,mips) class share one array object,
+// each on its own layer (index_x = n_used/N picks the array, layer = n_used%N). This is the PREREQ for
+// Step-3 MDI doodad batching: many doodads that used to force a distinct bind-per-draw can now share one
+// array bind + per-instance layer -> collapse into a single glMultiDrawElementsIndirect call.
+//   * NO perf gain on its own -- draw-call count is unchanged until Step 3. This bump is a correctness gate:
+//     the M2 shader samples texture(tex, vec3(uv, tex1_index)) and the WMO shader carries the layer per-vertex
+//     through the render-batch TBO, so both already sample the right layer; verify no cross-layer bleed.
+//   * VRAM: each class pre-allocates all N layers up front (immutable array size). ~11MB per 512^2-DXT1
+//     64-layer array; worst case ~1GB of tail waste across all loaded classes -- fine on the 24GB target GPU.
+//     Watch [MEM] vram= after the bump; dial back if it pressures the eviction path we just stabilised.
+constexpr unsigned N_ARRAY_TEX = 64;
+namespace
+{
+  constexpr char const* fallback_texture_filename = "tileset/generic/black.blp";
+
+  // Anisotropic filtering (checklist 20.5): the client exposes this as a CVar; noggit had none, so
+  // oblique/distant tilesets and model textures were blurrier than in-game. EXT_texture_filter_
+  // anisotropic is core-adjacent and universally supported; constants defined locally since the
+  // GL headers in use predate them. Level from QSettings render/anisotropic_filtering (default 16),
+  // clamped to the hardware max; <= 1 disables. Re-read every call so the Settings slider applies
+  // live -- TextureManager::reapply_anisotropy() re-runs it over every loaded array on a change.
+  constexpr GLenum GL_TEXTURE_MAX_ANISOTROPY_LOCAL = 0x84FE;
+  constexpr GLenum GL_MAX_TEXTURE_MAX_ANISOTROPY_LOCAL = 0x84FF;
+
+  float anisotropy_level()
+  {
+    // hw_max is a hardware constant -> query it once (the first call happens during array creation,
+    // with a live GL context). The requested level is re-read from QSettings every call.
+    static float const hw_max = []
+    {
+      GLfloat m = 1.0f;
+      gl.getFloatv(GL_MAX_TEXTURE_MAX_ANISOTROPY_LOCAL, &m);
+      return (m >= 1.0f) ? m : 1.0f; // extension absent or query failed -> no AF
+    }();
+    float const requested = QSettings().value("render/anisotropic_filtering", 16.0f).toFloat();
+    return std::clamp(requested, 1.0f, hw_max);
+  }
+
+  void apply_anisotropy(GLenum target)
+  {
+    float const level = anisotropy_level();
+    if (level > 1.0f)
+    {
+      gl.texParameterf(target, GL_TEXTURE_MAX_ANISOTROPY_LOCAL, level);
+    }
+  }
+
+  bool is_null_texture_reference(std::string filename)
+  {
+    auto const is_trimmed_char = [](unsigned char character)
+    {
+      return character == '\0' || std::isspace(character);
+    };
+
+    filename.erase(filename.begin(),
+                   std::find_if(filename.begin(), filename.end(),
+                                [&](unsigned char character) { return !is_trimmed_char(character); }));
+    filename.erase(std::find_if(filename.rbegin(), filename.rend(),
+                                [&](unsigned char character) { return !is_trimmed_char(character); }).base(),
+                   filename.end());
+
+    std::transform(filename.begin(), filename.end(), filename.begin(), [](unsigned char character)
+    {
+      return static_cast<char>(std::tolower(character));
+    });
+
+    std::replace(filename.begin(), filename.end(), '\\', '/');
+
+    if (filename.empty() || filename == "0" || filename == "none" || filename == "null")
+    {
+      return true;
+    }
+
+    if (filename.find('/') == std::string::npos)
+    {
+      auto const extension_pos = filename.rfind('.');
+      if (extension_pos != std::string::npos && filename.substr(0, extension_pos) == "0")
+      {
+        return filename.substr(extension_pos) == ".blp";
+      }
+    }
+
+    return false;
+  }
+
+  std::string safe_texture_filename(std::string filename)
+  {
+    if (is_null_texture_reference(filename))
+    {
+      return fallback_texture_filename;
+    }
+
+    filename = BlizzardArchive::ClientData::normalizeFilenameInternal(std::move(filename));
+    return is_null_texture_reference(filename) ? fallback_texture_filename : std::move(filename);
+  }
+
+  BlizzardArchive::Listfile::FileKey safe_texture_file_key(BlizzardArchive::Listfile::FileKey const& file_key)
+  {
+    if (!file_key.hasFilepath())
+    {
+      return BlizzardArchive::Listfile::FileKey(fallback_texture_filename);
+    }
+
+    return BlizzardArchive::Listfile::FileKey(safe_texture_filename(file_key.filepath()));
+  }
+}
 
 void TextureManager::report()
 {
@@ -44,6 +162,34 @@ void TextureManager::unload_all(Noggit::NoggitRenderContext context)
   {
     gl.deleteTextures(static_cast<GLuint>(pair.second.arrays.size()), pair.second.arrays.data());
   }
+
+  // Drop the bookkeeping too. Without this the map kept the DELETED GL names and their n_used counters,
+  // so every later lookup for the same (format,size,mips) bucket walked past stale entries and the names
+  // were never reconciled with reality -- GL is free to hand those exact names back out to new textures.
+  // Clearing resets both the name list and n_used. [2026-07-30]
+  arrays_for_context.clear();
+}
+
+void TextureManager::reapply_anisotropy()
+{
+  // Live re-apply of the anisotropic-filtering level (Settings -> Anisotropic filtering) to every
+  // already-uploaded texture array: models, particles and tilesets all live in _tex_arrays. AF is
+  // otherwise set once at array creation, so without this a change wouldn't take effect until the
+  // texture reloaded. Must run with a current GL context (called from WorldRender::draw). The level
+  // is always set explicitly, including 1 (= off), so lowering the setting actually clears a
+  // previously-set higher value on each array.
+  float const level = std::max(1.0f, anisotropy_level());
+  for (auto& arrays_for_context : _tex_arrays)
+  {
+    for (auto& pair : arrays_for_context)
+    {
+      for (GLuint array : pair.second.arrays)
+      {
+        gl.bindTexture(GL_TEXTURE_2D_ARRAY, array);
+        gl.texParameterf(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAX_ANISOTROPY_LOCAL, level);
+      }
+    }
+  }
 }
 
 void TextureManager::register_raw_texture(std::string const& filename, Noggit::NoggitRenderContext context, int width, int height, std::vector<uint32_t> data)
@@ -53,11 +199,13 @@ void TextureManager::register_raw_texture(std::string const& filename, Noggit::N
     return;
   }
 
+  std::lock_guard<std::mutex> lock(_raw_textures_mutex);
   _raw_textures[{BlizzardArchive::ClientData::normalizeFilenameInternal(filename), static_cast<int>(context)}] = {width, height, std::move(data)};
 }
 
 bool TextureManager::load_raw_texture(std::string const& filename, Noggit::NoggitRenderContext context, int& width, int& height, std::map<int, std::vector<uint32_t>>& data)
 {
+  std::lock_guard<std::mutex> lock(_raw_textures_mutex);
   auto found = _raw_textures.find({BlizzardArchive::ClientData::normalizeFilenameInternal(filename), static_cast<int>(context)});
   if (found == _raw_textures.end())
   {
@@ -103,8 +251,9 @@ TexArrayParams& TextureManager::get_tex_array(int width, int height, int mip_lev
     }
 
     gl.texParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAX_LEVEL, mip_level - 1);
-    gl.texParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+    gl.texParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MIN_FILTER, mip_level > 1 ? GL_LINEAR_MIPMAP_LINEAR : GL_LINEAR);
     gl.texParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    apply_anisotropy(GL_TEXTURE_2D_ARRAY);
   }
   else
   {
@@ -146,8 +295,9 @@ TexArrayParams& TextureManager::get_tex_array(GLint compression, int width, int 
     }
 
     gl.texParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAX_LEVEL, mip_level - 1);
-    gl.texParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+    gl.texParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MIN_FILTER, mip_level > 1 ? GL_LINEAR_MIPMAP_LINEAR : GL_LINEAR);
     gl.texParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    apply_anisotropy(GL_TEXTURE_2D_ARRAY);
   }
   else
   {
@@ -197,6 +347,7 @@ void blp_texture::bind()
 
 void blp_texture::uploadToArray(unsigned layer)
 {
+  noggit::perf::Scoped _prof_tex(noggit::perf::Phase::TexUpload); // M2 spike hunt: BLP texture upload
   if (!finished)
   {
     try
@@ -256,6 +407,7 @@ void blp_texture::uploadToArray(unsigned layer)
 
 void blp_texture::upload()
 {
+  noggit::perf::Scoped _prof_tex(noggit::perf::Phase::TexUpload); // M2 spike hunt: BLP texture upload
   if (!finished || loading_failed())
   {
     return;
@@ -270,6 +422,28 @@ void blp_texture::upload()
   {
     return;
   }
+
+  // [wrong-texture root cause 2026-08-08] upload() runs LAZILY from inside the draw loop (bindTexture /
+  // resolveStaticBatch resolve textures on first sight) and binds ITS array on whatever texture unit is
+  // currently active to allocate/subimage. The draw paths cache "what's bound on unit N" CPU-side and
+  // skip redundant glBindTexture -- so an upload mid-draw silently clobbers the unit and every cached
+  // bind after it samples ANOTHER array (MC lavafalls turning catwalk-metal/molten-steel up close as
+  // nearby textures streamed in; same class as the terrain wrong-texture bug). Restore the exact
+  // binding we clobber. glGet is sync but uploads only happen on stream-in, never steady-state.
+  GLint prev_active = GL_TEXTURE0;
+  GLint prev_array = 0;
+  gl.getIntegerv(GL_ACTIVE_TEXTURE, &prev_active);
+  gl.getIntegerv(GL_TEXTURE_BINDING_2D_ARRAY, &prev_array);
+  struct RestoreBinding
+  {
+    GLint active;
+    GLint array;
+    ~RestoreBinding()
+    {
+      gl.activeTexture(static_cast<GLenum>(active));
+      gl.bindTexture(GL_TEXTURE_2D_ARRAY, static_cast<GLuint>(array));
+    }
+  } const _restore{prev_active, prev_array};
 
   int width = _width, height = _height;
 
@@ -301,6 +475,17 @@ void blp_texture::upload()
 
     params.n_used++;
 
+    {
+      static bool const s_texup_log = std::getenv("NOGGIT_TEXUP_LOG") != nullptr;
+      if (s_texup_log)
+      {
+        LogError << "[TEXUP] " << _file_key.stringRepr() << " " << _width << "x" << _height
+                 << " fmt=raw mips=" << _data.size()
+                 << " arr=" << _texture_array << " layer=" << _array_index
+                 << " ctx=" << static_cast<int>(_context) << std::endl;
+      }
+    }
+
     //LogDebug << "Mip level: " << std::to_string(_data.size()) << std::endl;
 
     _data.clear();
@@ -330,11 +515,25 @@ void blp_texture::upload()
 
     params.n_used++;
 
+    // [FALLS-DIAG 2026-08-08] NOGGIT_TEXUP_LOG=1: name every array upload (file -> array/layer) so a
+    // layer collision or unexpected writer in a class is visible from one run. Diagnostic only.
+    {
+      static bool const s_texup_log = std::getenv("NOGGIT_TEXUP_LOG") != nullptr;
+      if (s_texup_log)
+      {
+        LogError << "[TEXUP] " << _file_key.stringRepr() << " " << _width << "x" << _height
+                 << " fmt=" << _compression_format.value() << " mips=" << _compressed_data.size()
+                 << " arr=" << _texture_array << " layer=" << _array_index
+                 << " ctx=" << static_cast<int>(_context) << std::endl;
+      }
+    }
+
     //LogDebug << "Mip level (compressed): " << std::to_string(_compressed_data.size()) << std::endl;
     _compressed_data.clear();
   }
 
   _uploaded = true;
+  g_texture_upload_epoch.fetch_add(1, std::memory_order_relaxed); // MDI batcher cache-invalidation signal
 }
 
 void blp_texture::unload()
@@ -402,6 +601,19 @@ void blp_texture::loadFromUncompressedData(BLPHeader const* lHeader, char const*
                 a++;
               }
             }
+            else if (alphabits == 4)
+            {
+              // 4-bit alpha (BLP2 alphaSize=4): two 4-bit alphas packed per byte, low nibble = even pixel;
+              // expand the nibble to 8-bit (v<<4|v). Hits exactly ONE Turtle asset
+              // (Character\Tauren\Male\TAURENMALESKIN00_20_EXTRA), which without this branch rendered opaque. (7.3)
+              int const nib = (*a >> (4 * cnt)) & 0x0F;
+              alpha = (nib << 4) | nib;
+              if (++cnt == 2)
+              {
+                cnt = 0;
+                a++;
+              }
+            }
           }
 
           k |= alpha << 24;
@@ -460,20 +672,25 @@ void blp_texture::loadFromCompressedData(BLPHeader const* lHeader, char const* l
 }
 
 blp_texture::blp_texture(BlizzardArchive::Listfile::FileKey const& file_key, Noggit::NoggitRenderContext context)
-  : AsyncObject(file_key)
+  : AsyncObject(safe_texture_file_key(file_key))
   , _context(context)
 {
 }
 
 void blp_texture::finishLoading()
 {
-  if (TextureManager::load_raw_texture(_file_key.filepath(), _context, _width, _height, _data))
+  auto const texture_filename = _file_key.hasFilepath()
+    ? safe_texture_filename(_file_key.filepath())
+    : std::string(fallback_texture_filename);
+
+  if (TextureManager::load_raw_texture(texture_filename, _context, _width, _height, _data))
   {
     finished = true;
+    _state_changed.notify_all();
     return;
   }
 
-  bool exists = Noggit::Application::NoggitApplication::instance()->clientData()->exists( _file_key.filepath());
+  bool exists = Noggit::Application::NoggitApplication::instance()->clientData()->exists(texture_filename);
   if (!exists)
   {
     LogError << "file not found: '" <<  _file_key.stringRepr() << "'" << std::endl;
@@ -482,11 +699,11 @@ void blp_texture::finishLoading()
   std::string spec_filename;
   bool has_specular = false;
 
-  if (_file_key.filepath().starts_with("tileset/"))
+  if (texture_filename.starts_with("tileset/"))
   {
     _is_tileset = true;
 
-    spec_filename = _file_key.filepath().substr(0, _file_key.filepath().find_last_of(".")) + "_s.blp";
+    spec_filename = texture_filename.substr(0, texture_filename.find_last_of(".")) + "_s.blp";
     has_specular = Noggit::Application::NoggitApplication::instance()->clientData()->exists(spec_filename);
 
     if (has_specular)
@@ -496,7 +713,7 @@ void blp_texture::finishLoading()
   }
 
   BlizzardArchive::ClientFile f(
-      exists ? (has_specular ? spec_filename : _file_key.filepath()) : "textures/shanecube.blp"
+      exists ? (has_specular ? spec_filename : texture_filename) : "textures/shanecube.blp"
       , Noggit::Application::NoggitApplication::instance()->clientData());
   if (f.isEof())
   {
@@ -516,6 +733,38 @@ void blp_texture::finishLoading()
   else if (lHeader->attr_0_compression == 2)
   {
     loadFromCompressedData(lHeader, lData);
+  }
+  else if (lHeader->attr_0_compression == 3)
+  {
+    // Uncompressed 32-bit BLP (D3DFMT_A8R8G8B8 -> BGRA bytes per pixel, e.g. Textures\sunGlare.blp).
+    // Convert to RGBA for the GL_RGBA/GL_UNSIGNED_BYTE array upload (same target as the palettized path).
+    int width = _width, height = _height;
+    for (int i = 0; i < 16; ++i)
+    {
+      width = std::max(1, width);
+      height = std::max(1, height);
+      if (lHeader->offsets[i] > 0 && lHeader->sizes[i] > 0)
+      {
+        uint32_t const* src = reinterpret_cast<uint32_t const*>(&lData[lHeader->offsets[i]]);
+        int const n = width * height;
+        std::vector<uint32_t> data(n);
+        for (int j = 0; j < n; ++j)
+        {
+          uint32_t const s = src[j]; // 0xAARRGGBB (BGRA byte order in memory)
+          data[j] = ((s >> 16) & 0x000000FFu)  // R -> byte 0
+                  | (s & 0x0000FF00u)           // G stays byte 1
+                  | ((s & 0x000000FFu) << 16)   // B -> byte 2
+                  | (s & 0xFF000000u);          // A stays byte 3
+        }
+        _data[i] = std::move(data);
+      }
+      else
+      {
+        break;
+      }
+      width >>= 1;
+      height >>= 1;
+    }
   }
   else
   {
@@ -686,7 +935,7 @@ namespace Noggit
 
                                   void main()
                                   {
-                                    out_color = vec4(texture(tex, vec3(f_tex_coord/2.f + vec2(0.5), tex_index)).rgb, 1.);
+                                    out_color = texture(tex, vec3(f_tex_coord/2.f + vec2(0.5), tex_index));
                                   }
                                   )code"
                                }
@@ -729,12 +978,12 @@ namespace Noggit
 }
 
 scoped_blp_texture_reference::scoped_blp_texture_reference (std::string const& filename, Noggit::NoggitRenderContext context)
-  : _blp_texture(TextureManager::_.emplace(filename, context))
+  : _blp_texture(TextureManager::_.emplace(safe_texture_filename(filename), context))
   , _context(context)
 {}
 
 scoped_blp_texture_reference::scoped_blp_texture_reference (scoped_blp_texture_reference const& other)
-  : _blp_texture(other._blp_texture ? TextureManager::_.emplace(other._blp_texture->file_key().filepath(), other._context) : nullptr)
+  : _blp_texture(other._blp_texture ? TextureManager::_.emplace(safe_texture_filename(other._blp_texture->file_key().filepath()), other._context) : nullptr)
   , _context(other._context)
 {}
 

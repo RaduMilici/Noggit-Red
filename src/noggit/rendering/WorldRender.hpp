@@ -8,22 +8,52 @@
 #include <external/glm/glm.hpp>
 #include <math/trig.hpp>
 
+#include <set>
+
+namespace math { class frustum; } // referenced by the animated-MDI batching (drawDoodadsBatched/fillMdiBones)
+
 #include <noggit/tool_enums.hpp>
 #include <noggit/rendering/CursorRender.hpp>
 #include <noggit/rendering/LiquidTextureManager.hpp>
+#include <noggit/TextureManager.h>
 #include <noggit/map_horizon.h>
 #include <noggit/Sky.h>
 
 #include <opengl/shader.hpp>
+#include <opengl/types.hpp>                     // OpenGL::DrawElementsIndirectCommand (MDI doodad batching)
 #include <noggit/rendering/Primitives.hpp>
+#include <noggit/rendering/ModelRender.hpp>     // StaticBatchKey (MDI doodad batching)
+#include <noggit/rendering/TileRender.hpp>      // TileRender::DoodadInstanceBuffer (MDI doodad batching)
+#include <noggit/ModelInstance.h>
+#include <noggit/InteriorVolume.hpp>
 
+#include <QtCore/QElapsedTimer>
+
+#include <chrono>
+#include <cstdint>
 #include <memory>
+#include <string>
+#include <unordered_map>
+#include <vector>
 
 class World;
+class WMO;
+class WMOGroup;
 struct MinimapRenderSettings;
 
 namespace Noggit::Rendering
 {
+  // Per-frame acceleration structure for the legacy-creature-doodad overlap test. Maps a creature model
+  // path to the spawn overlays that use it, so should_suppress_legacy_creature_instance() is an O(1)
+  // lookup + tiny bucket scan instead of walking ALL ~35k creature spawns per creature instance per frame.
+  struct LegacyOverlayInfo
+  {
+    glm::vec3 pos = glm::vec3(0.0f);
+    float overlay_radius = 1.0f;
+    std::uint32_t guid = 0;
+    std::string overlay_model;
+  };
+
   class WorldRender : public BaseRender
   {
   public:
@@ -31,6 +61,17 @@ namespace Noggit::Rendering
 
     void upload() override;
     void unload() override;
+
+    // True while the camera is inside a WMO this frame (cached in draw()). Read by WMORender to route WMO
+    // exterior-lit / portal-spill faces to the WMO's interior context instead of the outdoor map light.
+    bool cameraInsideWmo() const { return _camera_inside_wmo; }
+
+    // Called by WMORender instead of drawing its liquid inline -- see _deferred_wmo_liquid.
+    void queueWmoLiquid(std::vector<WMOGroup*> groups, glm::mat4x4 const& transform,
+                        bool interior_only, bool draw_fog)
+    {
+      _deferred_wmo_liquid.push_back({std::move(groups), transform, interior_only, draw_fog});
+    }
 
     void draw (glm::mat4x4 const& model_view
         , glm::mat4x4 const& projection
@@ -70,6 +111,8 @@ namespace Noggit::Rendering
         , bool draw_occlusion_boxes = false
         , bool minimap_render = false
         , bool draw_wmo_exterior = true
+        , bool draw_bloom = false
+        , bool draw_ground_clutter = true
     );
 
     bool saveMinimap (TileIndex const& tile_idx
@@ -84,6 +127,30 @@ namespace Noggit::Rendering
 
     [[nodiscard]] std::unique_ptr<Skies>& skies() { return _skies; };
 
+    // Per-room (MOLR) point-light scoping: the client lights each interior WMO group ONLY by the
+    // MOLT lights its MOLR chunk references. Called by WMORender between group draws to swap the
+    // point-light region of the lighting UBO to the group's authored set; restore returns to the
+    // frame's global nearest-16 pool (kept in _lighting_ubo_data) before non-WMO passes.
+    void setWmoGroupPointLights(WMO const* wmo, std::vector<int16_t> const& light_refs,
+                                glm::mat4x4 const& transform, glm::vec3 const& camera_pos);
+    void restoreGlobalPointLights();
+
+    // The zone fog currently in the lighting UBO (always the OUTDOOR values -- per-WMO MFOG is
+    // blended on top by WMORender). start is a FRACTION of end (can be negative: mist scaler).
+    void getZoneFog(glm::vec3& color, float& start_frac, float& end) const
+    {
+      color = glm::vec3(_lighting_ubo_data.FogColor_FogOn);
+      start_frac = _lighting_ubo_data.DiffuseColor_FogStart.w;
+      end = _lighting_ubo_data.AmbientColor_FogEnd.w;
+    }
+
+    // Editor fog-distance multiplier. There are now TWO (2026-07-25): "fog_distance_scale" for OUTDOOR
+    // (zone) fog and "fog_distance_scale_interior" for INDOOR (WMO) fog. updateLightingUniformBlock picks
+    // the one matching _camera_inside_wmo each frame and stores it in _active_fog_distance_scale; the zone
+    // fog in the UBO already has it applied, and WMORender reads this getter for per-group MFOG so WMO
+    // geometry matches the scene's active fog band.
+    float fogDistanceScale() const { return _active_fog_distance_scale; }
+
   private:
 
     void drawMinimap ( MapTile *tile
@@ -93,7 +160,7 @@ namespace Noggit::Rendering
         , MinimapRenderSettings* settings
     );
 
-    void updateMVPUniformBlock(const glm::mat4x4& model_view, const glm::mat4x4& projection);
+    void updateMVPUniformBlock(const glm::mat4x4& model_view, const glm::mat4x4& projection, glm::vec3 const& camera_pos);
     void updateLightingUniformBlock(bool draw_fog, glm::vec3 const& camera_pos);
     void updateLightingUniformBlockMinimap(MinimapRenderSettings* settings);
 
@@ -103,21 +170,180 @@ namespace Noggit::Rendering
     void setupChunkBuffers();
     void setupLiquidChunkBuffers();
 
+    // Bloom post-process: (re)create the offscreen targets for the given viewport size, and run the
+    // bright-pass -> blur -> composite once the scene has been rendered into the scene target.
+    void ensureBloomTargets(int w, int h);
+    void renderBloomAndComposite(GLuint target_fbo, int w, int h, glm::vec3 const& camera_pos);
+    // Blit the current depth buffer into _decal_depth_tex for screen-space projected decals (blob
+    // shadows + selection circles). Idempotent per frame (guarded by _decal_depth_ready). Returns
+    // false if it couldn't (no viewport). Call after terrain+WMO+doodads, before creatures.
+    bool snapshotDecalDepth();
+
+    // Same, into _world_depth_tex. Must be called after the WMO pass and before the M2 pass.
+    bool snapshotWorldDepth();
+
     World* _world;
-    float _cull_distance;
+    float _cull_distance;         // how far OBJECTS/WMOs/models render (Object Render Distance slider), clamped to terrain
+    float _terrain_cull_distance; // how far TERRAIN/horizon/sky render = view distance; fog never affects it
     float _view_distance;
+    float _fog_distance_scale = 1.0f;          // OUTDOOR (zone) fog distance multiplier
+    float _fog_distance_scale_interior = 1.0f; // INDOOR (WMO) fog distance multiplier
+    float _active_fog_distance_scale = 1.0f;   // whichever of the two matches _camera_inside_wmo this frame
+
+    // Ground clutter (checklist 14.1): persistent model refs for detail doodads, keyed by path, so
+    // the handful of shared grass/pebble M2s stay resident while the camera moves.
+    std::unordered_map<std::string, scoped_model_reference> _detail_doodad_models;
+
+    // Rebuilt from the world's creature spawns; keyed by spawn model_path. THROTTLED (2026-07-25 perf):
+    // the index is derived from static spawn placements + lazily-refining model radii, but rebuilding the
+    // whole string-keyed map every frame cost ~3ms in Stormwind (10% of the frame). rebuildLegacySuppressIndex
+    // now only rebuilds on a spawn-count change or every N frames; these track the throttle state.
+    std::unordered_map<std::string, std::vector<LegacyOverlayInfo>> _legacy_suppress_index;
+    std::size_t _legacy_suppress_last_count = static_cast<std::size_t>(-1);
+    unsigned _legacy_suppress_tick = 0;
+    void rebuildLegacySuppressIndex();
 
     // shaders
     std::unique_ptr<OpenGL::program> _mcnk_program;;
     std::unique_ptr<OpenGL::program> _mfbo_program;
     std::unique_ptr<OpenGL::program> _m2_program;
     std::unique_ptr<OpenGL::program> _m2_instanced_program;
+    std::unique_ptr<OpenGL::program> _m2_batched_program; // [perf 2026-08-05] MDI cross-model doodad batching (instanced+batched defines)
     std::unique_ptr<OpenGL::program> _m2_particles_program;
     std::unique_ptr<OpenGL::program> _m2_ribbons_program;
+    std::unique_ptr<OpenGL::program> _blob_shadow_program; // unit (creature) ground blob shadows
     std::unique_ptr<OpenGL::program> _m2_box_program;
     std::unique_ptr<OpenGL::program> _wmo_program;
     std::unique_ptr<OpenGL::program> _liquid_program;
+    std::unique_ptr<OpenGL::program> _wmo_liquid_program;
     std::unique_ptr<OpenGL::program> _occluder_program;
+
+    // [perf 2026-08-05] MDI cross-model doodad batching (NOGGIT_DOODAD_MDI). An append-only shared geometry
+    // arena holds every batchable doodad model's geometry (concatenated once at first use, never freed); each
+    // frame the visible batchable instances are assembled into one instance buffer + indirect-command buffer
+    // and drawn with one glMultiDrawElementsIndirect per (texture-array x state) group via _m2_batched_program.
+    // See ensureMdiArena / mdiEnsureModelInArena / drawDoodadsBatched in WorldRender.cpp.
+    struct MdiArenaSlot { GLint base_vertex = 0; GLuint index_base = 0; bool ok = false; };
+    // Keyed by the model's STABLE file identity, NOT Model* -- the arena is append-only/never cleared, but
+    // Model* addresses are reused after a model unloads (dense streaming), so a Model* key would map a new
+    // model to a DIFFERENT unloaded model's arena geometry -> exploded vertices. Same file == same geometry,
+    // so file-keying is both correct and deduplicating.
+    std::unordered_map<std::string, MdiArenaSlot> _mdi_slots;     // arena location per model FILE (append-only)
+    std::unordered_map<Model*, std::uint8_t> _mdi_batched_models; // per-frame: models the MDI pass drew (skip elsewhere)
+    OpenGL::Scoped::deferred_upload_buffers<7> _mdi_buffers;      // 0 arena_vbo 1 arena_ibo 2 inst_tf 3 inst_interior 4 inst_tex 5 indirect 6 bone_ssbo
+    OpenGL::Scoped::deferred_upload_vertex_arrays<1> _mdi_vao_arr;
+    bool _mdi_ready = false;
+    GLsizeiptr _mdi_arena_vbo_cap = 0, _mdi_arena_ibo_cap = 0;
+    GLsizei _mdi_arena_vtx = 0, _mdi_arena_idx = 0;
+    GLsizeiptr _mdi_inst_cap = 0, _mdi_indirect_cap = 0;          // current instance/indirect buffer byte capacities
+    std::vector<std::pair<Model*, TileRender::DoodadInstanceBuffer const*>> _mdi_all_loaded; // GPU-driven P1: ALL loaded tiles' doodads (camera-independent) -> batch rebuilds only on tile load/unload
+    std::vector<glm::mat4x4> _mdi_scratch_tf;                     // per-frame scratch (retained to avoid re-alloc)
+    std::vector<glm::vec4>   _mdi_scratch_interior;
+    std::vector<glm::ivec4>  _mdi_scratch_tex;
+    std::vector<OpenGL::DrawElementsIndirectCommand> _mdi_scratch_cmds;
+    // [animated MDI 2026-08-07] SHARED-pose animated batched models: each gets a FIXED bone-block slot in the
+    // batched bone SSBO (buffer 6), so inst_tex.z (block base) / inst_tex.w (bone count) are STABLE across
+    // frames (cached with the structure). Each frame fillMdiBones() re-animates the VISIBLE ones (bbox frustum
+    // cull) into _mdi_scratch_bones at their base and uploads it; off-screen models keep last pose (they're
+    // GPU frustum-culled anyway). This keeps the draw-call collapse without an "animate everything" regression.
+    struct MdiBoneModel { Model* model; std::uint32_t bone_base; std::uint32_t bone_count; glm::vec3 bbox_min; glm::vec3 bbox_max; };
+    std::vector<MdiBoneModel> _mdi_bone_models;    // cached with the structure (rebuilt on cache miss)
+    std::vector<glm::mat4x4>  _mdi_scratch_bones;  // per-frame bone matrices for ALL batched animated models
+    std::size_t _mdi_bone_total = 0;               // total mat4 slots in the bone SSBO
+    bool _mdi_bones_uploaded_once = false;         // first upload must happen even if nothing is visible yet
+
+    // [pib-MDI 2026-08-07] batch the per-instance-animation (billboard) WMO doodads through MDI, IN-PLACE at
+    // the same pipeline position as the old serial per-group draws (ordering semantics preserved). Own
+    // per-frame instance buffers + VAO (the tile batch's are cached across frames; these re-upload each
+    // frame) sharing the SAME geometry arena, and a bone SSBO with PER-INSTANCE blocks: each instance's
+    // inst_tex.z points at its own pose (big_bones is already the per-instance concatenation).
+    struct PibGroup
+    {
+      Model* pmodel = nullptr;
+      std::vector<ModelInstance*> const* doodads = nullptr;
+      bool has_bones = false;
+      bool batched = false; // consumed by drawPibBatched -> the serial fallback loop skips it
+      std::vector<glm::mat4x4> transforms;
+      std::vector<glm::vec4> interiors;
+      std::vector<std::uint64_t> keys;
+      std::vector<glm::mat4x4> big_bones;
+    };
+    // [GL perf 2026-08-08] PibPrep cache: the dedupe/group/transform/interior prep (~1.7ms) rebuilt only when
+    // the VISIBLE pib set changes (cheap pointer-XOR signature per frame; cache-node pointers are stable).
+    // The bake (bones) + draws stay per-frame; big_bones are cleared per bake since groups now persist.
+    std::vector<PibGroup> _pib_groups_cache;
+    unsigned long long _pib_groups_sig = 0;
+    bool _pib_groups_valid = false;
+
+    OpenGL::Scoped::deferred_upload_buffers<5> _pib_buffers; // 0 inst_tf 1 inst_interior 2 inst_tex 3 indirect 4 bone_ssbo
+    OpenGL::Scoped::deferred_upload_vertex_arrays<1> _pib_vao_arr;
+    bool _pib_ready = false;
+    std::vector<glm::mat4x4> _pib_scratch_tf;
+    std::vector<glm::vec4>   _pib_scratch_interior;
+    std::vector<glm::ivec4>  _pib_scratch_tex;
+    std::vector<OpenGL::DrawElementsIndirectCommand> _pib_scratch_cmds;
+    std::vector<glm::mat4x4> _pib_scratch_bones;
+    void ensurePibMdi();                                // VAO over the shared arena + the pib instance buffers
+    void drawPibBatched(std::vector<PibGroup>& groups); // classify + build + MDI-draw; marks consumed groups
+
+    // [dyn-MDI 2026-08-07] the DYNAMIC instanced pool (per-frame gathered WMO doodads + GOs, models_to_draw)
+    // through the same per-frame MDI machinery (shares the pib buffers/VAO -- bufferData orphaning makes the
+    // sequential reuse safe). Consumed buckets land in _dyn_batched_models; the classic loop keeps ALL its
+    // side-effects (deferral, particle collection) and just skips the draw for them. Shared-pose bone block
+    // per model (one animate per model, all its instances point at it).
+    std::unordered_map<Model*, std::uint8_t> _dyn_batched_models;
+    void drawDynamicBatched(tsl::robin_map<Model*, std::vector<glm::mat4x4>> const& buckets,
+                            tsl::robin_map<Model*, std::vector<glm::vec4>>& interiors,
+                            tsl::robin_map<Model*, std::vector<float>>& fades,
+                            std::set<Model*> const& go_buckets,
+                            glm::mat4x4 const& model_view, int animtime, bool draw_hidden_models);
+
+    // [perf 2026-08-06] AMORTIZATION: the assembled batch is cached across frames and rebuilt ONLY when the
+    // visible doodad set changes (cheap per-frame signature over persistent_doodad_draws + the texture-upload
+    // epoch). On a cache hit the GPU instance/indirect buffers still hold the last upload, so per-frame work
+    // collapses to re-issuing the cached groups. _mdi_batched_models is likewise kept across a hit.
+    struct MdiGroup { StaticBatchKey key; std::uint32_t first_cmd = 0; std::uint32_t cmd_count = 0; };
+    std::vector<MdiGroup> _mdi_cached_groups;
+    unsigned long long _mdi_last_sig = 0;
+    bool _mdi_cache_valid = false;
+    std::size_t _mdi_cached_instances = 0; // rendered-object count added each frame (hit or miss)
+
+    void ensureMdiArena();          // one-time arena/instance/indirect buffer + VAO setup
+    bool mdiEnsureModelInArena(Model* m); // lazily append a model's geometry to the arena; false if it can't batch
+    void drawDoodadsBatched(
+        std::vector<std::pair<Model*, TileRender::DoodadInstanceBuffer const*>> const& persistent_doodad_draws,
+        glm::mat4x4 const& model_view, bool draw_hidden_models,
+        math::frustum const& frustum, int animtime); // fills _mdi_batched_models + bone SSBO + MDI-draws them
+    void drawMdiGroups();           // issue the cached groups (constant uniforms + per-group check-before-set + MDI)
+    void fillMdiBones(glm::mat4x4 const& model_view, math::frustum const& frustum, int animtime); // per-frame: animate VISIBLE batched models into the bone SSBO + upload
+
+    // bloom post-process
+    std::unique_ptr<OpenGL::program> _bloom_bright_program;
+    std::unique_ptr<OpenGL::program> _bloom_blur_program;
+    std::unique_ptr<OpenGL::program> _bloom_composite_program;
+    bool _bloom_initialized = false;
+    int _bloom_w = -1, _bloom_h = -1, _bloom_bw = 0, _bloom_bh = 0;
+    GLuint _bloom_vao = 0;
+    std::unique_ptr<OpenGL::program> _sun_program; // sky sun disc
+    std::unique_ptr<OpenGL::program> _sunshaft_program; // screen-space radial sunshaft
+    std::unique_ptr<OpenGL::program> _moon_program; // textured celestial billboard (sun/moon disc + glare)
+    std::unique_ptr<scoped_blp_texture_reference> _moon_texture;       // textures/moon.blp  (White Lady disc)
+    std::unique_ptr<scoped_blp_texture_reference> _moon2_texture;      // textures/moon02.blp (Blue Child disc)
+    std::unique_ptr<scoped_blp_texture_reference> _moon_glare_texture; // textures/moonGlare.blp (white moon halo)
+    std::unique_ptr<scoped_blp_texture_reference> _sun_center_texture; // textures/sunCenter.blp (sun disc)
+    std::unique_ptr<scoped_blp_texture_reference> _sun_glare_texture;  // textures/sunGlare.blp (sun corona/rays)
+    glm::vec2 _sun_screen_uv{0.5f, 0.5f}; // sun projected to screen [0,1], for the sunshaft pass
+    float _sun_shaft_strength = 0.0f;     // view-alignment-faded strength; 0 = sun off-screen/behind
+    GLuint _bloom_scene_fbo = 0, _bloom_scene_color = 0, _bloom_scene_depth = 0;
+    // MSAA: the scene renders into multisampled renderbuffers (when render/msaa > 0) and is resolved
+    // into _bloom_scene_color before the bloom chain. 0 = off.
+    GLuint _msaa_fbo = 0, _msaa_color_rb = 0, _msaa_depth_rb = 0;
+    int _msaa_samples = 0;
+    // Live-apply guard for render/anisotropic_filtering: draw() re-applies AF to every loaded texture
+    // array (via TextureManager + liquid manager) only when this changes. -1 forces apply on frame 1.
+    float _last_anisotropy = -1.0f;
+    GLuint _bloom_fbo[2] = {0, 0};
+    GLuint _bloom_tex[2] = {0, 0};
 
     // horizon && skies && lighting
     std::unique_ptr<Noggit::map_horizon::render> _horizon_render;
@@ -131,6 +357,89 @@ namespace Noggit::Rendering
     Noggit::Rendering::Primitives::Square _square_render;
     Noggit::Rendering::Primitives::Line _line_render;
     Noggit::Rendering::Primitives::Circle _circle_render;
+    Noggit::Rendering::Primitives::PathDecal _path_decal_render; // creature patrol routes
+
+    // Patrol routes DRAPED onto the walkable surface. The authored waypoints are only corner points,
+    // so the straight chord between two of them cuts under a bridge deck and through a hill crest.
+    // Trying to absorb that with a vertical tolerance in the shader can't work: the tolerance needed
+    // to clear an arched bridge is also wide enough to swallow a roof, a tree canopy and the body of
+    // an NPC standing on the route. So the route is resampled and probed down onto the real ground
+    // once, cached, and the shader then only has to tolerate micro-relief.
+    // NOTE: routes are NOT probed onto the ground. That was tried and removed: each probe is a
+    // World::intersect against every loaded tile and WMO instance, which cost so much that routes
+    // took many seconds to appear even spread across frames. It is also no longer needed -- draping
+    // existed to keep the shader's height tolerance tight enough to exclude NPC bodies, and the
+    // world-depth comparison now excludes models outright, so the tolerance can be loose enough to
+    // span a bridge arch on its own.
+
+    // Per-object interior lighting: cache of quantized-world-position -> interior light (rgb = WMO room
+    // ambient, a = 1 when the position is inside an indoor group; (0,0,0,0) = outdoor). Objects in the
+    // same room share a cell, and the value is spatial, so a coarse ~1yd grid key is exact enough. Cleared
+    // periodically (_interior_light_epoch) so WMOs that stream in late get picked up.
+    std::unordered_map<std::int64_t, glm::vec4> _interior_light_cache;
+    // Indoor-group AABBs, rebuilt only every _interior_light_epoch tick (the gather is EXPENSIVE); object
+    // interior tests are then cheap AABB checks against this list.
+    std::vector<InteriorVolume> _interior_volumes;
+    unsigned _interior_light_epoch = 0;
+    // Per-frame budget for cold-cache interior-light computes, so a WMO streaming in spreads its doodads'
+    // interior sampling over frames instead of one hitch. Reset each frame in updateLightingUniformBlock.
+    int _interior_miss_budget = 0;
+    // The client's unit shadow decal texture (Textures\ShadowBlob.blp), lazily acquired on first
+    // blob-shadow draw. 32x32 grayscale oval, drawn modulate (see blob_shadow_frag).
+    std::unique_ptr<scoped_blp_texture_reference> _shadow_blob_texture;
+    // Depth snapshot for screen-space projected decals (blob shadows): the scene depth (terrain +
+    // WMO + doodads, pre-creatures) blitted into a sampleable texture once per frame.
+    GLuint _decal_depth_fbo = 0;
+    GLuint _decal_depth_tex = 0;
+    int _decal_depth_w = -1;
+    int _decal_depth_h = -1;
+
+    // WORLD-ONLY depth: the same blit, but taken after terrain + WMOs and BEFORE the M2 pass, so it
+    // holds the walkable world without any doodad, creature or gameobject model in it.
+    //
+    // A ground decal needs both. The world depth says where the GROUND is at a pixel -- the surface
+    // the decal belongs on -- while the full scene depth says what is actually VISIBLE there. When
+    // something is visible in front of the ground, the model owns that pixel and the decal must not
+    // paint it. Reconstructing from the full scene depth alone cannot express that: on an NPC's
+    // boots the visible surface IS the NPC, which is why the ribbon and the selection rings were
+    // painting over the models no matter how the height tolerances were tuned.
+    GLuint _world_depth_fbo = 0;
+    GLuint _world_depth_tex = 0;
+    int _world_depth_w = -1;
+    int _world_depth_h = -1;
+    bool _world_depth_ready = false; // snapshot taken THIS frame (reset at draw start)
+    // Cache of faction-template id -> selection-circle hostility color (red/green/yellow), so the
+    // FactionTemplate.dbc isn't walked per spawn per frame.
+    std::unordered_map<std::uint32_t, glm::vec4> _faction_reaction_cache;
+    // Per-frame spawn guid -> cull-fade alpha, so the selection circle fades in lockstep with its
+    // creature (populated in the creature gather, read in the marker pass).
+    std::unordered_map<std::uint32_t, float> _creature_fade_by_guid;
+    bool _decal_depth_ready = false;      // snapshot taken THIS frame (reset at draw start)
+    glm::mat4x4 _decal_inv_vp{1.0f};      // inv(proj*view) captured with the snapshot
+    glm::vec2 _decal_inv_viewport{0.0f};  // 1/viewport
+    // Loaded-WMO-set fingerprint from last volume gather: a change (WMO streamed in/out) triggers an
+    // immediate re-gather + cache flush so freshly loaded rooms light their objects the SAME frame.
+    std::uint64_t _last_wmo_fingerprint = 0;
+    // Placement-keyed cache of the OWNING ModelInstance copies for per-instance-animated WMO doodads
+    // (billboarded glow cards / global-seq flicker). The by-value copy bumps the ModelManager +
+    // TextureManager refcounts through a shared mutex, so it is EXPENSIVE (~25ms/frame of GatherMerge in
+    // dense interiors like Ironforge). Copying once per placement and reusing across frames removes that
+    // per-frame cost. std::unordered_map is NODE-BASED, so element addresses are STABLE across insert /
+    // rehash -- per_instance_wmo_doodads holds bare pointers INTO this map and they stay valid for the
+    // whole frame (we only ever emplace, never erase, mid-frame). The owning copy keeps its Model alive
+    // (async-unload-safe -- the same safety the old by-value list bought). Cleared ONLY when the loaded-
+    // WMO fingerprint changes (load/unload/move/rotate/doodadset edit) -- never on the interior-light
+    // 60-frame epoch -- so it persists across pure camera panning. Render-thread only (no races).
+    std::unordered_map<std::uint64_t, ModelInstance> _pi_doodad_cache;
+    // World-space MFOG entries (rebuilt on the same epoch tick) for the per-frame ENTITY fog: the
+    // camera's fog context written into the lighting UBO Env slots (see types.hpp).
+    std::vector<WmoGroupFogVolume> _env_fog_volumes;
+    // [MC red fog 2026-08-08] sticky interior-group MFOG (held across group-AABB gaps while the camera
+    // stays inside a WMO -- prevents red<->zone fog snapping on bridges/doorways).
+    glm::vec3 _int_fog_color = glm::vec3(0.f);
+    float _int_fog_end = 0.f;
+    float _int_fog_start = 0.f;
+    bool _int_fog_valid = false;
 
     // buffers
     OpenGL::Scoped::deferred_upload_buffers<8> _buffers;
@@ -146,6 +455,8 @@ namespace Noggit::Rendering
     // uniform blocks
     OpenGL::MVPUniformBlock _mvp_ubo_data;
     OpenGL::LightingUniformBlock _lighting_ubo_data;
+    bool _point_lights_scoped = false; // true while the UBO carries a WMO group's MOLR set
+    bool _camera_inside_wmo = false;   // cached per frame; drives the WMO shader's camera_inside_wmo uniform
     OpenGL::TerrainParamsUniformBlock _terrain_params_ubo_data;
 
 
@@ -156,6 +467,21 @@ namespace Noggit::Rendering
     GLuint const& _occluder_vao = _vertex_arrays[2];
 
     LiquidTextureManager _liquid_texture_manager;
+
+    // Deferred WMO liquid. WMO groups are drawn in the WMO pass, which runs BEFORE the M2/creature
+    // passes -- so WMO water drawn inline there is behind everything that comes after it: creatures
+    // standing in it painted straight over the surface with no water tint at all. ADT water does not
+    // have this problem because its pass runs after the models. Queue the WMO liquid here during the
+    // WMO pass and flush it in the water phase instead, so it blends over the creatures like ADT
+    // water does. Cleared every frame.
+    struct DeferredWmoLiquid
+    {
+      std::vector<WMOGroup*> groups;
+      glm::mat4x4 transform;
+      bool interior_only;
+      bool draw_fog;
+    };
+    std::vector<DeferredWmoLiquid> _deferred_wmo_liquid;
 
     bool _need_terrain_params_ubo_update = false;
   };

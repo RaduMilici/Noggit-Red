@@ -76,7 +76,8 @@ enum class editing_mode
   stamp = 11,
   light = 12,
   scripting = 13,
-  chunk = 14
+  chunk = 14,
+  gameobject = 15
 };
 
 enum water_opacity

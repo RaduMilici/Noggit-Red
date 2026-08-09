@@ -50,11 +50,15 @@ public:
 
   void normalizeDirection();
 
+  // Return by const-ref: the model-collection loops call this for every doodad every frame; returning a
+  // 64-byte copy at thousands of call sites was pure churn. No caller mutates the result (verified).
   [[nodiscard]]
-  glm::mat4x4 transformMatrix() const { return _transform_mat; };
+  glm::mat4x4 const& transformMatrix() const { return _transform_mat; };
+
+  void setTransformMatrix(glm::mat4x4 const& matrix);
 
   [[nodiscard]]
-  glm::mat4x4 transformMatrixInverted() const { return _transform_mat_inverted; };
+  glm::mat4x4 const& transformMatrixInverted() const { return _transform_mat_inverted; };
 
   [[nodiscard]]
   SceneObjectTypes which() const { return _type; };
@@ -62,8 +66,11 @@ public:
   void refTile(MapTile* tile);
   void derefTile(MapTile* tile);
 
+  // Returns a snapshot copy: _tiles is mutated from the tile-update-queue thread (refTile) and the
+  // main thread (derefTile on tile unload) while readers run on the render thread, so handing out a
+  // reference would race. See SceneObject.cpp for the shared guard.
   [[nodiscard]]
-  std::vector<MapTile*> const& getTiles() const { return _tiles; };
+  std::vector<MapTile*> getTiles() const;
 
   [[nodiscard]]
   virtual AsyncObject* instance_model() const = 0;
@@ -82,6 +89,13 @@ public:
   float scale = 1.f;
   unsigned int uid;
   int frame;
+
+  // Cull-range fade state (client-exact, RE'd from wow.exe 5875: fade-in list in FUN_00614a90,
+  // SWModelFadeout in FUN_00672ef0): the cull test drives a 2000 ms timer; fade-in alpha = t^3,
+  // fade-out alpha = smoothstep((1-t) * a0). Advanced by WorldRender's gather each frame.
+  std::uint8_t _cull_fade_phase = 0; // 0 hidden, 1 fading in, 2 shown, 3 fading out
+  float _cull_fade_ms_ref = 0.f;
+  float _cull_fade_out_a0 = 0.f;
 
 protected:
   SceneObjectTypes _type;

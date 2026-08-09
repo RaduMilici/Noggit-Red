@@ -5,6 +5,7 @@
 #include <noggit/project/CurrentProject.hpp>
 
 #include <filesystem>
+#include <cstdlib>
 #include <QString>
 #include <QFile>
 #include <QTimer>
@@ -46,6 +47,58 @@ NoggitProjectSelectionWindow::NoggitProjectSelectionWindow(Noggit::Application::
   //_ui->changelog_button->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
 
   Component::RecentProjectsComponent::buildRecentProjectsList(this);
+
+  auto launch_project_path = [this](std::filesystem::path const& input_path)
+  {
+    std::filesystem::path project_path = input_path;
+    if (project_path.extension() == ".noggitproj")
+    {
+      project_path = project_path.parent_path();
+    }
+
+    if (project_path.empty())
+    {
+      return false;
+    }
+
+    auto application_configuration = _noggit_application->getConfiguration();
+    auto application_project_service = Noggit::Project::ApplicationProject(application_configuration);
+    auto project_to_launch = application_project_service.loadProject(project_path);
+    if (!project_to_launch)
+    {
+      return false;
+    }
+
+    Component::RecentProjectsComponent::registerProjectChange(project_path.string());
+
+    QTimer::singleShot(0, this, [this, project_to_launch]
+    {
+      Noggit::Application::NoggitApplication::instance()->setClientData(project_to_launch->ClientData);
+
+      Noggit::Project::CurrentProject::initialize(project_to_launch.get());
+
+      _project_selection_page = std::make_unique<Noggit::Ui::Windows::NoggitWindow>(
+          _noggit_application->getConfiguration(),
+          project_to_launch);
+      _project_selection_page->showMaximized();
+
+      close();
+    });
+
+    return true;
+  };
+
+  if (char const* autoload_project = std::getenv("NOGGIT_AUTOLOAD_PROJECT"))
+  {
+    std::filesystem::path autoload_path(autoload_project);
+    if (std::filesystem::exists(autoload_path))
+    {
+      if (launch_project_path(autoload_path))
+      {
+        return;
+      }
+    }
+  }
 
   QObject::connect(_ui->settings_button, &QToolButton::clicked, [&]
       {
@@ -100,32 +153,10 @@ NoggitProjectSelectionWindow::NoggitProjectSelectionWindow(Noggit::Application::
                        return;
                      }
 
-                     Component::RecentProjectsComponent::registerProjectChange(filepath.parent_path().string());
-
-                     auto application_configuration = _noggit_application->getConfiguration();
-                     auto application_projects_folder_path = std::filesystem::path(application_configuration->ApplicationProjectPath);
-                     auto application_project_service = Noggit::Project::ApplicationProject(application_configuration);
-
-                     auto project_to_launch = application_project_service.loadProject(filepath.parent_path());
-
-                     if (!project_to_launch)
+                     if (!launch_project_path(filepath))
                      {
                        return;
                      }
-
-                     QTimer::singleShot(0, this, [this, project_to_launch]
-                     {
-                       Noggit::Application::NoggitApplication::instance()->setClientData(project_to_launch->ClientData);
-
-                       Noggit::Project::CurrentProject::initialize(project_to_launch.get());
-
-                       _project_selection_page = std::make_unique<Noggit::Ui::Windows::NoggitWindow>(
-                           _noggit_application->getConfiguration(),
-                           project_to_launch);
-                       _project_selection_page->showMaximized();
-
-                       close();
-                     });
                    }
   );
 

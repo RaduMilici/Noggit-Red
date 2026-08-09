@@ -9,6 +9,7 @@
 #include <cstring>
 #include <algorithm>
 #include <memory>
+#include <unordered_map>
 #include <blizzard-archive-library/include/ClientData.hpp>
 
 class DBCFile
@@ -197,8 +198,36 @@ public:
 
   inline size_t getRecordCount()  { return recordCount; }
   inline size_t getFieldCount()  { return fieldCount; }
+  // getByID/CheckIfIdExists/getRecordRowId were O(recordCount) LINEAR SCANS. That is catastrophic for a
+  // hot caller against a large DBC: MapChunk::detailDoodads() does gGroundEffectTextureDB.getByID() per
+  // subcell (64/chunk) + per scattered doodad, and an Ascension client ships a 38k-record
+  // GroundEffectTexture.dbc (~14x a stock WotLK one) -> ~1e9 comparisons per tile -> the map view HANGS
+  // on every map. Build an id->row hash index once (lazy) and look up in O(1). The index is only valid for
+  // the primary key (field 0); a non-0 field still scans (rare). Invalidated on record add/remove (see
+  // DBCFile.cpp) so the DBC editor stays correct. First-occurrence-wins matches the old scan semantics.
+  void build_id_index()
+  {
+    _id_index.clear();
+    _id_index.reserve(recordCount);
+    for (std::uint32_t r = 0; r < recordCount; ++r)
+    {
+      unsigned int const rid = *reinterpret_cast<unsigned int const*>(data.data() + static_cast<size_t>(r) * recordSize);
+      _id_index.emplace(rid, r);
+    }
+    _id_index_built = true;
+  }
+  void invalidate_id_index() { _id_index_built = false; }
+
   inline Record getByID(unsigned int id, size_t field = 0)
   {
+    if (field == 0)
+    {
+      if (!_id_index_built) { build_id_index(); }
+      auto const it = _id_index.find(id);
+      if (it != _id_index.end())
+        return Record(*this, data.data() + static_cast<size_t>(it->second) * recordSize);
+      throw NotFound();
+    }
     for (Iterator i = begin(); i != end(); ++i)
     {
       if (i->getUInt(field) == id)
@@ -208,6 +237,11 @@ public:
   }
   inline bool CheckIfIdExists(unsigned int id, size_t field = 0)
   {
+      if (field == 0)
+      {
+        if (!_id_index_built) { build_id_index(); }
+        return _id_index.find(id) != _id_index.end();
+      }
       for (Iterator i = begin(); i != end(); ++i)
       {
           if (i->getUInt(field) == id)
@@ -217,6 +251,14 @@ public:
   }
   inline int getRecordRowId(unsigned int id, size_t field = 0)
   {
+      if (field == 0)
+      {
+        if (!_id_index_built) { build_id_index(); }
+        auto const it = _id_index.find(id);
+        if (it != _id_index.end())
+          return static_cast<int>(it->second);
+        throw NotFound();
+      }
       int row_id = 0;
       for (Iterator i = begin(); i != end(); ++i)
       {
@@ -241,4 +283,8 @@ private:
   std::uint32_t stringSize;
   std::vector<unsigned char> data;
   std::vector<char> stringTable;
+
+  // Lazy id (field 0) -> row index for O(1) getByID. Rebuilt on demand; invalidated on record add/remove.
+  std::unordered_map<unsigned int, std::uint32_t> _id_index;
+  bool _id_index_built = false;
 };

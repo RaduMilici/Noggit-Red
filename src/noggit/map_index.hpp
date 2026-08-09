@@ -196,7 +196,7 @@ public:
   void enterTile(const TileIndex& tile);
   MapTile *loadTile(const TileIndex& tile, bool reloading = false, bool load_models = true, bool load_textures = true);
 
-  void update_model_tile(const TileIndex& tile, model_update type, SceneObject* instance);
+  void update_model_tile(const TileIndex& tile, model_update type, SceneObject* instance, bool mark_changed = true);
 
   void setChanged(const TileIndex& tile);
   void setChanged(MapTile* tile);

@@ -45,9 +45,17 @@
 
 class World;
 class QCheckBox;
+class QComboBox;
 class QLineEdit;
+class QGroupBox;
 class QListWidget;
+class QVBoxLayout;
+class QMenu;
+class QToolButton;
+class QToolBar;
 class QListWidgetItem;
+class QPushButton;
+class QTreeWidget;
 
 namespace Noggit::Ui::Windows
 {
@@ -60,6 +68,13 @@ namespace Noggit
   namespace Ui::Tools::ViewToolbar::Ui
   {
     class ViewToolbar;
+  }
+
+  namespace Ui
+  {
+    class TimeGlobeWidget;
+    class ZoneMusicPlayer;
+    class CreatureInfoPanel;
   }
 
   namespace Ui::Tools
@@ -153,13 +168,22 @@ public:
   Noggit::BoolToggleProperty _draw_terrain = {true};
   Noggit::BoolToggleProperty _draw_wmo = {true};
   Noggit::BoolToggleProperty _draw_water = {true};
+  Noggit::BoolToggleProperty _draw_clouds = {true};
+  Noggit::BoolToggleProperty _draw_sun = {true};
+  Noggit::BoolToggleProperty _draw_moon = {true};
+  Noggit::BoolToggleProperty _draw_bloom = {true};
+  Noggit::BoolToggleProperty _draw_ground_clutter = {true};
+  // Opt-in coarse WDL-horizon occlusion (perf). Default off; WorldRender reads the QSetting each
+  // frame, so the toggle persists on change.
+  Noggit::BoolToggleProperty _wdl_horizon_occlusion = {false};
   Noggit::BoolToggleProperty _draw_wmo_doodads = {true};
   Noggit::BoolToggleProperty _draw_wmo_exterior = { true };
   Noggit::BoolToggleProperty _draw_models = {true};
   Noggit::BoolToggleProperty _draw_model_animations = {true};
   Noggit::BoolToggleProperty _draw_hole_lines = {false};
   Noggit::BoolToggleProperty _draw_models_with_box = {false};
-  Noggit::BoolToggleProperty _draw_fog = {false};
+  Noggit::BoolToggleProperty _draw_fog = {true}; // parity default: in-game always has atmospheric fog (DBC-driven). Toggle off (F12 / Graphics tab) for far editing.
+  Noggit::Ui::ZoneMusicPlayer* _zone_music_player = nullptr;
   Noggit::BoolToggleProperty _draw_hidden_models = {false};
   Noggit::BoolToggleProperty _draw_occlusion_boxes = {false};
   Noggit::BoolToggleProperty _game_mode_camera = { false };
@@ -173,7 +197,13 @@ private:
 
   [[nodiscard]]
   math::ray intersect_ray() const;
-  selection_result intersect_result(bool terrain_only);
+  // force_objects overrides the "objects are only pickable in object/minimap mode" rule. Needed by the
+  // creature/gameobject drag, which must land on top of a WMO roof or a doodad instead of falling
+  // through to the terrain underneath it.
+  selection_result intersect_result(bool terrain_only, bool force_objects = false);
+  // Nearest solid surface under the mouse -- terrain, WMO or M2, whichever the ray hits first.
+  // std::nullopt when the ray hits nothing (e.g. pointing at the sky).
+  std::optional<glm::vec3> surface_pos_under_cursor();
   void doSelection(bool selectTerrainOnly, bool mouseMove = false);
   void update_cursor_pos();
 
@@ -245,6 +275,8 @@ private:
   Noggit::Ui::Tools::ViewToolbar::Ui::ViewToolbar* _view_toolbar;
   Noggit::Ui::Tools::ViewToolbar::Ui::ViewToolbar* _secondary_toolbar;
   Noggit::Ui::Tools::ViewToolbar::Ui::ViewToolbar* _left_sec_toolbar;
+  Noggit::Ui::TimeGlobeWidget* _time_globe = nullptr; // WC3 time-of-day globe, floated top-centre
+  QWidget* _globe_balance_spacer = nullptr; // far-right spacer tracking leftSecondaryToolbarHolder width to keep the globe centred
 
   void save(save_mode mode);
 
@@ -272,6 +304,7 @@ public:
           , std::unique_ptr<World>
           , uid_fix_mode uid_fix = uid_fix_mode::none
           , bool from_bookmark = false
+          , bool capture_probe = false
           );
   ~MapView();
 
@@ -282,6 +315,8 @@ public:
   void initMinimapSave() { saving_minimap = true; };
   auto setBrushTexture(QImage const* img) -> void;
   Noggit::Camera* getCamera() { return &_camera; };
+  void setCameraForCapture(glm::vec3 const& position, math::degrees yaw, math::degrees pitch);
+  QImage grabRenderedFrameForCapture();
   void randomizeTerrainRotation();
   void randomizeTexturingRotation();
   void randomizeShaderRotation();
@@ -289,6 +324,7 @@ public:
   void onSettingsSave();
   void updateRotationEditor() { _rotation_editor_need_update = true; };
   void setCameraDirty() { _camera_moved_since_last_draw = true; };
+  void requestRedraw() { _needs_redraw = true; };
 
   [[nodiscard]]
   Noggit::Ui::minimap_widget* getMinimapWidget() const { return _minimap;  }
@@ -302,6 +338,10 @@ public:
   [[nodiscard]]
   QWidget *getLeftSecondaryToolbar();
 
+  // Show/hide the "Quick Facts" creature-info window (creature secondary toolbar checkbox). The
+  // window is a free-floating tool window the user can move around.
+  void setCreatureInfoPanelVisible(bool visible);
+
   [[nodiscard]]
   QWidget* getActiveStampModeItem();
 
@@ -313,6 +353,10 @@ public:
 
   [[nodiscard]]
   World* getWorld() { return _world.get(); };
+
+  // Calendar dropdown button (checkable game-events that toggle which seasonal event's spawns render).
+  // Public so the time-globe popup can host it under its time slider.
+  QToolButton* makeSeasonalEventsToolButton(QWidget* parent);
 
   [[nodiscard]]
   QDockWidget* getAssetBrowser() {return _asset_browser_dock; };
@@ -410,6 +454,7 @@ private:
   Noggit::BoolToggleProperty _show_texture_palette_window = {false};
   Noggit::BoolToggleProperty _show_texture_palette_small_window = {false};
   Noggit::BoolToggleProperty _show_creature_browser = {false};
+  Noggit::BoolToggleProperty _show_gameobject_browser = {false};
   Noggit::BoolToggleProperty _showStampPalette{false};
 
   Noggit::Ui::minimap_widget* _minimap;
@@ -418,6 +463,9 @@ private:
   QDockWidget* _object_palette_dock;
 
   void move_camera_with_auto_height (glm::vec3 const&);
+  // Frame a spawn: place the camera back-and-up at ~45 degrees and aim it AT the target (used when
+  // picking a creature/gameobject from the browser list), instead of dropping straight overhead.
+  void focus_camera_on_target (glm::vec3 const&);
 
   void setToolPropertyWidgetVisibility(editing_mode mode);
 
@@ -449,27 +497,103 @@ private:
 
   QDockWidget* _asset_browser_dock;
   QDockWidget* _node_editor_dock;
+  QWidget* _creature_actions_overlay = nullptr;
+  QDockWidget* _creature_editor_dock = nullptr;
+  QWidget* _creature_editor_panel = nullptr;
+  QWidget* _creature_pending_popup = nullptr;
+  QListWidget* _creature_pending_list = nullptr;
   QDockWidget* _creature_browser_dock;
+  QDockWidget* _creature_model_picker_dock = nullptr;
   QDockWidget* _texture_browser_dock;
   QDockWidget* _texture_picker_dock;
   QDockWidget* _detail_infos_dock;
 
   QLineEdit* _creature_search_field = nullptr;
-  QCheckBox* _creature_search_all_maps = nullptr;
+  QCheckBox* _creature_zone_filter = nullptr;
+  QCheckBox* _gameobject_zone_filter = nullptr;
   QListWidget* _creature_list_widget = nullptr;
   QLabel* _creature_browser_status = nullptr;
+  // Type/rank filter for the current-map creature browser (same controls as the model picker). Looked
+  // up per spawn by entry from _creature_template_filter_info (filled when the model picker loads
+  // creature_template).
+  QComboBox* _creature_browser_type_filter = nullptr;
+  QCheckBox* _creature_browser_elite = nullptr;
+  QCheckBox* _creature_browser_boss = nullptr;
+  QCheckBox* _creature_browser_civilian = nullptr;
+  QCheckBox* _creature_browser_trainer = nullptr;
+  struct CreatureFilterInfo
+  {
+    std::uint32_t creature_type = 0;
+    std::uint32_t rank = 0;
+    std::uint32_t type_flags = 0;
+    std::uint32_t flags_extra = 0;
+    std::uint32_t npc_flags = 0;
+  };
+  std::unordered_map<std::uint32_t, CreatureFilterInfo> _creature_template_filter_info;
+  // guid -> resolved zone id cache for the "Zone only" browser filter (only valid ids cached, so
+  // spawns in not-yet-loaded tiles get retried). Cleared on spawn reload.
+  std::unordered_map<std::uint32_t, unsigned int> _creature_zone_cache;
+  std::unordered_map<std::uint32_t, unsigned int> _gameobject_zone_cache;
+  QTreeWidget* _creature_model_tree = nullptr;
+  QLabel* _creature_model_picker_status = nullptr;
 
   QLabel* _creature_editor_info = nullptr;
+  // "Quick Facts" dropdown (creature_template stats + spell/aura icons) toggled from the creature
+  // secondary toolbar; refreshed on spawn selection change.
+  Noggit::Ui::CreatureInfoPanel* _creature_info_panel = nullptr;
   QDoubleSpinBox* _spawn_edit_x = nullptr;
   QDoubleSpinBox* _spawn_edit_y = nullptr;
   QDoubleSpinBox* _spawn_edit_z = nullptr;
   QDoubleSpinBox* _spawn_edit_orientation = nullptr;
+
+  // "Edit/New Creature" form fields -- populated from the selected spawn so its guid/entry/display show.
+  QGroupBox* _creature_spawn_box = nullptr;
+  QLineEdit* _creature_spawn_guid_field = nullptr;
+  QLineEdit* _creature_spawn_entry_field = nullptr;
+  QLineEdit* _creature_spawn_display_field = nullptr;
+  QGroupBox* _gameobject_spawn_box = nullptr;
+  QLineEdit* _gameobject_spawn_guid_field = nullptr;
+  QLineEdit* _gameobject_spawn_entry_field = nullptr;
+  QLineEdit* _gameobject_spawn_display_field = nullptr;
 
   std::optional<std::uint32_t> _selected_creature_spawn_guid;
   std::optional<std::uint32_t> _hovered_creature_spawn_guid;
   bool _dragging_creature_spawn = false;
   std::optional<glm::vec3> _creature_drag_anchor_pos;
   std::vector<std::pair<std::uint32_t, glm::vec3>> _creature_drag_initial_positions;
+
+  // GameObject tool docks/widgets (mirror the creature ones above; gameobjects have no model picker,
+  // so the coordinate editor panel lives inside the browser dock).
+  QWidget* _gameobject_actions_overlay = nullptr;
+  QWidget* _gameobject_editor_panel = nullptr;
+  QWidget* _gameobject_pending_popup = nullptr;
+  QListWidget* _gameobject_pending_list = nullptr;
+  QDockWidget* _gameobject_browser_dock = nullptr;
+  QDockWidget* _gameobject_model_picker_dock = nullptr;
+  QTreeWidget* _gameobject_model_tree = nullptr;
+  QLabel* _gameobject_model_picker_status = nullptr;
+
+  // Seasonal Events calendar dropdown lives in the toolbar strip right of the time globe (see makeSeasonalEventsToolButton).
+
+  QLineEdit* _gameobject_search_field = nullptr;
+  QListWidget* _gameobject_list_widget = nullptr;
+  QLabel* _gameobject_browser_status = nullptr;
+  // Type filter for the current-map gameobject browser (gameobjects only have a type, no rank/elite).
+  // Looked up per spawn entry from _gameobject_template_filter_type (filled by the model picker).
+  QComboBox* _gameobject_browser_type_filter = nullptr;
+  std::unordered_map<std::uint32_t, std::uint32_t> _gameobject_template_filter_type;
+
+  QLabel* _gameobject_editor_info = nullptr;
+  QDoubleSpinBox* _go_spawn_edit_x = nullptr;
+  QDoubleSpinBox* _go_spawn_edit_y = nullptr;
+  QDoubleSpinBox* _go_spawn_edit_z = nullptr;
+  QDoubleSpinBox* _go_spawn_edit_orientation = nullptr;
+
+  std::optional<std::uint32_t> _selected_gameobject_spawn_guid;
+  std::optional<std::uint32_t> _hovered_gameobject_spawn_guid;
+  bool _dragging_gameobject_spawn = false;
+  std::optional<glm::vec3> _gameobject_drag_anchor_pos;
+  std::vector<std::pair<std::uint32_t, glm::vec3>> _gameobject_drag_initial_positions;
 
   Noggit::Ui::Tools::ToolPanel* _tool_panel_dock;
 
@@ -484,11 +608,13 @@ private:
   bool _gl_initialized = false;
   bool _destroying = false;
   bool _needs_redraw = false;
+  bool _capture_probe = false;
 
   bool _mod_z_down = false;
   bool _mod_x_down = false;
 
   bool event(QEvent* e) override;
+  bool eventFilter(QObject* obj, QEvent* e) override;
 
   unsigned _mmap_async_index = 0;
   unsigned _mmap_render_index = 0;
@@ -514,6 +640,13 @@ private:
   void setupObjectEditorUi();
   void setupCreatureEditorUi();
   void setupCreatureBrowserUi();
+  void setupCreatureActionsUi();
+  void setupCreatureModelPickerUi();
+  void setupGameObjectEditorUi();
+  void setupGameObjectBrowserUi();
+  void setupGameObjectModelPickerUi();
+  void setupGameObjectActionsUi();
+  void populateSeasonalEventsMenu(QMenu* menu);
   void setupMinimapEditorUi();
   void setupStampUi();
   void setupLightEditorUi();
@@ -535,6 +668,12 @@ private:
   void refreshCreatureSpawnOverlay(bool force_reload = false);
   void updateDatabaseStatus();
   void rebuildCreatureBrowserList(bool preserve_selection = true);
+  // Move the highlighted row without rebuilding the list -- a selection change touches no content.
+  void highlightCreatureBrowserSelection();
+  // Label for one creature row, shared by the full rebuild and the targeted refresh.
+  static QString creature_spawn_item_text(World::CreatureSpawnOverlay const& spawn);
+  // Retext only the listed spawns' rows (cheap) instead of repopulating the whole list.
+  void refreshCreatureBrowserItems(std::vector<std::uint32_t> const& guids);
   void updateCreatureBrowserStatus(QString const& override_text = QString());
   std::size_t selectedCreatureSpawnCount() const;
   void setSelectedCreatureSpawn(std::optional<std::uint32_t> guid, bool update_browser = true);
@@ -542,14 +681,47 @@ private:
   void selectCreatureSpawnsInArea(QRect const& rect, bool add_to_selection = true);
   void refreshCreatureEditorKnobs();
   void setHoveredCreatureSpawn(std::optional<std::uint32_t> guid);
-  std::optional<std::uint32_t> findCreatureSpawnAtCursor() const;
+  std::optional<std::uint32_t> findCreatureSpawnAtCursor(); // mesh-first pick (non-const: intersect)
   void updateCreatureSpawnHover(QPoint const& global_pos);
   bool tryStartCreatureSpawnDrag();
   void translateSelectedCreatureSpawns(glm::vec3 const& delta);
+  // Wheel-rotate every spawn currently being dragged, about its own centre (degrees).
+  void rotateDraggedSpawns(float degrees);
   void updateSelectedCreatureSpawnPosition(glm::vec3 const& pos);
   void showSelectedCreatureSpawnMenu(QPoint const& global_pos);
+  void discardPendingCreatureSpawns();
   void saveDirtyCreatureSpawns();
   void jumpToCreatureListItem(QListWidgetItem* item);
+  // Delete (Del) the selected creature spawn(s): marks them pending_delete (DELETE on SQL export,
+  // hidden from view/browser) and records them so Ctrl+Z restores the most recent batch.
+  void deleteSelectedCreatureSpawns();
+  bool undoLastCreatureDelete();
+  std::vector<std::vector<std::uint32_t>> _creature_delete_undo;
+
+  // GameObject tool methods (mirror the creature ones; no model picker / new-spawn creation).
+  void rebuildGameObjectBrowserList(bool preserve_selection = true);
+  void highlightGameObjectBrowserSelection();
+  // Retext only the listed gameobject spawns' rows instead of repopulating the whole list.
+  void refreshGameObjectBrowserItems(std::vector<std::uint32_t> const& guids);
+  void updateGameObjectBrowserStatus(QString const& override_text = QString());
+  std::size_t selectedGameObjectSpawnCount() const;
+  void setSelectedGameObjectSpawn(std::optional<std::uint32_t> guid, bool update_browser = true);
+  void addGameObjectSpawnToSelection(std::uint32_t guid, bool update_browser = true);
+  void selectGameObjectSpawnsInArea(QRect const& rect, bool add_to_selection = true);
+  void refreshGameObjectEditorKnobs();
+  void setHoveredGameObjectSpawn(std::optional<std::uint32_t> guid);
+  std::optional<std::uint32_t> findGameObjectSpawnAtCursor(); // mesh-first pick (non-const: intersect)
+  void updateGameObjectSpawnHover(QPoint const& global_pos);
+  bool tryStartGameObjectSpawnDrag();
+  void translateSelectedGameObjectSpawns(glm::vec3 const& delta);
+  void updateSelectedGameObjectSpawnPosition(glm::vec3 const& pos);
+  void showSelectedGameObjectSpawnMenu(QPoint const& global_pos);
+  void discardPendingGameObjectSpawns();
+  void saveDirtyGameObjectSpawns();
+  void jumpToGameObjectListItem(QListWidgetItem* item);
+  void deleteSelectedGameObjectSpawns();
+  bool undoLastGameObjectDelete();
+  std::vector<std::vector<std::uint32_t>> _gameobject_delete_undo;
 
   QWidget* _overlay_widget;
 };

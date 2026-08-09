@@ -9,6 +9,7 @@
 #include <opengl/scoped.hpp>
 #include <opengl/shader.hpp>
 #include <math/frustum.hpp>
+#include <tuple>
 
 class Model;
 class ModelInstance;
@@ -61,6 +62,37 @@ namespace Noggit::Rendering
     none
   };
 
+  // [perf 2026-08-05] MDI batching group-key + per-instance texture layers for ONE static doodad render pass.
+  // Passes with an identical identity() can be collapsed into a single glMultiDrawElementsIndirect call. The
+  // texture-array LAYER (layer0/layer1) is deliberately NOT part of the identity -- it rides the per-instance
+  // inst_tex stream, so passes sampling different layers of the SAME array object still batch together.
+  struct StaticBatchKey
+  {
+    GLuint tex_array0 = 0;   // GL_TEXTURE_2D_ARRAY object on unit 1 (0 => pass not resolved)
+    GLuint tex_array1 = 0;   // unit 2 (0 => single-texture pass)
+    int    tu_lookup0 = 0;
+    int    tu_lookup1 = 0;
+    int    pixel_shader = 0;
+    int    tex_clamp0 = 0;
+    int    tex_clamp1 = 0;
+    uint16_t blend_mode = 0;
+    bool   backface_cull = true;
+    // [pib-MDI 2026-08-07] carried for the billboard-doodad batch only (glow cards are commonly unlit and/or
+    // unfogged; the tile-doodad batch always resolves these to false, so its grouping is unchanged).
+    bool   unfogged = false;
+    bool   unlit = false;
+    // per-instance (NOT identity)
+    int    layer0 = 0;
+    int    layer1 = 0;
+
+    auto identity() const
+    {
+      return std::tie(tex_array0, tex_array1, tu_lookup0, tu_lookup1, pixel_shader,
+                      tex_clamp0, tex_clamp1, blend_mode, backface_cull, unfogged, unlit);
+    }
+    bool operator<(StaticBatchKey const& o) const { return identity() < o.identity(); }
+  };
+
 
   struct ModelRenderPass : ModelTexUnit
   {
@@ -68,18 +100,41 @@ namespace Noggit::Rendering
     ModelRenderPass(ModelTexUnit const& tex_unit, Model* m);
 
     float ordering_thingy = 0.f;
+    // Model-space submesh sort-centre (classic: geoset.center; wotlk: SkinSection CenterPosition -- both
+    // land in BoundingBox[0], the point the client keys its transparency distance-sort on). Consumed by the
+    // per-frame per-instance back-to-front transparency sort in ModelRender::draw (single-instance overload).
+    glm::vec3 sort_center = glm::vec3(0.f);
     uint16_t index_start = 0, index_count = 0, vertex_start = 0, vertex_end = 0;
+    uint16_t geoset_id = 0;
     uint16_t blend_mode = 0;
     texture_unit_lookup tu_lookups[2];
     uint16_t textures[2];
     uint16_t uv_animations[2];
     std::optional<ModelPixelShader> pixel_shader;
 
+    // Fishing-pool water-effect geoset (foam/bubble/sparkle) on a _water_surface_effect model: promote
+    // the authored-Opaque blend to alpha + drop depth-write so it reads translucent and sits flush on
+    // the water instead of z-fighting. Tri-state cache: -1 = not yet resolved, 0 = no, 1 = yes.
+    int _water_effect_translucent = -1;
 
-    bool prepareDraw(OpenGL::Scoped::use_program& m2_shader, Model *m, ModelInstance const* instance, OpenGL::M2RenderState& model_render_state);
+
+    // extra_alpha: distance-fade factor for instanced draws -- multiplies into the instance alpha so
+    // opaque passes promote to alpha-blend and fade out instead of popping at the render distance.
+    bool prepareDraw(OpenGL::Scoped::use_program& m2_shader, Model *m, ModelInstance const* instance, OpenGL::M2RenderState& model_render_state, float extra_alpha = 1.0f);
     void afterDraw();
     bool bindTexture(size_t index, Model* m, ModelInstance const* instance, OpenGL::M2RenderState& model_render_state, OpenGL::Scoped::use_program& m2_shader);
     void initUVTypes(Model* m);
+
+    // [perf 2026-08-05] MDI batching: fill `out` with this pass's group-key + per-instance texture layers,
+    // resolving only the model's BASE textures (no instance/special-texture path). Returns false when the pass
+    // is NOT batchable -> the caller must draw it the classic per-model way. Mirrors the batchable subset of
+    // prepareDraw/bindTexture: rejects special/replaceable textures, animated UV, animated bones, non-default
+    // colour/opacity/flags, non-Opaque/Alpha_Key blend, creature/character/lightray/water-effect models, and
+    // any texture not yet loaded+uploaded (deferred this frame). See StaticBatchKey.
+    // for_pib widens the gate for the billboard-doodad (per-instance-animation) batch: additive/alpha blends
+    // (2..4) and unfogged/unlit passes become batchable (carried per-group in the key). Default keeps the
+    // strict tile-doodad subset.
+    [[nodiscard]] bool resolveStaticBatch(Model* m, StaticBatchKey& out, bool for_pib = false) const;
 
     bool operator< (const ModelRenderPass &m) const
     {
@@ -104,6 +159,10 @@ namespace Noggit::Rendering
 
   public:
     ModelRender(Model* model);
+    // NOT override: BaseRender has no virtual destructor. ModelRender is only ever destroyed as a concrete
+    // value member of Model (never through a BaseRender*), so a non-virtual dtor is safe. Frees the raw
+    // _bone_matrices_buf_tex on model eviction (which never calls unload()) -- see ModelRender.cpp.
+    ~ModelRender();
 
     void upload() override;
     void unload() override;
@@ -118,6 +177,16 @@ namespace Noggit::Rendering
         , int animtime
         , display_mode display
         , bool no_cull = false
+        , bool bloom_mask_only = false // re-stamp only the emissive bloom mask (alpha channel); no colour
+        // Interior light for this object: rgb = the MOCV floor colour sampled under it, a = 1 when
+        // indoors; (0,0,0,0) = outdoor (default). The shader splits the colour into ambient/diffuse per
+        // the client's unit interior lighting (RE_notes/15) instead of the outdoor sun.
+        , glm::vec4 const& interior_light = glm::vec4(0.f)
+        // Cull-range fade alpha for this instance (client 2000 ms fade; 1.0 = fully shown).
+        , float dist_fade = 1.0f
+        // skip_animate: bones were pre-computed for this instance on a worker thread (creature parallel-
+        // animate pre-pass) and already restored into _model->bone_matrices -- upload them, don't recompute.
+        , bool skip_animate = false
     );
 
     void draw (glm::mat4x4 const& model_view
@@ -132,11 +201,71 @@ namespace Noggit::Rendering
         , std::unordered_map<Model*, std::size_t>& model_boxes_to_draw
         , display_mode display
         , bool no_cull = false
+        // Representative instance supplying the per-instance resolves the instanced draw can't do per-copy
+        // (replaceable creature skin texture, geoset selection). All instances in ONE call must share it --
+        // callers group creatures by (model, display) so each batch is a single skin. nullptr for doodads.
+        , ModelInstance const* representative = nullptr
+        // Per-instance interior light (parallel to `instances`): rgb = sampled MOCV floor colour,
+        // a = 1 indoors. Empty = all outdoor. The draw partitions instances by this value into sub-draws.
+        , std::vector<glm::vec4> const& instance_interior = {}
+        // Per-instance distance fade 0..1 (parallel to `instances`): alpha ramp over the last stretch
+        // before the render distance so doodads dissolve instead of popping. Empty = no fade (1.0).
+        , std::vector<float> const& instance_fades = {}
+        // Per-instance bone matrices (perf 2026-07-20): instances.size() * bone_matrix_count matrices,
+        // instance i's slice at [i*count, (i+1)*count). Each billboard doodad's own CPU-baked bones so
+        // they draw INSTANCED (one drawElementsInstanced per interior group) instead of one draw each.
+        // Non-empty => per-instance bone slices + skip the single shared animate(). Empty = unchanged.
+        , std::vector<glm::mat4x4> const& per_instance_bones = {}
     );
+
+    // [perf 2026-08-05] Draw a whole persistent doodad bucket from an EXTERNAL, tile-owned instance buffer
+    // (TileRender::DoodadInstanceBuffer) -- no per-frame gather, no transform upload, no per-instance cull.
+    // The caller frustum-culls at TILE granularity and the fragment shader distance-clips (slice_dist); this
+    // just binds the external transform + interior buffers to the shared VAO's instance attributes and draws
+    // every pass once at full alpha (fade=1). For static tile M2 doodads only (outdoor, no per-instance
+    // bones / no emitters). transform_vbo carries each instance's full world matrix; interior_vbo the
+    // per-instance room light (all-zero for tile doodads). representative=nullptr (doodads).
+    void drawPersistent(glm::mat4x4 const& model_view
+        , GLuint transform_vbo
+        , GLuint interior_vbo
+        , int instance_count
+        , OpenGL::Scoped::use_program& m2_shader
+        , OpenGL::M2RenderState& model_render_state
+        , int animtime
+        , float extra_alpha = 1.0f // <1 => distance fade: alpha-blend the whole bucket (still lit)
+    );
+
+    // True iff drawPersistent() would actually render this model. The persistent buffer build MUST gate on
+    // this exact predicate: a model put in the buffer but skipped by drawPersistent gets skipped in the
+    // dynamic gather too (it's "persistent") and then renders NOWHERE -> missing pieces of multi-model
+    // structures (the fragmented-building bug). Mirrors drawPersistent's early-returns + the emitter exclusion.
+    [[nodiscard]] bool eligibleForPersistentDraw() const;
 
     void drawParticles(glm::mat4x4 const& model_view
         , OpenGL::Scoped::use_program& particles_shader
         , std::size_t instance_count
+    );
+
+    // Draw particles/ribbons for a FILTERED set of instance transforms (uploads them to the
+    // instance buffer first). Used for the client-faithful particle draw range: the batched world
+    // pass culls doodad instances beyond the range instead of stamping every placement's identical
+    // cloud (IF Great Forge: stacked LavaSteam columns multiplied additively into a white core).
+    void drawParticlesFiltered(glm::mat4x4 const& model_view
+        , OpenGL::Scoped::use_program& particles_shader
+        , std::vector<glm::mat4x4> const& transforms
+    );
+
+    void drawRibbonsFiltered(OpenGL::Scoped::use_program& ribbons_shader
+        , std::vector<glm::mat4x4> const& transforms
+    );
+
+    // Draw this model's particles for ONE instance with the given world transform. Creature spawns
+    // render through a per-instance path (not the batched model_with_particles set), so their emitters
+    // are drawn here -- uploads the single transform to the instance buffer then reuses drawParticles.
+    void drawParticlesForInstance(glm::mat4x4 const& model_view
+        , OpenGL::Scoped::use_program& particles_shader
+        , glm::mat4x4 const& transform
+        , float model_alpha = 1.0f
     );
 
     void drawRibbons(OpenGL::Scoped::use_program& ribbons_shader
@@ -151,6 +280,7 @@ namespace Noggit::Rendering
     void updateBoneMatrices();
 
     void initRenderPasses(ModelView const* view, ModelTexUnit const* tex_unit, ModelGeoset const* model_geosets);
+    void hideEmitterPlaceholderCards();
 
   private:
 
@@ -163,7 +293,7 @@ namespace Noggit::Rendering
     Model* _model;
 
     // buffers
-    OpenGL::Scoped::deferred_upload_buffers<6> _buffers;
+    OpenGL::Scoped::deferred_upload_buffers<7> _buffers;
     OpenGL::Scoped::deferred_upload_vertex_arrays<2> _vertex_arrays;
 
     std::vector<uint16_t> const _box_indices = {5, 7, 3, 2, 0, 1, 3, 1, 5, 4, 0, 4, 6, 2, 6, 7};
@@ -174,11 +304,20 @@ namespace Noggit::Rendering
     GLuint const& _indices_buffer = _buffers[3];
     GLuint const& _box_indices_buffer = _buffers[4];
     GLuint const& _bone_matrices_buffer = _buffers[5];
+    // [perf 2026-08-05] per-instance INTERIOR light attribute (divisor 1), parallel to _transform_buffer.
+    // Moving interior off the per-draw uniform onto a vertex attribute lets instances with DIFFERENT room
+    // colours batch in ONE instanced draw -- previously each distinct interior value forced its own sub-draw
+    // group (WMO doodads in a city split ~6 ways -> groups/model=6.1, the dominant SubmitInst cost).
+    GLuint const& _interior_buffer = _buffers[6];
 
     GLuint const& _box_vao = _vertex_arrays[1];
     GLuint const& _box_vbo = _buffers[2];
 
-    GLuint _bone_matrices_buf_tex;
+    // 0 = not generated. This raw GLuint is the sentinel the guarded deletes in unload() and ~ModelRender
+    // key off, so it MUST start at 0: a model that loads but is never drawn never runs upload() (which
+    // otherwise zeroes it), and the destructor would then read an uninitialized name and delete garbage.
+    GLuint _bone_matrices_buf_tex = 0;
+    std::size_t _bone_matrices_buffer_size = 0;
     std::vector<glm::vec3> _vertex_box_points;
     std::vector<ModelRenderPass> _render_passes;
 

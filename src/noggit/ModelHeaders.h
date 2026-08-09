@@ -1,5 +1,6 @@
 // This file is part of Noggit3, licensed under GNU General Public License (version 3).
 #pragma once
+#include <cstddef>
 #include <cstdint>
 #include <glm/glm.hpp>
 
@@ -138,6 +139,22 @@ struct AnimationBlock {
   uint32_t ofsKeys;
 };
 
+struct ClassicAnimationRange {
+  uint32_t start;
+  uint32_t end;
+};
+
+struct ClassicAnimationBlock {
+  int16_t type; // interpolation type (0=none, 1=linear, 2=hermite, 3=Bezier)
+  int16_t seq; // global sequence id or -1
+  uint32_t nRanges;
+  uint32_t ofsRanges;
+  uint32_t nTimes;
+  uint32_t ofsTimes;
+  uint32_t nKeys;
+  uint32_t ofsKeys;
+};
+
 struct FakeAnimationBlock {
   uint32_t nTimes;
   uint32_t ofsTimes;
@@ -157,6 +174,10 @@ struct AnimSubStructure {
 
 struct ModelTexAnimDef {
   AnimationBlock trans, rot, scale;
+};
+
+struct ClassicModelTexAnimDef {
+  ClassicAnimationBlock trans, rot, scale;
 };
 
 struct ModelVertex {
@@ -232,9 +253,20 @@ struct ModelColorDef {
   AnimationBlock opacity;
 };
 
+// Classic (1.12) color defs: same two tracks in the older 28-byte ClassicAnimationBlock form
+// (mirrors ClassicModelTransDef below).
+struct ClassicModelColorDef {
+  ClassicAnimationBlock color;
+  ClassicAnimationBlock opacity;
+};
+
 // block H - transp defs
 struct ModelTransDef {
   AnimationBlock trans;
+};
+
+struct ClassicModelTransDef {
+  ClassicAnimationBlock trans;
 };
 
 struct ModelTextureDef {
@@ -256,6 +288,22 @@ struct ModelLightDef {
   AnimationBlock Enabled;
 };
 
+// Classic (1.12, M2 version 256) light definition: same leading fields, but the animated tracks use
+// the older ClassicAnimationBlock layout (28 bytes, with the extra nRanges/ofsRanges) instead of the
+// WotLK AnimationBlock (20 bytes). Total size = 2 + 2 + 12 + 7*28 = 212 bytes.
+struct ClassicModelLightDef {
+  int16_t type;
+  int16_t bone;
+  glm::vec3 pos;
+  ClassicAnimationBlock ambColor;
+  ClassicAnimationBlock ambIntensity;
+  ClassicAnimationBlock color;
+  ClassicAnimationBlock intensity;
+  ClassicAnimationBlock attStart;
+  ClassicAnimationBlock attEnd;
+  ClassicAnimationBlock Enabled;
+};
+
 struct ModelCameraDef {
   int32_t id;
   float fov, farclip, nearclip;
@@ -266,25 +314,44 @@ struct ModelCameraDef {
   AnimationBlock rot;
 };
 
+// M2ParticleOld "old params" tail (WotLK v264). This block is byte-identical in layout to
+// ClassicModelParticleParams below -- same fields in the same order -- the only difference is that the
+// WotLK version reaches its per-life ramps through M2PartTrack (FakeAnimationBlock: keyed times+values)
+// where classic stores 3 inline keys. It used to carry the legacy WoWModelViewer guess-names
+// (unk/scales/rotation/Rot1/Rot2/Trans/f2), which hid real authored fields: what was called "Intensity"
+// is the flipbook HEAD CELL track, and "scales" is actually {twinkleScaleMin, twinkleScaleMax,
+// burstMultiplier} -- neither is an intensity nor a size multiplier. Field identity confirmed against
+// 26030 emitters in the 3.3.5a client: twinkleScale is an ordered (min<=max) pair in every emitter,
+// emitterType==3 count equals the spline-point count exactly, and the head cell keys are in-range cell
+// indices for their rows*cols sheet. Offsets below are from the start of the emitter record.
 struct ModelParticleParams {
-  FakeAnimationBlock colors;   // (short, vec3f)  This one points to 3 floats defining red, green and blue.
-  FakeAnimationBlock opacity;      // (short, short)    Looks like opacity (short), Most likely they all have 3 timestamps for {start, middle, end}.
-  FakeAnimationBlock sizes;     // (short, vec2f)  It carries two floats per key. (x and y scale)
-  int32_t d[2];
-  FakeAnimationBlock Intensity;   // Some kind of intensity values seen: 0,16,17,32(if set to different it will have high intensity) (short, short)
-  FakeAnimationBlock unk2;     // (short, short)
-  float unk[3];
-  float scales[3];
-  float slowdown;
-  float unknown1[2];
-  float rotation;        //Sprite Rotation
-  float unknown2[2];
-  float Rot1[3];          //Model Rotation 1
-  float Rot2[3];          //Model Rotation 2
-  float Trans[3];        //Model Translation
-  float f2[4];
-  int32_t nUnknownReference;
-  int32_t ofsUnknownReferenc;
+  FakeAnimationBlock colors;        // 0x104 M2PartTrack<fixed16 vec3>
+  FakeAnimationBlock opacity;       // 0x114 M2PartTrack<fixed16>
+  FakeAnimationBlock sizes;         // 0x124 M2PartTrack<C2Vector>
+  float scaleVary[2];               // 0x134 (was int32_t d[2])
+  FakeAnimationBlock headCellTrack; // 0x13c flipbook cell over life (was "Intensity")
+  FakeAnimationBlock tailCellTrack; // 0x14c (was unk2)
+  float tailLength;                 // 0x15c (was unk[0])
+  float twinkleSpeed;               // 0x160 (was unk[1])
+  float twinklePercent;             // 0x164 (was unk[2])
+  float twinkleScaleMin;            // 0x168 (was scales[0])
+  float twinkleScaleMax;            // 0x16c (was scales[1])
+  float burstMultiplier;            // 0x170 (was scales[2])
+  float drag;                       // 0x174 (was slowdown)
+  float baseSpin;                   // 0x178 (was unknown1[0])
+  float baseSpinVary;               // 0x17c (was unknown1[1])
+  float spin;                       // 0x180 sprite spin, rad/s (was rotation)
+  float spinVary;                   // 0x184 (was unknown2[0])
+  glm::vec3 tumbleMin;              // 0x188 (straddled unknown2[1] + Rot1)
+  glm::vec3 tumbleMax;              // 0x194 (straddled Rot1 + Rot2)
+  glm::vec3 windVector;             // 0x1a0 (straddled Rot2 + Trans)
+  float windTime;                   // 0x1ac (was Trans[2])
+  float followSpeed1;               // 0x1b0 (was f2[0])
+  float followScale1;               // 0x1b4
+  float followSpeed2;               // 0x1b8
+  float followScale2;               // 0x1bc
+  uint32_t nSplinePoints;           // 0x1c0 (was nUnknownReference)
+  uint32_t ofsSplinePoints;         // 0x1c4
 };
 
 #define  MODELPARTICLE_DONOTTRAIL      0x10
@@ -323,6 +390,81 @@ struct ModelParticleEmitterDef {
   AnimationBlock en;
 };
 
+// M2ParticleOld is 476 bytes in v264 and the params block 196; the renaming above is a pure relabel of
+// the same bytes, so pin both down. If either fires, every field read below is reading the wrong offset.
+static_assert(sizeof(ModelParticleParams) == 196, "WotLK particle params must stay 196 bytes");
+static_assert(sizeof(ModelParticleEmitterDef) == 476, "WotLK particle emitter must stay 476 bytes");
+static_assert(offsetof(ModelParticleEmitterDef, p.headCellTrack) == 0x13c, "head cell track offset");
+static_assert(offsetof(ModelParticleEmitterDef, p.spin) == 0x180, "spin offset");
+
+struct ClassicParticleColor
+{
+  std::uint8_t red;
+  std::uint8_t green;
+  std::uint8_t blue;
+  std::uint8_t alpha;
+};
+
+struct ClassicModelParticleParams
+{
+  float midPoint;
+  ClassicParticleColor colorValues[3];
+  float scalesValues[3];
+  std::uint16_t lifespanUVAnim[3];
+  std::uint16_t decayUVAnim[3];
+  std::uint16_t tailUVAnim[2];
+  std::uint16_t tailDecayUVAnim[2];
+  float tailLength;
+  float twinkleSpeed;
+  float twinklePercent;
+  float twinkleScaleMin;
+  float twinkleScaleMax;
+  float burstMultiplier;
+  float drag;
+  float spin;
+  glm::vec3 tumbleMin;
+  glm::vec3 tumbleMax;
+  glm::vec3 windVector;
+  float windTime;
+  float followSpeed1;
+  float followScale1;
+  float followSpeed2;
+  float followScale2;
+  std::uint32_t nSplinePoints;
+  std::uint32_t ofsSplinePoints;
+};
+
+struct ClassicModelParticleEmitterDef {
+  int32_t id;
+  int32_t flags;
+  glm::vec3 pos;
+  int16_t bone;
+  int16_t texture;
+  int32_t nModelFileName;
+  int32_t ofsModelFileName;
+  int32_t nParticleFileName;
+  int32_t ofsParticleFileName;
+  uint16_t blend;
+  uint16_t EmitterType;
+  uint8_t ParticleType;
+  uint8_t HeadorTail;
+  int16_t TextureTileRotation;
+  int16_t cols;
+  int16_t rows;
+  ClassicAnimationBlock EmissionSpeed;
+  ClassicAnimationBlock SpeedVariation;
+  ClassicAnimationBlock VerticalRange;
+  ClassicAnimationBlock HorizontalRange;
+  ClassicAnimationBlock Gravity;
+  ClassicAnimationBlock Lifespan;
+  ClassicAnimationBlock EmissionRate;
+  ClassicAnimationBlock EmissionAreaLength;
+  ClassicAnimationBlock EmissionAreaWidth;
+  ClassicAnimationBlock Gravity2;
+  ClassicModelParticleParams p;
+  ClassicAnimationBlock en;
+};
+
 
 struct ModelRibbonEmitterDef {
   int32_t id;
@@ -343,6 +485,30 @@ struct ModelRibbonEmitterDef {
   int32_t unknown;
 };
 
+// Classic (1.12, M2 version 256) ribbon emitter. Same field order as the WotLK def, but the animated
+// tracks use the 28-byte ClassicAnimationBlock instead of the 20-byte WotLK AnimationBlock, and there
+// is NO trailing 'unknown' int32. Total = 36 (head) + 4*28 (color/opacity/above/below) + 12 (res,
+// length, angle) + 4 (s1,s2) + 2*28 (unk1,unk2) = 220 bytes (verified against phoenix/kaelthas/mounts).
+struct ClassicModelRibbonEmitterDef {
+  int32_t id;
+  int32_t bone;
+  glm::vec3 pos;
+  int32_t nTextures;
+  int32_t ofsTextures;
+  int32_t nMaterials;
+  int32_t ofsMaterials;
+  ClassicAnimationBlock color;
+  ClassicAnimationBlock opacity;
+  ClassicAnimationBlock above;
+  ClassicAnimationBlock below;
+  float res, length, Emissionangle;
+  int16_t s1, s2;
+  ClassicAnimationBlock unk1;
+  ClassicAnimationBlock unk2;
+};
+static_assert(sizeof(ClassicModelRibbonEmitterDef) == 220,
+              "Classic ribbon emitter def must be 220 bytes (verified stride); padding would misparse it");
+
 
 struct ModelEvents {
   char id[4];
@@ -356,10 +522,22 @@ struct ModelEvents {
 };
 
 struct ModelAttachmentDef {
-  int32_t id;
-  int32_t bone;
+  uint32_t id;
+  uint16_t bone;
+  uint16_t unknown1;
   glm::vec3 pos;
   AnimationBlock Enabled;
+};
+
+struct ClassicModelBoneDef {
+  int32_t KeyBoneID;
+  uint32_t flags;
+  int16_t parent; // parent bone index
+  uint16_t submesh_id;
+  ClassicAnimationBlock translation;
+  ClassicAnimationBlock rotation;
+  ClassicAnimationBlock scaling;
+  glm::vec3 pivot;
 };
 
 struct ModelBoneDef {

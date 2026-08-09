@@ -26,6 +26,7 @@ layout (std140) uniform matrices
 {
   mat4 model_view;
   mat4 projection;
+  vec4 camera_pos;
 };
 
 uniform mat4 transform;
@@ -61,7 +62,11 @@ void main()
   else
   {
     vec4 pos = transform * position;
-    vec4 view_space_pos = model_view * pos;
+    // Camera-relative (see terrain_vert.glsl): subtract camera before the rotation so world-scale
+    // coords never cancel in float -> no PS1 jitter of WMO geometry against the models/terrain.
+    mat4 view_rot = model_view;
+    view_rot[3].xyz = vec3(0.0);
+    vec4 view_space_pos = view_rot * vec4(pos.xyz - camera_pos.xyz, 1.0);
     gl_Position = projection * view_space_pos;
 
     f_position = pos.xyz;
@@ -78,11 +83,24 @@ void main()
     tex1 = batch_second_half.g;
     alpha_test_mode = batch_second_half.b;
 
-    // Env and EnvMetal
+    // Env and EnvMetal: the second coordinate is a generated SPHERE-MAP lookup, not a mesh UV.
+    //
+    // Two bugs fixed here:
+    //  1. FRAME MISMATCH -- the incident vector is CAMERA space (view_space_pos) but f_normal is WORLD
+    //     space (mat3(transform) * normal), so reflect() combined two different frames. Same class of bug
+    //     as the terrain specular half-vector (see terrain_frag.glsl). Rotate the normal into view space
+    //     first, using the same translation-stripped view matrix used for the position.
+    //  2. NO REMAP -- a reflection vector's xy spans [-1,1], but a texture lookup needs [0,1]. The raw
+    //     value sampled far outside the map and relied on GL_REPEAT wrapping, mirroring the env map
+    //     across the surface. Remap with 0.5 + 0.5*r.
     if(shader == 3 || shader == 5)
     {
       f_texcoord = texcoord;
-      f_texcoord_2 = reflect(normalize(view_space_pos.xyz), f_normal).xy;
+
+      vec3 normal_view = normalize(mat3(view_rot) * f_normal);
+      vec3 incident_view = normalize(view_space_pos.xyz);
+      vec3 reflected = reflect(incident_view, normal_view);
+      f_texcoord_2 = 0.5 + 0.5 * reflected.xy;
     }
     else
     {

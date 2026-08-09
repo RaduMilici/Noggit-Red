@@ -46,6 +46,8 @@ namespace Noggit::Application {
         }
 
         BlizzardArchive::ClientData* clientData() { return _client_data.get(); }
+        // For APIs that take ownership-sharing handles, e.g. DBCFile::open (used to open Spell.dbc lazily).
+        std::shared_ptr<BlizzardArchive::ClientData> clientDataShared() { return _client_data; }
         void setClientData(std::shared_ptr<BlizzardArchive::ClientData> data) { _client_data = data; }
 
         void initalize(int argc, char* argv[], std::vector<bool> Parser);

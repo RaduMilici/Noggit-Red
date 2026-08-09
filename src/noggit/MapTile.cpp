@@ -13,6 +13,7 @@
 #include <noggit/texture_set.hpp>
 #include <noggit/ui/TexturingGUI.h>
 #include <noggit/application/NoggitApplication.hpp>
+#include <noggit/project/CurrentProject.hpp>
 #include <ClientFile.hpp>
 #include <opengl/scoped.hpp>
 #include <opengl/shader.hpp>
@@ -22,7 +23,11 @@
 #include <noggit/World.inl>
 #include <QtCore/QSettings>
 
+#include <algorithm>
 #include <cassert>
+#include <cctype>
+#include <cstdio>
+#include <cstring>
 #include <list>
 #include <map>
 #include <optional>
@@ -33,9 +38,77 @@
 
 namespace
 {
+  std::uint32_t reverse_fourcc(std::uint32_t fourcc)
+  {
+    return ((fourcc & 0x000000FFu) << 24u)
+         | ((fourcc & 0x0000FF00u) << 8u)
+         | ((fourcc & 0x00FF0000u) >> 8u)
+         | ((fourcc & 0xFF000000u) >> 24u);
+  }
+
+  std::string fourcc_to_string(std::uint32_t fourcc)
+  {
+    char text[5] = {};
+    std::memcpy(text, &fourcc, 4);
+    return text;
+  }
+
+  bool is_null_adt_asset_reference(std::string filename)
+  {
+    auto const is_trimmed_char = [](unsigned char character)
+    {
+      return character == '\0' || std::isspace(character);
+    };
+
+    filename.erase(filename.begin(),
+                   std::find_if(filename.begin(), filename.end(),
+                                [&](unsigned char character) { return !is_trimmed_char(character); }));
+    filename.erase(std::find_if(filename.rbegin(), filename.rend(),
+                                [&](unsigned char character) { return !is_trimmed_char(character); }).base(),
+                   filename.end());
+
+    std::transform(filename.begin(), filename.end(), filename.begin(), [](unsigned char character)
+    {
+      return static_cast<char>(std::tolower(character));
+    });
+    std::replace(filename.begin(), filename.end(), '\\', '/');
+
+    if (filename.empty() || filename == "0" || filename == "none" || filename == "null")
+    {
+      return true;
+    }
+
+    if (filename.find('/') == std::string::npos)
+    {
+      auto const extension_pos = filename.rfind('.');
+      if (extension_pos != std::string::npos && filename.substr(0, extension_pos) == "0")
+      {
+        auto const extension = filename.substr(extension_pos);
+        return extension == ".m2" || extension == ".mdx" || extension == ".mdl" || extension == ".wmo";
+      }
+    }
+
+    return false;
+  }
+
+  std::string normalize_adt_asset_filename(std::string filename)
+  {
+    if (is_null_adt_asset_reference(filename))
+    {
+      return {};
+    }
+
+    filename = BlizzardArchive::ClientData::normalizeFilenameInternal(std::move(filename));
+    return is_null_adt_asset_reference(filename) ? std::string() : std::move(filename);
+  }
+
   std::string normalize_adt_model_filename(std::string filename)
   {
-    filename = BlizzardArchive::ClientData::normalizeFilenameInternal(std::move(filename));
+    filename = normalize_adt_asset_filename(std::move(filename));
+    if (filename.empty())
+    {
+      return {};
+    }
 
     auto const marker = filename.find(".m2/");
     if (marker == std::string::npos)
@@ -51,7 +124,7 @@ namespace
       filename.erase(marker + 3);
     }
 
-    return filename;
+    return is_null_adt_asset_reference(filename) ? std::string() : std::move(filename);
   }
 
   bool readADTChunkHeader(BlizzardArchive::ClientFile& file, std::uint32_t absolute_offset,
@@ -73,8 +146,47 @@ namespace
     if (fourcc != expected_fourcc)
     {
       LogError << "Expected ADT chunk " << chunk_name << " at offset " << absolute_offset
-               << ", got fourcc 0x" << std::hex << fourcc << std::dec << "." << std::endl;
+               << ", got fourcc '" << fourcc_to_string(fourcc)
+               << "' (0x" << std::hex << fourcc << std::dec << ")." << std::endl;
       return false;
+    }
+
+    if (*size > file.getSize() - absolute_offset - 8)
+    {
+      LogError << "ADT chunk " << chunk_name << " at offset " << absolute_offset
+               << " has size " << *size << " beyond file size " << file.getSize()
+               << "." << std::endl;
+      return false;
+    }
+
+    return true;
+  }
+
+  template<typename Callback>
+  bool readADTStringTable(BlizzardArchive::ClientFile& file,
+                          std::uint32_t size,
+                          char const* chunk_name,
+                          Callback&& callback)
+  {
+    char const* cursor = reinterpret_cast<char const*>(file.getPointer());
+    char const* const end = cursor + size;
+
+    while (cursor < end)
+    {
+      char const* const terminator = std::find(cursor, end, '\0');
+      if (terminator == end)
+      {
+        LogError << "ADT string table " << chunk_name
+                 << " is not null-terminated inside its chunk bounds." << std::endl;
+        return false;
+      }
+
+      if (terminator != cursor)
+      {
+        callback(std::string(cursor, terminator));
+      }
+
+      cursor = terminator + 1;
     }
 
     return true;
@@ -143,6 +255,15 @@ MapTile::MapTile( int pX
 
 MapTile::~MapTile()
 {
+  // During full world teardown, skip ALL per-tile instance bookkeeping. _model_instance_storage frees
+  // every M2/WMO instance itself when the World is destroyed, so touching the (possibly already-freed,
+  // shared-across-tiles) instances here would crash -- derefTile() on a dangling SceneObject, or
+  // remove_models_if_needed() unloading an instance another not-yet-destroyed tile still points at.
+  if (_world && _world->is_unloading())
+  {
+    return;
+  }
+
   for (auto& pair : object_instances)
   {
     for (auto& instance : pair.second)
@@ -190,6 +311,12 @@ void MapTile::finishLoading()
     error_on_loading();
   };
 
+  // Track the load stage so the exception handler below can report exactly where a tile
+  // load blows up (this is how the Karazahn40 MPHD big-alpha AV was pinpointed).
+  char load_stage[128] = "open";
+  try
+  {
+
   BlizzardArchive::ClientFile theFile(_file_key, Noggit::Application::NoggitApplication::instance()->clientData());
 
   Log << "Opening tile " << index.x << ", " << index.z << " (\"" << _file_key.stringRepr() << "\") from " << (theFile.isExternal() ? "disk" : "MPQ") << "." << std::endl;
@@ -210,18 +337,22 @@ void MapTile::finishLoading()
 
   uint32_t version;
 
+  std::snprintf(load_stage, sizeof(load_stage), "MVER/MHDR");
   theFile.read(&fourcc, 4);
   theFile.seekRelative(4);
   theFile.read(&version, 4);
 
-  if (fourcc != 'MVER' || version != 18)
+  if (fourcc != 'MVER' || (version != 18 && version != 19))
   {
-    char fourcc_text[5] = {};
-    std::memcpy(fourcc_text, &fourcc, 4);
-    LogError << "ADT \"" << _file_key.stringRepr() << "\" has unsupported MVER fourcc='" << fourcc_text
+    LogError << "ADT \"" << _file_key.stringRepr() << "\" has unsupported MVER fourcc='" << fourcc_to_string(fourcc)
              << "' version=" << version << ". Aborting tile load." << std::endl;
     abort_loading();
     return;
+  }
+  if (version == 19)
+  {
+    LogDebug << "ADT \"" << _file_key.stringRepr() << "\" uses legacy MVER fourcc='"
+             << fourcc_to_string(fourcc) << "' version=" << version << "." << std::endl;
   }
 
   // - MHDR ----------------------------------------------
@@ -231,7 +362,8 @@ void MapTile::finishLoading()
 
   if (fourcc != 'MHDR')
   {
-    LogError << "ADT \"" << _file_key.stringRepr() << "\" is missing MHDR. Aborting tile load." << std::endl;
+    LogError << "ADT \"" << _file_key.stringRepr() << "\" is missing MHDR; got fourcc='"
+             << fourcc_to_string(fourcc) << "'. Aborting tile load." << std::endl;
     abort_loading();
     return;
   }
@@ -242,9 +374,17 @@ void MapTile::finishLoading()
 
   // - MCIN ----------------------------------------------
 
+  std::snprintf(load_stage, sizeof(load_stage), "MCIN..MODF tables");
   if (!readADTChunkHeader(theFile, Header.mcin + 0x14, 'MCIN', "MCIN", &size))
   {
     LogError << "ADT \"" << _file_key.stringRepr() << "\" is missing a readable MCIN. Aborting tile load." << std::endl;
+    abort_loading();
+    return;
+  }
+  if (size < 256 * 16)
+  {
+    LogError << "ADT \"" << _file_key.stringRepr() << "\" has short MCIN size "
+             << size << ". Aborting tile load." << std::endl;
     abort_loading();
     return;
   }
@@ -268,16 +408,11 @@ void MapTile::finishLoading()
 
   if (_load_textures)
   {
-    {
-      char const* lCurPos = reinterpret_cast<char const*>(theFile.getPointer());
-      char const* lEnd = lCurPos + size;
-
-      while (lCurPos < lEnd)
+    _load_textures = readADTStringTable(theFile, size, "MTEX",
+      [this](std::string const& filename)
       {
-        mTextureFilenames.push_back(BlizzardArchive::ClientData::normalizeFilenameInternal(std::string(lCurPos)));
-        lCurPos += strlen(lCurPos) + 1;
-      }
-    }
+        mTextureFilenames.push_back(BlizzardArchive::ClientData::normalizeFilenameInternal(filename));
+      });
   }
   if (_load_models)
   {
@@ -292,17 +427,15 @@ void MapTile::finishLoading()
 
   if (_load_models)
   {
-    {
-      char const* lCurPos = reinterpret_cast<char const*>(theFile.getPointer());
-      char const* lEnd = lCurPos + size;
-
-      while (lCurPos < lEnd)
+    _load_models = readADTStringTable(theFile, size, "MMDX",
+      [this](std::string const& filename)
       {
-        mModelFilenames.push_back(normalize_adt_model_filename(std::string(lCurPos)));
-        lCurPos += strlen(lCurPos) + 1;
-      }
-    }
+        mModelFilenames.push_back(normalize_adt_model_filename(filename));
+      });
+  }
 
+  if (_load_models)
+  {
     // - MWMO ----------------------------------------------
 
     if (!readADTChunkHeader(theFile, Header.mwmo + 0x14, 'MWMO', "MWMO", &size))
@@ -314,17 +447,15 @@ void MapTile::finishLoading()
 
   if (_load_models)
   {
-    {
-      char const* lCurPos = reinterpret_cast<char const*>(theFile.getPointer());
-      char const* lEnd = lCurPos + size;
-
-      while (lCurPos < lEnd)
+    _load_models = readADTStringTable(theFile, size, "MWMO",
+      [this](std::string const& filename)
       {
-        mWMOFilenames.push_back(BlizzardArchive::ClientData::normalizeFilenameInternal(std::string(lCurPos)));
-        lCurPos += strlen(lCurPos) + 1;
-      }
-    }
+        mWMOFilenames.push_back(normalize_adt_asset_filename(filename));
+      });
+  }
 
+  if (_load_models)
+  {
     // - MDDF ----------------------------------------------
 
     if (!readADTChunkHeader(theFile, Header.mddf + 0x14, 'MDDF', "MDDF", &size))
@@ -365,11 +496,15 @@ void MapTile::finishLoading()
   //! \todo  Parse all chunks in the new style!
 
   // - MH2O ----------------------------------------------
+  std::snprintf(load_stage, sizeof(load_stage), "MH2O/MFBO");
   if (Header.mh2o != 0) {
     int ofsW = Header.mh2o + 0x14 + 0x8;
-    if (readOptionalADTChunkHeader(theFile, Header.mh2o, 'MH2O', "MH2O"))
+    if (auto mh2o_size = readOptionalADTChunkHeader(theFile, Header.mh2o, 'MH2O', "MH2O"))
     {
-      Water.readFromFile(theFile, ofsW);
+      if (*mh2o_size != 0)
+      {
+        Water.readFromFile(theFile, ofsW);
+      }
     }
   }
 
@@ -447,16 +582,42 @@ void MapTile::finishLoading()
 
     for (auto const& object : lWMOInstances)
     {
-      add_model(_world->add_wmo_instance(WMOInstance(mWMOFilenames[object.nameID],
-                                                     &object, _context), _tile_is_being_reloaded));
+      if (object.nameID >= mWMOFilenames.size())
+      {
+        LogError << "ADT \"" << _file_key.stringRepr() << "\" MODF references missing WMO nameID "
+                 << object.nameID << " (names=" << mWMOFilenames.size() << ")." << std::endl;
+        continue;
+      }
+
+      auto const& filename = mWMOFilenames[object.nameID];
+      if (filename.empty())
+      {
+        continue;
+      }
+
+      std::snprintf(load_stage, sizeof(load_stage), "wmo-instance uid=%u '%s'", object.uniqueID, filename.c_str());
+      add_model(_world->add_wmo_instance(WMOInstance(filename, &object, _context), _tile_is_being_reloaded));
     }
 
     // - Load M2s ------------------------------------------
 
     for (auto const& model : lModelInstances)
     {
-      add_model(_world->add_model_instance(ModelInstance(mModelFilenames[model.nameID],
-                                                         &model, _context), _tile_is_being_reloaded));
+      if (model.nameID >= mModelFilenames.size())
+      {
+        LogError << "ADT \"" << _file_key.stringRepr() << "\" MDDF references missing M2 nameID "
+                 << model.nameID << " (names=" << mModelFilenames.size() << ")." << std::endl;
+        continue;
+      }
+
+      auto const& filename = mModelFilenames[model.nameID];
+      if (filename.empty())
+      {
+        continue;
+      }
+
+      std::snprintf(load_stage, sizeof(load_stage), "m2-instance uid=%u '%s'", model.uniqueID, filename.c_str());
+      add_model(_world->add_model_instance(ModelInstance(filename, &model, _context), _tile_is_being_reloaded));
     }
 
     _world->need_model_updates = true;
@@ -466,6 +627,7 @@ void MapTile::finishLoading()
 
   for (int nextChunk = 0; nextChunk < 256; ++nextChunk)
   {
+    std::snprintf(load_stage, sizeof(load_stage), "MCNK %d (ofs=0x%X)", nextChunk, lMCNKOffsets[nextChunk]);
     theFile.seek(lMCNKOffsets[nextChunk]);
 
     unsigned x = nextChunk / 16;
@@ -485,6 +647,22 @@ void MapTile::finishLoading()
   finished = true;
   _tile_is_being_reloaded = false;
   _state_changed.notify_all();
+
+  }
+  catch (std::exception const& e)
+  {
+    // Report exactly where this tile load blew up, then let the AsyncLoader handle the
+    // failure as before.
+    LogError << "MapTile " << index.x << "," << index.z << " (\"" << _file_key.stringRepr()
+             << "\") load exception at stage: " << load_stage << " -- " << e.what() << std::endl;
+    throw;
+  }
+  catch (...)
+  {
+    LogError << "MapTile " << index.x << "," << index.z << " (\"" << _file_key.stringRepr()
+             << "\") load exception at stage: " << load_stage << std::endl;
+    throw;
+  }
 }
 
 bool MapTile::isTile(int pX, int pZ)
@@ -631,6 +809,19 @@ void MapTile::saveTile(World* world)
   int lID;  // This is a global counting variable. Do not store something in here you need later.
   std::vector<WMOInstance*> lObjectInstances;
   std::vector<ModelInstance*> lModelInstances;
+
+  // Drop redundant duplicate liquid layers before writing so neither MH2O nor MCLQ serializes
+  // multiple identical water blocks for a chunk.
+  for (int z = 0; z < 16; ++z)
+  {
+    for (int x = 0; x < 16; ++x)
+    {
+      if (ChunkWater* cw = Water.getChunk(x, z))
+      {
+        cw->removeDuplicateLayers();
+      }
+    }
+  }
 
   // Check which doodads and WMOs are on this ADT.
   glm::vec3 lTileExtents[2];
@@ -946,12 +1137,23 @@ void MapTile::saveTile(World* world)
   //MH2O
   Water.saveToFile(lADTFile, lMHDR_Position, lCurrentPosition);
 
+  // Classic projects additionally write vanilla MCLQ liquid (alongside MH2O above).
+  // WotLK stays MH2O-only. Gated behind a setting (default on for classic).
+  bool write_mclq = false;
+  {
+    auto project = Noggit::Project::CurrentProject::get();
+    bool const is_classic = project
+                          && project->projectVersion == Noggit::Project::ProjectVersion::CLASSIC;
+    write_mclq = is_classic
+              && QSettings().value("water/save_classic_mclq", true).toBool();
+  }
+
   // MCNK
   for (int y = 0; y < 16; ++y)
   {
     for (int x = 0; x < 16; ++x)
     {
-      mChunks[y][x]->save(lADTFile, lCurrentPosition, lMCIN_Position, lTextures, lObjectInstances, lModelInstances);
+      mChunks[y][x]->save(lADTFile, lCurrentPosition, lMCIN_Position, lTextures, lObjectInstances, lModelInstances, write_mclq);
     }
   }
 
@@ -1052,6 +1254,8 @@ void MapTile::remove_model(uint32_t uid)
 
     instance->derefTile(this);
     _requires_object_extents_recalc = true;
+    _object_buckets_dirty = true;
+    _doodad_instance_buffers_dirty = true;
   }
 }
 
@@ -1080,6 +1284,8 @@ void MapTile::remove_model(SceneObject* instance)
     }
 
     _requires_object_extents_recalc = true;
+    _object_buckets_dirty = true;
+    _doodad_instance_buffers_dirty = true;
   }
 }
 
@@ -1114,6 +1320,9 @@ void MapTile::add_model(uint32_t uid)
       _requires_object_extents_recalc = true;
     }
 
+    _object_buckets_dirty = true;
+
+    _doodad_instance_buffers_dirty = true;
     instance->refTile(this);
   }
 }
@@ -1147,8 +1356,81 @@ void MapTile::add_model(SceneObject* instance)
       _requires_object_extents_recalc = true;
     }
 
+    _object_buckets_dirty = true;
+
+    _doodad_instance_buffers_dirty = true;
     instance->refTile(this);
   }
+}
+
+std::array<MapTile::ObjectBucket, 256> const& MapTile::getObjectBuckets()
+{
+  if (_object_buckets_dirty)
+  {
+    rebuildObjectBuckets();
+  }
+  return _object_buckets;
+}
+
+void MapTile::rebuildObjectBuckets()
+{
+  std::lock_guard<std::mutex> const lock(_mutex);
+
+  for (auto& bucket : _object_buckets)
+  {
+    bucket.instances.clear();
+  }
+
+  bool all_loaded = true;
+
+  for (auto& pair : object_instances)
+  {
+    for (auto* instance : pair.second)
+    {
+      glm::vec3 ext_min, ext_max;
+
+      if (instance->finishedLoading())
+      {
+        instance->ensureExtents();
+        ext_min = instance->extents[0];
+        ext_max = instance->extents[1];
+      }
+      else
+      {
+        // No extents yet: park it in a generous box around its position and keep the buckets dirty
+        // so the tile rebuilds next frame until everything has loaded (self-healing).
+        all_loaded = false;
+        ext_min = instance->pos - glm::vec3(30.0f);
+        ext_max = instance->pos + glm::vec3(30.0f);
+      }
+
+      int const i0 = std::clamp(static_cast<int>((ext_min.x - xbase) / CHUNKSIZE), 0, 15);
+      int const i1 = std::clamp(static_cast<int>((ext_max.x - xbase) / CHUNKSIZE), 0, 15);
+      int const j0 = std::clamp(static_cast<int>((ext_min.z - zbase) / CHUNKSIZE), 0, 15);
+      int const j1 = std::clamp(static_cast<int>((ext_max.z - zbase) / CHUNKSIZE), 0, 15);
+
+      for (int j = j0; j <= j1; ++j)
+      {
+        for (int i = i0; i <= i1; ++i)
+        {
+          auto& bucket = _object_buckets[j * 16 + i];
+          if (bucket.instances.empty())
+          {
+            bucket.aabb_min = ext_min;
+            bucket.aabb_max = ext_max;
+          }
+          else
+          {
+            bucket.aabb_min = glm::min(bucket.aabb_min, ext_min);
+            bucket.aabb_max = glm::max(bucket.aabb_max, ext_max);
+          }
+          bucket.instances.emplace_back(pair.first, instance);
+        }
+      }
+    }
+  }
+
+  _object_buckets_dirty = !all_loaded;
 }
 
 void MapTile::initEmptyChunks()
@@ -1810,5 +2092,3 @@ void MapTile::recalcCombinedExtents()
 
   _combined_extents_dirty = false;
 }
-
-

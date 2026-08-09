@@ -5,6 +5,8 @@
 #include <noggit/Selection.h>
 #include <noggit/tool_enums.hpp>
 #include <noggit/AsyncLoader.h>
+#include <noggit/rendering/ModelRender.hpp>
+#include <noggit/Log.h>
 
 #include <vector>
 #include <cmath>
@@ -12,6 +14,7 @@
 #include <limits>
 #include <thread>
 #include <chrono>
+#include <cstdlib>
 
 #include <QSettings>
 #include <QColor>
@@ -20,6 +23,24 @@
 
 
 using namespace Noggit::Ui::Tools;
+
+
+namespace
+{
+  // Offscreen thumbnail rendering is DISABLED by default. The preview model/WMO draw __fastfails the
+  // NVIDIA driver (0xC0000409 in nvoglv64), surfacing at the next GL flush (readback). Dump-confirmed
+  // it's a DRIVER-level fastfail on that draw: it crashes even with the main map-view context current,
+  // it is NOT a catchable C++ exception (try/catch is useless), and app code can only AVOID it by not
+  // issuing the draw. This is the fix the user confirmed 2026-07-13 -- it lived ONLY in the
+  // noggit-red-features tree, but the nrcln build compiles noggit-red, which never got it, so the
+  // asset-browser crash "kept coming back". Ported into the build tree here.
+  // Set NOGGIT_ENABLE_PREVIEW_THUMBS=1 to re-enable the render (for a future real driver-trigger fix).
+  bool offscreen_previews_enabled()
+  {
+    static bool const on = std::getenv("NOGGIT_ENABLE_PREVIEW_THUMBS") != nullptr;
+    return on;
+  }
+}
 
 
 PreviewRenderer::PreviewRenderer(int width, int height, Noggit::NoggitRenderContext context, QWidget* parent)
@@ -34,6 +55,14 @@ PreviewRenderer::PreviewRenderer(int width, int height, Noggit::NoggitRenderCont
   _cache = {};
 
   OpenGL::context::save_current_context const context_save (::gl);
+  // Share GL objects with the global (main-window) context so models uploaded there are valid to
+  // draw here -- otherwise the offscreen draw __fastfails the NVIDIA driver (see AA_ShareOpenGLContexts
+  // in main). AA_ShareOpenGLContexts already routes create() through the global share context, but
+  // set it explicitly too for clarity/robustness.
+  if (QOpenGLContext::globalShareContext())
+  {
+    _offscreen_context.setShareContext(QOpenGLContext::globalShareContext());
+  }
   _offscreen_context.create();
 
   _fmt.setSamples(1);
@@ -46,6 +75,9 @@ PreviewRenderer::PreviewRenderer(int width, int height, Noggit::NoggitRenderCont
   OpenGL::context::scoped_setter const context_set (::gl, &_offscreen_context);
 
   _light_dir = glm::vec3(0.0f, 1.0f, 0.0f);
+  _diffuse_light = {1.0f, 0.532352924f, 0.0f};
+  _ambient_light = {0.407770514f, 0.508424163f, 0.602650642f};
+  _background_color = {0.5f, 0.5f, 0.5f};
 }
 
 void PreviewRenderer::setModel(std::string const &filename)
@@ -102,6 +134,16 @@ void PreviewRenderer::setModel(std::string const &filename)
 
 void PreviewRenderer::setModelOffscreen(std::string const& filename)
 {
+  // Offscreen thumbnails disabled (see offscreen_previews_enabled / renderToPixmap): don't load or
+  // touch the offscreen GL context for a preview that will never be drawn -- renderToPixmap returns a
+  // blank thumbnail. Just remember the filename. (This is what neutralises the AssetBrowser showEvent
+  // farm.wmo warm-up that used to __fastfail on first open.)
+  if (!offscreen_previews_enabled())
+  {
+    _filename = filename;
+    return;
+  }
+
   OpenGL::context::save_current_context const context_save (::gl);
   _offscreen_context.makeCurrent(&_offscreen_surface);
   OpenGL::context::scoped_setter const context_set (::gl, &_offscreen_context);
@@ -113,13 +155,33 @@ void PreviewRenderer::setModelOffscreen(std::string const& filename)
 void PreviewRenderer::resetCamera(float x, float y, float z, float roll, float yaw, float pitch)
 {
   _camera.reset(x, y, z, roll, yaw, pitch);
-  float radius = 0.f;
 
   std::vector<glm::vec3> extents = calcSceneExtents();
-  _camera.position = (extents[0] + extents[1]) / 2.0f;
-  radius = std::max(glm::distance(_camera.position, extents[0]), glm::distance(_camera.position, extents[1]));
+  auto const valid_vec = [](glm::vec3 const& value)
+  {
+    return std::isfinite(value.x) && std::isfinite(value.y) && std::isfinite(value.z);
+  };
 
-  float distance_factor = abs( radius / sin(_camera.fov()._ / 2.f));
+  if (!valid_vec(extents[0]) || !valid_vec(extents[1])
+      || extents[0].x > extents[1].x
+      || extents[0].y > extents[1].y
+      || extents[0].z > extents[1].z)
+  {
+    return;
+  }
+
+  _camera.position = (extents[0] + extents[1]) / 2.0f;
+  float radius = std::max(glm::distance(_camera.position, extents[0]), glm::distance(_camera.position, extents[1]));
+  if (!std::isfinite(radius) || radius < 1.0f)
+  {
+    radius = 1.0f;
+  }
+
+  float distance_factor = std::abs(radius / std::sin(_camera.fov()._ / 2.f));
+  if (!std::isfinite(distance_factor))
+  {
+    distance_factor = radius * 2.0f;
+  }
   _camera.move_forward_factor(-1.f, distance_factor);
 
 }
@@ -127,11 +189,17 @@ void PreviewRenderer::resetCamera(float x, float y, float z, float roll, float y
 
 void PreviewRenderer::draw()
 {
+  auto trace = [this](char const* step) {
+    if (_preview_trace) { LogError << "PREVIEW draw step: " << step << " '" << _filename << "'" << std::endl; gl.finish(); }
+  };
+  trace("enter");
+
   if (!_uploaded)
   [[unlikely]]
-  {  
+  {
     upload();
   }
+  trace("uploaded");
 
   gl.clearColor(_background_color.r, _background_color.g, _background_color.b, 1.0f);
   gl.depthMask(GL_TRUE);
@@ -145,7 +213,7 @@ void PreviewRenderer::draw()
   glm::mat4x4 const mvp(proj * mv);
   math::frustum const frustum (glm::transpose(mvp));
 
-  updateMVPUniformBlock(mv, proj);
+  updateMVPUniformBlock(mv, proj, _camera.position);
 
   if (_lighting_needs_update)
     updateLightingUniformBlock();
@@ -160,6 +228,7 @@ void PreviewRenderer::draw()
 
   if (_draw_wmo.get() && !_wmo_instances.empty())
   {
+    trace("wmo begin");
     /* set anim time only once per frame
     {
       OpenGL::Scoped::use_program water_shader {_liquid_render->shader_program()};
@@ -189,7 +258,7 @@ void PreviewRenderer::draw()
         wmo_instance.wmo->waitForChildrenLoaded();
         wmo_instance.ensureExtents();
         wmo_instance.draw(
-            wmo_program, model_view(), projection(), frustum, culldistance,
+            wmo_program, nullptr, nullptr, model_view(), projection(), frustum, culldistance,
             _camera.position, _draw_boxes.get(), _draw_models.get() 
             , false, std::vector<selection_type>(), 0, false, display_mode::in_3D, true
         );
@@ -219,70 +288,88 @@ void PreviewRenderer::draw()
     if (_draw_animated.get())
       ModelManager::resetAnim();
 
-    OpenGL::Scoped::use_program m2_shader {*_m2_instanced_program.get()};
-
-    OpenGL::M2RenderState model_render_state;
-    model_render_state.tex_arrays = { 0, 0 };
-    model_render_state.tex_indices = { 0, 0 };
-    model_render_state.tex_unit_lookups = { 0, 0 };
-    gl.blendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-    gl.disable(GL_BLEND);
-    gl.depthMask(GL_TRUE);
-    m2_shader.uniform("blend_mode", 0);
-    m2_shader.uniform("unfogged", static_cast<int>(model_render_state.unfogged));
-    m2_shader.uniform("unlit", static_cast<int>(model_render_state.unlit));
-    m2_shader.uniform("tex_unit_lookup_1", 0);
-    m2_shader.uniform("tex_unit_lookup_2", 0);
-    m2_shader.uniform("masked_additive", 0);
-    m2_shader.uniform("pixel_shader", 0);
-
-    std::vector<ModelInstance*> instance{ nullptr };
-    std::vector<glm::mat4x4> instance_mtx{ glm::mat4x4(1)};
-
-    for (auto& model_instance : _model_instances)
+    auto setup_m2_render_state = [](OpenGL::Scoped::use_program& m2_shader,
+                                    OpenGL::M2RenderState& model_render_state)
     {
-      model_instance.model->wait_until_loaded();
-      model_instance.model->waitForChildrenLoaded();
-      instance[0] = &model_instance;
-      instance_mtx[0] = model_instance.transformMatrix();
+      model_render_state.tex_arrays = { 0, 0 };
+      model_render_state.tex_indices = { 0, 0 };
+      model_render_state.tex_unit_lookups = { 0, 0 };
+      gl.blendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+      gl.disable(GL_BLEND);
+      gl.depthMask(GL_TRUE);
+      gl.enable(GL_CULL_FACE);
+      m2_shader.uniform("blend_mode", 0);
+      m2_shader.uniform("unfogged", static_cast<int>(model_render_state.unfogged));
+      m2_shader.uniform("unlit", static_cast<int>(model_render_state.unlit));
+      m2_shader.uniform("tex_unit_lookup_1", 0);
+      m2_shader.uniform("tex_unit_lookup_2", 0);
+      m2_shader.uniform("masked_additive", 0);
+      m2_shader.uniform("pixel_shader", 0);
+    };
 
-      model_instance.model->renderer()->draw(
-        mv
-        , instance_mtx
-        , m2_shader
-        , model_render_state
-        , frustum
-        , culldistance
-        , _camera.position
-        , _animtime
-        , _draw_boxes.get()
-        , model_boxes_to_draw
-        , display_mode::in_3D
-      );
-    }
-
-    for (auto& it : _wmo_doodads)
+    if (!_model_instances.empty())
     {
-      instance_mtx.clear();
-      
-      for (auto& instance : it.second)
+      trace("m2 instances begin");
+      OpenGL::Scoped::use_program m2_shader {*_m2_program.get()};
+
+      OpenGL::M2RenderState model_render_state;
+      setup_m2_render_state(m2_shader, model_render_state);
+
+      for (auto& model_instance : _model_instances)
       {
-        instance_mtx.push_back(instance->transformMatrix());
-      }
+        model_instance.model->wait_until_loaded();
+        model_instance.model->waitForChildrenLoaded();
+        if (_preview_trace && model_instance.model->file_key().hasFilepath())
+        { LogError << "PREVIEW draw m2: '" << model_instance.model->file_key().filepath() << "'" << std::endl; gl.finish(); }
 
-      it.second[0]->model->renderer()->draw(
+        model_instance.model->renderer()->draw(
           mv
-          , instance_mtx
+          , model_instance
           , m2_shader
           , model_render_state
           , frustum
           , culldistance
           , _camera.position
           , _animtime
-          , _draw_boxes.get()
-          , model_boxes_to_draw
           , display_mode::in_3D
-      );
+        );
+      }
+    }
+
+    if (!_wmo_doodads.empty())
+    {
+      trace("wmo doodads begin");
+      // WMO doodads are drawn INDIVIDUALLY here (uniform transform), NOT through the instanced
+      // path. In the asset-browser OFFSCREEN context the instanced doodad draw (per-instance
+      // transform attribute + bone samplerBuffer) __fastfails the NVIDIA driver even though every
+      // buffer/param is valid and the same draw works in the main-window context -- a driver-level
+      // instanced-VAO fragility specific to the offscreen preview context (RE: barrel01 crash,
+      // trace boneBufSize=64 valid). The individual path avoids the per-instance transform
+      // attribute entirely and renders the doodads correctly.
+      OpenGL::Scoped::use_program m2_shader {*_m2_program.get()};
+
+      OpenGL::M2RenderState model_render_state;
+      setup_m2_render_state(m2_shader, model_render_state);
+
+      for (auto& it : _wmo_doodads)
+      {
+        for (auto* instance : it.second)
+        {
+          if (_preview_trace && instance->model->file_key().hasFilepath())
+          { LogError << "PREVIEW draw wmo-doodad: '" << instance->model->file_key().filepath() << "'" << std::endl; gl.finish(); }
+          instance->model->renderer()->draw(
+            mv
+            , *instance
+            , m2_shader
+            , model_render_state
+            , frustum
+            , culldistance
+            , _camera.position
+            , _animtime
+            , display_mode::in_3D
+          );
+        }
+      }
     }
 
 
@@ -372,7 +459,7 @@ glm::mat4x4 PreviewRenderer::model_view() const
 
 glm::mat4x4 PreviewRenderer::projection() const
 {
-  float far_z = _settings->value("farZ", 2048).toFloat();
+  float far_z = _settings->value("farZ", 900).toFloat();
   return glm::perspective(_camera.fov()._, aspect_ratio(), 1.f, far_z);
 }
 
@@ -387,9 +474,9 @@ std::vector<glm::vec3> PreviewRenderer::calcSceneExtents()
                          std::numeric_limits<float>::max(),
                          std::numeric_limits<float>::max()};
 
-  glm::vec3 max = {std::numeric_limits<float>::min(),
-                         std::numeric_limits<float>::min(),
-                         std::numeric_limits<float>::min()};
+  glm::vec3 max = {std::numeric_limits<float>::lowest(),
+                         std::numeric_limits<float>::lowest(),
+                         std::numeric_limits<float>::lowest()};
 
   for (auto& instance : _model_instances)
   {
@@ -420,54 +507,120 @@ QPixmap* PreviewRenderer::renderToPixmap()
   if(it != _cache.end())
     return &it->second;
 
-  OpenGL::context::save_current_context const context_save (::gl);
+  // Offscreen thumbnails DISABLED (see offscreen_previews_enabled): the preview draw __fastfails the
+  // NVIDIA driver at the next GL flush -- a driver kill, NOT a C++ exception, so the try/catch below
+  // cannot save us. Return a blank thumbnail instead of issuing the crashing draw. The onscreen 3D
+  // ModelViewer is a different path and still renders. NOGGIT_ENABLE_PREVIEW_THUMBS=1 re-enables.
+  if (!offscreen_previews_enabled())
+    return &(_cache[curEntry] = QPixmap());
 
-  _offscreen_context.makeCurrent(&_offscreen_surface);
-
-  OpenGL::context::scoped_setter const context_set (::gl, &_offscreen_context);
-
-  QOpenGLFramebufferObject pixel_buffer(_width, _height, _fmt);
-  pixel_buffer.bind();
-
-  gl.viewport(0, 0, _width, _height);
-  gl.clearColor(_background_color.r, _background_color.g, _background_color.b, 1.f);
-  gl.depthMask(GL_TRUE);
-  gl.clear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-
-  tick(1.0f);
-  draw();
-
-  auto& async_loader = AsyncLoader::instance();
-
-  if (async_loader.is_loading())
+  // The whole GL section is wrapped: noggit's GL-error-check throws (from verify_context AND its
+  // destructor) on any GL error, and the preview offscreen context legitimately hits errors
+  // (e.g. bindBuffer GL_INVALID_OPERATION when a Model's GL buffers live in the main context, not
+  // this one). Unhandled, that throw escaped the Qt showEvent handler -> std::terminate ->
+  // 0xC0000409 (the asset-browser crash). Catch everything here and fall back to a blank preview.
+  try
   {
-    // wait for the loader to finish
-    do
+    OpenGL::context::save_current_context const context_save (::gl);
+
+    if (!_offscreen_context.makeCurrent(&_offscreen_surface)
+        || QOpenGLContext::currentContext() != &_offscreen_context)
     {
-      std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    } while (async_loader.is_loading());
+      LogError << "PreviewRenderer: could not make the offscreen GL context current for '"
+               << _filename << "' -- skipping preview." << std::endl;
+      return &(_cache[curEntry] = QPixmap());
+    }
 
-    // redraw
+    OpenGL::context::scoped_setter const context_set (::gl, &_offscreen_context);
+
+    QOpenGLFramebufferObject pixel_buffer(_width, _height, _fmt);
+    pixel_buffer.bind();
+
+    gl.viewport(0, 0, _width, _height);
+    gl.clearColor(_background_color.r, _background_color.g, _background_color.b, 1.f);
+    gl.depthMask(GL_TRUE);
     gl.clear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+    // FLUSHED STEP-LOG for the NVIDIA offscreen __fastfail hunt: gl.finish() forces each GL step to
+    // complete synchronously, so the LAST line written to log.txt before the process dies names the
+    // exact failing call. (Env NOGGIT_PREVIEW_TRACE=1 to enable; off by default -- it's slow.)
+    static bool const s_preview_trace = std::getenv("NOGGIT_PREVIEW_TRACE") != nullptr;
+    _preview_trace = s_preview_trace;
+    if (s_preview_trace) { LogError << "PREVIEW '" << _filename << "' pre-draw" << std::endl; gl.finish(); }
+
+    tick(1.0f);
     draw();
+
+    if (s_preview_trace) { LogError << "PREVIEW '" << _filename << "' post-draw" << std::endl; gl.finish(); }
+
+    auto& async_loader = AsyncLoader::instance();
+
+    if (async_loader.is_loading())
+    {
+      // wait for the loader to finish
+      do
+      {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      } while (async_loader.is_loading());
+
+      // redraw
+      gl.clear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+      draw();
+    }
+
+    // Clearing alpha from image
+    gl.colorMask(false, false, false, true);
+    gl.clearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    gl.colorMask(true, true, true, true);
+
+    // The draws all complete, but the readback (glReadPixels via toImage) __fastfails the NVIDIA
+    // driver. Prime suspect: the offscreen context was lost during draw()'s async-loader wait
+    // (wait_until_loaded pumps and can make the main window context current again), so the readback
+    // runs against a context/FBO that is no longer valid. Re-assert both before reading.
+    bool const ctx_ok = (QOpenGLContext::currentContext() == &_offscreen_context)
+                     || _offscreen_context.makeCurrent(&_offscreen_surface);
+    bool fbo_ok = false;
+    if (ctx_ok)
+    {
+      pixel_buffer.bind();
+      gl.finish();
+      fbo_ok = pixel_buffer.isValid();
+    }
+    if (!ctx_ok || !fbo_ok)
+    {
+      LogError << "PreviewRenderer: offscreen context/FBO not ready at readback for '"
+               << _filename << "' (ctxOk=" << ctx_ok << " fboValid=" << fbo_ok
+               << ") -- skipping preview (no crash)." << std::endl;
+      return &(_cache[curEntry] = QPixmap());
+    }
+    if (_preview_trace) { LogError << "PREVIEW '" << _filename << "' pre-readback (toImage)" << std::endl; gl.finish(); }
+    QPixmap result{};
+    result = std::move(QPixmap::fromImage(pixel_buffer.toImage()));
+    if (_preview_trace) { LogError << "PREVIEW '" << _filename << "' post-readback" << std::endl; }
+    pixel_buffer.release();
+
+    if (result.isNull())
+    {
+      LogError << "PreviewRenderer: null render result for '" << _filename
+               << "' -- skipping preview." << std::endl;
+      return &(_cache[curEntry] = QPixmap());
+    }
+
+    return &(_cache[curEntry] = std::move(result));
   }
-
-  // Clearing alpha from image
-  gl.colorMask(false, false, false, true);
-  gl.clearColor(0.0f, 0.0f, 0.0f, 1.0f);
-  glClear(GL_COLOR_BUFFER_BIT);
-  gl.colorMask(true, true, true, true);
-
-  QPixmap result{};
-  result = std::move(QPixmap::fromImage(pixel_buffer.toImage()));
-  pixel_buffer.release();
-
-  if (result.isNull())
+  catch (std::exception const& ex)
   {
-    throw std::runtime_error("failed rendering " + _filename + " to pixmap");
+    LogError << "PreviewRenderer: preview render failed for '" << _filename
+             << "' (" << ex.what() << ") -- skipping preview (no crash)." << std::endl;
+    return &(_cache[curEntry] = QPixmap());
   }
-
-  return &(_cache[curEntry] = std::move(result));
+  catch (...)
+  {
+    LogError << "PreviewRenderer: preview render failed for '" << _filename
+             << "' (unknown) -- skipping preview (no crash)." << std::endl;
+    return &(_cache[curEntry] = QPixmap());
+  }
 }
 
 void PreviewRenderer::setLightDirection(float y, float z)
@@ -490,12 +643,26 @@ void PreviewRenderer::setLightDirection(float y, float z)
 
 void PreviewRenderer::update_emitters(float dt)
 {
-  while (dt > 0.1f)
+  // Advance ONLY this preview's own models -- NOT the global ModelManager (which ticks EVERY loaded model's
+  // particles/animation). The main MapView already ticks the global set once per frame; when a tool's
+  // preview was also open it called the global update a SECOND time, so every creature in the main scene
+  // animated at ~2x speed (and got out of sync with its bones). Updating just _model_instances keeps the
+  // preview animated without touching the main scene.
+  for (auto& instance : _model_instances)
   {
-    ModelManager::updateEmitters(0.1f);
-    dt -= 0.1f;
+    if (!instance.model->finishedLoading())
+    {
+      continue;
+    }
+
+    float remaining = dt;
+    while (remaining > 0.1f)
+    {
+      instance.model->updateEmitters(0.1f);
+      remaining -= 0.1f;
+    }
+    instance.model->updateEmitters(remaining);
   }
-  ModelManager::updateEmitters(dt);
 }
 
 void PreviewRenderer::tick(float dt)
@@ -640,8 +807,6 @@ void PreviewRenderer::upload()
 
   }
 
-  setModel("world/wmo/azeroth/buildings/human_farm/farm.wmo");
-
   auto background_color = _settings->value("assetBrowser/background_color",
     QVariant::fromValue(QColor(127, 127, 127))).value<QColor>();
 
@@ -678,6 +843,10 @@ void PreviewRenderer::unloadOpenglData()
 {
   if (_offscreen_mode)
   {
+    // Context gone (teardown): nothing to unload -- the GL resources die with it. Guarding avoids
+    // scoped_setter dereferencing a null/invalid context (context.cpp:21 versionFunctions -> AV).
+    if (!_offscreen_context.isValid())
+      return;
     OpenGL::context::save_current_context const context_save (::gl);
     _offscreen_context.makeCurrent(&_offscreen_surface);
     OpenGL::context::scoped_setter const context_set (::gl, &_offscreen_context);
@@ -686,8 +855,16 @@ void PreviewRenderer::unloadOpenglData()
     return;
   }
 
+  // On return-to-menu the QOpenGLWidget viewport is being destroyed and its context() is already
+  // null/invalid; makeCurrent() + scoped_setter(context()) would then null-deref in
+  // versionFunctions (context.cpp:21) -> 0xc0000005. Skip the GL unload; the context is taking the
+  // resources with it anyway.
+  QOpenGLContext* const ctx = context();
+  if (!ctx || !ctx->isValid())
+    return;
+
   makeCurrent();
-  OpenGL::context::scoped_setter const _ (::gl, context());
+  OpenGL::context::scoped_setter const _ (::gl, ctx);
 
   ModelManager::unload_all(_context);
   WMOManager::unload_all(_context);
@@ -719,10 +896,14 @@ void Noggit::Ui::Tools::PreviewRenderer::updateLightingUniformBlock()
   _lighting_needs_update = false;
 }
 
-void Noggit::Ui::Tools::PreviewRenderer::updateMVPUniformBlock(const glm::mat4x4& model_view, const glm::mat4x4& projection)
+void Noggit::Ui::Tools::PreviewRenderer::updateMVPUniformBlock(const glm::mat4x4& model_view, const glm::mat4x4& projection, const glm::vec3& camera_pos)
 {
   _mvp_ubo_data.model_view = model_view;
   _mvp_ubo_data.projection = projection;
+  // The M2/WMO/terrain vertex shaders render CAMERA-RELATIVE (they zero the view translation and subtract
+  // camera_pos): without a real camera_pos the camera's translation is ignored, so moving the preview
+  // camera did nothing and it appeared glued to the model centre. Feed the actual camera position.
+  _mvp_ubo_data.camera_pos = glm::vec4(camera_pos, 1.0f);
 
   gl.bindBuffer(GL_UNIFORM_BUFFER, _mvp_ubo);
   gl.bufferSubData(GL_UNIFORM_BUFFER, 0, sizeof(OpenGL::MVPUniformBlock), &_mvp_ubo_data);

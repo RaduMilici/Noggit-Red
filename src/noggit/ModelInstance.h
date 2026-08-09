@@ -16,6 +16,7 @@
 #include <map>
 #include <optional>
 #include <cstdint>
+#include <vector>
 
 namespace math { class frustum; }
 class Model;
@@ -30,6 +31,29 @@ public:
   scoped_model_reference model;
 
   glm::vec3 light_color = { 1.f, 1.f, 1.f };
+
+  // Model-wide opacity from CreatureDisplayInfo.CreatureModelAlpha (0..1; 1 = fully opaque). The client
+  // draws creatures at this opacity (translucent ghosts/elementals etc.); 1.0 means no change.
+  float model_alpha = 1.0f;
+
+  // Model-wide color multiplier from aura char-proc tints (Ghost Visual's light-blue shift).
+  // (1,1,1) = no change. Applied to every render pass's mesh color alongside model_alpha.
+  glm::vec3 model_tint = glm::vec3(1.0f);
+
+  // Camera-relative render anchor (jitter fix). When set, the vertex shader uses `_render_origin` as
+  // the ~17000 world anchor and `_render_transform_rel` as the vertex transform RELATIVE to it (small
+  // translation). Attachments (helmet/weapon following an animated parent bone) set this from a
+  // DOUBLE-precision computation so the animated offset isn't quantized to the coarse float grid at
+  // world scale. The plain transformMatrix() stays world-space (particles, picking) untouched.
+  glm::vec3 _render_origin = glm::vec3(0.0f);
+  glm::mat4x4 _render_transform_rel = glm::mat4x4(1.0f);
+  bool _has_render_anchor = false;
+  void setRenderAnchor(glm::vec3 const& origin, glm::mat4x4 const& rel)
+  {
+    _render_origin = origin;
+    _render_transform_rel = rel;
+    _has_render_anchor = true;
+  }
 
   // used when flag 0x8 is set in wdt
   // longest side of an AABB transformed model's bounding box from the M2 header
@@ -48,9 +72,17 @@ public:
     : SceneObject(other._type, other._context)
     , model (std::move (other.model))
     , light_color (other.light_color)
+    , model_alpha (other.model_alpha)
+    , model_tint (other.model_tint)
     , size_cat (other.size_cat)
     , _need_recalc_extents(other._need_recalc_extents)
     , _forced_anim_id(other._forced_anim_id)
+    , _close_hand_main(other._close_hand_main)
+    , _close_hand_off(other._close_hand_off)
+    , _replace_textures(std::move(other._replace_textures))
+    , _show_geosets(std::move(other._show_geosets))
+    , _visible_geoset_ids(std::move(other._visible_geoset_ids))
+    , _controlled_geoset_families(std::move(other._controlled_geoset_families))
   {
     pos = other.pos;
     dir = other.dir;
@@ -68,11 +100,19 @@ public:
     std::swap (pos, other.pos);
     std::swap (dir, other.dir);
     std::swap (light_color, other.light_color);
+    std::swap (model_alpha, other.model_alpha);
+    std::swap (model_tint, other.model_tint);
     std::swap (uid, other.uid);
     std::swap (scale, other.scale);
     std::swap (size_cat, other.size_cat);
     std::swap (_need_recalc_extents, other._need_recalc_extents);
     std::swap (_forced_anim_id, other._forced_anim_id);
+    std::swap (_close_hand_main, other._close_hand_main);
+    std::swap (_close_hand_off, other._close_hand_off);
+    std::swap (_replace_textures, other._replace_textures);
+    std::swap (_show_geosets, other._show_geosets);
+    std::swap (_visible_geoset_ids, other._visible_geoset_ids);
+    std::swap (_controlled_geoset_families, other._controlled_geoset_families);
     std::swap (extents, other.extents);
     std::swap(_transform_mat_inverted, other._transform_mat_inverted);
     std::swap(_context, other._context);
@@ -105,13 +145,44 @@ public:
   [[nodiscard]]
   virtual bool isWMODoodad() const { return false; };
 
+  // Ground footprint radius (world units) = the model's horizontal bounding-box extent * scale. Matches
+  // the in-game selection-ring size, which follows the unit's footprint -- NOT the bounding SPHERE
+  // (model->rad), which includes the full height and over-sizes tall creatures. M2 space is Z-up, so the
+  // footprint is the X/Y extent. Used for the creature/gameobject selection circles (draw + pick).
+  [[nodiscard]]
+  float selectionRingRadius() const;
+
   [[nodiscard]]
   AsyncObject* instance_model() const override { return model.get(); };
 
   void setReplaceTexture(std::size_t texture_type, std::string const& filename);
+  void setGeosetVisibility(std::vector<bool> show_geosets) { _show_geosets = std::move(show_geosets); }
+  void setGeosetSelections(std::vector<std::uint16_t> visible_geoset_ids,
+                           std::vector<std::uint16_t> controlled_geoset_families)
+  {
+    _visible_geoset_ids = std::move(visible_geoset_ids);
+    _controlled_geoset_families = std::move(controlled_geoset_families);
+  }
 
   [[nodiscard]]
   std::map<std::size_t, scoped_blp_texture_reference> const& replaceTextures() const { return _replace_textures; }
+  [[nodiscard]]
+  std::vector<bool> const& geosetVisibility() const { return _show_geosets; }
+  [[nodiscard]]
+  std::vector<std::uint16_t> const& visibleGeosetIds() const { return _visible_geoset_ids; }
+  [[nodiscard]]
+  std::vector<std::uint16_t> const& controlledGeosetFamilies() const { return _controlled_geoset_families; }
+  [[nodiscard]]
+  bool isGeosetFamilyControlled(std::uint16_t geoset_family) const
+  {
+    return std::find(_controlled_geoset_families.begin(), _controlled_geoset_families.end(), geoset_family)
+      != _controlled_geoset_families.end();
+  }
+  [[nodiscard]]
+  bool isGeosetIdVisible(std::uint16_t geoset_id) const
+  {
+    return std::find(_visible_geoset_ids.begin(), _visible_geoset_ids.end(), geoset_id) != _visible_geoset_ids.end();
+  }
 
   void updateDetails(Noggit::Ui::detail_infos* detail_widget) override;
 
@@ -121,12 +192,25 @@ public:
   void setForcedAnimationId(int anim_id) { _forced_anim_id = anim_id; }
   [[nodiscard]] int forcedAnimationId() const { return _forced_anim_id; }
 
+  // Weapon grip: overlay the HandsClosed pose onto the finger bones only (fist closes around a held weapon)
+  // while the body keeps its normal idle. PER-HAND (2026-07-25): main = right/mainhand, off = left/offhand,
+  // so an empty hand stays open. See Model::applyHandGripOverlay.
+  void setCloseHandMain(bool v) { _close_hand_main = v; }
+  void setCloseHandOff(bool v) { _close_hand_off = v; }
+  [[nodiscard]] bool closeHandMain() const { return _close_hand_main; }
+  [[nodiscard]] bool closeHandOff() const { return _close_hand_off; }
+
 protected:
   bool _need_recalc_extents = true;
   bool _need_gpu_transform_update = true;
   std::uint32_t _gpu_transform_uid;
   int _forced_anim_id = -1;
+  bool _close_hand_main = false;
+  bool _close_hand_off = false;
   std::map<std::size_t, scoped_blp_texture_reference> _replace_textures;
+  std::vector<bool> _show_geosets;
+  std::vector<std::uint16_t> _visible_geoset_ids;
+  std::vector<std::uint16_t> _controlled_geoset_families;
 
 };
 

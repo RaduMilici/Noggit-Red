@@ -1,7 +1,12 @@
 #include <noggit/errorHandling.h>
 #include <noggit/Log.h>
 
+#include <atomic>
 #include <csignal>
+#include <cstdint>
+#include <cstdlib>
+#include <exception>
+#include <iostream>
 #include <string>
 #include <vector>
 
@@ -10,6 +15,22 @@
 #else
   #include <win/StackWalker.h>
   #include <errhandlingapi.h>
+
+namespace
+{
+  // StackWalker writes to OutputDebugString/printf by default, which vanish in a GUI build (no
+  // console). Route every line to std::cerr instead -- InitLogging redirects std::cerr to log.txt,
+  // so the crash callstack lands in the log. Flush each line so nothing is lost when we crash.
+  class LogStackWalker : public StackWalker
+  {
+  protected:
+    void OnOutput(LPCSTR szText) override
+    {
+      std::cerr << szText;
+      std::cerr.flush();
+    }
+  };
+}
 #endif
 
 namespace Noggit
@@ -34,7 +55,7 @@ namespace Noggit
 
     free (strings);
 #else
-    StackWalker sw;
+    LogStackWalker sw;
     sw.ShowCallstack();
 #endif
   }
@@ -137,15 +158,108 @@ namespace Noggit
 
       return EXCEPTION_CONTINUE_SEARCH;
     }
+
+    // Vectored exception handler: runs on the FAULTING thread the instant a hardware exception is
+    // raised -- before SEH unwinding, before any __fastfail, and it can't be replaced the way
+    // SetUnhandledExceptionFilter can (Qt etc.). Crucially we walk from ep->ContextRecord, so the
+    // logged callstack is the actual CRASH site (not this handler's frame). Output goes to log.txt
+    // via LogStackWalker. Only fatal hardware codes, capped, so handled first-chance faults don't
+    // spam -- the unhandled crash is the last one logged before the process dies.
+    LONG WINAPI vectored_exception_handler(EXCEPTION_POINTERS* ep)
+    {
+      DWORD const code = ep->ExceptionRecord->ExceptionCode;
+      bool const fatal =
+           code == EXCEPTION_ACCESS_VIOLATION
+        || code == EXCEPTION_ILLEGAL_INSTRUCTION
+        || code == EXCEPTION_STACK_OVERFLOW
+        || code == EXCEPTION_INT_DIVIDE_BY_ZERO
+        || code == EXCEPTION_PRIV_INSTRUCTION
+        || code == EXCEPTION_IN_PAGE_ERROR
+        || code == EXCEPTION_ARRAY_BOUNDS_EXCEEDED
+        || code == EXCEPTION_DATATYPE_MISALIGNMENT;
+
+      if (fatal)
+      {
+        static std::atomic<int> logged{0};
+        if (logged.fetch_add(1) < 8)
+        {
+          std::cerr << "\n=== [VEH] fatal exception 0x" << std::hex << code
+                    << " at " << ep->ExceptionRecord->ExceptionAddress << std::dec
+                    << " (thread " << GetCurrentThreadId() << ") ===\n";
+          std::cerr.flush();
+          LogStackWalker sw;
+          sw.ShowCallstack(GetCurrentThread(), ep->ContextRecord);
+          std::cerr << "=== [VEH] end callstack ===\n";
+          std::cerr.flush();
+        }
+      }
+
+      return EXCEPTION_CONTINUE_SEARCH;
+    }
 #endif
 
+  }
+
+  namespace
+  {
+    // std::terminate is reached by an unhandled C++ exception, an exception escaping a noexcept function
+    // or a destructor during unwind, or a rethrow with no active exception. On MSVC it goes straight to
+    // __fastfail, which bypasses the vectored/SEH handlers above -- so those crashes leave NO callstack
+    // in the log (the classic "died with a clean log" symptom). Log the active exception + a stack here.
+    [[noreturn]] void on_terminate()
+    {
+      LogError << "\n=== std::terminate() -- unhandled C++ exception / noexcept violation (thread "
+#ifdef _WIN32
+               << GetCurrentThreadId()
+#endif
+               << ") ===" << std::endl;
+      if (auto const ex = std::current_exception())
+      {
+        try { std::rethrow_exception(ex); }
+        catch (std::exception const& e) { LogError << "  active exception: " << e.what() << std::endl; }
+        catch (...) { LogError << "  active exception: <non-std type>" << std::endl; }
+      }
+      else
+      {
+        LogError << "  (no active exception -- likely a bad rethrow or a direct std::terminate call)" << std::endl;
+      }
+      printStacktrace();
+      std::cerr << "=== end terminate ===" << std::endl;
+      std::cerr.flush();
+      std::abort();
+    }
+
+#ifdef _WIN32
+    // The CRT invalid-parameter handler (bad iterator, sprintf with a null, etc.) and a pure-virtual
+    // call BOTH __fastfail silently by default. Route them through the stack logger too.
+    void on_invalid_parameter(wchar_t const*, wchar_t const*, wchar_t const*, unsigned int, uintptr_t)
+    {
+      LogError << "\n=== CRT invalid parameter (thread " << GetCurrentThreadId() << ") ===" << std::endl;
+      printStacktrace();
+      std::cerr.flush();
+      std::abort();
+    }
+
+    void on_purecall()
+    {
+      LogError << "\n=== pure virtual function call (thread " << GetCurrentThreadId() << ") ===" << std::endl;
+      printStacktrace();
+      std::cerr.flush();
+      std::abort();
+    }
+#endif
   }
 
   void RegisterErrorHandlers()
   {
 #ifdef _WIN32
+    AddVectoredExceptionHandler(1 /*call first*/, vectored_exception_handler);
     SetUnhandledExceptionFilter(windows_exception_handler);
+    _set_invalid_parameter_handler(on_invalid_parameter);
+    _set_purecall_handler(on_purecall);
 #endif
+
+    std::set_terminate(on_terminate);
 
     signal (SIGABRT, leave);
     signal (SIGFPE, leave);

@@ -13,6 +13,7 @@
 #include <noggit/rendering/WMORender.hpp>
 #include <noggit/rendering/Primitives.hpp>
 #include <ClientFile.hpp>
+#include <external/glm/gtc/type_precision.hpp> // glm::u8vec3 (_ground_colors)
 #include <optional>
 
 #include <map>
@@ -31,6 +32,7 @@ class Model;
 
 namespace Noggit::Rendering
 {
+  class LiquidTextureManager;
   class WMOGroupRender;
   class WMORender;
 }
@@ -171,14 +173,15 @@ public:
 
   void load();
 
-  /*
   void drawLiquid ( glm::mat4x4 const& transform
-                  , liquid_render& render
+                  , OpenGL::Scoped::use_program& water_shader
+                  , Noggit::Rendering::LiquidTextureManager& texture_manager
                   , bool draw_fog
                   , int animtime
+                  // translucent = water: keep the caller's additive blend and DO NOT write depth
+                  // (a depth-writing water plane occludes the later M2 pass). false = opaque lava.
+                  , bool translucent = false
                   );
-
-  */
 
   void setupFog (bool draw_fog, std::function<void (bool)> setup_fog);
 
@@ -196,6 +199,10 @@ public:
   [[nodiscard]]
   std::vector<uint16_t> doodad_ref() const { return _doodad_ref; }
 
+  // MOLR: indices into the root WMO's MOLT light list that illuminate this group (per-room lighting).
+  [[nodiscard]]
+  std::vector<int16_t> const& light_refs() const { return _light_refs; }
+
   glm::vec3 BoundingBoxMin;
   glm::vec3 BoundingBoxMax;
   glm::vec3 VertexBoxMin;
@@ -211,12 +218,68 @@ public:
   bool is_indoor() const { return header.flags.indoor; }
 
   [[nodiscard]]
+  bool is_exterior() const { return header.flags.exterior; }
+
+  [[nodiscard]]
+  bool is_exterior_lit() const { return header.flags.exterior_lit; }
+
+  [[nodiscard]]
+  bool has_mocv() const { return header.flags.has_vertex_color; }
+
+  [[nodiscard]]
+  std::uint32_t wmo_area_table_group_id() const { return header.id; }
+
+  // This group's authored MFOG references (MOGP fogs[4]) -- the client selects the scene fog from the
+  // CAMERA group's list, which is how fog colour/distance changes per room (Kara vs Deadmines ship etc).
+  [[nodiscard]]
+  std::uint8_t fog_id(int i) const { return header.fogs[i]; }
+
+  // Range into the root WMO's _portal_refs list = this group's portals (for portal-visibility culling).
+  [[nodiscard]]
+  std::uint16_t portal_start() const { return header.portal_start; }
+  [[nodiscard]]
+  std::uint16_t portal_count() const { return header.portal_count; }
+
+  [[nodiscard]]
   Noggit::Rendering::WMOGroupRender* renderer() { return &_renderer; };
   ::glm::vec3 center;
 
+  // Root-side MOGI flags for this group, read at ROOT load (available for every group before any group
+  // FILE loads). Needed by AttenTransVerts: a portal brightens only when its TARGET group has
+  // MOGI.flags & 0x48 (exterior / exterior-lit).
+  std::uint32_t mogi_flags = 0;
+
+  // Client CWorldEntity::SampleGroundColor (RE_notes/15, wow.exe 0x69E4C0/0x6B9A50): straight-down ray in
+  // WMO-LOCAL space from local_pos.y+1.0 to local_pos.y-12.0 against this group's triangles; on hit,
+  // barycentric-interpolates the retained MOCV rgb of the face into *out (0..1). Returns false when this
+  // group keeps no ground colours (non-indoor / no MOCV) or no floor is under the point. This colour is
+  // the ENTIRE base light of a unit standing indoors (MOHD ambient and the sun play no part).
+  // out_alpha (optional): the face's PRISTINE baked MOCV floor ALPHA barycentric-interpolated into [0..1]
+  // (GAP B / checklist 8.7 doorway spill) -- ~0 deep inside a room, ramping to 1 near a portal/window.
+  // out_floor_y (optional): the GROUP-LOCAL y of the hit floor face (the highest floor within the
+  // client's [pos.y-12, pos.y+1] down-ray). Lets the caller reject an outdoor object sitting on the
+  // terrain above an underground WMO whose floor is far below it (terrain-separation test).
+  bool sample_ground_color(glm::vec3 const& local_pos, glm::vec3* out, float* out_alpha = nullptr,
+                           float* out_floor_y = nullptr) const;
+
 private:
   void load_mocv(BlizzardArchive::ClientFile& f, uint32_t size);
+  // The 1.12 client's ONLY load-time MOCV mutation (byte-matched 100% on 64,317 traced verts across 3
+  // WMOs, RE_notes/19): brighten TRANSPARENCY-BATCH vertices toward white by proximity to portals that
+  // lead to exterior groups (op = 1 - 0.15*d, accumulated, capped 1), written ONLY when the new alpha
+  // byte exceeds the stored one. Everything else ships to the GPU verbatim -- the wowdev
+  // "FixColorVertexAlpha" (ambient subtract / halve / alpha fold) does NOT exist in 1.12.
+  void atten_trans_verts(std::vector<std::uint32_t>& colors); // parked (reverted; see WMO.cpp note)
   void fix_vertex_color_alpha();
+  // WotLK/3.3.5a CMapObjGroup::FixColorVertexAlpha (RE'd byte-exact from stock 12340 FUN_007D7380): the
+  // load-time MOCV transform 1.12 lacks. Paired with the mod2x (tex*MOCV*2) interior combine in wmo_frag.
+  // Gated to non-CLASSIC projects behind NOGGIT_335A_WMO_MOD2X (A/B, interior-lighting rule).
+  void fix_vertex_color_alpha_wotlk();
+  void compute_portal_openness();
+  // Client-faithful (SMOGroup flag `do_not_attenuate_vertices_based_on_distance_to_portal`): brighten
+  // interior vertices toward the outdoor light by their proximity to this group's portals, so the light
+  // spills smoothly through a doorway/window instead of a hard interior/exterior seam. Stored per-vertex
+  // as an "openness" factor in the vertex-colour alpha (1 at a portal, fading to 0 inward).
 
   WMO *wmo;
   wmo_group_header header;
@@ -224,10 +287,16 @@ private:
   int32_t num;
   int32_t fog;
   std::vector<uint16_t> _doodad_ref;
+  std::vector<int16_t> _light_refs; // MOLR
   std::unique_ptr<wmo_liquid> lq;
 
   std::vector <wmo_triangle_material_info> _material_infos;
   std::vector<wmo_batch> _batches;
+
+  // (Legacy, always false now: the portal-spill experiment is superseded by the byte-matched 1.12
+  // AttenTransVerts + tex*MOCV*(1+4a) pipeline, RE_notes/19.)
+  // this (indoor) group. The renderer flags such batches so the shader applies the outdoor-light spill.
+  bool _has_portal_openness = false;
 
   std::vector<::glm::vec3> _vertices;
   std::vector<::glm::vec3> _normals;
@@ -235,6 +304,19 @@ private:
   std::vector<glm::vec2> _texcoords_2;
   std::vector<glm::vec4> _vertex_colors;
   std::vector<uint16_t> _indices;
+  // Compact MOCV rgb copy (post atten_trans_verts), INDOOR groups only: the renderer clears
+  // _vertex_colors on GPU upload, but sample_ground_color() needs the baked floor colours on the CPU.
+  std::vector<glm::u8vec3> _ground_colors;
+  // Parallel to _ground_colors (same size / vertex indexing, INDOOR groups only): the PRISTINE baked
+  // MOCV floor ALPHA per vertex [0..255] (GAP B / checklist 8.7 doorway spill). ~0 deep interior,
+  // ramping to 255 near a portal/window. sample_ground_color() barycentric-interpolates it for the
+  // doorway day/night spill. Sourced from _mocv_pristine_alpha (below), NOT from the .w that
+  // fix_vertex_color_alpha / compute_portal_openness overwrite.
+  std::vector<std::uint8_t> _ground_alphas;
+  // Transient (load-time bridge): the pristine MOCV alpha straight from colorFromInt [0..1], captured in
+  // load_mocv BEFORE fix_vertex_color_alpha (.w=1) / compute_portal_openness (.w=portal-fade) clobber it,
+  // so the _ground_alphas build (end of load()) can read the true baked floor exposure.
+  std::vector<float> _mocv_pristine_alpha;
 
   std::optional<std::vector<wmo_bsp_node>> _bsp_tree_nodes;
   std::optional<std::vector<uint16_t>> _bsp_indices;
@@ -263,6 +345,17 @@ struct WMOPV {
 
 struct WMOPR {
   int16_t portal, group, dir, reserved;
+};
+
+// One MOPT entry: the polygon of a portal is _portal_vertices[base_vertex .. base_vertex+vertex_count).
+// (For CULLING the plane is recomputed from the transformed polygon; but the 1.12 AttenTransVerts pass
+// (RE_notes/19) needs the AUTHORED plane, stored here in noggit's swapped coord convention -- the swap
+// is orthogonal so dot(normal_swapped, v_swapped) + dist is invariant.)
+struct wmo_portal_info {
+  uint16_t base_vertex;
+  uint16_t vertex_count;
+  glm::vec3 plane_normal = glm::vec3(0.f);
+  float plane_dist = 0.f;
 };
 
 struct WMODoodadSet {
@@ -321,11 +414,23 @@ public:
 
   std::vector<WMOGroup> groups;
   std::vector<WMOMaterial> materials;
+  // Per material: the material asks for an Env/EnvMetal shader but its MOTX second-texture entry is EMPTY
+  // (e.g. Stormwind's SW_Harbor_Docks.wmo on the docked ship). There is no environment map to reflect, so
+  // the renderer must not sample one -- see eWMOBatch_NoEnvTexture.
+  std::vector<std::uint8_t> material_env_texture_missing;
   glm::vec3 extents[2];
   std::vector<scoped_blp_texture_reference> textures;
   std::vector<std::string> models;
   std::vector<wmo_doodad_instance> modelis;
   std::vector<glm::vec3> model_nearest_light_vector;
+
+  // Portal graph for interior visibility culling (MOPV/MOPT/MOPR). _portal_vertices = all portal polygon
+  // corners (WMO local space); _portal_info[p] = which slice of _portal_vertices is portal p's polygon;
+  // _portal_refs = the links (each group's portals are _portal_refs[group.portal_start .. +portal_count),
+  // giving the neighbour group index + which side of the portal that group sits on).
+  std::vector<glm::vec3> _portal_vertices;
+  std::vector<wmo_portal_info> _portal_info;
+  std::vector<WMOPR> _portal_refs;
 
   std::vector<WMOLight> lights;
   glm::vec4 ambient_light_color;
@@ -335,6 +440,17 @@ public:
   mohd_flags flags;
 
   std::vector<WMOFog> fogs;
+
+  // CLIENT-EXACT fog evaluation for one group at the camera position (wow.exe @0069de20 +
+  // weight @0069e1c0 + lerp @0069efd0; docs/client_re/27). Returns false when this WMO carries
+  // only the default MFOG entry -- the client evaluator bails there and the ZONE fog applies.
+  // Otherwise the result STARTS as fogs[0] (the default entry, NOT the zone fog) and every
+  // candidate from the group's MOGP fog indices (index != 0, !(flags & 1), camera closer than r2)
+  // is lerped over it FARTHEST-first with w = 1 inside r1, linear to 0 at r2 -- so the nearest
+  // fog dominates. fog_start_abs is absolute (WMOFog::init pre-multiplies the authored scaler).
+  bool evaluate_camera_fog(WMOGroup const& group, glm::mat4x4 const& transform,
+                           glm::vec3 const& camera, bool camera_inside_wmo, glm::vec3* color,
+                           float* fog_end, float* fog_start_abs) const;
 
   std::vector<WMODoodadSet> doodadsets;
 
@@ -371,6 +487,7 @@ public:
   static void report();
   static void clear_hidden_wmos();
   static void unload_all(Noggit::NoggitRenderContext context);
+  static std::size_t loaded_count() { return _.size(); } // [mem-diag]
 private:
   friend struct scoped_wmo_reference;
   static Noggit::AsyncObjectMultimap<WMO> _;

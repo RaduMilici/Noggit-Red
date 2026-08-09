@@ -11,6 +11,7 @@ layout (std140) uniform matrices
 {
   mat4 model_view;
   mat4 projection;
+  vec4 camera_pos;
 };
 
 struct ChunkInstanceData
@@ -173,24 +174,32 @@ void main()
 
   float NaN = makeNaN(1);
 
-  vec4 pos_after_holecheck = (is_hole ? vec4(NaN, NaN, NaN, 1.0) : vec4(pos, 1.0));
-  gl_Position = projection * model_view * pos_after_holecheck;
+  // Camera-relative rendering: subtract the camera position (Sterbenz-exact when both are near the
+  // same ~17000 magnitude, i.e. the near geometry that matters) BEFORE the rotation, so the float
+  // pipeline never cancels world-scale coordinates. view_rot = model_view with its translation
+  // zeroed (pure rotation); view_rot * (pos - camera) == model_view * pos exactly, but computed from
+  // small numbers. Fixes terrain wobbling against the (already precise) models = the PS1 jitter.
+  mat4 view_rot = model_view;
+  view_rot[3].xyz = vec3(0.0);
+  vec3 rel_pos = pos - camera_pos.xyz;
+  vec4 pos_after_holecheck = (is_hole ? vec4(NaN, NaN, NaN, 1.0) : vec4(rel_pos, 1.0));
+  gl_Position = projection * view_rot * pos_after_holecheck;
 
   vary_normal = normal_pos.rgb;
   triangle_normal = normal_pos.rgb;
   vary_position = pos;
   vary_mccv = texelFetch(mccv, ivec2(gl_VertexID, instanceID), 0).rgb;
 
-  vary_t0_uv = texcoord + animUVOffset(instances[instanceID].ChunkTexDoAnim.r,
+  vary_t0_uv = texcoord + animUVOffset(instances[instanceID].ChunkTexDoAnim.r & 1,
     instances[instanceID].ChunkTexAnimSpeed.r, instances[instanceID].ChunkTexAnimDir.r);
 
-  vary_t1_uv = texcoord + animUVOffset(instances[instanceID].ChunkTexDoAnim.g,
+  vary_t1_uv = texcoord + animUVOffset(instances[instanceID].ChunkTexDoAnim.g & 1,
     instances[instanceID].ChunkTexAnimSpeed.g, instances[instanceID].ChunkTexAnimDir.g);
 
-  vary_t2_uv = texcoord + animUVOffset(instances[instanceID].ChunkTexDoAnim.b,
+  vary_t2_uv = texcoord + animUVOffset(instances[instanceID].ChunkTexDoAnim.b & 1,
     instances[instanceID].ChunkTexAnimSpeed.b, instances[instanceID].ChunkTexAnimDir.b);
 
-  vary_t3_uv = texcoord + animUVOffset(instances[instanceID].ChunkTexDoAnim.a,
+  vary_t3_uv = texcoord + animUVOffset(instances[instanceID].ChunkTexDoAnim.a & 1,
     instances[instanceID].ChunkTexAnimSpeed.a, instances[instanceID].ChunkTexAnimDir.a);
 
   vary_texcoord = texcoord;

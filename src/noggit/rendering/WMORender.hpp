@@ -11,11 +11,15 @@
 #include <math/frustum.hpp>
 
 #include <map>
+#include <vector>
 
 class WMO;
 
 namespace Noggit::Rendering
 {
+  class LiquidTextureManager;
+  class WorldRender;
+
   class WMORender : public BaseRender
   {
   public:
@@ -25,6 +29,8 @@ namespace Noggit::Rendering
     void unload() override;
 
     void draw(OpenGL::Scoped::use_program& wmo_shader
+        , OpenGL::program* wmo_liquid_program
+        , LiquidTextureManager* liquid_texture_manager
         , glm::mat4x4 const& model_view
         , glm::mat4x4 const& projection
         , glm::mat4x4 const& transform_matrix
@@ -38,6 +44,10 @@ namespace Noggit::Rendering
         , bool world_has_skies
         , display_mode display
         , bool interior_only
+        , WorldRender* world_renderer = nullptr // per-room (MOLR) light scoping
+        // Written with this draw's per-group portal visibility (empty = all visible / culling off),
+        // so the caller can filter per-group WMO DOODADS the same way (hidden rooms hide their props).
+        , std::vector<uint8_t>* out_group_visibility = nullptr
     );
 
     bool drawSkybox(glm::mat4x4 const& model_view

@@ -5,8 +5,14 @@
 #include <noggit/Misc.h>
 #include <noggit/ModelManager.h> // ModelManager
 #include <noggit/TextureManager.h> // TextureManager, Texture
+#include <noggit/WMO.h> // WMOManager (mem-diag)
 #include <noggit/WMOInstance.h> // WMOInstance
+#ifdef _WIN32
+#include <windows.h>
+#include <psapi.h> // GetProcessMemoryInfo (mem-diag)
+#endif
 #include <noggit/World.h>
+#include <noggit/rendering/vulkan/VulkanBackend.hpp> // [VULKAN PHASE 0] interop proof of life (win32-gated inside)
 #include <noggit/map_index.hpp>
 #include <noggit/uid_storage.hpp>
 #include <noggit/ui/CurrentTexture.h>
@@ -19,6 +25,8 @@
 #include <noggit/ui/RotationEditor.h>
 #include <noggit/ui/TexturePicker.h>
 #include <noggit/ui/TexturingGUI.h>
+#include <noggit/ui/ZoneMusicPlayer.hpp>
+#include <noggit/ui/CreatureInfoPanel.hpp>
 #include <noggit/ui/Toolbar.h> // Noggit::Ui::toolbar
 #include <noggit/ui/Water.h>
 #include <noggit/ui/ZoneIDBrowser.h>
@@ -32,9 +40,14 @@
 #include <noggit/ui/texture_palette_small.hpp>
 #include <noggit/ui/MinimapCreator.hpp>
 #include <noggit/project/CurrentProject.hpp>
+#include <noggit/frame_profiler.hpp>
 #include <opengl/scoped.hpp>
 #include <noggit/ui/tools/ViewToolbar/Ui/ViewToolbar.hpp>
+#include <noggit/ui/tools/TimeGlobe/TimeGlobeWidget.hpp>
+#include <QtWidgets/QAction>
+#include <QtWidgets/QToolBar>
 #include <noggit/ui/tools/AssetBrowser/Ui/AssetBrowser.hpp>
+#include <noggit/ui/tools/AssetBrowser/ModelView.hpp>
 #include <noggit/ui/tools/PresetEditor/Ui/PresetEditor.hpp>
 #include <noggit/ui/tools/NodeEditor/Ui/NodeEditor.hpp>
 #include <noggit/ui/tools/UiCommon/ImageBrowser.hpp>
@@ -49,11 +62,13 @@
 #include <limits>
 #include <variant>
 #include <noggit/Selection.h>
+#include <math/ray.hpp>
 
 #ifdef USE_MYSQL_UID_STORAGE
 #include <mysql/mysql.h>
 
 #include <QtCore/QSettings>
+#include <noggit/MySqlSettings.hpp>
 #endif
 
 #include <noggit/scripting/scripting_tool.hpp>
@@ -68,8 +83,10 @@
 
 #include <QtCore/QTimer>
 #include <QtGui/QMouseEvent>
+#include <QtGui/QColor>
 #include <QtWidgets/QApplication>
 #include <QtWidgets/QCheckBox>
+#include <QtWidgets/QComboBox>
 #include <QtWidgets/QHBoxLayout>
 #include <QtWidgets/QLineEdit>
 #include <QtWidgets/QListWidget>
@@ -77,10 +94,21 @@
 #include <QtWidgets/QMenuBar>
 #include <QtWidgets/QDoubleSpinBox>
 #include <QtWidgets/QFormLayout>
+#include <QtWidgets/QGroupBox>
+#include <QtWidgets/QHeaderView>
 #include <QtWidgets/QPushButton>
+#include <QtWidgets/QSplitter>
 #include <QtWidgets/QStatusBar>
 #include <QtWidgets/QToolTip>
+#include <QtWidgets/QTreeWidget>
 #include <QtWidgets/QVBoxLayout>
+#include <QtWidgets/QScrollArea>
+#include <QtWidgets/QToolButton>
+#include <QtGui/QIconEngine>
+#include <QtGui/QPainter>
+#include <QtGui/QPalette>
+#include <QtGui/QPixmap>
+#include <QtGui/QIcon>
 #include <QWidgetAction>
 #include <QSurfaceFormat>
 #include <QMessageBox>
@@ -96,16 +124,42 @@
 #include <QTextStream>
 
 #include <algorithm>
+#include <sstream>
+#include <cctype>
 #include <cmath>
 #include <cstdlib>
+#include <functional>
 #include <iomanip>
 #include <iostream>
+#include <map>
+#include <set>
+#include <memory>
 
 #include <vector>
 #include <random>
 
 namespace
 {
+  bool capture_debug_enabled()
+  {
+    if (char const* value = std::getenv("NOGGIT_CAPTURE_DEBUG"))
+    {
+      return std::string(value) != "0";
+    }
+
+    return false;
+  }
+
+  bool creature_capture_overlay_enabled()
+  {
+    if (char const* value = std::getenv("NOGGIT_CAPTURE_CREATURES"))
+    {
+      return std::string(value) != "0";
+    }
+
+    return true;
+  }
+
   glm::vec3 server_to_client_creature_position(float server_x, float server_y, float server_z, bool global_wmo_map)
   {
     if (global_wmo_map)
@@ -137,6 +191,140 @@ namespace
     }
 
     return orientation;
+  }
+
+  QString creature_type_label(std::uint32_t creature_type)
+  {
+    switch (creature_type)
+    {
+      case 1:  return "Beast";
+      case 2:  return "Dragonkin";
+      case 3:  return "Demon";
+      case 4:  return "Elemental";
+      case 5:  return "Giant";
+      case 6:  return "Undead";
+      case 7:  return "Humanoid";
+      case 8:  return "Critter";
+      case 9:  return "Mechanical";
+      case 10: return "Not specified";
+      case 11: return "Totem";
+      case 12: return "Non-combat Pet";
+      case 13: return "Gas Cloud";
+      default: return QString("Type %1").arg(creature_type);
+    }
+  }
+
+  class CreaturePreviewModelViewer final : public Noggit::Ui::Tools::AssetBrowser::ModelViewer
+  {
+  public:
+    explicit CreaturePreviewModelViewer(QWidget* parent = nullptr)
+      : Noggit::Ui::Tools::AssetBrowser::ModelViewer(parent, Noggit::NoggitRenderContext::ASSET_BROWSER)
+    {
+    }
+
+    std::function<void()> on_double_click;
+
+    void setCreatureSpawnPreview(World& world, World::CreatureSpawnOverlay const& spawn)
+    {
+      setModel(spawn.model_path);
+      if (_model_instances.empty())
+      {
+        return;
+      }
+
+      auto& instance = _model_instances.back();
+      instance.scale = std::clamp(spawn.template_scale * spawn.model_scale,
+                                  ModelInstance::min_scale(),
+                                  ModelInstance::max_scale());
+      instance.dir = glm::vec3(0.0f, spawn.orientation, 0.0f);
+      instance.updateTransformMatrix();
+      world.applyCreatureSpawnModelAppearance(spawn, instance, _context);
+      instance.recalcExtents();
+      resetCamera();
+    }
+
+  protected:
+    void mouseDoubleClickEvent(QMouseEvent* event) override
+    {
+      if (on_double_click)
+      {
+        on_double_click();
+      }
+      event->accept();
+    }
+  };
+
+  // A QMenu that stays open when a CHECKABLE item is clicked, so the Seasonal Events dropdown can toggle
+  // several events without reopening each time. Non-checkable items (All / None) and outside clicks close
+  // it as usual.
+  class MultiToggleMenu final : public QMenu
+  {
+  public:
+    using QMenu::QMenu;
+
+  protected:
+    void mouseReleaseEvent(QMouseEvent* event) override
+    {
+      QAction* const action = activeAction();
+      if (action && action->isEnabled() && action->isCheckable())
+      {
+        action->trigger(); // toggle in place; keep the menu open
+        return;
+      }
+      QMenu::mouseReleaseEvent(event);
+    }
+  };
+
+  // A clean calendar QIcon rendered ONCE at high resolution (so Qt smooth-scales it down without the
+  // aliasing/artifacts a per-size QIconEngine produced at 16px), tinted to the SAME palette color as the
+  // noggit font-glyph toolbar icons (see FontNoggitIconEngine).
+  QIcon make_calendar_icon()
+  {
+    Noggit::Ui::FontNoggitButtonStyle style;
+    style.ensurePolished();
+    QColor const color = style.palette().color(QPalette::WindowText);
+
+    int const S = 128;
+    QPixmap pm(S, S);
+    pm.fill(Qt::transparent);
+
+    QPainter p(&pm);
+    p.setRenderHint(QPainter::Antialiasing, true);
+
+    QPen pen(color);
+    pen.setWidthF(S * 0.055);
+    pen.setJoinStyle(Qt::RoundJoin);
+    pen.setCapStyle(Qt::RoundCap);
+    p.setPen(pen);
+    p.setBrush(Qt::NoBrush);
+
+    // Calendar body (rounded), leaving headroom at the top for the two binding tabs.
+    QRectF const body(S * 0.15, S * 0.24, S * 0.70, S * 0.60);
+    p.drawRoundedRect(body, S * 0.07, S * 0.07);
+
+    // Two binding tabs crossing the top edge.
+    qreal const tabX1 = body.left() + body.width() * 0.28;
+    qreal const tabX2 = body.left() + body.width() * 0.72;
+    qreal const tabTop = S * 0.15;
+    qreal const tabBot = body.top() + body.height() * 0.10;
+    p.drawLine(QPointF(tabX1, tabTop), QPointF(tabX1, tabBot));
+    p.drawLine(QPointF(tabX2, tabTop), QPointF(tabX2, tabBot));
+
+    // Header separator, then a filled header strip so it reads clearly as a calendar at small sizes.
+    qreal const headerY = body.top() + body.height() * 0.30;
+    p.drawLine(QPointF(body.left(), headerY), QPointF(body.right(), headerY));
+
+    // A single centered "day" block in the lower area (one clean mark scales far better than a dot grid).
+    p.setPen(Qt::NoPen);
+    p.setBrush(color);
+    QRectF const day(body.center().x() - body.width() * 0.16,
+                     headerY + body.height() * 0.22,
+                     body.width() * 0.32,
+                     body.height() * 0.30);
+    p.drawRoundedRect(day, S * 0.03, S * 0.03);
+
+    p.end();
+    return QIcon(pm);
   }
 }
 
@@ -263,6 +451,10 @@ static const float YSENS = 15.0f;
 
 void MapView::set_editing_mode(editing_mode mode)
 {
+  // Selection markers (the disc under a spawn) only show while that spawn's tool is the active mode.
+  _world->setDrawCreatureMarkers(mode == editing_mode::creature);
+  _world->setDrawGameObjectMarkers(mode == editing_mode::gameobject);
+  _world->setDrawGameObjectSpawns(mode == editing_mode::gameobject);
 
   {
     QSignalBlocker const asset_browser_blocker(_asset_browser_dock);
@@ -357,6 +549,7 @@ void MapView::set_editing_mode(editing_mode mode)
         _minimap->use_selection(minimapTool->getSelectedTiles());
         break;
       case editing_mode::creature:
+        _show_creature_browser.set(true);
         if (!_world->hasCreatureSpawnsLoaded())
         {
           _world->reloadCreatureSpawns();
@@ -364,6 +557,12 @@ void MapView::set_editing_mode(editing_mode mode)
         _world->setDrawCreatureSpawns(true);
         rebuildCreatureBrowserList(true);
         updateDatabaseStatus();
+        break;
+      case editing_mode::gameobject:
+        _show_gameobject_browser.set(true);
+        _world->ensureGameObjectSpawnsLoaded();
+        rebuildGameObjectBrowserList(true);
+        updateGameObjectBrowserStatus();
         break;
       default:
         break;
@@ -388,7 +587,53 @@ void MapView::set_editing_mode(editing_mode mode)
 
 void MapView::setToolPropertyWidgetVisibility(editing_mode mode)
 {
-  _tool_panel_dock->setCurrentIndex(static_cast<int>(mode));
+  bool const creature_mode = mode == editing_mode::creature;
+  bool const gameobject_mode = mode == editing_mode::gameobject;
+  bool const spawn_mode = creature_mode || gameobject_mode; // dock-based tools without a tool panel
+  _main_window->setCorner(Qt::BottomRightCorner,
+                          spawn_mode ? Qt::BottomDockWidgetArea : Qt::RightDockWidgetArea);
+
+  if (_tool_panel_dock)
+  {
+    _tool_panel_dock->setVisible(!ui_hidden && !spawn_mode);
+    if (!spawn_mode)
+    {
+      // gameobject (=15) has no tool-panel page; setCurrentIndex must not be called with it.
+      _tool_panel_dock->setCurrentIndex(static_cast<int>(mode));
+    }
+  }
+
+  auto set_creature_docks_visible = [](bool visible, std::initializer_list<QDockWidget*> docks)
+  {
+    for (auto* dock : docks)
+    {
+      if (dock)
+      {
+        dock->setVisible(visible);
+      }
+    }
+  };
+
+  if (mode != editing_mode::creature)
+  {
+    if (_creature_actions_overlay)
+    {
+      _creature_actions_overlay->setVisible(false);
+    }
+    set_creature_docks_visible(false, {_creature_browser_dock,
+                                       _creature_editor_dock,
+                                       _creature_model_picker_dock});
+  }
+
+  if (mode != editing_mode::gameobject)
+  {
+    if (_gameobject_actions_overlay)
+    {
+      _gameobject_actions_overlay->setVisible(false);
+    }
+    set_creature_docks_visible(false, {_gameobject_browser_dock,
+                                       _gameobject_model_picker_dock});
+  }
 
   switch (mode)
   {
@@ -399,7 +644,51 @@ void MapView::setToolPropertyWidgetVisibility(editing_mode mode)
     _viewport_overlay_ui->gizmoBar->setVisible(!ui_hidden);
     break;
   case editing_mode::creature:
-    _creature_browser_dock->setVisible(!ui_hidden);
+    if (_creature_actions_overlay)
+    {
+      _creature_actions_overlay->setVisible(!ui_hidden && _show_creature_browser.get());
+    }
+    set_creature_docks_visible(!ui_hidden && _show_creature_browser.get(),
+                               {_creature_browser_dock,
+                                _creature_editor_dock,
+                                _creature_model_picker_dock});
+    if (!ui_hidden && _show_creature_browser.get())
+    {
+      if (_creature_browser_dock && _creature_editor_dock)
+      {
+        _main_window->resizeDocks({_creature_browser_dock, _creature_editor_dock},
+                                  {3, 1},
+                                  Qt::Vertical);
+      }
+      if (_creature_browser_dock)
+      {
+        _main_window->resizeDocks({_creature_browser_dock}, {330}, Qt::Horizontal);
+      }
+      if (_creature_model_picker_dock)
+      {
+        _main_window->resizeDocks({_creature_model_picker_dock}, {260}, Qt::Vertical);
+      }
+    }
+    break;
+  case editing_mode::gameobject:
+    if (_gameobject_actions_overlay)
+    {
+      _gameobject_actions_overlay->setVisible(!ui_hidden && _show_gameobject_browser.get());
+    }
+    set_creature_docks_visible(!ui_hidden && _show_gameobject_browser.get(),
+                               {_gameobject_browser_dock,
+                                _gameobject_model_picker_dock});
+    if (!ui_hidden && _show_gameobject_browser.get())
+    {
+      if (_gameobject_browser_dock)
+      {
+        _main_window->resizeDocks({_gameobject_browser_dock}, {330}, Qt::Horizontal);
+      }
+      if (_gameobject_model_picker_dock)
+      {
+        _main_window->resizeDocks({_gameobject_model_picker_dock}, {260}, Qt::Vertical);
+      }
+    }
     break;
   case editing_mode::paint:
     _texture_browser_dock->setVisible(!ui_hidden && _settings->value("map_view/texture_browser", false).toBool());
@@ -945,11 +1234,18 @@ void MapView::setupObjectEditorUi()
 
 void MapView::setupCreatureEditorUi()
 {
+  // The coordinate editor lives as a column inside the NPC Model Picker splitter (built later in
+  // setupCreatureModelPickerUi); we just build the panel widget here and hand it off via the member.
   auto container = new QWidget(this);
+  container->setMinimumWidth(240);
   auto layout = new QVBoxLayout(container);
   layout->setContentsMargins(6, 6, 6, 6);
 
-  auto hint = new QLabel("Left click: select/drag spawn\nShift+click or shift-drag: multi-select\nUse 'Export SQL' to persist", container);
+  auto coord_title = new QLabel("Creature Coordinates", container);
+  coord_title->setStyleSheet("font-weight: bold;");
+  layout->addWidget(coord_title);
+
+  auto hint = new QLabel("Left click: select or drag\nShift: add or box-select", container);
   hint->setWordWrap(true);
   layout->addWidget(hint);
 
@@ -967,9 +1263,11 @@ void MapView::setupCreatureEditorUi()
     return sb;
   };
 
-  _spawn_edit_x           = make_spin(-20000.0, 20000.0, 0.1);
-  _spawn_edit_y           = make_spin(  -500.0,  5000.0, 0.1);
-  _spawn_edit_z           = make_spin(-20000.0, 20000.0, 0.1);
+  // Noggit client coordinates span 0..2*ZEROPOINT (~34133) on normal maps and +/-ZEROPOINT on global
+  // WMO maps, so the X/Z range must be wide enough not to clamp distant spawns.
+  _spawn_edit_x           = make_spin(-64000.0, 64000.0, 0.1);
+  _spawn_edit_y           = make_spin(-20000.0, 20000.0, 0.1);
+  _spawn_edit_z           = make_spin(-64000.0, 64000.0, 0.1);
   _spawn_edit_orientation = make_spin(     0.0,   360.0, 1.0);
   _spawn_edit_orientation->setWrapping(true);
   _spawn_edit_orientation->setSuffix(QString::fromUtf8("\xc2\xb0"));  // ┬░
@@ -982,7 +1280,6 @@ void MapView::setupCreatureEditorUi()
   form->addRow("Z:", _spawn_edit_z);
   form->addRow("Orientation:", _spawn_edit_orientation);
   layout->addLayout(form);
-  layout->addStretch();
 
   auto on_change = [this](double) {
     if (!_selected_creature_spawn_guid)
@@ -995,8 +1292,9 @@ void MapView::setupCreatureEditorUi()
       static_cast<float>(_spawn_edit_x->value()),
       static_cast<float>(_spawn_edit_y->value()),
       static_cast<float>(_spawn_edit_z->value()));
-    spawn->orientation = static_cast<float>(glm::radians(_spawn_edit_orientation->value()));
-    spawn->dirty = glm::distance(spawn->pos, spawn->original_pos) > 0.01f
+    spawn->orientation = static_cast<float>(_spawn_edit_orientation->value());
+    spawn->dirty = spawn->pending_create
+                || glm::distance(spawn->pos, spawn->original_pos) > 0.01f
                 || std::abs(spawn->orientation - spawn->original_orientation) > 0.01f;
 
     if (spawn->model_instance)
@@ -1016,16 +1314,18 @@ void MapView::setupCreatureEditorUi()
   connect(_spawn_edit_z,           qOverload<double>(&QDoubleSpinBox::valueChanged), on_change);
   connect(_spawn_edit_orientation, qOverload<double>(&QDoubleSpinBox::valueChanged), on_change);
 
-  _tool_panel_dock->registerTool("Creature Editor", container);
+  _creature_editor_panel = container;
 }
 
 void MapView::setupCreatureBrowserUi()
 {
-  _creature_browser_dock = new QDockWidget("Creature Browser", this);
+  _creature_browser_dock = new QDockWidget("Creature Browser", _main_window);
   _creature_browser_dock->setFeatures(QDockWidget::DockWidgetMovable
                                       | QDockWidget::DockWidgetFloatable
                                       | QDockWidget::DockWidgetClosable);
   _creature_browser_dock->setAllowedAreas(Qt::LeftDockWidgetArea | Qt::RightDockWidgetArea | Qt::BottomDockWidgetArea);
+  _creature_browser_dock->setMinimumWidth(330);
+  _creature_browser_dock->resize(380, 520);
   _main_window->addDockWidget(Qt::RightDockWidgetArea, _creature_browser_dock);
   connect(this, &QObject::destroyed, _creature_browser_dock, &QObject::deleteLater);
 
@@ -1037,28 +1337,58 @@ void MapView::setupCreatureBrowserUi()
   _creature_search_field->setPlaceholderText("Search by creature name, guid, or entry");
   layout->addWidget(_creature_search_field);
 
-  _creature_search_all_maps = new QCheckBox("Search all maps", container);
-  layout->addWidget(_creature_search_all_maps);
+  _creature_zone_filter = new QCheckBox("Zone only (current zone)", container);
+  _creature_zone_filter->setToolTip("Only list creatures whose position is in the same zone as the camera"
+                                    " (e.g. Searing Gorge). Spawns in unloaded tiles are excluded.");
+  layout->addWidget(_creature_zone_filter);
+  connect(_creature_zone_filter, &QCheckBox::toggled, [this]() { rebuildCreatureBrowserList(true); });
+
+  // Type/rank filter, mirroring the NPC model picker. Filters the current-map spawn list by the spawned
+  // creature's template type/rank (looked up per spawn entry from _creature_template_filter_info, which
+  // the model picker fills when it loads creature_template). The Type combo is populated there too.
+  {
+    auto type_row = new QHBoxLayout();
+    type_row->addWidget(new QLabel("Type", container));
+    _creature_browser_type_filter = new QComboBox(container);
+    _creature_browser_type_filter->addItem("All types"); // index 0 -> no type filter
+    _creature_browser_type_filter->setToolTip("Filter the spawn list by creature type.");
+    type_row->addWidget(_creature_browser_type_filter, 1);
+    layout->addLayout(type_row);
+
+    auto flag_row = new QHBoxLayout();
+    _creature_browser_elite = new QCheckBox("Elite", container);
+    _creature_browser_boss = new QCheckBox("Boss", container);
+    _creature_browser_civilian = new QCheckBox("Civilian", container);
+    _creature_browser_trainer = new QCheckBox("Trainer", container);
+    _creature_browser_elite->setToolTip("Show rank 1 and 2 spawns.");
+    _creature_browser_boss->setToolTip("Show rank 3 and higher spawns.");
+    flag_row->addWidget(_creature_browser_elite);
+    flag_row->addWidget(_creature_browser_boss);
+    flag_row->addWidget(_creature_browser_civilian);
+    flag_row->addWidget(_creature_browser_trainer);
+    flag_row->addStretch(1);
+    layout->addLayout(flag_row);
+
+    connect(_creature_browser_type_filter, qOverload<int>(&QComboBox::currentIndexChanged),
+            [this]() { rebuildCreatureBrowserList(true); });
+    for (auto* cb : {_creature_browser_elite, _creature_browser_boss,
+                     _creature_browser_civilian, _creature_browser_trainer})
+    {
+      connect(cb, &QCheckBox::toggled, [this]() { rebuildCreatureBrowserList(true); });
+    }
+  }
 
   _creature_list_widget = new QListWidget(container);
   _creature_list_widget->setSelectionMode(QAbstractItemView::SingleSelection);
+  _creature_list_widget->setMinimumHeight(360);
   layout->addWidget(_creature_list_widget, 1);
-
-  auto button_row = new QHBoxLayout();
-  auto reload_button = new QPushButton("Reload", container);
-  auto save_button = new QPushButton("Export SQL", container);
-  auto revert_button = new QPushButton("Discard Pending", container);
-  button_row->addWidget(reload_button);
-  button_row->addWidget(save_button);
-  button_row->addWidget(revert_button);
-  layout->addLayout(button_row);
 
   _creature_browser_status = new QLabel(container);
   _creature_browser_status->setWordWrap(true);
   layout->addWidget(_creature_browser_status);
 
   _creature_browser_dock->setWidget(container);
-  _creature_browser_dock->setVisible(_settings->value("map_view/creature_browser", false).toBool());
+  _creature_browser_dock->setVisible(false);
 
   connect(_creature_browser_dock, &QDockWidget::visibilityChanged,
           [this](bool visible)
@@ -1073,9 +1403,25 @@ void MapView::setupCreatureBrowserUi()
   connect(&_show_creature_browser, &Noggit::BoolToggleProperty::changed,
           [this](bool visible)
           {
-            if (!ui_hidden && _creature_browser_dock)
+            bool const show = visible && !ui_hidden && terrainMode == editing_mode::creature;
+            if (ui_hidden && visible)
             {
-              _creature_browser_dock->setVisible(visible);
+              return;
+            }
+
+            if (_creature_actions_overlay)
+            {
+              _creature_actions_overlay->setVisible(show);
+            }
+
+            for (auto* dock : {_creature_browser_dock,
+                               _creature_editor_dock,
+                               _creature_model_picker_dock})
+            {
+              if (dock)
+              {
+                dock->setVisible(show);
+              }
             }
           });
   connect(_creature_browser_dock, &QDockWidget::visibilityChanged,
@@ -1086,13 +1432,136 @@ void MapView::setupCreatureBrowserUi()
           {
             rebuildCreatureBrowserList(true);
           });
-  connect(_creature_search_all_maps, &QCheckBox::toggled,
-          [this]()
-          {
-            rebuildCreatureBrowserList(false);
-          });
   connect(_creature_list_widget, &QListWidget::itemClicked,
           this, &MapView::jumpToCreatureListItem);
+
+  updateCreatureBrowserStatus();
+}
+
+void MapView::setupCreatureActionsUi()
+{
+  if (!_overlay_widget)
+  {
+    return;
+  }
+
+  _creature_actions_overlay = new QWidget(_overlay_widget);
+  _creature_actions_overlay->setObjectName("creatureActionsOverlay");
+  _creature_actions_overlay->setAttribute(Qt::WA_StyledBackground, true);
+  _creature_actions_overlay->setStyleSheet(
+    "#creatureActionsOverlay { background: rgba(28, 31, 37, 210); border: 1px solid rgba(85, 91, 103, 180); }"
+    "#creatureActionsOverlay QPushButton { padding: 5px 9px; }");
+
+  auto layout = new QHBoxLayout(_creature_actions_overlay);
+  layout->setContentsMargins(5, 5, 5, 5);
+  layout->setSpacing(5);
+
+  auto reload_button = new QPushButton("Reload Spawns", _creature_actions_overlay);
+  auto save_button = new QPushButton("Export SQL", _creature_actions_overlay);
+  auto revert_button = new QPushButton("Discard Pending", _creature_actions_overlay);
+  auto pending_button = new QPushButton("Pending \xE2\x96\xBE", _creature_actions_overlay);
+  pending_button->setToolTip("Show the list of pending creature updates waiting for SQL export.");
+  layout->addWidget(reload_button);
+  layout->addWidget(save_button);
+  layout->addWidget(revert_button);
+  layout->addWidget(pending_button);
+
+  // Toggleable dropdown listing every pending change (new / moved / deleted) awaiting SQL export.
+  _creature_pending_popup = new QWidget(this, Qt::Popup);
+  _creature_pending_popup->setObjectName("creaturePendingPopup");
+  _creature_pending_popup->setAttribute(Qt::WA_StyledBackground, true);
+  _creature_pending_popup->setStyleSheet(
+    "#creaturePendingPopup { background: rgba(28, 31, 37, 235); border: 1px solid rgba(85, 91, 103, 200); }");
+  auto pending_layout = new QVBoxLayout(_creature_pending_popup);
+  pending_layout->setContentsMargins(6, 6, 6, 6);
+  pending_layout->setSpacing(4);
+  auto pending_title = new QLabel("Pending creature updates", _creature_pending_popup);
+  pending_title->setStyleSheet("font-weight: bold; color: #ddd;");
+  pending_layout->addWidget(pending_title);
+  _creature_pending_list = new QListWidget(_creature_pending_popup);
+  _creature_pending_list->setMinimumSize(360, 220);
+  _creature_pending_list->setSelectionMode(QListWidget::NoSelection);
+  pending_layout->addWidget(_creature_pending_list);
+
+  auto refresh_pending = [this]()
+  {
+    if (!_creature_pending_list)
+    {
+      return;
+    }
+    _creature_pending_list->clear();
+    int count = 0;
+    for (auto const& spawn : _world->creatureSpawns())
+    {
+      if (!spawn.dirty)
+      {
+        continue;
+      }
+      // A spawn created and deleted this session never hit the DB -> nothing to export.
+      if (spawn.pending_delete && spawn.pending_create)
+      {
+        continue;
+      }
+      QString action;
+      if (spawn.pending_delete)
+      {
+        action = "DELETE";
+      }
+      else if (spawn.pending_create)
+      {
+        action = "NEW";
+      }
+      else
+      {
+        action = "MOVE";
+      }
+      QString const name = QString::fromStdString(spawn.name.empty() ? std::string("<unnamed>") : spawn.name);
+      _creature_pending_list->addItem(
+        QString("[%1] guid %2  entry %3  %4").arg(action).arg(spawn.guid).arg(spawn.entry).arg(name));
+      ++count;
+    }
+    if (count == 0)
+    {
+      _creature_pending_list->addItem("No pending updates.");
+    }
+  };
+
+  connect(pending_button, &QPushButton::clicked,
+          [this, pending_button, refresh_pending]()
+          {
+            if (!_creature_pending_popup)
+            {
+              return;
+            }
+            if (_creature_pending_popup->isVisible())
+            {
+              _creature_pending_popup->hide();
+              return;
+            }
+            refresh_pending();
+            _creature_pending_popup->adjustSize();
+            QPoint const below = pending_button->mapToGlobal(QPoint(0, pending_button->height() + 2));
+            _creature_pending_popup->move(below);
+            _creature_pending_popup->show();
+          });
+
+  auto place_actions = [this]()
+  {
+    if (!_creature_actions_overlay)
+    {
+      return;
+    }
+
+    _creature_actions_overlay->adjustSize();
+    _creature_actions_overlay->move(std::max(8, width() - _creature_actions_overlay->width() - 14), 8);
+    _creature_actions_overlay->raise();
+  };
+
+  _creature_actions_overlay->setVisible(false);
+  place_actions();
+  connect(this, &MapView::resized, this, place_actions);
+  connect(this, &QObject::destroyed, _creature_actions_overlay, &QObject::deleteLater);
+
   connect(reload_button, &QPushButton::clicked,
           [this]()
           {
@@ -1106,10 +1575,1440 @@ void MapView::setupCreatureBrowserUi()
   connect(revert_button, &QPushButton::clicked,
           [this]()
           {
-            refreshCreatureSpawnOverlay(true);
+            discardPendingCreatureSpawns();
+          });
+}
+
+void MapView::setupCreatureModelPickerUi()
+{
+  _creature_model_picker_dock = new QDockWidget("NPC Model Picker", _main_window);
+  _creature_model_picker_dock->setFeatures(QDockWidget::DockWidgetMovable
+                                           | QDockWidget::DockWidgetFloatable
+                                           | QDockWidget::DockWidgetClosable);
+  _creature_model_picker_dock->setAllowedAreas(Qt::BottomDockWidgetArea | Qt::TopDockWidgetArea);
+  _creature_model_picker_dock->setMinimumHeight(220);
+
+  auto container = new QWidget(this);
+  auto root_layout = new QVBoxLayout(container);
+  root_layout->setContentsMargins(6, 6, 6, 6);
+  root_layout->setSpacing(6);
+
+  // Filters now live in a small vertical panel beside the list (added to the splitter below).
+  auto filter_panel = new QWidget(container);
+  filter_panel->setMaximumWidth(150);
+  auto filter_layout = new QVBoxLayout(filter_panel);
+  filter_layout->setContentsMargins(4, 4, 4, 4);
+  filter_layout->setSpacing(4);
+  auto filter_title = new QLabel("Filters", filter_panel);
+  filter_title->setStyleSheet("font-weight: bold;");
+  filter_layout->addWidget(filter_title);
+  auto type_label = new QLabel("Type", filter_panel);
+  auto type_filter = new QComboBox(filter_panel);
+  type_filter->setToolTip("Filter entries by creature type. Populated from the loaded creature_template list.");
+  type_filter->addItem("All types");  // index 0: no data -> no type filter
+  auto elite_only = new QCheckBox("Elite", filter_panel);
+  auto boss_only = new QCheckBox("Boss", filter_panel);
+  auto civilian_only = new QCheckBox("Civilian", filter_panel);
+  auto trainer_only = new QCheckBox("Trainer", filter_panel);
+  elite_only->setToolTip("Show rank 1 and 2 entries.");
+  boss_only->setToolTip("Show rank 3 and higher entries.");
+  civilian_only->setToolTip("Show entries with the civilian type flag.");
+  trainer_only->setToolTip("Show entries with trainer NPC flags.");
+  filter_layout->addWidget(type_label);
+  filter_layout->addWidget(type_filter);
+  filter_layout->addWidget(elite_only);
+  filter_layout->addWidget(boss_only);
+  filter_layout->addWidget(civilian_only);
+  filter_layout->addWidget(trainer_only);
+  filter_layout->addStretch();
+
+  auto splitter = new QSplitter(Qt::Horizontal, container);
+
+  // Search box now sits directly above the model tree (list) column at the list width.
+  auto list_column = new QWidget(splitter);
+  auto list_column_layout = new QVBoxLayout(list_column);
+  list_column_layout->setContentsMargins(0, 0, 0, 0);
+  list_column_layout->setSpacing(4);
+
+  auto search_box = new QLineEdit(list_column);
+  search_box->setPlaceholderText("Search by entry id or name...");
+  search_box->setClearButtonEnabled(true);
+  search_box->setToolTip("Filter the list by creature_template entry id or name (case-insensitive).");
+  list_column_layout->addWidget(search_box);
+
+  _creature_model_tree = new QTreeWidget(list_column);
+  _creature_model_tree->setHeaderHidden(true);
+  _creature_model_tree->setMinimumWidth(360);
+  list_column_layout->addWidget(_creature_model_tree, 1);
+
+  auto preview = new CreaturePreviewModelViewer(splitter);
+  preview->setMinimumSize(360, 220);
+
+  auto spawn_box = new QGroupBox("Edit/New Creature", splitter);
+  _creature_spawn_box = spawn_box;
+  auto spawn_layout = new QFormLayout(spawn_box);
+  auto guid_field = new QLineEdit(spawn_box);
+  auto entry_field = new QLineEdit(spawn_box);
+  auto display_field = new QLineEdit(spawn_box);
+  _creature_spawn_guid_field = guid_field;
+  _creature_spawn_entry_field = entry_field;
+  _creature_spawn_display_field = display_field;
+  auto add_button = new QPushButton("Add Pending Spawn", spawn_box);
+  add_button->setEnabled(false);
+  guid_field->setPlaceholderText("GUID");
+  entry_field->setPlaceholderText("Entry");
+  display_field->setPlaceholderText("Display ID");
+  spawn_layout->addRow("GUID:", guid_field);
+  spawn_layout->addRow("Entry:", entry_field);
+  spawn_layout->addRow("Display:", display_field);
+  spawn_layout->addRow(add_button);
+  splitter->addWidget(list_column);
+  splitter->addWidget(filter_panel);
+  splitter->addWidget(preview);
+  splitter->addWidget(spawn_box);
+  if (_creature_editor_panel)
+  {
+    splitter->addWidget(_creature_editor_panel);
+  }
+  splitter->setStretchFactor(0, 2);  // model tree
+  splitter->setStretchFactor(1, 0);  // filter panel
+  splitter->setStretchFactor(2, 3);  // preview
+  splitter->setStretchFactor(3, 1);  // new spawn
+  splitter->setStretchFactor(4, 1);  // coordinate editor
+  splitter->setSizes({380, 130, 520, 240, 280});
+  root_layout->addWidget(splitter, 1);
+
+  _creature_model_picker_status = new QLabel("Loading creature_template entries...", container);
+  _creature_model_picker_status->setWordWrap(true);
+  root_layout->addWidget(_creature_model_picker_status);
+
+  struct TemplatePickerEntry
+  {
+    std::uint32_t entry = 0;
+    std::uint32_t faction = 0;
+    std::uint32_t creature_type = 0;
+    std::uint32_t rank = 0;
+    std::uint32_t npc_flags = 0;
+    std::uint32_t type_flags = 0;
+    std::uint32_t flags_extra = 0;
+    std::uint32_t display_id = 0;
+    std::uint32_t model_id = 0;
+    std::string name;
+    std::string path;
+    float template_scale = 1.0f;
+    float model_scale = 1.0f;
+  };
+
+  auto normalize_picker_path = [](std::string path)
+  {
+    std::replace(path.begin(), path.end(), '\\', '/');
+    std::transform(path.begin(), path.end(), path.begin(), [](unsigned char c)
+    {
+      return static_cast<char>(std::tolower(c));
+    });
+
+    if (auto extension_pos = path.rfind(".mdx"); extension_pos != std::string::npos)
+    {
+      path.replace(extension_pos, 4, ".m2");
+    }
+    else if (auto extension_pos = path.rfind(".mdl"); extension_pos != std::string::npos)
+    {
+      path.replace(extension_pos, 4, ".m2");
+    }
+    else if (path.rfind('.') == std::string::npos)
+    {
+      path += ".m2";
+    }
+    return path;
+  };
+
+  // model_scale = CreatureModelData.ModelScale (M, intrinsic). display_scale_out =
+  // CreatureDisplayInfo.CreatureModelScale (D), the object-scale fallback used when
+  // creature_template.scale is 0 (server ObjectMgr.cpp:1436). Final render = (template.scale or D) * M.
+  // D is a fallback, NOT an extra multiplier -- do not fold it into model_scale.
+  auto resolve_display_model = [&](std::uint32_t display_id,
+                                   std::uint32_t& model_id,
+                                   std::string& model_path,
+                                   float& model_scale,
+                                   float& display_scale_out)
+  {
+    try
+    {
+      auto display = gCreatureDisplayInfoDB.getByID(display_id);
+      model_id = display.getUInt(CreatureDisplayInfoDB::ModelID);
+      auto model = gCreatureModelDataDB.getByID(model_id);
+      model_path = normalize_picker_path(model.getString(CreatureModelDataDB::ModelName));
+      float display_scale = display.getFloat(CreatureDisplayInfoDB::CreatureModelScale);
+      float model_data_scale = model.getFloat(CreatureModelDataDB::ModelScale);
+      display_scale_out = display_scale > 0.0f ? display_scale : 1.0f;
+      model_scale = model_data_scale > 0.0f ? model_data_scale : 1.0f;
+      return !model_path.empty();
+    }
+    catch (DBCFile::NotFound const&)
+    {
+      model_id = 0;
+      model_path.clear();
+      model_scale = 1.0f;
+      display_scale_out = 1.0f;
+      return false;
+    }
+  };
+
+  auto template_entries = std::make_shared<std::vector<TemplatePickerEntry>>();
+
+#ifdef USE_MYSQL_UID_STORAGE
+  std::string template_error;
+  auto records = mysql::getCreatureTemplates(25000, &template_error);
+  template_entries->reserve(records.size());
+  for (auto const& record : records)
+  {
+    TemplatePickerEntry entry;
+    entry.entry = record.entry;
+    entry.faction = record.faction;
+    entry.creature_type = record.creature_type;
+    entry.rank = record.rank;
+    entry.npc_flags = record.npc_flags;
+    entry.type_flags = record.type_flags;
+    entry.flags_extra = record.flags_extra;
+    entry.display_id = record.display_id;
+    entry.name = record.name;
+    entry.template_scale = record.template_scale;
+    if (entry.display_id)
+    {
+      float display_scale = 1.0f;
+      resolve_display_model(entry.display_id, entry.model_id, entry.path, entry.model_scale, display_scale);
+      // creature_template.scale of 0 -> fall back to CreatureDisplayInfo scale D (server behavior).
+      if (entry.template_scale <= 0.0f)
+      {
+        entry.template_scale = display_scale;
+      }
+    }
+    if (entry.template_scale <= 0.0f)
+    {
+      entry.template_scale = 1.0f;
+    }
+    template_entries->push_back(std::move(entry));
+  }
+#else
+  std::string template_error = "Build does not include MySQL support.";
+#endif
+
+  // Populate the type dropdown with every distinct creature type present in the loaded list.
+  {
+    std::set<std::uint32_t> distinct_types;
+    for (auto const& entry : *template_entries)
+    {
+      distinct_types.insert(entry.creature_type);
+    }
+    for (auto const creature_type : distinct_types)  // std::set keeps them sorted
+    {
+      QString const label = creature_type
+        ? QString("%1 (%2)").arg(creature_type_label(creature_type)).arg(creature_type)
+        : QString("None (0)");
+      type_filter->addItem(label, static_cast<qulonglong>(creature_type));
+    }
+  }
+
+  // Share the loaded creature_template type/rank info with the current-map creature browser so it can
+  // offer the same Type/Elite/Boss/Civilian/Trainer filter, and populate its Type combo identically.
+  {
+    _creature_template_filter_info.clear();
+    for (auto const& entry : *template_entries)
+    {
+      _creature_template_filter_info[entry.entry] =
+        CreatureFilterInfo{entry.creature_type, entry.rank, entry.type_flags, entry.flags_extra, entry.npc_flags};
+    }
+    if (_creature_browser_type_filter)
+    {
+      std::set<std::uint32_t> distinct_types;
+      for (auto const& entry : *template_entries)
+      {
+        distinct_types.insert(entry.creature_type);
+      }
+      QSignalBlocker blocker(_creature_browser_type_filter);
+      for (auto const creature_type : distinct_types)
+      {
+        QString const label = creature_type
+          ? QString("%1 (%2)").arg(creature_type_label(creature_type)).arg(creature_type)
+          : QString("None (0)");
+        _creature_browser_type_filter->addItem(label, static_cast<qulonglong>(creature_type));
+      }
+    }
+    rebuildCreatureBrowserList(true); // refresh now that the filter data is available
+  }
+
+  auto selected_template = std::make_shared<std::optional<TemplatePickerEntry>>();
+
+  auto suggested_guid = [this]()
+  {
+    std::uint32_t highest = 0;
+    for (auto const& spawn : _world->creatureSpawns())
+    {
+      highest = std::max(highest, spawn.guid);
+    }
+    return highest + 1;
+  };
+
+  auto passes_filters = [=](TemplatePickerEntry const& entry)
+  {
+    auto const needle = search_box->text().trimmed();
+    if (!needle.isEmpty())
+    {
+      QString const name = QString::fromStdString(entry.name);
+      QString const id = QString::number(entry.entry);
+      if (!name.contains(needle, Qt::CaseInsensitive) && !id.contains(needle))
+      {
+        return false;
+      }
+    }
+    auto const type_data = type_filter->currentData();
+    if (type_data.isValid() && entry.creature_type != static_cast<std::uint32_t>(type_data.toULongLong()))
+    {
+      return false;
+    }
+    if (elite_only->isChecked() && !(entry.rank == 1u || entry.rank == 2u))
+    {
+      return false;
+    }
+    if (boss_only->isChecked() && entry.rank < 3u && (entry.type_flags & 0x4u) == 0u)
+    {
+      return false;
+    }
+    if (civilian_only->isChecked() && (entry.flags_extra & 0x2u) == 0u && (entry.type_flags & 0x80u) == 0u)
+    {
+      return false;
+    }
+    if (trainer_only->isChecked() && (entry.npc_flags & 0x10u) == 0u)
+    {
+      return false;
+    }
+    return true;
+  };
+
+  auto rebuild_template_tree = [=]()
+  {
+    _creature_model_tree->clear();
+    std::size_t visible_count = 0;
+    std::size_t previewable_count = 0;
+
+    for (auto const& entry : *template_entries)
+    {
+      if (!passes_filters(entry))
+      {
+        continue;
+      }
+
+      ++visible_count;
+      if (!entry.path.empty())
+      {
+        ++previewable_count;
+      }
+
+      auto* row = new QTreeWidgetItem(_creature_model_tree);
+      row->setText(0, QString("%1 - %2").arg(entry.entry).arg(QString::fromStdString(entry.name)));
+      row->setData(0, Qt::UserRole, static_cast<qulonglong>(entry.entry));
+      row->setData(0, Qt::UserRole + 1, true);
+      if (entry.path.empty())
+      {
+        row->setForeground(0, QColor(135, 135, 135));
+      }
+    }
+
+    _creature_model_tree->sortItems(0, Qt::AscendingOrder);
+
+    if (_creature_model_picker_status)
+    {
+      QString message = QString("%1 creature_template entr%2 shown, %3 previewable")
+                          .arg(visible_count)
+                          .arg(visible_count == 1 ? "y" : "ies")
+                          .arg(previewable_count);
+      if (!template_error.empty())
+      {
+        message = QString("Template load failed: %1").arg(QString::fromStdString(template_error));
+      }
+      _creature_model_picker_status->setText(message);
+    }
+  };
+
+  auto update_add_button = [=]()
+  {
+    bool guid_ok = false;
+    bool entry_ok = false;
+    bool display_ok = false;
+    guid_field->text().toUInt(&guid_ok);
+    entry_field->text().toUInt(&entry_ok);
+    display_field->text().toUInt(&display_ok);
+    add_button->setEnabled(guid_ok && entry_ok && display_ok && selected_template && selected_template->has_value()
+                           && !selected_template->value().path.empty());
+  };
+
+  auto select_template_entry = [=](std::uint32_t entry_id)
+  {
+    auto found = std::find_if(template_entries->begin(), template_entries->end(),
+      [entry_id](TemplatePickerEntry const& entry)
+      {
+        return entry.entry == entry_id;
+      });
+
+    if (found == template_entries->end())
+    {
+      selected_template->reset();
+      update_add_button();
+      return;
+    }
+
+    *selected_template = *found;
+    guid_field->setText(QString::number(suggested_guid()));
+    entry_field->setText(QString::number(found->entry));
+    display_field->setText(QString::number(found->display_id));
+
+    if (!found->path.empty())
+    {
+      World::CreatureSpawnOverlay preview_spawn;
+      preview_spawn.guid = suggested_guid();
+      preview_spawn.entry = found->entry;
+      preview_spawn.display_id = found->display_id;
+      preview_spawn.name = found->name;
+      preview_spawn.template_scale = found->template_scale;
+      preview_spawn.model_scale = found->model_scale;
+      preview_spawn.model_path = found->path;
+      preview_spawn.is_character_model = preview_spawn.model_path.rfind("character/", 0) == 0;
+
+      try
+      {
+        preview->setCreatureSpawnPreview(*_world, preview_spawn);
+        _creature_model_picker_status->setText(QString("%1 | entry %2 | display %3 | %4")
+                                                 .arg(QString::fromStdString(found->name))
+                                                 .arg(found->entry)
+                                                 .arg(found->display_id)
+                                                 .arg(found->creature_type
+                                                   ? creature_type_label(found->creature_type)
+                                                   : QString("faction %1").arg(found->faction)));
+      }
+      catch (std::exception const& error)
+      {
+        _creature_model_picker_status->setText(QString("Preview failed for %1: %2")
+                                                 .arg(QString::fromStdString(found->path))
+                                                 .arg(error.what()));
+      }
+      catch (...)
+      {
+        _creature_model_picker_status->setText(QString("Preview failed for %1")
+                                                 .arg(QString::fromStdString(found->path)));
+      }
+    }
+    else
+    {
+      _creature_model_picker_status->setText(QString("%1 has no previewable CreatureDisplayInfo model")
+                                               .arg(QString::fromStdString(found->name)));
+    }
+
+    update_add_button();
+  };
+
+  auto add_pending_spawn = [=]()
+  {
+    if (!selected_template || !selected_template->has_value())
+    {
+      _main_window->statusBar()->showMessage("Select a creature_template entry first", 5000);
+      return;
+    }
+
+    bool guid_ok = false;
+    bool entry_ok = false;
+    bool display_ok = false;
+    auto const guid = guid_field->text().toUInt(&guid_ok);
+    auto const entry_id = entry_field->text().toUInt(&entry_ok);
+    auto const display_id = display_field->text().toUInt(&display_ok);
+    if (!guid_ok || !entry_ok || !display_ok || !guid || !entry_id || !display_id)
+    {
+      _main_window->statusBar()->showMessage("Enter a valid GUID, entry, and display ID", 5000);
+      return;
+    }
+
+    if (_world->findCreatureSpawn(guid))
+    {
+      _main_window->statusBar()->showMessage(QString("Creature GUID %1 already exists in this overlay").arg(guid), 5000);
+      return;
+    }
+
+    TemplatePickerEntry entry = selected_template->value();
+    if (entry.display_id != display_id)
+    {
+      entry.display_id = display_id;
+      float display_scale = 1.0f;
+      resolve_display_model(entry.display_id, entry.model_id, entry.path, entry.model_scale, display_scale);
+      if (entry.template_scale <= 0.0f)
+      {
+        entry.template_scale = display_scale;
+      }
+    }
+
+    if (entry.path.empty())
+    {
+      _main_window->statusBar()->showMessage(QString("Creature template %1 has no previewable model").arg(entry_id), 5000);
+      return;
+    }
+
+    glm::vec3 spawn_pos = _camera.position + _camera.direction() * 8.0f;
+    if (spawn_pos.y < -5000.0f)
+    {
+      spawn_pos = _cursor_pos;
+    }
+
+    World::CreatureSpawnOverlay spawn;
+    spawn.guid = guid;
+    spawn.entry = entry_id;
+    spawn.display_id = entry.display_id;
+    spawn.name = entry.name.empty() ? "New pending NPC" : entry.name;
+    spawn.pos = spawn_pos;
+    spawn.original_pos = spawn.pos;
+    spawn.orientation = _camera.yaw()._;
+    spawn.original_orientation = spawn.orientation;
+    spawn.animation_time_offset = static_cast<int>(((guid * 1103515245u) + (entry_id * 12345u)) % 3500u);
+    spawn.template_scale = entry.template_scale;
+    spawn.model_scale = entry.model_scale;
+    spawn.model_path = entry.path;
+    spawn.is_character_model = spawn.model_path.rfind("character/", 0) == 0;
+    spawn.pending_create = true;
+    spawn.dirty = true;
+    spawn.selected = true;
+
+    for (auto& existing_spawn : _world->creatureSpawns())
+    {
+      existing_spawn.selected = false;
+    }
+
+    _world->creatureSpawns().push_back(std::move(spawn));
+    auto& added_spawn = _world->creatureSpawns().back();
+    _world->ensureCreatureSpawnModel(added_spawn);
+
+    _selected_creature_spawn_guid = guid;
+    rebuildCreatureBrowserList(true);
+    refreshCreatureEditorKnobs();
+    updateDatabaseStatus();
+    guid_field->setText(QString::number(suggested_guid()));
+    _needs_redraw = true;
+    _main_window->statusBar()->showMessage(QString("Pending creature spawn %1 added in front of camera").arg(guid), 5000);
+  };
+
+  connect(_creature_model_tree, &QTreeWidget::itemClicked,
+          [=](QTreeWidgetItem* item, int)
+          {
+            if (!item || !item->data(0, Qt::UserRole + 1).toBool())
+            {
+              return;
+            }
+            select_template_entry(static_cast<std::uint32_t>(item->data(0, Qt::UserRole).toULongLong()));
           });
 
-  updateCreatureBrowserStatus();
+  connect(guid_field, &QLineEdit::textChanged, update_add_button);
+  connect(entry_field, &QLineEdit::textChanged, update_add_button);
+  connect(display_field, &QLineEdit::textChanged, update_add_button);
+  connect(type_filter, qOverload<int>(&QComboBox::currentIndexChanged), rebuild_template_tree);
+  connect(elite_only, &QCheckBox::stateChanged, rebuild_template_tree);
+  connect(boss_only, &QCheckBox::stateChanged, rebuild_template_tree);
+  connect(civilian_only, &QCheckBox::stateChanged, rebuild_template_tree);
+  connect(trainer_only, &QCheckBox::stateChanged, rebuild_template_tree);
+  connect(search_box, &QLineEdit::textChanged, rebuild_template_tree);
+  connect(add_button, &QPushButton::clicked, add_pending_spawn);
+  preview->on_double_click = add_pending_spawn;
+
+  rebuild_template_tree();
+
+  _creature_model_picker_dock->setWidget(container);
+  _main_window->addDockWidget(Qt::BottomDockWidgetArea, _creature_model_picker_dock);
+  _creature_model_picker_dock->setVisible(false);
+  connect(this, &QObject::destroyed, _creature_model_picker_dock, &QObject::deleteLater);
+}
+
+void MapView::setupGameObjectEditorUi()
+{
+  // GameObjects have no model picker, so the coordinate editor panel is hosted inside the browser dock
+  // (added below the list in setupGameObjectBrowserUi); we just build the panel widget here.
+  auto container = new QWidget(this);
+  container->setMinimumWidth(240);
+  auto layout = new QVBoxLayout(container);
+  layout->setContentsMargins(6, 6, 6, 6);
+
+  auto coord_title = new QLabel("GameObject Coordinates", container);
+  coord_title->setStyleSheet("font-weight: bold;");
+  layout->addWidget(coord_title);
+
+  auto hint = new QLabel("Left click: select or drag\nShift: add or box-select", container);
+  hint->setWordWrap(true);
+  layout->addWidget(hint);
+
+  _gameobject_editor_info = new QLabel("No spawn selected", container);
+  _gameobject_editor_info->setWordWrap(true);
+  _gameobject_editor_info->setStyleSheet("font-style: italic; color: #888; padding: 2px 0;");
+  layout->addWidget(_gameobject_editor_info);
+
+  auto make_spin = [&](double lo, double hi, double step) {
+    auto* sb = new QDoubleSpinBox(container);
+    sb->setRange(lo, hi);
+    sb->setDecimals(3);
+    sb->setSingleStep(step);
+    sb->setEnabled(false);
+    return sb;
+  };
+
+  // Match the creature editor: client coordinates can exceed 20000, so use a wide range to avoid clamping.
+  _go_spawn_edit_x           = make_spin(-64000.0, 64000.0, 0.1);
+  _go_spawn_edit_y           = make_spin(-20000.0, 20000.0, 0.1);
+  _go_spawn_edit_z           = make_spin(-64000.0, 64000.0, 0.1);
+  _go_spawn_edit_orientation = make_spin(     0.0,   360.0, 1.0);
+  _go_spawn_edit_orientation->setWrapping(true);
+  _go_spawn_edit_orientation->setSuffix(QString::fromUtf8("\xc2\xb0"));  // ┬░
+
+  auto form = new QFormLayout();
+  form->setContentsMargins(0, 4, 0, 0);
+  form->setSpacing(3);
+  form->addRow("X:", _go_spawn_edit_x);
+  form->addRow("Y (height):", _go_spawn_edit_y);
+  form->addRow("Z:", _go_spawn_edit_z);
+  form->addRow("Orientation:", _go_spawn_edit_orientation);
+  layout->addLayout(form);
+
+  auto on_change = [this](double) {
+    if (!_selected_gameobject_spawn_guid)
+      return;
+    auto* spawn = _world->findGameObjectSpawn(*_selected_gameobject_spawn_guid);
+    if (!spawn)
+      return;
+
+    spawn->pos = glm::vec3(
+      static_cast<float>(_go_spawn_edit_x->value()),
+      static_cast<float>(_go_spawn_edit_y->value()),
+      static_cast<float>(_go_spawn_edit_z->value()));
+    spawn->orientation = static_cast<float>(_go_spawn_edit_orientation->value());
+    spawn->dirty = spawn->pending_create
+                || glm::distance(spawn->pos, spawn->original_pos) > 0.01f
+                || std::abs(spawn->orientation - spawn->original_orientation) > 0.01f;
+
+    if (spawn->model_instance)
+    {
+      spawn->model_instance->pos = spawn->pos;
+      spawn->model_instance->dir = glm::vec3(0.0f, spawn->orientation, 0.0f);
+      spawn->model_instance->recalcExtents();
+    }
+
+    updateGameObjectBrowserStatus();
+    rebuildGameObjectBrowserList(true);
+    _needs_redraw = true;
+  };
+
+  connect(_go_spawn_edit_x,           qOverload<double>(&QDoubleSpinBox::valueChanged), on_change);
+  connect(_go_spawn_edit_y,           qOverload<double>(&QDoubleSpinBox::valueChanged), on_change);
+  connect(_go_spawn_edit_z,           qOverload<double>(&QDoubleSpinBox::valueChanged), on_change);
+  connect(_go_spawn_edit_orientation, qOverload<double>(&QDoubleSpinBox::valueChanged), on_change);
+
+  _gameobject_editor_panel = container;
+}
+
+void MapView::setupGameObjectBrowserUi()
+{
+  _gameobject_browser_dock = new QDockWidget("GameObject Browser", _main_window);
+  _gameobject_browser_dock->setFeatures(QDockWidget::DockWidgetMovable
+                                        | QDockWidget::DockWidgetFloatable
+                                        | QDockWidget::DockWidgetClosable);
+  _gameobject_browser_dock->setAllowedAreas(Qt::LeftDockWidgetArea | Qt::RightDockWidgetArea | Qt::BottomDockWidgetArea);
+  _gameobject_browser_dock->setMinimumWidth(330);
+  _gameobject_browser_dock->resize(380, 520);
+  _main_window->addDockWidget(Qt::RightDockWidgetArea, _gameobject_browser_dock);
+  connect(this, &QObject::destroyed, _gameobject_browser_dock, &QObject::deleteLater);
+
+  auto container = new QWidget(this);
+  auto layout = new QVBoxLayout(container);
+  layout->setContentsMargins(6, 6, 6, 6);
+
+  _gameobject_search_field = new QLineEdit(container);
+  _gameobject_search_field->setPlaceholderText("Search by gameobject name, guid, or entry");
+  layout->addWidget(_gameobject_search_field);
+
+  _gameobject_zone_filter = new QCheckBox("Zone only (current zone)", container);
+  _gameobject_zone_filter->setToolTip("Only list gameobjects whose position is in the same zone as the"
+                                      " camera. Spawns in unloaded tiles are excluded.");
+  layout->addWidget(_gameobject_zone_filter);
+  connect(_gameobject_zone_filter, &QCheckBox::toggled, [this]() { rebuildGameObjectBrowserList(true); });
+
+  // Type filter mirroring the gameobject model picker. Filters the current-map spawn list by the
+  // spawned object's template type (looked up per spawn entry from _gameobject_template_filter_type;
+  // the combo is populated by the model picker when it loads gameobject_template).
+  {
+    auto type_row = new QHBoxLayout();
+    type_row->addWidget(new QLabel("Type", container));
+    _gameobject_browser_type_filter = new QComboBox(container);
+    _gameobject_browser_type_filter->addItem("All types"); // index 0 -> no type filter
+    _gameobject_browser_type_filter->setToolTip("Filter the spawn list by gameobject type.");
+    type_row->addWidget(_gameobject_browser_type_filter, 1);
+    layout->addLayout(type_row);
+    connect(_gameobject_browser_type_filter, qOverload<int>(&QComboBox::currentIndexChanged),
+            [this]() { rebuildGameObjectBrowserList(true); });
+  }
+
+  _gameobject_list_widget = new QListWidget(container);
+  _gameobject_list_widget->setSelectionMode(QAbstractItemView::SingleSelection);
+  _gameobject_list_widget->setMinimumHeight(280);
+  layout->addWidget(_gameobject_list_widget, 1);
+
+  _gameobject_browser_status = new QLabel(container);
+  _gameobject_browser_status->setWordWrap(true);
+  layout->addWidget(_gameobject_browser_status);
+
+  // The coordinate editor panel now lives in the model picker (last splitter column),
+  // mirroring the creature tool.
+
+  _gameobject_browser_dock->setWidget(container);
+  _gameobject_browser_dock->setVisible(false);
+
+  connect(_gameobject_browser_dock, &QDockWidget::visibilityChanged,
+          [this](bool visible)
+          {
+            if (ui_hidden)
+              return;
+
+            _settings->setValue("map_view/gameobject_browser", visible);
+            _settings->sync();
+          });
+
+  connect(&_show_gameobject_browser, &Noggit::BoolToggleProperty::changed,
+          [this](bool visible)
+          {
+            bool const show = visible && !ui_hidden && terrainMode == editing_mode::gameobject;
+            if (ui_hidden && visible)
+            {
+              return;
+            }
+
+            if (_gameobject_actions_overlay)
+            {
+              _gameobject_actions_overlay->setVisible(show);
+            }
+
+            if (_gameobject_browser_dock)
+            {
+              _gameobject_browser_dock->setVisible(show);
+            }
+
+            if (_gameobject_model_picker_dock)
+            {
+              _gameobject_model_picker_dock->setVisible(show);
+            }
+          });
+  connect(_gameobject_browser_dock, &QDockWidget::visibilityChanged,
+          &_show_gameobject_browser, &Noggit::BoolToggleProperty::set);
+
+  connect(_gameobject_search_field, &QLineEdit::textChanged,
+          [this]()
+          {
+            rebuildGameObjectBrowserList(true);
+          });
+  connect(_gameobject_list_widget, &QListWidget::itemClicked,
+          this, &MapView::jumpToGameObjectListItem);
+
+  updateGameObjectBrowserStatus();
+}
+
+void MapView::setupGameObjectModelPickerUi()
+{
+  _gameobject_model_picker_dock = new QDockWidget("GameObject Model Picker", _main_window);
+  _gameobject_model_picker_dock->setFeatures(QDockWidget::DockWidgetMovable
+                                             | QDockWidget::DockWidgetFloatable
+                                             | QDockWidget::DockWidgetClosable);
+  _gameobject_model_picker_dock->setAllowedAreas(Qt::BottomDockWidgetArea | Qt::TopDockWidgetArea);
+  _gameobject_model_picker_dock->setMinimumHeight(220);
+
+  auto container = new QWidget(this);
+  auto root_layout = new QVBoxLayout(container);
+  root_layout->setContentsMargins(6, 6, 6, 6);
+  root_layout->setSpacing(6);
+
+  // Gameobject "Type" label helper (mirrors creature_type_label, but local to the picker).
+  auto gameobject_type_label = [](std::uint32_t type) -> QString
+  {
+    switch (type)
+    {
+      case 0:  return "Door";
+      case 1:  return "Button";
+      case 2:  return "Quest Giver";
+      case 3:  return "Chest";
+      case 4:  return "Binding";
+      case 5:  return "Generic";
+      case 6:  return "Trap";
+      case 7:  return "Chair";
+      case 8:  return "Spell Focus";
+      case 9:  return "Text";
+      case 10: return "Goober";
+      case 11: return "Transport";
+      case 12: return "Area Damage";
+      case 13: return "Camera";
+      case 14: return "Map Object";
+      case 15: return "Mo Transport";
+      case 17: return "Fishing Node";
+      case 21: return "Door (summon)";
+      case 22: return "Summoning Ritual";
+      case 25: return "Auction House";
+      case 26: return "Guard";
+      default: return QString("Type %1").arg(type);
+    }
+  };
+
+  // Filters live in a thin vertical panel beside the list (added to the splitter below).
+  auto filter_panel = new QWidget(container);
+  filter_panel->setMaximumWidth(150);
+  auto filter_layout = new QVBoxLayout(filter_panel);
+  filter_layout->setContentsMargins(4, 4, 4, 4);
+  filter_layout->setSpacing(4);
+  auto filter_title = new QLabel("Filters", filter_panel);
+  filter_title->setStyleSheet("font-weight: bold;");
+  filter_layout->addWidget(filter_title);
+  auto type_label = new QLabel("Type", filter_panel);
+  auto type_filter = new QComboBox(filter_panel);
+  type_filter->setToolTip("Filter entries by gameobject type. Populated from the loaded gameobject_template list.");
+  type_filter->addItem("All types");  // index 0: no data -> no type filter
+  filter_layout->addWidget(type_label);
+  filter_layout->addWidget(type_filter);
+  filter_layout->addStretch();
+
+  auto splitter = new QSplitter(Qt::Horizontal, container);
+
+  // Search box sits directly above the model tree (list) column at the list width.
+  auto list_column = new QWidget(splitter);
+  auto list_column_layout = new QVBoxLayout(list_column);
+  list_column_layout->setContentsMargins(0, 0, 0, 0);
+  list_column_layout->setSpacing(4);
+
+  auto search_box = new QLineEdit(list_column);
+  search_box->setPlaceholderText("Search by entry id or name...");
+  search_box->setClearButtonEnabled(true);
+  search_box->setToolTip("Filter the list by gameobject_template entry id or name (case-insensitive).");
+  list_column_layout->addWidget(search_box);
+
+  _gameobject_model_tree = new QTreeWidget(list_column);
+  _gameobject_model_tree->setHeaderHidden(true);
+  _gameobject_model_tree->setMinimumWidth(360);
+  list_column_layout->addWidget(_gameobject_model_tree, 1);
+
+  auto preview = new CreaturePreviewModelViewer(splitter);
+  preview->setMinimumSize(360, 220);
+
+  auto spawn_box = new QGroupBox("Edit/New GameObject", splitter);
+  _gameobject_spawn_box = spawn_box;
+  auto spawn_layout = new QFormLayout(spawn_box);
+  auto guid_field = new QLineEdit(spawn_box);
+  auto entry_field = new QLineEdit(spawn_box);
+  auto display_field = new QLineEdit(spawn_box);
+  _gameobject_spawn_guid_field = guid_field;
+  _gameobject_spawn_entry_field = entry_field;
+  _gameobject_spawn_display_field = display_field;
+  auto add_button = new QPushButton("Add Pending Spawn", spawn_box);
+  add_button->setEnabled(false);
+  guid_field->setPlaceholderText("GUID");
+  entry_field->setPlaceholderText("Entry");
+  display_field->setPlaceholderText("Display ID");
+  spawn_layout->addRow("GUID:", guid_field);
+  spawn_layout->addRow("Entry:", entry_field);
+  spawn_layout->addRow("Display:", display_field);
+  spawn_layout->addRow(add_button);
+
+  splitter->addWidget(list_column);
+  splitter->addWidget(filter_panel);
+  splitter->addWidget(preview);
+  splitter->addWidget(spawn_box);
+  if (_gameobject_editor_panel)
+  {
+    splitter->addWidget(_gameobject_editor_panel);
+  }
+  splitter->setStretchFactor(0, 2);  // model tree
+  splitter->setStretchFactor(1, 0);  // filter panel
+  splitter->setStretchFactor(2, 3);  // preview
+  splitter->setStretchFactor(3, 1);  // new spawn
+  splitter->setStretchFactor(4, 1);  // coordinate editor
+  splitter->setSizes({380, 130, 520, 240, 280});
+  root_layout->addWidget(splitter, 1);
+
+  _gameobject_model_picker_status = new QLabel("Loading gameobject_template entries...", container);
+  _gameobject_model_picker_status->setWordWrap(true);
+  root_layout->addWidget(_gameobject_model_picker_status);
+
+  struct TemplatePickerEntry
+  {
+    std::uint32_t entry = 0;
+    std::uint32_t type = 0;
+    std::uint32_t display_id = 0;
+    std::string name;
+    std::string path;
+    float template_scale = 1.0f;
+  };
+
+  auto normalize_picker_path = [](std::string path)
+  {
+    std::replace(path.begin(), path.end(), '\\', '/');
+    std::transform(path.begin(), path.end(), path.begin(), [](unsigned char c)
+    {
+      return static_cast<char>(std::tolower(c));
+    });
+
+    if (auto extension_pos = path.rfind(".mdx"); extension_pos != std::string::npos)
+    {
+      path.replace(extension_pos, 4, ".m2");
+    }
+    else if (auto extension_pos = path.rfind(".mdl"); extension_pos != std::string::npos)
+    {
+      path.replace(extension_pos, 4, ".m2");
+    }
+    else if (path.rfind('.') == std::string::npos)
+    {
+      path += ".m2";
+    }
+    return path;
+  };
+
+  auto resolve_display_model = [&](std::uint32_t display_id, std::string& model_path)
+  {
+    try
+    {
+      auto display = gGameObjectDisplayInfoDB.getByID(display_id);
+      model_path = normalize_picker_path(display.getString(GameObjectDisplayInfoDB::ModelName));
+      return !model_path.empty();
+    }
+    catch (DBCFile::NotFound const&)
+    {
+      model_path.clear();
+      return false;
+    }
+  };
+
+  auto template_entries = std::make_shared<std::vector<TemplatePickerEntry>>();
+
+#ifdef USE_MYSQL_UID_STORAGE
+  std::string template_error;
+  auto records = mysql::getGameObjectTemplates(25000, &template_error);
+  template_entries->reserve(records.size());
+  for (auto const& record : records)
+  {
+    TemplatePickerEntry entry;
+    entry.entry = record.entry;
+    entry.type = record.type;
+    entry.display_id = record.display_id;
+    entry.name = record.name;
+    entry.template_scale = record.template_scale;
+    if (entry.display_id)
+    {
+      resolve_display_model(entry.display_id, entry.path);
+    }
+    template_entries->push_back(std::move(entry));
+  }
+#else
+  std::string template_error = "Build does not include MySQL support.";
+#endif
+
+  // Populate the type dropdown with every distinct gameobject type present in the loaded list.
+  {
+    std::set<std::uint32_t> distinct_types;
+    for (auto const& entry : *template_entries)
+    {
+      distinct_types.insert(entry.type);
+    }
+    for (auto const type : distinct_types)  // std::set keeps them sorted
+    {
+      type_filter->addItem(QString("%1 (%2)").arg(gameobject_type_label(type)).arg(type),
+                           static_cast<qulonglong>(type));
+    }
+  }
+
+  // Share the gameobject template type info with the current-map browser so it can offer the same Type
+  // filter, and populate its Type combo identically.
+  {
+    _gameobject_template_filter_type.clear();
+    for (auto const& entry : *template_entries)
+    {
+      _gameobject_template_filter_type[entry.entry] = entry.type;
+    }
+    if (_gameobject_browser_type_filter)
+    {
+      std::set<std::uint32_t> distinct_types;
+      for (auto const& entry : *template_entries)
+      {
+        distinct_types.insert(entry.type);
+      }
+      QSignalBlocker blocker(_gameobject_browser_type_filter);
+      for (auto const type : distinct_types)
+      {
+        _gameobject_browser_type_filter->addItem(
+          QString("%1 (%2)").arg(gameobject_type_label(type)).arg(type), static_cast<qulonglong>(type));
+      }
+    }
+    rebuildGameObjectBrowserList(true);
+  }
+
+  auto selected_template = std::make_shared<std::optional<TemplatePickerEntry>>();
+
+  auto suggested_guid = [this]()
+  {
+    std::uint32_t highest = 0;
+    for (auto const& spawn : _world->gameObjectSpawns())
+    {
+      highest = std::max(highest, spawn.guid);
+    }
+    return highest + 1;
+  };
+
+  auto passes_filters = [=](TemplatePickerEntry const& entry)
+  {
+    auto const needle = search_box->text().trimmed();
+    if (!needle.isEmpty())
+    {
+      QString const name = QString::fromStdString(entry.name);
+      QString const id = QString::number(entry.entry);
+      if (!name.contains(needle, Qt::CaseInsensitive) && !id.contains(needle))
+      {
+        return false;
+      }
+    }
+    auto const type_data = type_filter->currentData();
+    if (type_data.isValid() && entry.type != static_cast<std::uint32_t>(type_data.toULongLong()))
+    {
+      return false;
+    }
+    return true;
+  };
+
+  auto rebuild_template_tree = [=]()
+  {
+    _gameobject_model_tree->clear();
+    std::size_t visible_count = 0;
+    std::size_t previewable_count = 0;
+
+    for (auto const& entry : *template_entries)
+    {
+      if (!passes_filters(entry))
+      {
+        continue;
+      }
+
+      ++visible_count;
+      if (!entry.path.empty())
+      {
+        ++previewable_count;
+      }
+
+      auto* row = new QTreeWidgetItem(_gameobject_model_tree);
+      row->setText(0, QString("%1 - %2").arg(entry.entry).arg(QString::fromStdString(entry.name)));
+      row->setData(0, Qt::UserRole, static_cast<qulonglong>(entry.entry));
+      row->setData(0, Qt::UserRole + 1, true);
+      if (entry.path.empty())
+      {
+        row->setForeground(0, QColor(135, 135, 135));
+      }
+    }
+
+    _gameobject_model_tree->sortItems(0, Qt::AscendingOrder);
+
+    if (_gameobject_model_picker_status)
+    {
+      QString message = QString("%1 gameobject_template entr%2 shown, %3 previewable")
+                          .arg(visible_count)
+                          .arg(visible_count == 1 ? "y" : "ies")
+                          .arg(previewable_count);
+      if (!template_error.empty())
+      {
+        message = QString("Template load failed: %1").arg(QString::fromStdString(template_error));
+      }
+      _gameobject_model_picker_status->setText(message);
+    }
+  };
+
+  auto update_add_button = [=]()
+  {
+    bool guid_ok = false;
+    bool entry_ok = false;
+    bool display_ok = false;
+    guid_field->text().toUInt(&guid_ok);
+    entry_field->text().toUInt(&entry_ok);
+    display_field->text().toUInt(&display_ok);
+    add_button->setEnabled(guid_ok && entry_ok && display_ok && selected_template && selected_template->has_value()
+                           && !selected_template->value().path.empty());
+  };
+
+  auto select_template_entry = [=](std::uint32_t entry_id)
+  {
+    auto found = std::find_if(template_entries->begin(), template_entries->end(),
+      [entry_id](TemplatePickerEntry const& entry)
+      {
+        return entry.entry == entry_id;
+      });
+
+    if (found == template_entries->end())
+    {
+      selected_template->reset();
+      update_add_button();
+      return;
+    }
+
+    *selected_template = *found;
+    guid_field->setText(QString::number(suggested_guid()));
+    entry_field->setText(QString::number(found->entry));
+    display_field->setText(QString::number(found->display_id));
+
+    if (!found->path.empty())
+    {
+      World::CreatureSpawnOverlay preview_spawn;
+      preview_spawn.guid = suggested_guid();
+      preview_spawn.entry = found->entry;
+      preview_spawn.display_id = found->display_id;
+      preview_spawn.name = found->name;
+      preview_spawn.template_scale = found->template_scale;
+      preview_spawn.model_scale = 1.0f;
+      preview_spawn.model_path = found->path;
+      preview_spawn.is_character_model = false;
+
+      try
+      {
+        preview->setCreatureSpawnPreview(*_world, preview_spawn);
+        _gameobject_model_picker_status->setText(QString("%1 | entry %2 | display %3 | %4")
+                                                 .arg(QString::fromStdString(found->name))
+                                                 .arg(found->entry)
+                                                 .arg(found->display_id)
+                                                 .arg(gameobject_type_label(found->type)));
+      }
+      catch (std::exception const& error)
+      {
+        _gameobject_model_picker_status->setText(QString("Preview failed for %1: %2")
+                                                 .arg(QString::fromStdString(found->path))
+                                                 .arg(error.what()));
+      }
+      catch (...)
+      {
+        _gameobject_model_picker_status->setText(QString("Preview failed for %1")
+                                                 .arg(QString::fromStdString(found->path)));
+      }
+    }
+    else
+    {
+      _gameobject_model_picker_status->setText(QString("%1 has no previewable GameObjectDisplayInfo model")
+                                               .arg(QString::fromStdString(found->name)));
+    }
+
+    update_add_button();
+  };
+
+  auto add_pending_spawn = [=]()
+  {
+    if (!selected_template || !selected_template->has_value())
+    {
+      _main_window->statusBar()->showMessage("Select a gameobject_template entry first", 5000);
+      return;
+    }
+
+    bool guid_ok = false;
+    bool entry_ok = false;
+    bool display_ok = false;
+    auto const guid = guid_field->text().toUInt(&guid_ok);
+    auto const entry_id = entry_field->text().toUInt(&entry_ok);
+    auto const display_id = display_field->text().toUInt(&display_ok);
+    if (!guid_ok || !entry_ok || !display_ok || !guid || !entry_id || !display_id)
+    {
+      _main_window->statusBar()->showMessage("Enter a valid GUID, entry, and display ID", 5000);
+      return;
+    }
+
+    if (_world->findGameObjectSpawn(guid))
+    {
+      _main_window->statusBar()->showMessage(QString("GameObject GUID %1 already exists in this overlay").arg(guid), 5000);
+      return;
+    }
+
+    TemplatePickerEntry entry = selected_template->value();
+    if (entry.display_id != display_id)
+    {
+      entry.display_id = display_id;
+      resolve_display_model(entry.display_id, entry.path);
+    }
+
+    if (entry.path.empty())
+    {
+      _main_window->statusBar()->showMessage(QString("GameObject template %1 has no previewable model").arg(entry_id), 5000);
+      return;
+    }
+
+    glm::vec3 spawn_pos = _camera.position + _camera.direction() * 8.0f;
+    if (spawn_pos.y < -5000.0f)
+    {
+      spawn_pos = _cursor_pos;
+    }
+
+    World::GameObjectSpawnOverlay spawn;
+    spawn.guid = guid;
+    spawn.entry = entry_id;
+    spawn.display_id = entry.display_id;
+    spawn.name = entry.name.empty() ? "New pending gameobject" : entry.name;
+    spawn.pos = spawn_pos;
+    spawn.original_pos = spawn.pos;
+    spawn.orientation = _camera.yaw()._;
+    spawn.original_orientation = spawn.orientation;
+    spawn.template_scale = entry.template_scale;
+    spawn.model_path = entry.path;
+    spawn.pending_create = true;
+    spawn.dirty = true;
+    spawn.selected = true;
+
+    for (auto& existing_spawn : _world->gameObjectSpawns())
+    {
+      existing_spawn.selected = false;
+    }
+
+    _world->gameObjectSpawns().push_back(std::move(spawn));
+    auto& added_spawn = _world->gameObjectSpawns().back();
+    _world->ensureGameObjectSpawnModel(added_spawn);
+
+    _selected_gameobject_spawn_guid = guid;
+    rebuildGameObjectBrowserList(true);
+    refreshGameObjectEditorKnobs();
+    updateGameObjectBrowserStatus();
+    guid_field->setText(QString::number(suggested_guid()));
+    _needs_redraw = true;
+    _main_window->statusBar()->showMessage(QString("Pending gameobject spawn %1 added in front of camera").arg(guid), 5000);
+  };
+
+  connect(_gameobject_model_tree, &QTreeWidget::itemClicked,
+          [=](QTreeWidgetItem* item, int)
+          {
+            if (!item || !item->data(0, Qt::UserRole + 1).toBool())
+            {
+              return;
+            }
+            select_template_entry(static_cast<std::uint32_t>(item->data(0, Qt::UserRole).toULongLong()));
+          });
+
+  connect(guid_field, &QLineEdit::textChanged, update_add_button);
+  connect(entry_field, &QLineEdit::textChanged, update_add_button);
+  connect(display_field, &QLineEdit::textChanged, update_add_button);
+  connect(type_filter, qOverload<int>(&QComboBox::currentIndexChanged), rebuild_template_tree);
+  connect(search_box, &QLineEdit::textChanged, rebuild_template_tree);
+  connect(add_button, &QPushButton::clicked, add_pending_spawn);
+  preview->on_double_click = add_pending_spawn;
+
+  rebuild_template_tree();
+
+  _gameobject_model_picker_dock->setWidget(container);
+  _main_window->addDockWidget(Qt::BottomDockWidgetArea, _gameobject_model_picker_dock);
+  _gameobject_model_picker_dock->setVisible(false);
+  connect(this, &QObject::destroyed, _gameobject_model_picker_dock, &QObject::deleteLater);
+}
+
+void MapView::setupGameObjectActionsUi()
+{
+  if (!_overlay_widget)
+  {
+    return;
+  }
+
+  _gameobject_actions_overlay = new QWidget(_overlay_widget);
+  _gameobject_actions_overlay->setObjectName("gameobjectActionsOverlay");
+  _gameobject_actions_overlay->setAttribute(Qt::WA_StyledBackground, true);
+  _gameobject_actions_overlay->setStyleSheet(
+    "#gameobjectActionsOverlay { background: rgba(28, 31, 37, 210); border: 1px solid rgba(85, 91, 103, 180); }"
+    "#gameobjectActionsOverlay QPushButton { padding: 5px 9px; }");
+
+  auto layout = new QHBoxLayout(_gameobject_actions_overlay);
+  layout->setContentsMargins(5, 5, 5, 5);
+  layout->setSpacing(5);
+
+  auto reload_button = new QPushButton("Reload Spawns", _gameobject_actions_overlay);
+  auto save_button = new QPushButton("Export SQL", _gameobject_actions_overlay);
+  auto revert_button = new QPushButton("Discard Pending", _gameobject_actions_overlay);
+  auto pending_button = new QPushButton("Pending \xE2\x96\xBE", _gameobject_actions_overlay);
+  pending_button->setToolTip("Show the list of pending gameobject updates waiting for SQL export.");
+  layout->addWidget(reload_button);
+  layout->addWidget(save_button);
+  layout->addWidget(revert_button);
+  layout->addWidget(pending_button);
+
+  // Toggleable dropdown listing every pending change (moved / deleted) awaiting SQL export.
+  _gameobject_pending_popup = new QWidget(this, Qt::Popup);
+  _gameobject_pending_popup->setObjectName("gameobjectPendingPopup");
+  _gameobject_pending_popup->setAttribute(Qt::WA_StyledBackground, true);
+  _gameobject_pending_popup->setStyleSheet(
+    "#gameobjectPendingPopup { background: rgba(28, 31, 37, 235); border: 1px solid rgba(85, 91, 103, 200); }");
+  auto pending_layout = new QVBoxLayout(_gameobject_pending_popup);
+  pending_layout->setContentsMargins(6, 6, 6, 6);
+  pending_layout->setSpacing(4);
+  auto pending_title = new QLabel("Pending gameobject updates", _gameobject_pending_popup);
+  pending_title->setStyleSheet("font-weight: bold; color: #ddd;");
+  pending_layout->addWidget(pending_title);
+  _gameobject_pending_list = new QListWidget(_gameobject_pending_popup);
+  _gameobject_pending_list->setMinimumSize(360, 220);
+  _gameobject_pending_list->setSelectionMode(QListWidget::NoSelection);
+  pending_layout->addWidget(_gameobject_pending_list);
+
+  auto refresh_pending = [this]()
+  {
+    if (!_gameobject_pending_list)
+    {
+      return;
+    }
+    _gameobject_pending_list->clear();
+    int count = 0;
+    for (auto const& spawn : _world->gameObjectSpawns())
+    {
+      if (!spawn.dirty)
+      {
+        continue;
+      }
+      QString action = spawn.pending_delete ? "DELETE" : "MOVE";
+      QString const name = QString::fromStdString(spawn.name.empty() ? std::string("<unnamed>") : spawn.name);
+      _gameobject_pending_list->addItem(
+        QString("[%1] guid %2  entry %3  %4").arg(action).arg(spawn.guid).arg(spawn.entry).arg(name));
+      ++count;
+    }
+    if (count == 0)
+    {
+      _gameobject_pending_list->addItem("No pending updates.");
+    }
+  };
+
+  connect(pending_button, &QPushButton::clicked,
+          [this, pending_button, refresh_pending]()
+          {
+            if (!_gameobject_pending_popup)
+            {
+              return;
+            }
+            if (_gameobject_pending_popup->isVisible())
+            {
+              _gameobject_pending_popup->hide();
+              return;
+            }
+            refresh_pending();
+            _gameobject_pending_popup->adjustSize();
+            QPoint const below = pending_button->mapToGlobal(QPoint(0, pending_button->height() + 2));
+            _gameobject_pending_popup->move(below);
+            _gameobject_pending_popup->show();
+          });
+
+  auto place_actions = [this]()
+  {
+    if (!_gameobject_actions_overlay)
+    {
+      return;
+    }
+
+    _gameobject_actions_overlay->adjustSize();
+    _gameobject_actions_overlay->move(std::max(8, width() - _gameobject_actions_overlay->width() - 14), 8);
+    _gameobject_actions_overlay->raise();
+  };
+
+  _gameobject_actions_overlay->setVisible(false);
+  place_actions();
+  connect(this, &MapView::resized, this, place_actions);
+  connect(this, &QObject::destroyed, _gameobject_actions_overlay, &QObject::deleteLater);
+
+  connect(reload_button, &QPushButton::clicked,
+          [this]()
+          {
+            _world->ensureGameObjectSpawnsLoaded();
+            rebuildGameObjectBrowserList(true);
+          });
+  connect(save_button, &QPushButton::clicked,
+          [this]()
+          {
+            saveDirtyGameObjectSpawns();
+          });
+  connect(revert_button, &QPushButton::clicked,
+          [this]()
+          {
+            discardPendingGameObjectSpawns();
+          });
+}
+
+QToolButton* MapView::makeSeasonalEventsToolButton(QWidget* parent)
+{
+  // Calendar section button hosted under the time-globe popup's slider. Its menu of checkable game-events
+  // (checked = that event's creatures/objects render; nothing = base world only, the default) flies out to
+  // the RIGHT of the popup instead of dropping down, so it expands the panel sideways. Rebuilt on open so
+  // it always reflects the events in the loaded spawns. Affects both creature AND gameobject spawns.
+  auto button = new QToolButton(parent);
+  button->setIcon(make_calendar_icon());
+  button->setIconSize(QSize(18, 18));
+  button->setText("Seasonal Events");
+  button->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+  button->setToolTip("Toggle which event's creatures and objects are shown.\n"
+                     "Nothing checked = base world only.");
+  button->setAutoRaise(true);
+
+  // Not setMenu() (that drops DOWN): pop the menu manually anchored to the host popup's top-right corner so
+  // it opens to the right, like a submenu flyout.
+  auto menu = new MultiToggleMenu(button);
+  connect(menu, &QMenu::aboutToShow, [this, menu]() { populateSeasonalEventsMenu(menu); });
+  connect(button, &QToolButton::clicked, [button, menu]()
+  {
+    if (menu->isVisible())
+    {
+      menu->hide();
+      return;
+    }
+    QWidget* const host = button->parentWidget() ? button->parentWidget() : button;
+    QPoint const anchor = host->mapToGlobal(QPoint(host->width() + 2, 0));
+    menu->popup(anchor);
+  });
+  return button;
+}
+
+void MapView::populateSeasonalEventsMenu(QMenu* menu)
+{
+  if (!menu)
+  {
+    return;
+  }
+
+  menu->clear();
+
+  auto const entries = _world->spawnedEventEntries();
+  if (entries.empty())
+  {
+    auto* empty = menu->addAction(_world->hasCreatureSpawnsLoaded()
+                                    ? "No seasonal-event spawns on this map"
+                                    : "Enable creature/object spawns first");
+    empty->setEnabled(false);
+    return;
+  }
+
+  auto* all_action = menu->addAction("Show all events");
+  auto* none_action = menu->addAction("Hide all (base world only)");
+  connect(all_action, &QAction::triggered, [this]()
+  {
+    for (auto entry : _world->spawnedEventEntries())
+    {
+      _world->setEventActive(entry, true);
+    }
+    update();
+  });
+  connect(none_action, &QAction::triggered, [this]()
+  {
+    _world->clearActiveEvents();
+    update();
+  });
+  menu->addSeparator();
+
+  auto const& names = _world->gameEventNames();
+  for (std::int32_t entry : entries)
+  {
+    auto const name_it = names.find(entry);
+    QString const label = name_it != names.end() && !name_it->second.empty()
+      ? QString("%1 - %2").arg(entry).arg(QString::fromStdString(name_it->second))
+      : QString("Event %1").arg(entry);
+
+    auto* action = menu->addAction(label);
+    action->setCheckable(true);
+    action->setChecked(_world->isEventActive(entry));
+    connect(action, &QAction::toggled, [this, entry](bool checked)
+    {
+      _world->setEventActive(entry, checked);
+      update();
+    });
+  }
 }
 
 void MapView::setupMinimapEditorUi()
@@ -1145,6 +3044,8 @@ void MapView::setupNodeEditor()
                                  | QDockWidget::DockWidgetFloatable
                                  | QDockWidget::DockWidgetClosable);
 
+  // QtNodes startup can still abort the process during style initialization.
+  // Keep the dock shell, but do not restore/create the widget automatically.
   auto ensure_node_editor = [this]()
   {
     if (_node_editor_dock->widget())
@@ -1152,18 +3053,32 @@ void MapView::setupNodeEditor()
       return;
     }
 
-    auto node_editor = new Noggit::Ui::Tools::NodeEditor::Ui::NodeEditorWidget(this);
-    _node_editor_dock->setWidget(node_editor);
+    try
+    {
+      auto node_editor = new Noggit::Ui::Tools::NodeEditor::Ui::NodeEditorWidget(this);
+      _node_editor_dock->setWidget(node_editor);
+    }
+    catch (...)
+    {
+      LogError << "Failed to initialize node editor dock during map view setup; hiding dock to keep map load alive."
+               << std::endl;
+      _settings->setValue("map_view/node_editor", false);
+      _settings->sync();
+      _node_editor_dock->hide();
+    }
   };
 
-  _node_editor_dock->setVisible(_settings->value ("map_view/node_editor", false).toBool());
+  _settings->setValue("map_view/node_editor", false);
+  _settings->sync();
+  _node_editor_dock->hide();
 
   connect(_node_editor_dock, &QDockWidget::visibilityChanged,
           [=](bool visible)
           {
             if (visible)
             {
-              ensure_node_editor();
+              _node_editor_dock->hide();
+              return;
             }
 
             if (ui_hidden)
@@ -1355,6 +3270,75 @@ void MapView::setupToolbars()
 
   top_toolbar_layout->addWidget( _view_toolbar);
   sec_toolbar_layout->addWidget( _secondary_toolbar);
+
+  // WC3-style time-of-day globe: its own widget, NEVER inside a button layout (so it can't stretch the
+  // toolbars to its height). The icon strip is split into a left half (_view_toolbar) and a right half
+  // (right_toolbar); the globe sits between them and all three are laid out as siblings, vertically
+  // centred, so the button strips keep their normal small height and only the globe is tall.
+  _time_globe = new Noggit::Ui::TimeGlobeWidget(this);
+  _time_globe->setFixedSize(_time_globe->sizeHint());
+
+  auto* right_toolbar = new QToolBar(_overlay_widget);
+  right_toolbar->setMovable(false);
+  right_toolbar->setContextMenuPolicy(Qt::PreventContextMenu);
+  right_toolbar->setIconSize(_view_toolbar->iconSize());
+  right_toolbar->setStyleSheet(_view_toolbar->styleSheet());
+  right_toolbar->setSizePolicy(QSizePolicy::Maximum, QSizePolicy::Maximum);
+  right_toolbar->setContentsMargins(0, 0, 0, 0);
+  // no padding between the button strips and the globe
+  _view_toolbar->setContentsMargins(0, 0, 0, 0);
+  top_toolbar_layout->setContentsMargins(0, 0, 0, 0);
+  {
+    auto const acts = _view_toolbar->actions();
+    int const half = (static_cast<int>(acts.size()) + 1) / 2;
+    for (int i = half; i < acts.size(); ++i)
+    {
+      QAction* const a = acts.at(i);
+      _view_toolbar->removeAction(a);
+      right_toolbar->addAction(a);
+    }
+  }
+  // Hover tool-options (secondaryToolbarHolder, shown via getSecondaryToolBar()) stay in the row BELOW the
+  // globe so they never shove it when they pop up on hover.
+  _viewport_overlay_ui->horizontalLayout_4->removeWidget(_viewport_overlay_ui->secondaryToolbarHolder);
+  if (auto* below = _viewport_overlay_ui->horizontalLayout_8)
+    below->insertWidget(0, _viewport_overlay_ui->secondaryToolbarHolder, 0, Qt::AlignTop);
+
+  // The MODE secondary tools (Patrol paths / Creature info in creature mode; flatten & texture options in
+  // the terrain modes -> getLeftSecondaryToolbar()) live in leftSecondaryToolbarHolder, which the .ui put
+  // in the SECOND row. The tall time globe -- added to the row ABOVE it -- pushed that whole second row
+  // down, so the panel rendered well below the icon strip. Lift the holder INTO the globe's row at the FAR
+  // LEFT, TOP-aligned, so it sits at the same Y as the icons again (it is hidden except in the modes that
+  // populate it). A zero-width spacer on the far right, whose width tracks the holder (see eventFilter),
+  // keeps the centred globe block at the true viewport centre when the holder appears -- nothing shoves
+  // the globe.
+  if (auto* below = _viewport_overlay_ui->horizontalLayout_8)
+    below->removeWidget(_viewport_overlay_ui->leftSecondaryToolbarHolder);
+
+  _globe_balance_spacer = new QWidget(_overlay_widget);
+  _globe_balance_spacer->setFixedWidth(0);
+  _globe_balance_spacer->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Preferred);
+  _viewport_overlay_ui->leftSecondaryToolbarHolder->installEventFilter(this);
+
+  if (auto* row = _viewport_overlay_ui->horizontalLayout_4)
+  {
+    // drop the trailing .ui spacer
+    for (int i = row->count() - 1; i >= 0; --i)
+    {
+      if (row->itemAt(i)->spacerItem()) { delete row->takeAt(i); break; }
+    }
+    // Row order: [leftSecondary][stretch] main | globe | right-toolbar [stretch][balance-spacer]. Spacing 0
+    // so the button strips butt up against the globe; top-aligned so only the tall globe hangs down.
+    row->setSpacing(0);
+    row->insertWidget(1, right_toolbar, 0, Qt::AlignTop);
+    row->insertWidget(1, _time_globe, 0, Qt::AlignTop);
+    row->insertStretch(0, 1);
+    row->addStretch(1);
+    row->addWidget(_globe_balance_spacer, 0, Qt::AlignTop);
+    row->insertWidget(0, _viewport_overlay_ui->leftSecondaryToolbarHolder, 0, Qt::AlignTop);
+    row->setAlignment(_viewport_overlay_ui->upperToolbarHolder, Qt::AlignTop);
+    row->setAlignment(_viewport_overlay_ui->leftSecondaryToolbarHolder, Qt::AlignTop);
+  }
 }
 
 void MapView::setupKeybindingsGui()
@@ -1460,6 +3444,16 @@ void MapView::setupEditMenu()
   edit_menu->addSeparator();
   ADD_ACTION (edit_menu, "Delete", Qt::Key_Delete, [this]
   {
+    if (terrainMode == editing_mode::creature)
+    {
+      deleteSelectedCreatureSpawns();
+      return;
+    }
+    if (terrainMode == editing_mode::gameobject)
+    {
+      deleteSelectedGameObjectSpawns();
+      return;
+    }
     NOGGIT_ACTION_MGR->beginAction(this, Noggit::ActionFlags::eOBJECTS_REMOVED);
     DeleteSelectedObjects();
     NOGGIT_ACTION_MGR->endAction();
@@ -1488,7 +3482,12 @@ void MapView::setupEditMenu()
   edit_menu->addSeparator();
   edit_menu->addAction(createTextSeparator("State"));
   edit_menu->addSeparator();
-  ADD_ACTION (edit_menu, "Undo", "Ctrl+Z", [this] { NOGGIT_ACTION_MGR->undo(); });
+  ADD_ACTION (edit_menu, "Undo", "Ctrl+Z", [this]
+  {
+    if (terrainMode == editing_mode::creature && undoLastCreatureDelete()) { return; }
+    if (terrainMode == editing_mode::gameobject && undoLastGameObjectDelete()) { return; }
+    NOGGIT_ACTION_MGR->undo();
+  });
   ADD_ACTION (edit_menu, "Redo", "Ctrl+Shift+Z", [this] { NOGGIT_ACTION_MGR->redo(); });
 }
 
@@ -2142,6 +4141,34 @@ void MapView::setupAssistMenu()
 
 void MapView::setupViewMenu()
 {
+  // Apply persisted graphics toggles (Settings > Graphics > Render features) over the header
+  // defaults, so the user's render preferences survive restarts. Done BEFORE the ADD_TOGGLE macros
+  // below so the View-menu checkmarks reflect the loaded state. The pure render-path toggles are
+  // read live via property.get() each frame; the two terrain-param toggles also need their uniform
+  // block synced once here (the ADD_TOGGLE_POST lambdas only run that on user toggle, not at setup).
+  _draw_models.set           (_settings->value("render/doodads",          true ).toBool());
+  _draw_wmo_doodads.set      (_settings->value("render/wmo_doodads",      true ).toBool());
+  _draw_wmo.set              (_settings->value("render/wmo",              true ).toBool());
+  _draw_terrain.set          (_settings->value("render/terrain",          true ).toBool());
+  _draw_water.set            (_settings->value("render/water",            true ).toBool());
+  _draw_clouds.set           (_settings->value("render/draw_clouds",      true ).toBool());
+  _draw_sun.set              (_settings->value("render/draw_sun",         true ).toBool());
+  _draw_moon.set             (_settings->value("render/draw_moon",        true ).toBool());
+  _draw_model_animations.set (_settings->value("render/model_animations", true ).toBool());
+  _draw_bloom.set            (_settings->value("render/bloom",            true ).toBool());
+  _draw_ground_clutter.set   (_settings->value("render/ground_clutter",   true ).toBool());
+  _wdl_horizon_occlusion.set (_settings->value("render/wdl_horizon_occlusion", false).toBool());
+  _draw_fog.set              (_settings->value("render/fog",              true ).toBool());
+  _draw_vertex_color.set     (_settings->value("render/vertex_color",     true ).toBool());
+  _draw_baked_shadows.set    (_settings->value("render/baked_shadows",    true ).toBool());
+  if (_world && _world->renderer())
+  {
+    auto* tp = _world->renderer()->getTerrainParamsUniformBlock();
+    tp->draw_vertex_color = _draw_vertex_color.get();
+    tp->draw_shadows = _draw_baked_shadows.get();
+    _world->renderer()->markTerrainParamsUniformBlockDirty();
+  }
+
   auto view_menu (_main_window->_menuBar->addMenu ("View"));
   connect (this, &QObject::destroyed, view_menu, &QObject::deleteLater);
 
@@ -2152,7 +4179,36 @@ void MapView::setupViewMenu()
   ADD_TOGGLE (view_menu, "WMO doodads", Qt::Key_F2, _draw_wmo_doodads);
   ADD_TOGGLE (view_menu, "Terrain",     Qt::Key_F3, _draw_terrain);
   ADD_TOGGLE (view_menu, "Water",       Qt::Key_F4, _draw_water);
+  // Clouds/sun/moon render-paths read the SETTINGS each frame (Skies::draw_clouds and the
+  // WorldRender celestial block), so persist on toggle.
+  ADD_TOGGLE_POST (view_menu, "Clouds", Qt::SHIFT | Qt::Key_F5, _draw_clouds,
+                   [=]
+                   {
+                     _settings->setValue("render/draw_clouds", _draw_clouds.get());
+                     _settings->sync();
+                   });
+  ADD_TOGGLE_POST (view_menu, "Sun", Qt::SHIFT | Qt::Key_F6, _draw_sun,
+                   [=]
+                   {
+                     _settings->setValue("render/draw_sun", _draw_sun.get());
+                     _settings->sync();
+                   });
+  ADD_TOGGLE_POST (view_menu, "Moon", Qt::SHIFT | Qt::Key_F7, _draw_moon,
+                   [=]
+                   {
+                     _settings->setValue("render/draw_moon", _draw_moon.get());
+                     _settings->sync();
+                   });
+  ADD_TOGGLE (view_menu, "Bloom",       Qt::Key_F5, _draw_bloom);
   ADD_TOGGLE (view_menu, "WMOs",        Qt::Key_F6, _draw_wmo);
+  ADD_TOGGLE (view_menu, "Ground clutter", Qt::SHIFT | Qt::Key_G, _draw_ground_clutter);
+  // WorldRender reads render/wdl_horizon_occlusion each frame, so persist on toggle.
+  ADD_TOGGLE_POST (view_menu, "WDL horizon occlusion (perf)", 0, _wdl_horizon_occlusion,
+                   [=]
+                   {
+                     _settings->setValue("render/wdl_horizon_occlusion", _wdl_horizon_occlusion.get());
+                     _settings->sync();
+                   });
 
   ADD_TOGGLE_POST (view_menu, "Lines", Qt::Key_F7, _draw_lines,
                    [=]
@@ -2263,6 +4319,10 @@ void MapView::setupViewMenu()
         _texture_browser_dock,
         _texture_picker_dock,
         _detail_infos_dock,
+        _creature_actions_overlay,
+        _creature_browser_dock,
+        _creature_editor_dock,
+        _creature_model_picker_dock,
         _keybindings,
         _minimap_dock,
         objectEditor->modelImport,
@@ -2279,7 +4339,7 @@ void MapView::setupViewMenu()
     if (_main_window->displayed_widgets.empty())
     {
       for (auto widget : widget_list)
-        if (widget->isVisible())
+        if (widget && widget->isVisible())
         {
           _main_window->displayed_widgets.emplace(widget);
           widget->hide();
@@ -2289,7 +4349,8 @@ void MapView::setupViewMenu()
     else
     {
       for (auto widget : _main_window->displayed_widgets)
-        widget->show();
+        if (widget)
+          widget->show();
 
       _main_window->displayed_widgets.clear();
     }
@@ -2426,6 +4487,9 @@ void MapView::refreshCreatureSpawnOverlay(bool force_reload)
   if (force_reload || !_world->hasCreatureSpawnsLoaded())
   {
     _world->reloadCreatureSpawns();
+    // Spawns (and gameobjects, loaded alongside) were re-read -> drop the zone-filter caches.
+    _creature_zone_cache.clear();
+    _gameobject_zone_cache.clear();
     _main_window->statusBar()->showMessage(QString::fromStdString(_world->creatureSpawnStatus()), 5000);
   }
 
@@ -2438,11 +4502,11 @@ void MapView::updateDatabaseStatus()
 #ifdef USE_MYSQL_UID_STORAGE
   QStringList parts;
 
-  if (_settings->value("project/mysql/enabled", false).toBool())
+  if (Noggit::mysqlSetting("enabled", false).toBool())
   {
     parts << QString("MySQL %1:%2")
-                 .arg(_settings->value("project/mysql/server", "127.0.0.1").toString())
-                 .arg(_settings->value("project/mysql/port", 3306).toString());
+                 .arg(Noggit::mysqlSetting("server", "127.0.0.1").toString())
+                 .arg(Noggit::mysqlSetting("port", 3306).toString());
   }
 
   if (_draw_creature_spawns.get())
@@ -2489,6 +4553,124 @@ void MapView::updateDatabaseStatus()
   updateCreatureBrowserStatus();
 }
 
+// One row's label. Shared by the full rebuild and by refreshCreatureBrowserItems(), so the two can
+// never drift apart in what a row says.
+QString MapView::creature_spawn_item_text(World::CreatureSpawnOverlay const& spawn)
+{
+  QString prefix;
+  if (spawn.selected)
+  {
+    prefix += "[selected] ";
+  }
+  if (spawn.pending_create)
+  {
+    prefix += "[new] ";
+  }
+  if (spawn.dirty)
+  {
+    prefix += "[pending] ";
+  }
+
+  auto const name = QString::fromStdString(spawn.name.empty() ? std::string("<unnamed>") : spawn.name);
+  return QString("%1%2 [entry %3] guid %4").arg(prefix).arg(name).arg(spawn.entry).arg(spawn.guid);
+}
+
+// Retext ONLY the rows whose spawns changed, instead of clearing and repopulating the whole list.
+// Dragging flips a spawn's `dirty` flag, which changes its "[pending]" prefix -- but a full
+// rebuildCreatureBrowserList() allocates a QListWidgetItem for every spawn in the world, which is a
+// ~1s freeze on release. This walks the existing rows and touches the handful that moved.
+void MapView::refreshCreatureBrowserItems(std::vector<std::uint32_t> const& guids)
+{
+  if (!_creature_list_widget || guids.empty())
+  {
+    return;
+  }
+
+  QSignalBlocker blocker(_creature_list_widget);
+  for (int i = 0; i < _creature_list_widget->count(); ++i)
+  {
+    auto* item = _creature_list_widget->item(i);
+    if (!item)
+    {
+      continue;
+    }
+
+    auto const guid = static_cast<std::uint32_t>(item->data(Qt::UserRole).toULongLong());
+    if (std::find(guids.begin(), guids.end(), guid) == guids.end())
+    {
+      continue;
+    }
+
+    if (auto const* spawn = _world->findCreatureSpawn(guid))
+    {
+      item->setText(creature_spawn_item_text(*spawn));
+    }
+  }
+}
+
+// A SELECTION change does not change the list's CONTENT -- only which row is highlighted. Doing that
+// through rebuildCreatureBrowserList() cleared the QListWidget and allocated a fresh item for every
+// spawn in the world (plus a getZoneId() per spawn when the zone filter is on), which is the ~1s
+// freeze on every click in the creature tool -- including a click on empty ground, which only
+// deselects. Move the highlight instead; the rebuild is for content changes (create/delete/filter).
+void MapView::highlightCreatureBrowserSelection()
+{
+  if (!_creature_list_widget)
+  {
+    return;
+  }
+
+  QSignalBlocker blocker(_creature_list_widget);
+
+  if (_selected_creature_spawn_guid)
+  {
+    for (int i = 0; i < _creature_list_widget->count(); ++i)
+    {
+      auto* item = _creature_list_widget->item(i);
+      if (item && static_cast<std::uint32_t>(item->data(Qt::UserRole).toULongLong())
+                    == *_selected_creature_spawn_guid)
+      {
+        _creature_list_widget->setCurrentItem(item);
+        updateCreatureBrowserStatus();
+        return;
+      }
+    }
+  }
+
+  // Nothing selected, or the selected spawn is filtered out of the list by the search / zone / type
+  // filters -- a rebuild would not have highlighted anything either.
+  _creature_list_widget->setCurrentRow(-1);
+  updateCreatureBrowserStatus();
+}
+
+void MapView::highlightGameObjectBrowserSelection()
+{
+  if (!_gameobject_list_widget)
+  {
+    return;
+  }
+
+  QSignalBlocker blocker(_gameobject_list_widget);
+
+  if (_selected_gameobject_spawn_guid)
+  {
+    for (int i = 0; i < _gameobject_list_widget->count(); ++i)
+    {
+      auto* item = _gameobject_list_widget->item(i);
+      if (item && static_cast<std::uint32_t>(item->data(Qt::UserRole).toULongLong())
+                    == *_selected_gameobject_spawn_guid)
+      {
+        _gameobject_list_widget->setCurrentItem(item);
+        updateGameObjectBrowserStatus();
+        return;
+      }
+    }
+  }
+
+  _gameobject_list_widget->setCurrentRow(-1);
+  updateGameObjectBrowserStatus();
+}
+
 void MapView::rebuildCreatureBrowserList(bool preserve_selection)
 {
   if (!_creature_list_widget)
@@ -2500,44 +4682,38 @@ void MapView::rebuildCreatureBrowserList(bool preserve_selection)
   auto search_text = _creature_search_field ? _creature_search_field->text().trimmed() : QString();
   auto search_lower = search_text.toLower();
 
+  // "Zone only" filter: only keep spawns whose zone matches the camera's current zone. Disabled if
+  // the camera's own zone can't be resolved (e.g. standing outside any loaded area).
+  unsigned int camera_zone = (_creature_zone_filter && _creature_zone_filter->isChecked())
+    ? _world->getZoneId(_camera.position) : 0u;
+  bool const zone_only = camera_zone != 0u && camera_zone != static_cast<unsigned int>(-1);
+
   QSignalBlocker blocker(_creature_list_widget);
   _creature_list_widget->clear();
 
-#ifdef USE_MYSQL_UID_STORAGE
-  if (_creature_search_all_maps && _creature_search_all_maps->isChecked() && !search_text.isEmpty())
-  {
-    std::string error;
-    auto rows = mysql::searchCreatureSpawns(search_text.toStdString(), 500, &error);
-    if (!error.empty())
-    {
-      updateCreatureBrowserStatus(QString::fromStdString(error));
-      return;
-    }
-
-    for (auto const& row : rows)
-    {
-      auto* item = new QListWidgetItem(QString("%1 [entry %2] guid %3 | map %4")
-                                         .arg(QString::fromStdString(row.name.empty() ? std::string("<unnamed>") : row.name))
-                                         .arg(row.entry)
-                                         .arg(row.guid)
-                                         .arg(row.map),
-                                       _creature_list_widget);
-      item->setData(Qt::UserRole, static_cast<qulonglong>(row.guid));
-      item->setData(Qt::UserRole + 1, static_cast<int>(row.map));
-      item->setData(Qt::UserRole + 2, row.position_x);
-      item->setData(Qt::UserRole + 3, row.position_y);
-      item->setData(Qt::UserRole + 4, row.position_z);
-      item->setData(Qt::UserRole + 5, row.orientation);
-      item->setData(Qt::UserRole + 6, false);
-    }
-
-    updateCreatureBrowserStatus(QString("Global search: %1 result(s)").arg(_creature_list_widget->count()));
-    return;
-  }
-#endif
-
   for (auto const& spawn : _world->creatureSpawns())
   {
+    if (spawn.pending_delete) // marked for deletion -> hidden from the list
+    {
+      continue;
+    }
+    if (zone_only)
+    {
+      unsigned int zone;
+      auto cit = _creature_zone_cache.find(spawn.guid);
+      if (cit != _creature_zone_cache.end())
+      {
+        zone = cit->second;
+      }
+      else
+      {
+        zone = _world->getZoneId(spawn.pos);
+        if (zone != 0u && zone != static_cast<unsigned int>(-1))
+          _creature_zone_cache[spawn.guid] = zone; // cache only resolved zones (retry unloaded tiles)
+      }
+      if (zone != camera_zone)
+        continue;
+    }
     auto name = QString::fromStdString(spawn.name.empty() ? std::string("<unnamed>") : spawn.name);
     auto entry_text = QString::number(spawn.entry);
     auto guid_text = QString::number(spawn.guid);
@@ -2550,22 +4726,28 @@ void MapView::rebuildCreatureBrowserList(bool preserve_selection)
       continue;
     }
 
-    QString prefix;
-    if (spawn.selected)
+    // Type/rank filter (same semantics as the NPC model picker), looked up by spawn entry. Spawns whose
+    // creature_template info hasn't loaded yet are left visible (don't hide what we can't classify).
     {
-      prefix += "[selected] ";
-    }
-    if (spawn.dirty)
-    {
-      prefix += "[pending] ";
+      auto fit = _creature_template_filter_info.find(spawn.entry);
+      if (fit != _creature_template_filter_info.end())
+      {
+        auto const& info = fit->second;
+        auto const type_data = _creature_browser_type_filter ? _creature_browser_type_filter->currentData() : QVariant();
+        if (type_data.isValid() && info.creature_type != static_cast<std::uint32_t>(type_data.toULongLong()))
+          continue;
+        if (_creature_browser_elite && _creature_browser_elite->isChecked() && !(info.rank == 1u || info.rank == 2u))
+          continue;
+        if (_creature_browser_boss && _creature_browser_boss->isChecked() && info.rank < 3u && (info.type_flags & 0x4u) == 0u)
+          continue;
+        if (_creature_browser_civilian && _creature_browser_civilian->isChecked() && (info.flags_extra & 0x2u) == 0u && (info.type_flags & 0x80u) == 0u)
+          continue;
+        if (_creature_browser_trainer && _creature_browser_trainer->isChecked() && (info.npc_flags & 0x10u) == 0u)
+          continue;
+      }
     }
 
-    auto* item = new QListWidgetItem(QString("%1%2 [entry %3] guid %4")
-                                       .arg(prefix)
-                                       .arg(name)
-                                       .arg(spawn.entry)
-                                       .arg(spawn.guid),
-                                     _creature_list_widget);
+    auto* item = new QListWidgetItem(creature_spawn_item_text(spawn), _creature_list_widget);
     item->setData(Qt::UserRole, static_cast<qulonglong>(spawn.guid));
     item->setData(Qt::UserRole + 1, static_cast<int>(_world->getMapID()));
     item->setData(Qt::UserRole + 6, true);
@@ -2629,14 +4811,44 @@ void MapView::setSelectedCreatureSpawn(std::optional<std::uint32_t> guid, bool u
 {
   _selected_creature_spawn_guid = guid;
 
+  // Collect the spawns whose selected flag actually flips: their row text carries a "[selected]"
+  // prefix, so those are the only rows that need new text.
+  std::vector<std::uint32_t> retext;
   for (auto& spawn : _world->creatureSpawns())
   {
-    spawn.selected = guid && spawn.guid == *guid;
+    bool const now_selected = guid && spawn.guid == *guid;
+    if (spawn.selected != now_selected)
+    {
+      retext.push_back(spawn.guid);
+    }
+    spawn.selected = now_selected;
+  }
+
+  // Populate the "Edit/New Creature" form from the selected spawn (empty = New). So clicking an existing
+  // creature fills its guid/entry/display; deselecting clears back to the new-spawn state.
+  if (_creature_spawn_guid_field)
+  {
+    World::CreatureSpawnOverlay const* sp = guid ? _world->findCreatureSpawn(*guid) : nullptr;
+    if (sp)
+    {
+      _creature_spawn_guid_field->setText(QString::number(sp->guid));
+      _creature_spawn_entry_field->setText(QString::number(sp->entry));
+      _creature_spawn_display_field->setText(QString::number(sp->display_id));
+    }
+    else
+    {
+      _creature_spawn_guid_field->clear();
+      _creature_spawn_entry_field->clear();
+      _creature_spawn_display_field->clear();
+    }
   }
 
   if (update_browser)
   {
-    rebuildCreatureBrowserList(true);
+    // Selection only -- no content change. Retext the handful of rows whose prefix flipped and move
+    // the highlight, instead of clearing and repopulating the whole list (the ~1s click freeze).
+    refreshCreatureBrowserItems(retext);
+    highlightCreatureBrowserSelection();
   }
   else
   {
@@ -2667,7 +4879,9 @@ void MapView::addCreatureSpawnToSelection(std::uint32_t guid, bool update_browse
 
   if (update_browser)
   {
-    rebuildCreatureBrowserList(true);
+    // Only this row's "[selected]" prefix changed -- see setSelectedCreatureSpawn.
+    refreshCreatureBrowserItems({guid});
+    highlightCreatureBrowserSelection();
   }
   else
   {
@@ -2701,6 +4915,10 @@ void MapView::selectCreatureSpawnsInArea(QRect const& rect, bool add_to_selectio
 
   for (auto& spawn : _world->creatureSpawns())
   {
+    if (spawn.event_suppressed) // hidden by the Seasonal Events filter -> not box-selectable
+    {
+      continue;
+    }
     glm::vec3 const screen = glm::project(spawn.pos, mv, proj, vp);
     if (screen.z < 0.0f || screen.z > 1.0f)
     {
@@ -2735,10 +4953,64 @@ void MapView::selectCreatureSpawnsInArea(QRect const& rect, bool add_to_selectio
   updateDatabaseStatus();
 }
 
+void MapView::setCreatureInfoPanelVisible(bool visible)
+{
+  if (!_creature_info_panel)
+  {
+    // Free-floating tool window (movable by its own title bar), initially aligned with the left
+    // secondary toolbar so it doesn't cover the side icon strip.
+    _creature_info_panel = new Noggit::Ui::CreatureInfoPanel(this);
+    _creature_info_panel->setWindowFlags(Qt::Tool);
+    _creature_info_panel->setWindowTitle("Quick Facts");
+
+    QWidget* bar = getLeftSecondaryToolbar();
+    QPoint const initial = (bar && bar->isVisible())
+      ? bar->mapToGlobal(QPoint(0, bar->height() + 6))
+      : mapToGlobal(QPoint(60, 110));
+    _creature_info_panel->move(initial);
+  }
+
+  if (!visible)
+  {
+    _creature_info_panel->hide();
+    return;
+  }
+
+  if (_selected_creature_spawn_guid)
+  {
+    if (auto const* spawn = _world->findCreatureSpawn(*_selected_creature_spawn_guid))
+    {
+      _creature_info_panel->setCreature(spawn->entry);
+    }
+  }
+  else
+  {
+    _creature_info_panel->clearCreature();
+  }
+  _creature_info_panel->show();
+  _creature_info_panel->raise();
+}
+
 void MapView::refreshCreatureEditorKnobs()
 {
   if (!_spawn_edit_x)
     return;
+
+  // Keep the Quick Facts dropdown following the selection.
+  if (_creature_info_panel && _creature_info_panel->isVisible())
+  {
+    if (_selected_creature_spawn_guid)
+    {
+      if (auto const* info_spawn = _world->findCreatureSpawn(*_selected_creature_spawn_guid))
+      {
+        _creature_info_panel->setCreature(info_spawn->entry);
+      }
+    }
+    else
+    {
+      _creature_info_panel->clearCreature();
+    }
+  }
 
   auto disable_all = [this]() {
     _creature_editor_info->setText("No spawn selected");
@@ -2783,7 +5055,7 @@ void MapView::refreshCreatureEditorKnobs()
   _spawn_edit_x->setValue(static_cast<double>(spawn->pos.x));
   _spawn_edit_y->setValue(static_cast<double>(spawn->pos.y));
   _spawn_edit_z->setValue(static_cast<double>(spawn->pos.z));
-  _spawn_edit_orientation->setValue(static_cast<double>(glm::degrees(spawn->orientation)));
+  _spawn_edit_orientation->setValue(static_cast<double>(spawn->orientation));
 
   for (auto* w : {_spawn_edit_x, _spawn_edit_y, _spawn_edit_z, _spawn_edit_orientation})
   {
@@ -2820,7 +5092,7 @@ void MapView::setHoveredCreatureSpawn(std::optional<std::uint32_t> guid)
   _needs_redraw = true;
 }
 
-std::optional<std::uint32_t> MapView::findCreatureSpawnAtCursor() const
+std::optional<std::uint32_t> MapView::findCreatureSpawnAtCursor()
 {
   if (!_world->hasCreatureSpawnsLoaded())
     return std::optional<std::uint32_t>();
@@ -2829,29 +5101,68 @@ std::optional<std::uint32_t> MapView::findCreatureSpawnAtCursor() const
   glm::mat4x4 const proj = projection();
   glm::vec4 const vp(0.0f, 0.0f, float(width()), float(height()));
 
-  float const pick_px = 30.0f;
-  float best_dist_px = std::numeric_limits<float>::max();
-  std::optional<std::uint32_t> best_guid;
+  // Build the cursor ray in WORLD space (window Y is bottom-up for unProject; Qt mouse Y is top-down).
+  float const wx = float(_last_mouse_pos.x());
+  float const wy = float(height()) - float(_last_mouse_pos.y());
+  glm::vec3 const ray_near = glm::unProject(glm::vec3(wx, wy, 0.0f), mv, proj, vp);
+  glm::vec3 const ray_far  = glm::unProject(glm::vec3(wx, wy, 1.0f), mv, proj, vp);
+  glm::vec3 const ray_dir  = ray_far - ray_near;
 
+  // 1) Prefer a hit on the actual 3D MODEL MESH: click the creature's body, not just its ground disc.
+  //    ModelInstance::intersect ray-casts the animated triangles in the instance's own transform; we
+  //    take the spawn whose mesh the cursor ray strikes nearest the camera.
+  {
+    math::ray const world_ray(ray_near, ray_dir);
+    int const base_animtime = static_cast<int>(_world->model_animtime);
+    float best_dist = std::numeric_limits<float>::max();
+    std::optional<std::uint32_t> best_guid;
+    for (auto& spawn : _world->creatureSpawns())
+    {
+      if (spawn.pending_delete || spawn.event_suppressed || !spawn.model_instance.has_value())
+        continue;
+      auto& inst = *spawn.model_instance;
+      if (!inst.model.get() || !inst.model->finishedLoading() || inst.model->loading_failed())
+        continue;
+      selection_result hits;
+      inst.intersect(mv, world_ray, &hits, base_animtime + spawn.animation_time_offset);
+      for (auto const& h : hits)
+      {
+        if (h.first < best_dist)
+        {
+          best_dist = h.first;
+          best_guid = spawn.guid;
+        }
+      }
+    }
+    if (best_guid)
+      return best_guid;
+  }
+
+  // 2) Fallback: the ground selection-disc, so clicking the drawn circle still selects (handy when the
+  //    body is off-screen or behind terrain -- e.g. a flyer whose disc sits on the ground below it).
+  //    Same world centre (spawn.pos) and radius as the rendered marker; rank by relative distance from
+  //    the centre (0 = centre, <1 = inside) so overlapping discs resolve to the most-centred one.
+  float best_rel = 1.0f;
+  std::optional<std::uint32_t> best_guid;
   for (auto const& spawn : _world->creatureSpawns())
   {
-    glm::vec3 const screen = glm::project(spawn.pos, mv, proj, vp);
-    if (screen.z < 0.0f || screen.z > 1.0f)
+    if (spawn.pending_delete || spawn.event_suppressed)
       continue;
-
-    float const sx = screen.x;
-    float const sy = float(height()) - screen.y;
-    float const dx = sx - float(_last_mouse_pos.x());
-    float const dy = sy - float(_last_mouse_pos.y());
-    float const dist_px = std::sqrt(dx * dx + dy * dy);
-
-    if (dist_px < pick_px && dist_px < best_dist_px)
+    float const ring_radius = spawn.selectionRingWorldRadius();
+    if (std::abs(ray_dir.y) < 1e-6f)
+      continue;
+    float const t = (spawn.pos.y - ray_near.y) / ray_dir.y;
+    if (t < 0.0f)
+      continue;
+    glm::vec3 const hit = ray_near + ray_dir * t;
+    float const d = glm::length(glm::vec2(hit.x - spawn.pos.x, hit.z - spawn.pos.z));
+    float const rel = d / ring_radius;
+    if (rel < 1.0f && rel < best_rel)
     {
-      best_dist_px = dist_px;
+      best_rel = rel;
       best_guid = spawn.guid;
     }
   }
-
   return best_guid;
 }
 
@@ -2911,7 +5222,10 @@ bool MapView::tryStartCreatureSpawnDrag()
 
   if (!clicked_spawn->selected || selectedCreatureSpawnCount() <= 1)
   {
-    setSelectedCreatureSpawn(best_guid);
+    // update_browser=false: rebuildCreatureBrowserList() repopulates a QListWidget over every spawn in
+    // the world, which is a ~1s hitch at the moment you grab something. The drag end already rebuilds
+    // it (mouseReleaseEvent), so the list syncs there instead of stalling the grab.
+    setSelectedCreatureSpawn(best_guid, /*update_browser*/ false);
   }
 
   _creature_drag_anchor_pos = _cursor_pos;
@@ -2940,7 +5254,8 @@ void MapView::translateSelectedCreatureSpawns(glm::vec3 const& delta)
   auto apply_position = [](World::CreatureSpawnOverlay& spawn, glm::vec3 const& pos)
   {
     spawn.pos = pos;
-    spawn.dirty = glm::distance(spawn.pos, spawn.original_pos) > 0.01f
+    spawn.dirty = spawn.pending_create
+               || glm::distance(spawn.pos, spawn.original_pos) > 0.01f
                || std::abs(spawn.orientation - spawn.original_orientation) > 0.01f;
 
     if (spawn.model_instance)
@@ -2982,6 +5297,223 @@ void MapView::translateSelectedCreatureSpawns(glm::vec3 const& delta)
   refreshCreatureEditorKnobs();
 }
 
+void MapView::translateSelectedGameObjectSpawns(glm::vec3 const& delta)
+{
+  if (!_selected_gameobject_spawn_guid)
+  {
+    return;
+  }
+
+  auto apply_position = [](World::GameObjectSpawnOverlay& spawn, glm::vec3 const& pos)
+  {
+    spawn.pos = pos;
+    spawn.dirty = spawn.pending_create
+               || glm::distance(spawn.pos, spawn.original_pos) > 0.01f
+               || std::abs(spawn.orientation - spawn.original_orientation) > 0.01f;
+
+    if (spawn.model_instance)
+    {
+      spawn.model_instance->pos = spawn.pos;
+      spawn.model_instance->dir = glm::vec3(0.0f, spawn.orientation, 0.0f);
+      spawn.model_instance->recalcExtents();
+    }
+  };
+
+  bool moved_any = false;
+  for (auto& spawn : _world->gameObjectSpawns())
+  {
+    if (!spawn.selected)
+    {
+      continue;
+    }
+    apply_position(spawn, spawn.pos + delta);
+    moved_any = true;
+  }
+
+  if (!moved_any)
+  {
+    if (auto* spawn = _world->findGameObjectSpawn(*_selected_gameobject_spawn_guid))
+    {
+      apply_position(*spawn, spawn->pos + delta);
+      moved_any = true;
+    }
+  }
+
+  if (!moved_any)
+  {
+    return;
+  }
+
+  updateGameObjectBrowserStatus();
+  rebuildGameObjectBrowserList(true);
+  refreshGameObjectEditorKnobs();
+}
+
+void MapView::deleteSelectedCreatureSpawns()
+{
+  std::vector<std::uint32_t> deleted;
+
+  auto mark = [&](World::CreatureSpawnOverlay& spawn)
+  {
+    if (spawn.pending_delete)
+    {
+      return;
+    }
+    spawn.pending_delete = true; // hidden from view/browser/picking; exported as DELETE
+    spawn.dirty = true;          // count it as a pending change
+    spawn.selected = false;
+    spawn.hovered = false;
+    deleted.push_back(spawn.guid);
+  };
+
+  for (auto& spawn : _world->creatureSpawns())
+  {
+    if (spawn.selected)
+    {
+      mark(spawn);
+    }
+  }
+
+  if (deleted.empty() && _selected_creature_spawn_guid)
+  {
+    if (auto* spawn = _world->findCreatureSpawn(*_selected_creature_spawn_guid))
+    {
+      mark(*spawn);
+    }
+  }
+
+  if (deleted.empty())
+  {
+    return;
+  }
+
+  _creature_delete_undo.push_back(deleted);
+  setSelectedCreatureSpawn(std::nullopt, false);
+  updateDatabaseStatus();
+  rebuildCreatureBrowserList(true);
+  refreshCreatureEditorKnobs();
+  _main_window->statusBar()->showMessage(
+    QString("Marked %1 creature spawn(s) for deletion (Ctrl+Z to undo)").arg(deleted.size()), 5000);
+}
+
+bool MapView::undoLastCreatureDelete()
+{
+  if (_creature_delete_undo.empty())
+  {
+    return false;
+  }
+
+  auto const guids = _creature_delete_undo.back();
+  _creature_delete_undo.pop_back();
+
+  for (auto guid : guids)
+  {
+    if (auto* spawn = _world->findCreatureSpawn(guid))
+    {
+      spawn->pending_delete = false;
+      // Keep it dirty only if it still has real edits (or is a never-saved spawn).
+      spawn->dirty = spawn->pending_create
+                  || glm::distance(spawn->pos, spawn->original_pos) > 0.01f
+                  || std::abs(spawn->orientation - spawn->original_orientation) > 0.01f;
+    }
+  }
+
+  updateDatabaseStatus();
+  rebuildCreatureBrowserList(true);
+  refreshCreatureEditorKnobs();
+  _main_window->statusBar()->showMessage(
+    QString("Restored %1 creature spawn(s)").arg(guids.size()), 5000);
+  return true;
+}
+
+// Turn every spawn currently being dragged by `degrees` about its own centre. Used by the wheel while
+// a drag is in progress. Deliberately does NOT rebuild the browser list or the editor knobs -- those
+// are the expensive calls that used to stall the drag; the orientation spinbox is nudged directly and
+// the full resync happens on mouse-up like the position does.
+void MapView::rotateDraggedSpawns(float degrees)
+{
+  auto const wrap360 = [](float v)
+  {
+    v = std::fmod(v, 360.0f);
+    return v < 0.0f ? v + 360.0f : v;
+  };
+
+  if (_dragging_creature_spawn)
+  {
+    for (auto const& drag_state : _creature_drag_initial_positions)
+    {
+      auto* spawn = _world->findCreatureSpawn(drag_state.first);
+      if (!spawn)
+      {
+        continue;
+      }
+
+      spawn->orientation = wrap360(spawn->orientation + degrees);
+      spawn->dirty = spawn->pending_create
+                  || glm::distance(spawn->pos, spawn->original_pos) > 0.01f
+                  || std::abs(spawn->orientation - spawn->original_orientation) > 0.01f;
+
+      if (spawn->model_instance)
+      {
+        spawn->model_instance->dir = glm::vec3(0.0f, spawn->orientation, 0.0f);
+        spawn->model_instance->recalcExtents();
+      }
+      if (spawn->mount_instance)
+      {
+        spawn->mount_instance->dir = glm::vec3(0.0f, spawn->orientation, 0.0f);
+        spawn->mount_instance->recalcExtents();
+      }
+    }
+
+    if (_spawn_edit_orientation && _selected_creature_spawn_guid)
+    {
+      if (auto const* sel = _world->findCreatureSpawn(*_selected_creature_spawn_guid))
+      {
+        QSignalBlocker blocker(_spawn_edit_orientation);
+        _spawn_edit_orientation->setValue(static_cast<double>(sel->orientation));
+      }
+    }
+    return;
+  }
+
+  if (_dragging_gameobject_spawn)
+  {
+    for (auto const& drag_state : _gameobject_drag_initial_positions)
+    {
+      auto* spawn = _world->findGameObjectSpawn(drag_state.first);
+      if (!spawn)
+      {
+        continue;
+      }
+
+      spawn->orientation = wrap360(spawn->orientation + degrees);
+      spawn->dirty = spawn->pending_create
+                  || glm::distance(spawn->pos, spawn->original_pos) > 0.01f
+                  || std::abs(spawn->orientation - spawn->original_orientation) > 0.01f;
+
+      if (spawn->model_instance)
+      {
+        spawn->model_instance->dir = glm::vec3(0.0f, spawn->orientation, 0.0f);
+        spawn->model_instance->recalcExtents();
+      }
+      if (spawn->wmo_instance)
+      {
+        spawn->wmo_instance->dir = glm::vec3(0.0f, spawn->orientation, 0.0f);
+        spawn->wmo_instance->recalcExtents();
+      }
+    }
+
+    if (_go_spawn_edit_orientation && _selected_gameobject_spawn_guid)
+    {
+      if (auto const* sel = _world->findGameObjectSpawn(*_selected_gameobject_spawn_guid))
+      {
+        QSignalBlocker blocker(_go_spawn_edit_orientation);
+        _go_spawn_edit_orientation->setValue(static_cast<double>(sel->orientation));
+      }
+    }
+  }
+}
+
 void MapView::updateSelectedCreatureSpawnPosition(glm::vec3 const& pos)
 {
   if (!_selected_creature_spawn_guid)
@@ -2992,7 +5524,8 @@ void MapView::updateSelectedCreatureSpawnPosition(glm::vec3 const& pos)
   auto apply_position = [](World::CreatureSpawnOverlay& spawn, glm::vec3 const& new_pos)
   {
     spawn.pos = new_pos;
-    spawn.dirty = glm::distance(spawn.pos, spawn.original_pos) > 0.01f
+    spawn.dirty = spawn.pending_create
+               || glm::distance(spawn.pos, spawn.original_pos) > 0.01f
                || std::abs(spawn.orientation - spawn.original_orientation) > 0.01f;
 
     if (spawn.model_instance)
@@ -3005,16 +5538,26 @@ void MapView::updateSelectedCreatureSpawnPosition(glm::vec3 const& pos)
 
   if (_dragging_creature_spawn && _creature_drag_anchor_pos && !_creature_drag_initial_positions.empty())
   {
-    glm::vec3 const delta = pos - *_creature_drag_anchor_pos;
-    for (auto const& drag_state : _creature_drag_initial_positions)
+    if (_creature_drag_initial_positions.size() == 1)
     {
-      auto* spawn = _world->findCreatureSpawn(drag_state.first);
-      if (!spawn)
+      // Single spawn: snap it directly to the ground point under the cursor so it follows the mouse
+      // exactly (instead of keeping the click offset).
+      if (auto* spawn = _world->findCreatureSpawn(_creature_drag_initial_positions[0].first))
       {
-        continue;
+        apply_position(*spawn, pos);
       }
-
-      apply_position(*spawn, drag_state.second + delta);
+    }
+    else
+    {
+      // Multi-select: move the whole group together by the cursor delta to preserve their layout.
+      glm::vec3 const delta = pos - *_creature_drag_anchor_pos;
+      for (auto const& drag_state : _creature_drag_initial_positions)
+      {
+        if (auto* spawn = _world->findCreatureSpawn(drag_state.first))
+        {
+          apply_position(*spawn, drag_state.second + delta);
+        }
+      }
     }
   }
   else
@@ -3026,6 +5569,15 @@ void MapView::updateSelectedCreatureSpawnPosition(glm::vec3 const& pos)
     }
 
     apply_position(*spawn, pos);
+  }
+
+  // PERF: this runs on EVERY mouse-move while dragging, and rebuildCreatureBrowserList() clears and
+  // repopulates a QListWidget over every creature spawn in the world -- that is what dropped the drag
+  // to ~1 fps. All three calls are pure UI sync with no bearing on the spawn's position, so defer them
+  // to the end of the drag (mouseReleaseEvent), where they run exactly once.
+  if (_dragging_creature_spawn)
+  {
+    return;
   }
 
   updateDatabaseStatus();
@@ -3062,12 +5614,99 @@ void MapView::showSelectedCreatureSpawnMenu(QPoint const& global_pos)
 
   if (chosen == jump_action)
   {
-    move_camera_with_auto_height(spawn->pos);
+    focus_camera_on_target(spawn->pos);
   }
   else if (chosen == save_action)
   {
     saveDirtyCreatureSpawns();
   }
+}
+
+void MapView::discardPendingCreatureSpawns()
+{
+  auto dirty_count = _world->dirtyCreatureSpawnCount();
+  if (dirty_count == 0)
+  {
+    _main_window->statusBar()->showMessage("No creature spawn changes to discard", 4000);
+    updateCreatureBrowserStatus();
+    return;
+  }
+
+  _selected_creature_spawn_guid = std::nullopt;
+  _hovered_creature_spawn_guid = std::nullopt;
+  _dragging_creature_spawn = false;
+  _creature_drag_anchor_pos = std::nullopt;
+  _creature_drag_initial_positions.clear();
+  _creature_delete_undo.clear();
+
+  std::size_t removed_new = 0;
+  std::size_t reverted_existing = 0;
+
+  try
+  {
+    makeCurrent();
+    OpenGL::context::scoped_setter const _ (::gl, context());
+
+    auto& spawns = _world->creatureSpawns();
+    for (auto& spawn : spawns)
+    {
+      spawn.selected = false;
+      spawn.hovered = false;
+
+      if (!spawn.dirty || spawn.pending_create)
+      {
+        continue;
+      }
+
+      spawn.pos = spawn.original_pos;
+      spawn.orientation = spawn.original_orientation;
+      spawn.dirty = false;
+      spawn.pending_delete = false; // restore any spawn that was marked for deletion
+      if (spawn.model_instance)
+      {
+        spawn.model_instance->pos = spawn.pos;
+        spawn.model_instance->dir = glm::vec3(0.0f, spawn.orientation, 0.0f);
+        spawn.model_instance->recalcExtents();
+      }
+      ++reverted_existing;
+    }
+
+    auto pending_begin = std::remove_if(spawns.begin(), spawns.end(),
+      [&removed_new](World::CreatureSpawnOverlay const& spawn)
+      {
+        if (!spawn.pending_create)
+        {
+          return false;
+        }
+
+        ++removed_new;
+        return true;
+      });
+    spawns.erase(pending_begin, spawns.end());
+  }
+  catch (std::exception const& ex)
+  {
+    _main_window->statusBar()->showMessage(QString("Failed to discard creature spawn changes: %1").arg(ex.what()), 7000);
+    updateCreatureBrowserStatus();
+    return;
+  }
+  catch (...)
+  {
+    _main_window->statusBar()->showMessage("Failed to discard creature spawn changes: unknown error", 7000);
+    updateCreatureBrowserStatus();
+    return;
+  }
+
+  rebuildCreatureBrowserList(false);
+  refreshCreatureEditorKnobs();
+  updateDatabaseStatus();
+  _needs_redraw = true;
+
+  _main_window->statusBar()->showMessage(
+    QString("Discarded %1 pending creature spawn(s), reverted %2 edited spawn(s)")
+      .arg(removed_new)
+      .arg(reverted_existing),
+    5000);
 }
 
 void MapView::saveDirtyCreatureSpawns()
@@ -3118,20 +5757,50 @@ void MapView::saveDirtyCreatureSpawns()
       continue;
     }
 
+    if (spawn.pending_delete)
+    {
+      // A spawn created this session and then deleted never reached the DB -> nothing to export.
+      if (spawn.pending_create)
+      {
+        continue;
+      }
+      stream << "-- GUID " << spawn.guid << " entry " << spawn.entry << " "
+             << QString::fromStdString(spawn.name.empty() ? std::string("<unnamed>") : spawn.name) << "\n";
+      stream << "DELETE FROM creature WHERE guid=" << spawn.guid << ";\n\n";
+      continue;
+    }
+
     auto server_pos = client_to_server_creature_position(spawn.pos, _world->mapIndex.hasAGlobalWMO());
     auto server_orientation = client_to_server_creature_orientation(spawn.orientation);
     stream << "-- GUID " << spawn.guid << " entry " << spawn.entry << " "
            << QString::fromStdString(spawn.name.empty() ? std::string("<unnamed>") : spawn.name)
            << "\n";
-    stream << "UPDATE creature\n"
-           << "SET position_x = " << QString::number(server_pos.x, 'f', 6) << ",\n"
-           << "    position_y = " << QString::number(server_pos.y, 'f', 6) << ",\n"
-           << "    position_z = " << QString::number(server_pos.z, 'f', 6) << ",\n"
-           << "    orientation = " << QString::number(server_orientation, 'f', 6) << "\n"
-           << "WHERE guid = " << spawn.guid << ";\n\n";
+
+    if (spawn.pending_create)
+    {
+      stream << "-- Preview display ID: " << spawn.display_id << "\n";
+      stream << "INSERT INTO creature (guid, id, map, position_x, position_y, position_z, orientation)\n"
+             << "VALUES (" << spawn.guid << ", "
+             << spawn.entry << ", "
+             << _world->getMapID() << ", "
+             << QString::number(server_pos.x, 'f', 6) << ", "
+             << QString::number(server_pos.y, 'f', 6) << ", "
+             << QString::number(server_pos.z, 'f', 6) << ", "
+             << QString::number(server_orientation, 'f', 6) << ");\n\n";
+    }
+    else
+    {
+      stream << "UPDATE creature\n"
+             << "SET position_x = " << QString::number(server_pos.x, 'f', 6) << ",\n"
+             << "    position_y = " << QString::number(server_pos.y, 'f', 6) << ",\n"
+             << "    position_z = " << QString::number(server_pos.z, 'f', 6) << ",\n"
+             << "    orientation = " << QString::number(server_orientation, 'f', 6) << "\n"
+             << "WHERE guid = " << spawn.guid << ";\n\n";
+    }
 
     spawn.original_pos = spawn.pos;
     spawn.original_orientation = spawn.orientation;
+    spawn.pending_create = false;
     spawn.dirty = false;
   }
   output.close();
@@ -3158,7 +5827,7 @@ void MapView::jumpToCreatureListItem(QListWidgetItem* item)
     auto const* spawn = _world->findCreatureSpawn(guid);
     if (spawn)
     {
-      move_camera_with_auto_height(spawn->pos);
+      focus_camera_on_target(spawn->pos);
     }
     return;
   }
@@ -3168,6 +5837,954 @@ void MapView::jumpToCreatureListItem(QListWidgetItem* item)
                                                             item->data(Qt::UserRole + 4).toFloat(),
                                                             _world->mapIndex.hasAGlobalWMO());
   _main_window->jumpToMapPosition(map_id, target_pos, math::degrees(30.f), math::degrees(90.f), false);
+}
+
+// ---------------------------------------------------------------------------
+// GameObject tool (mirrors the creature tool above; no model picker / new-spawn creation).
+// ---------------------------------------------------------------------------
+
+// Gameobject counterpart of refreshCreatureBrowserItems -- see that function for why.
+void MapView::refreshGameObjectBrowserItems(std::vector<std::uint32_t> const& guids)
+{
+  if (!_gameobject_list_widget || guids.empty())
+  {
+    return;
+  }
+
+  QSignalBlocker blocker(_gameobject_list_widget);
+  for (int i = 0; i < _gameobject_list_widget->count(); ++i)
+  {
+    auto* item = _gameobject_list_widget->item(i);
+    if (!item)
+    {
+      continue;
+    }
+
+    auto const guid = static_cast<std::uint32_t>(item->data(Qt::UserRole).toULongLong());
+    if (std::find(guids.begin(), guids.end(), guid) == guids.end())
+    {
+      continue;
+    }
+
+    if (auto const* spawn = _world->findGameObjectSpawn(guid))
+    {
+      QString prefix;
+      if (spawn->selected)
+      {
+        prefix += "[selected] ";
+      }
+      if (spawn->dirty)
+      {
+        prefix += "[pending] ";
+      }
+
+      auto const name = QString::fromStdString(spawn->name.empty() ? std::string("<unnamed>") : spawn->name);
+      item->setText(QString("%1%2 [entry %3] guid %4")
+                      .arg(prefix).arg(name).arg(spawn->entry).arg(spawn->guid));
+    }
+  }
+}
+
+void MapView::rebuildGameObjectBrowserList(bool preserve_selection)
+{
+  if (!_gameobject_list_widget)
+  {
+    return;
+  }
+
+  auto selected_guid = preserve_selection ? _selected_gameobject_spawn_guid : std::optional<std::uint32_t>();
+  auto search_text = _gameobject_search_field ? _gameobject_search_field->text().trimmed() : QString();
+  auto search_lower = search_text.toLower();
+
+  unsigned int camera_zone = (_gameobject_zone_filter && _gameobject_zone_filter->isChecked())
+    ? _world->getZoneId(_camera.position) : 0u;
+  bool const zone_only = camera_zone != 0u && camera_zone != static_cast<unsigned int>(-1);
+
+  QSignalBlocker blocker(_gameobject_list_widget);
+  _gameobject_list_widget->clear();
+
+  for (auto const& spawn : _world->gameObjectSpawns())
+  {
+    if (spawn.pending_delete) // marked for deletion -> hidden from the list
+    {
+      continue;
+    }
+    if (zone_only)
+    {
+      unsigned int zone;
+      auto cit = _gameobject_zone_cache.find(spawn.guid);
+      if (cit != _gameobject_zone_cache.end())
+      {
+        zone = cit->second;
+      }
+      else
+      {
+        zone = _world->getZoneId(spawn.pos);
+        if (zone != 0u && zone != static_cast<unsigned int>(-1))
+          _gameobject_zone_cache[spawn.guid] = zone;
+      }
+      if (zone != camera_zone)
+        continue;
+    }
+    auto name = QString::fromStdString(spawn.name.empty() ? std::string("<unnamed>") : spawn.name);
+    auto entry_text = QString::number(spawn.entry);
+    auto guid_text = QString::number(spawn.guid);
+
+    if (!search_lower.isEmpty()
+        && !name.toLower().contains(search_lower)
+        && !entry_text.contains(search_lower)
+        && !guid_text.contains(search_lower))
+    {
+      continue;
+    }
+
+    // Type filter (mirrors the gameobject model picker), looked up by spawn entry. Spawns whose template
+    // type hasn't loaded yet are left visible.
+    if (_gameobject_browser_type_filter)
+    {
+      auto const type_data = _gameobject_browser_type_filter->currentData();
+      if (type_data.isValid())
+      {
+        auto fit = _gameobject_template_filter_type.find(spawn.entry);
+        if (fit != _gameobject_template_filter_type.end()
+            && fit->second != static_cast<std::uint32_t>(type_data.toULongLong()))
+        {
+          continue;
+        }
+      }
+    }
+
+    QString prefix;
+    if (spawn.selected)
+    {
+      prefix += "[selected] ";
+    }
+    if (spawn.dirty)
+    {
+      prefix += "[pending] ";
+    }
+
+    auto* item = new QListWidgetItem(QString("%1%2 [entry %3] guid %4")
+                                       .arg(prefix)
+                                       .arg(name)
+                                       .arg(spawn.entry)
+                                       .arg(spawn.guid),
+                                     _gameobject_list_widget);
+    item->setData(Qt::UserRole, static_cast<qulonglong>(spawn.guid));
+    item->setData(Qt::UserRole + 1, static_cast<int>(_world->getMapID()));
+    item->setData(Qt::UserRole + 6, true);
+
+    if (selected_guid && *selected_guid == spawn.guid)
+    {
+      _gameobject_list_widget->setCurrentItem(item);
+    }
+  }
+
+  updateGameObjectBrowserStatus();
+}
+
+void MapView::updateGameObjectBrowserStatus(QString const& override_text)
+{
+  if (!_gameobject_browser_status)
+  {
+    return;
+  }
+
+  if (!override_text.isEmpty())
+  {
+    _gameobject_browser_status->setText(override_text);
+    return;
+  }
+
+  QStringList parts;
+  parts << QString("Current map spawns: %1").arg(_world->gameObjectSpawnCount());
+  parts << QString("models: %1").arg(_world->gameObjectSpawnModelCount());
+
+  auto dirty_count = _world->dirtyGameObjectSpawnCount();
+  if (dirty_count > 0)
+  {
+    parts << QString("pending edits: %1").arg(dirty_count);
+  }
+
+  auto selected_count = selectedGameObjectSpawnCount();
+  if (selected_count > 1)
+  {
+    parts << QString("selected: %1").arg(selected_count);
+  }
+  else if (_selected_gameobject_spawn_guid)
+  {
+    parts << QString("selected guid: %1").arg(*_selected_gameobject_spawn_guid);
+  }
+
+  _gameobject_browser_status->setText(parts.join(" | "));
+}
+
+std::size_t MapView::selectedGameObjectSpawnCount() const
+{
+  return static_cast<std::size_t>(std::count_if(_world->gameObjectSpawns().begin(),
+                                                _world->gameObjectSpawns().end(),
+    [](World::GameObjectSpawnOverlay const& spawn)
+    {
+      return spawn.selected;
+    }));
+}
+
+void MapView::setSelectedGameObjectSpawn(std::optional<std::uint32_t> guid, bool update_browser)
+{
+  _selected_gameobject_spawn_guid = guid;
+
+  // Same as the creature path: only the rows whose selected flag flips need new text.
+  std::vector<std::uint32_t> retext;
+  for (auto& spawn : _world->gameObjectSpawns())
+  {
+    bool const now_selected = guid && spawn.guid == *guid;
+    if (spawn.selected != now_selected)
+    {
+      retext.push_back(spawn.guid);
+    }
+    spawn.selected = now_selected;
+  }
+
+  // Populate the "Edit/New GameObject" form from the selected spawn (empty = New).
+  if (_gameobject_spawn_guid_field)
+  {
+    World::GameObjectSpawnOverlay const* sp = guid ? _world->findGameObjectSpawn(*guid) : nullptr;
+    if (sp)
+    {
+      _gameobject_spawn_guid_field->setText(QString::number(sp->guid));
+      _gameobject_spawn_entry_field->setText(QString::number(sp->entry));
+      _gameobject_spawn_display_field->setText(QString::number(sp->display_id));
+    }
+    else
+    {
+      _gameobject_spawn_guid_field->clear();
+      _gameobject_spawn_entry_field->clear();
+      _gameobject_spawn_display_field->clear();
+    }
+  }
+
+  if (update_browser)
+  {
+    refreshGameObjectBrowserItems(retext);
+    highlightGameObjectBrowserSelection();
+  }
+  else
+  {
+    updateGameObjectBrowserStatus();
+  }
+
+  refreshGameObjectEditorKnobs();
+}
+
+void MapView::addGameObjectSpawnToSelection(std::uint32_t guid, bool update_browser)
+{
+  bool found = false;
+  for (auto& spawn : _world->gameObjectSpawns())
+  {
+    if (spawn.guid == guid)
+    {
+      spawn.selected = true;
+      found = true;
+    }
+  }
+
+  if (!found)
+  {
+    return;
+  }
+
+  _selected_gameobject_spawn_guid = guid;
+
+  if (update_browser)
+  {
+    refreshGameObjectBrowserItems({guid});
+    highlightGameObjectBrowserSelection();
+  }
+  else
+  {
+    updateGameObjectBrowserStatus();
+  }
+
+  refreshGameObjectEditorKnobs();
+}
+
+void MapView::selectGameObjectSpawnsInArea(QRect const& rect, bool add_to_selection)
+{
+  _world->ensureGameObjectSpawnsLoaded();
+
+  QRect const normalized_rect = rect.normalized();
+  glm::mat4x4 const mv = model_view();
+  glm::mat4x4 const proj = projection();
+  glm::vec4 const vp(0.0f, 0.0f, float(width()), float(height()));
+
+  if (!add_to_selection)
+  {
+    for (auto& spawn : _world->gameObjectSpawns())
+    {
+      spawn.selected = false;
+    }
+  }
+
+  std::optional<std::uint32_t> primary_guid = add_to_selection ? _selected_gameobject_spawn_guid : std::optional<std::uint32_t>();
+
+  for (auto& spawn : _world->gameObjectSpawns())
+  {
+    if (spawn.event_suppressed) // hidden by the Seasonal Events filter -> not box-selectable
+    {
+      continue;
+    }
+    glm::vec3 const screen = glm::project(spawn.pos, mv, proj, vp);
+    if (screen.z < 0.0f || screen.z > 1.0f)
+    {
+      continue;
+    }
+
+    QPoint const point(static_cast<int>(std::lround(screen.x)),
+                       static_cast<int>(std::lround(float(height()) - screen.y)));
+    if (!normalized_rect.contains(point))
+    {
+      continue;
+    }
+
+    spawn.selected = true;
+    if (!primary_guid)
+    {
+      primary_guid = spawn.guid;
+    }
+  }
+
+  if (primary_guid)
+  {
+    _selected_gameobject_spawn_guid = primary_guid;
+  }
+  else if (!add_to_selection)
+  {
+    _selected_gameobject_spawn_guid = std::optional<std::uint32_t>();
+  }
+
+  rebuildGameObjectBrowserList(true);
+  refreshGameObjectEditorKnobs();
+  updateGameObjectBrowserStatus();
+}
+
+void MapView::refreshGameObjectEditorKnobs()
+{
+  if (!_go_spawn_edit_x)
+    return;
+
+  auto disable_all = [this]() {
+    _gameobject_editor_info->setText("No spawn selected");
+    _gameobject_editor_info->setStyleSheet("font-style: italic; color: #888; padding: 2px 0;");
+    for (auto* w : {_go_spawn_edit_x, _go_spawn_edit_y, _go_spawn_edit_z, _go_spawn_edit_orientation})
+      w->setEnabled(false);
+  };
+
+  if (!_selected_gameobject_spawn_guid)
+  {
+    disable_all();
+    return;
+  }
+
+  auto selected_count = selectedGameObjectSpawnCount();
+  if (selected_count > 1)
+  {
+    _gameobject_editor_info->setText(QString("%1 gameobject spawns selected\nPrimary GUID: %2")
+                                       .arg(selected_count)
+                                       .arg(*_selected_gameobject_spawn_guid));
+    _gameobject_editor_info->setStyleSheet("font-weight: bold; padding: 2px 0;");
+    for (auto* w : {_go_spawn_edit_x, _go_spawn_edit_y, _go_spawn_edit_z, _go_spawn_edit_orientation})
+      w->setEnabled(false);
+    return;
+  }
+
+  auto const* spawn = _world->findGameObjectSpawn(*_selected_gameobject_spawn_guid);
+  if (!spawn)
+  {
+    disable_all();
+    return;
+  }
+
+  QString name = QString::fromStdString(spawn->name.empty() ? std::string("<unnamed>") : spawn->name);
+  _gameobject_editor_info->setText(
+    QString("%1\nGUID: %2  Entry: %3").arg(name).arg(spawn->guid).arg(spawn->entry));
+  _gameobject_editor_info->setStyleSheet("font-weight: bold; padding: 2px 0;");
+
+  for (auto* w : {_go_spawn_edit_x, _go_spawn_edit_y, _go_spawn_edit_z, _go_spawn_edit_orientation})
+    w->blockSignals(true);
+
+  _go_spawn_edit_x->setValue(static_cast<double>(spawn->pos.x));
+  _go_spawn_edit_y->setValue(static_cast<double>(spawn->pos.y));
+  _go_spawn_edit_z->setValue(static_cast<double>(spawn->pos.z));
+  _go_spawn_edit_orientation->setValue(static_cast<double>(spawn->orientation));
+
+  for (auto* w : {_go_spawn_edit_x, _go_spawn_edit_y, _go_spawn_edit_z, _go_spawn_edit_orientation})
+  {
+    w->setEnabled(true);
+    w->blockSignals(false);
+  }
+}
+
+void MapView::setHoveredGameObjectSpawn(std::optional<std::uint32_t> guid)
+{
+  if (_hovered_gameobject_spawn_guid == guid)
+  {
+    return;
+  }
+
+  if (_hovered_gameobject_spawn_guid)
+  {
+    if (auto* previous = _world->findGameObjectSpawn(*_hovered_gameobject_spawn_guid))
+    {
+      previous->hovered = false;
+    }
+  }
+
+  _hovered_gameobject_spawn_guid = guid;
+
+  if (_hovered_gameobject_spawn_guid)
+  {
+    if (auto* current = _world->findGameObjectSpawn(*_hovered_gameobject_spawn_guid))
+    {
+      current->hovered = true;
+    }
+  }
+
+  _needs_redraw = true;
+}
+
+std::optional<std::uint32_t> MapView::findGameObjectSpawnAtCursor()
+{
+  glm::mat4x4 const mv = model_view();
+  glm::mat4x4 const proj = projection();
+  glm::vec4 const vp(0.0f, 0.0f, float(width()), float(height()));
+
+  float const wx = float(_last_mouse_pos.x());
+  float const wy = float(height()) - float(_last_mouse_pos.y());
+  glm::vec3 const ray_near = glm::unProject(glm::vec3(wx, wy, 0.0f), mv, proj, vp);
+  glm::vec3 const ray_far  = glm::unProject(glm::vec3(wx, wy, 1.0f), mv, proj, vp);
+  glm::vec3 const ray_dir  = ray_far - ray_near;
+
+  // 1) Prefer a hit on the actual 3D MODEL MESH: click the object's body, not just its ground disc.
+  {
+    math::ray const world_ray(ray_near, ray_dir);
+    int const base_animtime = static_cast<int>(_world->model_animtime);
+    float best_dist = std::numeric_limits<float>::max();
+    std::optional<std::uint32_t> best_guid;
+    for (auto& spawn : _world->gameObjectSpawns())
+    {
+      if (spawn.pending_delete || spawn.event_suppressed || !spawn.model_instance.has_value())
+        continue;
+      auto& inst = *spawn.model_instance;
+      if (!inst.model.get() || !inst.model->finishedLoading() || inst.model->loading_failed())
+        continue;
+      selection_result hits;
+      inst.intersect(mv, world_ray, &hits, base_animtime + spawn.animation_time_offset);
+      for (auto const& h : hits)
+      {
+        if (h.first < best_dist)
+        {
+          best_dist = h.first;
+          best_guid = spawn.guid;
+        }
+      }
+    }
+    if (best_guid)
+      return best_guid;
+  }
+
+  // 2) Fallback: the ground selection-disc, so clicking the drawn circle still selects.
+  float best_rel = 1.0f;
+  std::optional<std::uint32_t> best_guid;
+  for (auto const& spawn : _world->gameObjectSpawns())
+  {
+    if (spawn.pending_delete || spawn.event_suppressed)
+      continue;
+    float ring_radius = 0.5f;
+    if (spawn.model_instance.has_value())
+    {
+      ring_radius = spawn.model_instance.value().selectionRingRadius();
+    }
+    ring_radius = std::max(0.25f, ring_radius);
+    if (std::abs(ray_dir.y) < 1e-6f)
+      continue;
+    float const t = (spawn.pos.y - ray_near.y) / ray_dir.y;
+    if (t < 0.0f)
+      continue;
+    glm::vec3 const hit = ray_near + ray_dir * t;
+    float const d = glm::length(glm::vec2(hit.x - spawn.pos.x, hit.z - spawn.pos.z));
+    float const rel = d / ring_radius;
+    if (rel < 1.0f && rel < best_rel)
+    {
+      best_rel = rel;
+      best_guid = spawn.guid;
+    }
+  }
+  return best_guid;
+}
+
+void MapView::updateGameObjectSpawnHover(QPoint const& global_pos)
+{
+  if (terrainMode != editing_mode::gameobject || _dragging_gameobject_spawn || rightMouse)
+  {
+    setHoveredGameObjectSpawn(std::optional<std::uint32_t>());
+    QToolTip::hideText();
+    return;
+  }
+
+  auto hovered_guid = findGameObjectSpawnAtCursor();
+  setHoveredGameObjectSpawn(hovered_guid);
+
+  if (!hovered_guid)
+  {
+    QToolTip::hideText();
+    return;
+  }
+
+  auto const* spawn = _world->findGameObjectSpawn(*hovered_guid);
+  if (!spawn)
+  {
+    QToolTip::hideText();
+    return;
+  }
+
+  QString name = QString::fromStdString(spawn->name.empty() ? std::string("<unnamed>") : spawn->name);
+  QToolTip::showText(global_pos, QString("%1\nGUID: %2\nEntry: %3")
+                               .arg(name)
+                               .arg(spawn->guid)
+                               .arg(spawn->entry), this);
+}
+
+bool MapView::tryStartGameObjectSpawnDrag()
+{
+  if (terrainMode != editing_mode::gameobject)
+  {
+    return false;
+  }
+
+  std::optional<std::uint32_t> best_guid = findGameObjectSpawnAtCursor();
+
+  if (!best_guid)
+  {
+    return false;
+  }
+
+  auto const* clicked_spawn = _world->findGameObjectSpawn(*best_guid);
+  if (!clicked_spawn)
+  {
+    return false;
+  }
+
+  if (!clicked_spawn->selected || selectedGameObjectSpawnCount() <= 1)
+  {
+    // Same as the creature path: skip the full browser-list rebuild on grab, it happens on release.
+    setSelectedGameObjectSpawn(best_guid, /*update_browser*/ false);
+  }
+
+  _gameobject_drag_anchor_pos = _cursor_pos;
+  _gameobject_drag_initial_positions.clear();
+  for (auto const& spawn : _world->gameObjectSpawns())
+  {
+    if (spawn.selected)
+    {
+      _gameobject_drag_initial_positions.emplace_back(spawn.guid, spawn.pos);
+    }
+  }
+
+  _dragging_gameobject_spawn = true;
+  _main_window->statusBar()->showMessage(QString("Dragging %1 gameobject spawn(s). Release mouse, then use Export SQL.")
+                                           .arg(_gameobject_drag_initial_positions.size()), 4000);
+  return true;
+}
+
+void MapView::deleteSelectedGameObjectSpawns()
+{
+  std::vector<std::uint32_t> deleted;
+
+  auto mark = [&](World::GameObjectSpawnOverlay& spawn)
+  {
+    if (spawn.pending_delete)
+    {
+      return;
+    }
+    spawn.pending_delete = true; // hidden from view/browser/picking; exported as DELETE
+    spawn.dirty = true;          // count it as a pending change
+    spawn.selected = false;
+    spawn.hovered = false;
+    deleted.push_back(spawn.guid);
+  };
+
+  for (auto& spawn : _world->gameObjectSpawns())
+  {
+    if (spawn.selected)
+    {
+      mark(spawn);
+    }
+  }
+
+  if (deleted.empty() && _selected_gameobject_spawn_guid)
+  {
+    if (auto* spawn = _world->findGameObjectSpawn(*_selected_gameobject_spawn_guid))
+    {
+      mark(*spawn);
+    }
+  }
+
+  if (deleted.empty())
+  {
+    return;
+  }
+
+  _gameobject_delete_undo.push_back(deleted);
+  setSelectedGameObjectSpawn(std::nullopt, false);
+  updateGameObjectBrowserStatus();
+  rebuildGameObjectBrowserList(true);
+  refreshGameObjectEditorKnobs();
+  _main_window->statusBar()->showMessage(
+    QString("Marked %1 gameobject spawn(s) for deletion (Ctrl+Z to undo)").arg(deleted.size()), 5000);
+}
+
+bool MapView::undoLastGameObjectDelete()
+{
+  if (_gameobject_delete_undo.empty())
+  {
+    return false;
+  }
+
+  auto const guids = _gameobject_delete_undo.back();
+  _gameobject_delete_undo.pop_back();
+
+  for (auto guid : guids)
+  {
+    if (auto* spawn = _world->findGameObjectSpawn(guid))
+    {
+      spawn->pending_delete = false;
+      // Keep it dirty only if it still has real edits (or is a never-saved spawn).
+      spawn->dirty = spawn->pending_create
+                  || glm::distance(spawn->pos, spawn->original_pos) > 0.01f
+                  || std::abs(spawn->orientation - spawn->original_orientation) > 0.01f;
+    }
+  }
+
+  updateGameObjectBrowserStatus();
+  rebuildGameObjectBrowserList(true);
+  refreshGameObjectEditorKnobs();
+  _main_window->statusBar()->showMessage(
+    QString("Restored %1 gameobject spawn(s)").arg(guids.size()), 5000);
+  return true;
+}
+
+void MapView::updateSelectedGameObjectSpawnPosition(glm::vec3 const& pos)
+{
+  if (!_selected_gameobject_spawn_guid)
+  {
+    return;
+  }
+
+  auto apply_position = [](World::GameObjectSpawnOverlay& spawn, glm::vec3 const& new_pos)
+  {
+    spawn.pos = new_pos;
+    spawn.dirty = spawn.pending_create
+               || glm::distance(spawn.pos, spawn.original_pos) > 0.01f
+               || std::abs(spawn.orientation - spawn.original_orientation) > 0.01f;
+
+    if (spawn.model_instance)
+    {
+      spawn.model_instance->pos = spawn.pos;
+      spawn.model_instance->dir = glm::vec3(0.0f, spawn.orientation, 0.0f);
+      spawn.model_instance->recalcExtents();
+    }
+  };
+
+  if (_dragging_gameobject_spawn && _gameobject_drag_anchor_pos && !_gameobject_drag_initial_positions.empty())
+  {
+    if (_gameobject_drag_initial_positions.size() == 1)
+    {
+      // Single spawn: snap directly under the cursor's ground point.
+      if (auto* spawn = _world->findGameObjectSpawn(_gameobject_drag_initial_positions[0].first))
+      {
+        apply_position(*spawn, pos);
+      }
+    }
+    else
+    {
+      glm::vec3 const delta = pos - *_gameobject_drag_anchor_pos;
+      for (auto const& drag_state : _gameobject_drag_initial_positions)
+      {
+        if (auto* spawn = _world->findGameObjectSpawn(drag_state.first))
+        {
+          apply_position(*spawn, drag_state.second + delta);
+        }
+      }
+    }
+  }
+  else
+  {
+    auto* spawn = _world->findGameObjectSpawn(*_selected_gameobject_spawn_guid);
+    if (!spawn)
+    {
+      return;
+    }
+
+    apply_position(*spawn, pos);
+  }
+
+  // PERF: same as the creature path -- rebuildGameObjectBrowserList() repopulates a list widget over
+  // every gameobject spawn on every mouse-move. Deferred to the drag end.
+  if (_dragging_gameobject_spawn)
+  {
+    return;
+  }
+
+  updateGameObjectBrowserStatus();
+  rebuildGameObjectBrowserList(true);
+  refreshGameObjectEditorKnobs();
+}
+
+void MapView::showSelectedGameObjectSpawnMenu(QPoint const& global_pos)
+{
+  if (!_selected_gameobject_spawn_guid)
+  {
+    return;
+  }
+
+  auto const* spawn = _world->findGameObjectSpawn(*_selected_gameobject_spawn_guid);
+  if (!spawn)
+  {
+    return;
+  }
+
+  QMenu menu(this);
+  menu.addAction(QString("GameObject: %1").arg(QString::fromStdString(spawn->name.empty() ? std::string("<unnamed>") : spawn->name)))->setEnabled(false);
+  menu.addAction(QString("Unique ID: %1").arg(spawn->guid))->setEnabled(false);
+  menu.addAction(QString("Entry: %1").arg(spawn->entry))->setEnabled(false);
+  menu.addAction(QString("Display ID: %1").arg(spawn->display_id))->setEnabled(false);
+  menu.addAction(QString("Position: %1, %2, %3")
+                   .arg(spawn->pos.x, 0, 'f', 2)
+                   .arg(spawn->pos.y, 0, 'f', 2)
+                   .arg(spawn->pos.z, 0, 'f', 2))->setEnabled(false);
+  menu.addSeparator();
+  auto* jump_action = menu.addAction("Center camera here");
+  auto* save_action = menu.addAction("Save pending gameobject changes");
+  auto* chosen = menu.exec(global_pos);
+
+  if (chosen == jump_action)
+  {
+    focus_camera_on_target(spawn->pos);
+  }
+  else if (chosen == save_action)
+  {
+    saveDirtyGameObjectSpawns();
+  }
+}
+
+void MapView::discardPendingGameObjectSpawns()
+{
+  auto dirty_count = _world->dirtyGameObjectSpawnCount();
+  if (dirty_count == 0)
+  {
+    _main_window->statusBar()->showMessage("No gameobject spawn changes to discard", 4000);
+    updateGameObjectBrowserStatus();
+    return;
+  }
+
+  _selected_gameobject_spawn_guid = std::nullopt;
+  _hovered_gameobject_spawn_guid = std::nullopt;
+  _dragging_gameobject_spawn = false;
+  _gameobject_drag_anchor_pos = std::nullopt;
+  _gameobject_drag_initial_positions.clear();
+  _gameobject_delete_undo.clear();
+
+  std::size_t removed_new = 0;
+  std::size_t reverted_existing = 0;
+
+  try
+  {
+    makeCurrent();
+    OpenGL::context::scoped_setter const _ (::gl, context());
+
+    auto& spawns = _world->gameObjectSpawns();
+    for (auto& spawn : spawns)
+    {
+      spawn.selected = false;
+      spawn.hovered = false;
+
+      if (!spawn.dirty || spawn.pending_create)
+      {
+        continue;
+      }
+
+      spawn.pos = spawn.original_pos;
+      spawn.orientation = spawn.original_orientation;
+      spawn.dirty = false;
+      spawn.pending_delete = false; // restore any spawn that was marked for deletion
+      if (spawn.model_instance)
+      {
+        spawn.model_instance->pos = spawn.pos;
+        spawn.model_instance->dir = glm::vec3(0.0f, spawn.orientation, 0.0f);
+        spawn.model_instance->recalcExtents();
+      }
+      ++reverted_existing;
+    }
+
+    auto pending_begin = std::remove_if(spawns.begin(), spawns.end(),
+      [&removed_new](World::GameObjectSpawnOverlay const& spawn)
+      {
+        if (!spawn.pending_create)
+        {
+          return false;
+        }
+
+        ++removed_new;
+        return true;
+      });
+    spawns.erase(pending_begin, spawns.end());
+  }
+  catch (std::exception const& ex)
+  {
+    _main_window->statusBar()->showMessage(QString("Failed to discard gameobject spawn changes: %1").arg(ex.what()), 7000);
+    updateGameObjectBrowserStatus();
+    return;
+  }
+  catch (...)
+  {
+    _main_window->statusBar()->showMessage("Failed to discard gameobject spawn changes: unknown error", 7000);
+    updateGameObjectBrowserStatus();
+    return;
+  }
+
+  rebuildGameObjectBrowserList(false);
+  refreshGameObjectEditorKnobs();
+  updateGameObjectBrowserStatus();
+  _needs_redraw = true;
+
+  _main_window->statusBar()->showMessage(
+    QString("Discarded %1 pending gameobject spawn(s), reverted %2 edited spawn(s)")
+      .arg(removed_new)
+      .arg(reverted_existing),
+    5000);
+}
+
+void MapView::saveDirtyGameObjectSpawns()
+{
+  auto dirty_count = _world->dirtyGameObjectSpawnCount();
+  if (dirty_count == 0)
+  {
+    _main_window->statusBar()->showMessage("No gameobject spawn changes to export", 4000);
+    updateGameObjectBrowserStatus();
+    return;
+  }
+
+  QDir project_dir(QString::fromStdString(Noggit::Project::CurrentProject::get()->ProjectPath));
+  QString export_dir_path = project_dir.filePath("sql_exports/gameobject_spawns");
+  QDir export_dir(export_dir_path);
+  if (!export_dir.exists() && !project_dir.mkpath("sql_exports/gameobject_spawns"))
+  {
+    auto message = QString("Failed to create gameobject SQL export folder: %1").arg(export_dir_path);
+    _main_window->statusBar()->showMessage(message, 6000);
+    updateGameObjectBrowserStatus(message);
+    return;
+  }
+
+  QString timestamp = QDateTime::currentDateTime().toString("yyyyMMdd_HHmmss");
+  QString file_name = QString("gameobject_updates_map%1_%2.sql").arg(_world->getMapID()).arg(timestamp);
+  QString file_path = export_dir.filePath(file_name);
+
+  QFile output(file_path);
+  if (!output.open(QIODevice::WriteOnly | QIODevice::Text | QFile::Truncate))
+  {
+    auto message = QString("Failed to write gameobject SQL export: %1").arg(file_path);
+    _main_window->statusBar()->showMessage(message, 6000);
+    updateGameObjectBrowserStatus(message);
+    return;
+  }
+
+  QTextStream stream(&output);
+  stream.setCodec("UTF-8");
+  stream << "-- Noggit gameobject spawn update export\n";
+  stream << "-- Map ID: " << _world->getMapID() << "\n";
+  stream << "-- Generated: " << QDateTime::currentDateTime().toString(Qt::ISODate) << "\n";
+  stream << "\n";
+
+  for (auto& spawn : _world->gameObjectSpawns())
+  {
+    if (!spawn.dirty)
+    {
+      continue;
+    }
+
+    if (spawn.pending_delete)
+    {
+      // A spawn created this session and then deleted never reached the DB -> nothing to export.
+      if (spawn.pending_create)
+      {
+        continue;
+      }
+      stream << "-- GUID " << spawn.guid << " entry " << spawn.entry << " "
+             << QString::fromStdString(spawn.name.empty() ? std::string("<unnamed>") : spawn.name) << "\n";
+      stream << "DELETE FROM gameobject WHERE guid=" << spawn.guid << ";\n\n";
+      continue;
+    }
+
+    auto server_pos = client_to_server_creature_position(spawn.pos, _world->mapIndex.hasAGlobalWMO());
+    auto server_orientation = client_to_server_creature_orientation(spawn.orientation);
+    stream << "-- GUID " << spawn.guid << " entry " << spawn.entry << " "
+           << QString::fromStdString(spawn.name.empty() ? std::string("<unnamed>") : spawn.name)
+           << "\n";
+
+    if (spawn.pending_create)
+    {
+      stream << "-- Preview display ID: " << spawn.display_id << "\n";
+      stream << "INSERT INTO gameobject (guid, id, map, position_x, position_y, position_z, orientation)\n"
+             << "VALUES (" << spawn.guid << ", "
+             << spawn.entry << ", "
+             << _world->getMapID() << ", "
+             << QString::number(server_pos.x, 'f', 6) << ", "
+             << QString::number(server_pos.y, 'f', 6) << ", "
+             << QString::number(server_pos.z, 'f', 6) << ", "
+             << QString::number(server_orientation, 'f', 6) << ");\n\n";
+    }
+    else
+    {
+      stream << "UPDATE gameobject\n"
+             << "SET position_x = " << QString::number(server_pos.x, 'f', 6) << ",\n"
+             << "    position_y = " << QString::number(server_pos.y, 'f', 6) << ",\n"
+             << "    position_z = " << QString::number(server_pos.z, 'f', 6) << ",\n"
+             << "    orientation = " << QString::number(server_orientation, 'f', 6) << "\n"
+             << "WHERE guid = " << spawn.guid << ";\n\n";
+    }
+
+    spawn.original_pos = spawn.pos;
+    spawn.original_orientation = spawn.orientation;
+    spawn.pending_create = false;
+    spawn.dirty = false;
+  }
+  output.close();
+
+  updateGameObjectBrowserStatus();
+  rebuildGameObjectBrowserList(true);
+  _main_window->statusBar()->showMessage(QString("GameObject spawn SQL exported: %1").arg(file_path), 7000);
+}
+
+void MapView::jumpToGameObjectListItem(QListWidgetItem* item)
+{
+  if (!item)
+  {
+    return;
+  }
+
+  auto guid = static_cast<std::uint32_t>(item->data(Qt::UserRole).toULongLong());
+  auto is_current_map_item = item->data(Qt::UserRole + 6).toBool();
+
+  if (is_current_map_item)
+  {
+    setSelectedGameObjectSpawn(guid, true);
+    auto const* spawn = _world->findGameObjectSpawn(guid);
+    if (spawn)
+    {
+      focus_camera_on_target(spawn->pos);
+    }
+    return;
+  }
 }
 
 void MapView::setupHotkeys()
@@ -3658,10 +7275,18 @@ void MapView::createGUI()
   LogDebug << "MapView::createGUI setupVertexPainterUi done" << std::endl;
   setupObjectEditorUi();
   LogDebug << "MapView::createGUI setupObjectEditorUi done" << std::endl;
-  setupCreatureEditorUi();
-  LogDebug << "MapView::createGUI setupCreatureEditorUi done" << std::endl;
   setupCreatureBrowserUi();
   LogDebug << "MapView::createGUI setupCreatureBrowserUi done" << std::endl;
+  setupCreatureEditorUi();
+  LogDebug << "MapView::createGUI setupCreatureEditorUi done" << std::endl;
+  setupCreatureModelPickerUi();
+  LogDebug << "MapView::createGUI setupCreatureModelPickerUi done" << std::endl;
+  setupGameObjectEditorUi();
+  LogDebug << "MapView::createGUI setupGameObjectEditorUi done" << std::endl;
+  setupGameObjectBrowserUi();
+  LogDebug << "MapView::createGUI setupGameObjectBrowserUi done" << std::endl;
+  setupGameObjectModelPickerUi();
+  LogDebug << "MapView::createGUI setupGameObjectModelPickerUi done" << std::endl;
   setupMinimapEditorUi();
   LogDebug << "MapView::createGUI setupMinimapEditorUi done" << std::endl;
   setupStampUi();
@@ -3676,8 +7301,10 @@ void MapView::createGUI()
 
   setupViewportOverlay();
   LogDebug << "MapView::createGUI setupViewportOverlay done" << std::endl;
-  setupNodeEditor();
-  LogDebug << "MapView::createGUI setupNodeEditor done" << std::endl;
+  setupCreatureActionsUi();
+  LogDebug << "MapView::createGUI setupCreatureActionsUi done" << std::endl;
+  setupGameObjectActionsUi();
+  LogDebug << "MapView::createGUI setupGameObjectActionsUi done" << std::endl;
   setupAssetBrowser();
   LogDebug << "MapView::createGUI setupAssetBrowser done" << std::endl;
   setupDetailInfos();
@@ -3706,9 +7333,14 @@ void MapView::createGUI()
 
   set_editing_mode (editing_mode::ground);
 
-  _draw_creature_spawns.set(_settings->value("view/creature_spawns", false).toBool());
-  _show_creature_browser.set(_settings->value("map_view/creature_browser", false).toBool());
+  _draw_creature_spawns.set(creature_capture_overlay_enabled()
+                              ? _settings->value("view/creature_spawns", false).toBool()
+                              : false);
+  _settings->setValue("map_view/creature_browser", false);
+  _settings->sync();
+  _show_creature_browser.set(false);
   refreshCreatureSpawnOverlay(false);
+  updateDatabaseStatus();
   LogDebug << "MapView::createGUI end" << std::endl;
 }
 
@@ -3723,6 +7355,12 @@ void MapView::on_exit_prompt()
   objectEditor->modelImport->hide();
   objectEditor->rotationEditor->hide();
   _detail_infos_dock->hide();
+  if (_creature_actions_overlay) _creature_actions_overlay->hide();
+  if (_creature_browser_dock) _creature_browser_dock->hide();
+  if (_creature_editor_dock) _creature_editor_dock->hide();
+  if (_creature_model_picker_dock) _creature_model_picker_dock->hide();
+  if (_gameobject_browser_dock) _gameobject_browser_dock->hide();
+  if (_gameobject_model_picker_dock) _gameobject_model_picker_dock->hide();
   _texture_picker_dock->hide();
   _texture_browser_dock->hide();
 }
@@ -3731,10 +7369,11 @@ MapView::MapView( math::degrees camera_yaw0
                 , math::degrees camera_pitch0
                 , glm::vec3 camera_pos
                 , Noggit::Ui::Windows::NoggitWindow* NoggitWindow
-				        , std::shared_ptr<Noggit::Project::NoggitProject> Project
+                , std::shared_ptr<Noggit::Project::NoggitProject> Project
                 , std::unique_ptr<World> world
                 , uid_fix_mode uid_fix
                 , bool from_bookmark
+                , bool capture_probe
                 )
   : _camera (camera_pos, camera_yaw0, camera_pitch0)
   , mTimespeed(0.0f)
@@ -3758,6 +7397,7 @@ MapView::MapView( math::degrees camera_yaw0
     _project(Project)
 {
   LogDebug << "MapView::MapView begin" << std::endl;
+  _capture_probe = capture_probe;
   setWindowTitle ("Noggit Studio Red - " STRPRODUCTVER);
   setFocusPolicy (Qt::StrongFocus);
   setMouseTracking (true);
@@ -3839,11 +7479,32 @@ MapView::MapView( math::degrees camera_yaw0
   int _fps_calcul = (int)((1.f / (float)_fps_limit) * 1000.f);
   std::cout << "FPS limit is set to : " << _fps_limit << " (" << _fps_calcul << ")" << std::endl;
 
-  _update_every_event_loop.start (_fps_calcul);
-  connect(&_update_every_event_loop, &QTimer::timeout,[=]{ _needs_redraw = true; update(); });
+  if (!capture_probe)
+  {
+    _update_every_event_loop.start (_fps_calcul);
+    connect(&_update_every_event_loop, &QTimer::timeout,[=]{ _needs_redraw = true; update(); });
+  }
+  else
+  {
+    LogDebug << "MapView::MapView capture probe mode: redraw timer disabled" << std::endl;
+  }
   LogDebug << "MapView::MapView before createGUI" << std::endl;
   createGUI();
   LogDebug << "MapView::MapView after createGUI" << std::endl;
+
+  // Zone music: a hidden dropdown widget (shown from the toolbar music button) that plays the current
+  // zone's background music, switching playlists as the camera crosses zone boundaries (see tick()).
+  // Enable/disable lives in the dropdown's own checkbox.
+  _zone_music_player = new Noggit::Ui::ZoneMusicPlayer(this);
+  _zone_music_player->setVisible(false);
+  if (capture_debug_enabled())
+  {
+    LogDebug << "MapView::MapView end capture_probe=" << _capture_probe
+             << " size=" << width() << "x" << height()
+             << " needs_redraw=" << _needs_redraw
+             << " gl_initialized=" << _gl_initialized
+             << std::endl;
+  }
 }
 
 void MapView::tabletEvent(QTabletEvent* event)
@@ -3905,6 +7566,40 @@ void MapView::move_camera_with_auto_height (glm::vec3 const& pos)
   _camera_moved_since_last_draw = true;
 }
 
+void MapView::focus_camera_on_target (glm::vec3 const& target)
+{
+  makeCurrent();
+  OpenGL::context::scoped_setter const _ (::gl, context());
+
+  TileIndex tile_index = TileIndex(target);
+  if (_world->mapIndex.hasTile(tile_index))
+  {
+    _world->mapIndex.loadTile(target)->wait_until_loaded();
+  }
+
+  float const dist = 28.0f; // viewing distance from the target (tune)
+  float const k = 0.70710678f; // cos/sin of 45 degrees
+
+  // Approach from the current horizontal facing so the jump isn't jarring; back + up at 45 degrees.
+  glm::vec3 dir = _camera.direction();
+  glm::vec3 horiz (dir.x, 0.0f, dir.z);
+  if (glm::length(horiz) < 0.001f)
+  {
+    horiz = glm::vec3(0.0f, 0.0f, 1.0f);
+  }
+  horiz = glm::normalize(horiz);
+
+  glm::vec3 const eye = target - horiz * (dist * k) + glm::vec3(0.0f, dist * k, 0.0f);
+  _camera.position = eye;
+
+  // Aim at the target. direction() = (cos(pitch)*sin(yaw), -sin(pitch), cos(pitch)*cos(yaw)).
+  glm::vec3 const d = glm::normalize(target - eye);
+  _camera.yaw(math::degrees(glm::degrees(std::atan2(d.x, d.z))));
+  _camera.pitch(math::degrees(glm::degrees(-std::asin(glm::clamp(d.y, -1.0f, 1.0f)))));
+
+  _camera_moved_since_last_draw = true;
+}
+
 void MapView::on_uid_fix_fail()
 {
   emit uid_fix_failed();
@@ -3915,6 +7610,14 @@ void MapView::on_uid_fix_fail()
 
 void MapView::initializeGL()
 {
+  if (capture_debug_enabled())
+  {
+    LogDebug << "MapView::initializeGL begin capture_probe=" << _capture_probe
+             << " size=" << width() << "x" << height()
+             << " pos=(" << _camera.position.x << ", " << _camera.position.y << ", " << _camera.position.z << ")"
+             << std::endl;
+  }
+
   bool uid_warning = false;
 
   OpenGL::context::scoped_setter const _ (::gl, context());
@@ -3970,6 +7673,10 @@ void MapView::initializeGL()
   _last_opengl_context = context();
 
   _world->renderer()->upload();
+  if (capture_debug_enabled())
+  {
+    LogDebug << "MapView::initializeGL after renderer upload" << std::endl;
+  }
   onSettingsSave();
 
   _buffers.upload();
@@ -3980,6 +7687,10 @@ void MapView::initializeGL()
   connect(context(), &QOpenGLContext::aboutToBeDestroyed, [this](){ emit aboutToLooseContext(); });
 
   _gl_initialized = true;
+  if (capture_debug_enabled())
+  {
+    LogDebug << "MapView::initializeGL end" << std::endl;
+  }
 }
 
 
@@ -4235,8 +7946,13 @@ void MapView::saveMinimap(MinimapRenderSettings* settings)
 
 void MapView::paintGL()
 {
-  ZoneScoped;
-
+  if (capture_debug_enabled())
+  {
+    LogDebug << "MapView::paintGL entered capture_probe=" << _capture_probe
+             << " needs_redraw=" << _needs_redraw
+             << " gl_initialized=" << _gl_initialized
+             << std::endl;
+  }
   static bool lock = false;
 
   if (lock)
@@ -4247,14 +7963,31 @@ void MapView::paintGL()
   else
     _needs_redraw = false;
 
+  if (capture_debug_enabled())
+  {
+    LogDebug << "MapView::paintGL after redraw gate" << std::endl;
+  }
+
   if (!_gl_initialized)
   {
+    if (capture_debug_enabled())
+    {
+      LogDebug << "MapView::paintGL before initializeGL" << std::endl;
+    }
     initializeGL();
+    if (capture_debug_enabled())
+    {
+      LogDebug << "MapView::paintGL after initializeGL gl_initialized=" << _gl_initialized << std::endl;
+    }
   }
 
   if (_last_opengl_context != context())
   {
     _gl_initialized = false;
+    if (capture_debug_enabled())
+    {
+      LogDebug << "MapView::paintGL context changed, skipping frame" << std::endl;
+    }
     return;
   }
 
@@ -4274,17 +8007,154 @@ void MapView::paintGL()
     return;
   }
 
+  if (capture_debug_enabled())
+  {
+    LogDebug << "MapView::paintGL before context setter" << std::endl;
+  }
   OpenGL::context::scoped_setter const _(::gl, context());
+  if (capture_debug_enabled())
+  {
+    LogDebug << "MapView::paintGL before makeCurrent" << std::endl;
+  }
   makeCurrent();
+  if (capture_debug_enabled())
+  {
+    LogDebug << "MapView::paintGL before clear" << std::endl;
+  }
+
+  // [unaccounted bisect 2026-08-07] PaintBody = this makeCurrent..paintGL-return span (function scope, RAII
+  // handles early returns). Frame is start..start; Frame-PaintBody = time Qt spends BETWEEN paintGL calls
+  // (buffer swap, QOpenGLWidget compositor blit, event-loop processing, any loader/GPU-upload callback).
+  // The spike line prints betweenFrame vs inPaintUnprof so a 500ms hitch is localized to one side in one run.
+  noggit::perf::Scoped _prof_paint_body(noggit::perf::Phase::PaintBody);
 
   gl.clear (GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+  {
+    // [perf] frame-to-frame total + throttled per-phase report (NOGGIT_FRAME_PROFILE=1). No-op when off.
+    static std::chrono::steady_clock::time_point s_prof_last;
+    static bool s_prof_have = false;
+    auto& _prof = noggit::perf::FrameProfiler::get();
+    auto const _prof_now = std::chrono::steady_clock::now();
+    if (s_prof_have)
+      _prof.add(noggit::perf::Phase::Frame,
+                std::chrono::duration<double, std::milli>(_prof_now - s_prof_last).count());
+    s_prof_last = _prof_now;
+    s_prof_have = true;
+    _prof.end_frame();
+
+    // [mem-diag 2026-08-04] Once/sec, log process working set + loaded-asset counts so a memory climb can
+    // be attributed: models/textures/wmos growing = assets not freeing; working set climbing while those
+    // stay flat = a GPU/loader-side leak. NOGGIT_FRAME_PROFILE gate (already on in the launcher).
+    if (_prof.on)
+    {
+      static std::chrono::steady_clock::time_point s_mem_last;
+      static bool s_mem_have = false;
+      if (!s_mem_have || std::chrono::duration<double, std::milli>(_prof_now - s_mem_last).count() > 1000.0)
+      {
+        s_mem_last = _prof_now;
+        s_mem_have = true;
+        std::size_t ws_mb = 0;
+#ifdef _WIN32
+        PROCESS_MEMORY_COUNTERS pmc{};
+        if (K32GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc))) // kernel32-exported, no psapi.lib
+          ws_mb = pmc.WorkingSetSize / (1024u * 1024u);
+#endif
+        // VRAM readout (NVIDIA GL_NVX_gpu_memory_info / AMD GL_ATI_meminfo). Vendor-gated so we never issue
+        // an unsupported enum (that would trip the once-per-frame GL error check). used=dedicated-available.
+        // evict/s (NVIDIA) = the driver paging VRAM<->RAM over PCIe -- the direct signal for a VRAM-pressure
+        // loading STUTTER: if it climbs while flying into new tiles, we're VRAM-capacity-bound.
+        static int s_vram_vendor = -2; // -2 uninit, -1 none/unknown, 0 nvidia, 1 amd
+        if (s_vram_vendor == -2)
+        {
+          s_vram_vendor = -1;
+          if (GLubyte const* v = gl.getString(GL_VENDOR))
+          {
+            std::string vs(reinterpret_cast<char const*>(v));
+            std::transform(vs.begin(), vs.end(), vs.begin(), [](unsigned char c){ return (char)std::tolower(c); });
+            if (vs.find("nvidia") != std::string::npos) s_vram_vendor = 0;
+            else if (vs.find("ati") != std::string::npos || vs.find("amd") != std::string::npos
+                     || vs.find("radeon") != std::string::npos) s_vram_vendor = 1;
+          }
+        }
+        std::string vram;
+        if (s_vram_vendor == 0)
+        {
+          constexpr GLenum NVX_DEDICATED = 0x9047, NVX_AVAILABLE = 0x9049, NVX_EVICTION_COUNT = 0x904A, NVX_EVICTED = 0x904B;
+          GLint ded = 0, avail = 0, evc = 0, evm = 0;
+          gl.getIntegerv(NVX_DEDICATED, &ded);
+          gl.getIntegerv(NVX_AVAILABLE, &avail);
+          gl.getIntegerv(NVX_EVICTION_COUNT, &evc);
+          gl.getIntegerv(NVX_EVICTED, &evm);
+          static GLint s_prev_evc = 0;
+          GLint const evc_delta = (s_prev_evc == 0) ? 0 : (evc - s_prev_evc); // per-report evictions = stutter rate
+          s_prev_evc = evc;
+          std::ostringstream os;
+          os << " vram=" << ((ded - avail) / 1024) << "/" << (ded / 1024) << "MB"
+             << " evict/s=" << evc_delta << " evictedNow=" << (evm / 1024) << "MB";
+          vram = os.str();
+        }
+        else if (s_vram_vendor == 1)
+        {
+          constexpr GLenum ATI_TEXTURE_FREE_MEMORY = 0x87FC;
+          GLint info[4] = {0, 0, 0, 0}; // [total_free, largest_free_block, total_aux_free, largest_aux_free] KB
+          gl.getIntegerv(ATI_TEXTURE_FREE_MEMORY, info);
+          std::ostringstream os;
+          os << " vramFree=" << (info[0] / 1024) << "MB";
+          vram = os.str();
+        }
+        LogError << "[MEM] workingSet=" << ws_mb << "MB"
+                 << " models=" << ModelManager::loaded_count()
+                 << " textures=" << TextureManager::loaded_count()
+                 << " wmos=" << WMOManager::loaded_count()
+                 << " tiles=" << (_world ? _world->mapIndex.getNLoadedTiles() : 0u)
+                 << vram
+                 << std::endl;
+      }
+    }
+  }
 
   if (!saving_minimap)
   {
     lock = true;
+    if (capture_debug_enabled())
+    {
+      LogDebug << "MapView::paintGL before draw_map" << std::endl;
+    }
     draw_map();
+    {
+      // [perf] GPU-boundedness probe (NOGGIT_FRAME_PROFILE only): time a glFinish right after the render.
+      // GpuWait ~= how long the CPU must WAIT for the GPU to finish the frame's draws beyond what already
+      // overlapped the CPU submit. Large GpuWait => GPU-BOUND (GPU render time ~= WorldDraw + GpuWait);
+      // ~0 => CPU-bound. Intrusive (it serializes CPU<->GPU), so it only runs while profiling.
+      auto& _prof_gpu = noggit::perf::FrameProfiler::get();
+      if (_prof_gpu.on)
+      {
+        auto const _gt0 = std::chrono::steady_clock::now();
+        gl.finish();
+        _prof_gpu.add(noggit::perf::Phase::GpuWait,
+                      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _gt0).count());
+      }
+    }
+    if (capture_debug_enabled())
+    {
+      LogDebug << "MapView::paintGL after draw_map" << std::endl;
+    }
     lock = false;
-    tick (now - _last_update);
+    if (capture_debug_enabled())
+    {
+      LogDebug << "MapView::paintGL before tick" << std::endl;
+    }
+    {
+      // [perf] time tick() into the (otherwise-unused) Overlays bucket so the frame-to-frame gap can be
+      // split: Frame - WorldDraw - Overlays = pure Qt event-loop/compositor cost outside our draw code.
+      noggit::perf::Scoped _prof_tick(noggit::perf::Phase::Overlays);
+      tick (now - _last_update);
+    }
+    if (capture_debug_enabled())
+    {
+      LogDebug << "MapView::paintGL after tick" << std::endl;
+    }
   }
 
   _last_update = now;
@@ -4399,7 +8269,25 @@ MapView::~MapView()
 
   _destroying = true;
 
+  // Make teardown single-threaded BEFORE destroying the world. The async loader threads finish
+  // model/WMO loads in the background, and completing a load can still feed SceneObject instances into
+  // MapTile::object_instances (under the tile mutex). World destruction (~World -> ~MapTile) iterates
+  // object_instances WITHOUT that lock and calls instance->derefTile(); if a loader thread mutates the
+  // tile mid-iteration the instance pointer is garbage -> access violation in SceneObject::derefTile.
+  // This is exactly the crash when leaving a still-streaming zone like Ironforge. Waiting until the
+  // loader is idle quiesces the background so the destruction below runs with no concurrent mutation.
+  // (finishLoading is CPU-side file parsing; GL upload is deferred to first draw, so this can't deadlock
+  // on the now-stopped render loop.)
+  AsyncLoader::instance().wait_until_idle();
+
   OpenGL::context::scoped_setter const _ (::gl, context());
+  // Force the GPU fully idle BEFORE deleting any GL resource below (and in ~World via _world.reset()).
+  // Returning to menu / switching maps crashed inside the NVIDIA GL driver (nvoglv64.dll, __fastfail):
+  // the last rendered frame's draws were still in flight referencing textures/buffers that teardown then
+  // deleted, so the driver touched freed objects. glFinish blocks until all queued GL commands complete,
+  // so nothing the deletes free is still in use. (The per-call glGetError sync used to hide this; this is
+  // the explicit, sync-setting-independent fix.)
+  gl.finish();
   delete _texBrush;
   delete _viewport_overlay_ui;
 
@@ -4460,8 +8348,27 @@ void MapView::tick (float dt)
   NOGGIT_ACTION_MGR->endActionOnModalityMismatch(action_modality);
 
   // start unloading tiles
-  _world->mapIndex.enterTile (TileIndex (_camera.position));
-  _world->mapIndex.unloadTiles (TileIndex (_camera.position));
+  // [perf 2026-08-05] Pinpoint the tick (Overlays) stall: time enterTile (loadTile ctor+queue) vs
+  // unloadTiles (tile free -> ~MapTile -> ensure_deletable waits on in-flight loads) separately.
+  if (noggit::perf::FrameProfiler::get().on)
+  {
+    auto const t0 = std::chrono::steady_clock::now();
+    _world->mapIndex.enterTile (TileIndex (_camera.position));
+    auto const t1 = std::chrono::steady_clock::now();
+    _world->mapIndex.unloadTiles (TileIndex (_camera.position));
+    auto const t2 = std::chrono::steady_clock::now();
+    double const enter_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    double const unload_ms = std::chrono::duration<double, std::milli>(t2 - t1).count();
+    if (enter_ms > 15.0 || unload_ms > 15.0)
+    {
+      LogError << "[TICK-STALL] enterTile=" << enter_ms << "ms unloadTiles=" << unload_ms << "ms" << std::endl;
+    }
+  }
+  else
+  {
+    _world->mapIndex.enterTile (TileIndex (_camera.position));
+    _world->mapIndex.unloadTiles (TileIndex (_camera.position));
+  }
 
   dt = std::min(dt, 1.0f);
 
@@ -5122,12 +9029,18 @@ void MapView::tick (float dt)
   // _minimap->update(); // causes massive performance issues
 
   _world->time += this->mTimespeed * dt;
+  // animtime must advance every frame (matches reference noggit3). It drives liquid
+  // texture-frame cycling (lava/water churn) which must animate regardless of the model
+  // animation toggle. Gating it here is what froze all lava.
   _world->animtime += dt * 1000.0f;
 
   lightEditor->UpdateWorldTime();
 
   if (_draw_model_animations.get())
   {
+    // Advance the model animation clock (bones/particles) only while enabled, so toggling it off
+    // pauses models in place rather than letting per-instance models keep animating.
+    _world->model_animtime += dt * 1000.0f;
     _world->update_models_emitters(dt);
   }
 
@@ -5141,6 +9054,17 @@ void MapView::tick (float dt)
     objectEditor->rotationEditor->updateValues(_world.get());
     _rotation_editor_need_update = false;
   }
+
+  // [PERF 2026-07-25] Throttle the status-bar + area / zone-music / detail-widget / db-status display refresh
+  // to ~10Hz. All of it is human-readable status (coords, area name, FPS, loaded/rendered counts, zone-music
+  // polling, the selection detail widget, water UI) that nobody perceives faster than that -- yet it ran EVERY
+  // frame and cost ~4ms of the tick in Stormwind (QLabel setText churn + getAreaID / getZoneMusic DBC lookups
+  // + updateDetailInfos). Camera movement and edit actions are handled ABOVE this gate, so they're unaffected.
+  static double s_status_accum = 0.0;
+  s_status_accum += dt;
+  if (s_status_accum >= 0.1)
+  {
+    s_status_accum = 0.0;
 
   QString status;
   status += ( QString ("tile: %1 %2")
@@ -5203,8 +9127,22 @@ void MapView::tick (float dt)
 
   updateDetailInfos();
 
+  unsigned int const current_area_id = _world->getAreaID (_camera.position);
   _status_area->setText
-    (QString::fromStdString (gAreaDB.getAreaName (_world->getAreaID (_camera.position))));
+    (QString::fromStdString (gAreaDB.getAreaName (current_area_id)));
+
+  // Drive zone music from the current area only. Only while enabled (the dropdown checkbox), so nothing
+  // music-related (incl. the QtMultimedia backend) runs when off.
+  if (_zone_music_player && _zone_music_player->enabled())
+  {
+    // Music deliberately does NOT follow the day/night cycle -- it used to swap tracks at every dawn/dusk
+    // as time advanced. Always request the zone's DAY music so it stays put regardless of time of day.
+    bool const is_day = true;
+    // World resolves WMOAreaTable first (cities/dungeons/caves -- Ironforge, Caverns of Time), then the
+    // AreaTable parent chain, for BOTH the looping ZoneMusic and the one-shot ZoneIntroMusic.
+    _zone_music_player->update_zone(_world->getZoneMusic(_camera.position),
+                                    _world->getZoneIntroMusic(_camera.position), is_day);
+  }
 
   {
     int time ((static_cast<int>(_world->time) % 2880) / 2);
@@ -5247,6 +9185,7 @@ void MapView::tick (float dt)
   updateDatabaseStatus();
 
   guiWater->updatePos (_camera.position);
+  } // end ~10Hz status-display throttle
 }
 
 glm::vec4 MapView::normalized_device_coords (int x, int y) const
@@ -5286,14 +9225,14 @@ math::ray MapView::intersect_ray() const
   }
 }
 
-selection_result MapView::intersect_result(bool terrain_only)
+selection_result MapView::intersect_result(bool terrain_only, bool force_objects)
 {
   selection_result results
-  ( _world->intersect 
+  ( _world->intersect
     ( glm::transpose(model_view())
     , intersect_ray()
     , terrain_only
-    , terrainMode == editing_mode::object || terrainMode == editing_mode::minimap
+    , force_objects || terrainMode == editing_mode::object || terrainMode == editing_mode::minimap
     , _draw_terrain.get()
     , _draw_wmo.get()
     , _draw_models.get()
@@ -5311,6 +9250,25 @@ selection_result MapView::intersect_result(bool terrain_only)
             );
 
   return std::move(results);
+}
+
+std::optional<glm::vec3> MapView::surface_pos_under_cursor()
+{
+  // _cursor_pos comes from a TERRAIN-ONLY raycast, which is right for the sculpt/paint brushes but
+  // wrong for placing a spawn: dragging an NPC over a building dropped it through the roof onto the
+  // ground underneath. Pick against terrain + WMOs + M2s instead and take the FIRST hit -- results are
+  // already sorted by ray distance, so front() is the nearest surface the cursor is actually over.
+  // Any hit type works because the entry's .first is the distance along the ray; a WMO/M2 entry
+  // carries no hit position of its own, so we evaluate the ray at that distance.
+  math::ray const ray(intersect_ray());
+  selection_result const results(intersect_result(false, true));
+
+  if (results.empty())
+  {
+    return std::nullopt;
+  }
+
+  return ray.position(results.front().first);
 }
 
 void MapView::doSelection (bool selectTerrainOnly, bool mouseMove)
@@ -5400,6 +9358,41 @@ void MapView::doSelection (bool selectTerrainOnly, bool mouseMove)
 
 void MapView::update_cursor_pos()
 {
+  // PERF (2026-07-21): this does a full ray-vs-terrain pick (World::intersect) EVERY frame to place the 3D
+  // brush cursor -- ~7ms, measured in the tick() phase (invisible to WorldDraw but real frame cost). The
+  // cursor only matters when the camera is SETTLED for editing; while you fly / look around it's wasted.
+  // Skip the pick on any frame the view is still changing -- it re-picks the instant you stop, and painting
+  // (camera still, mouse dragging) still picks every frame. Exact == is correct here: an unchanged camera
+  // keeps identical float bits, a moving one does not.
+  {
+    static glm::vec3 s_last_cam_pos(std::numeric_limits<float>::max());
+    static float s_last_yaw = std::numeric_limits<float>::max();
+    static float s_last_pitch = std::numeric_limits<float>::max();
+    static float s_last_mx = std::numeric_limits<float>::max();
+    static float s_last_mz = std::numeric_limits<float>::max();
+    bool const cam_still = s_last_cam_pos == _camera.position
+                        && s_last_yaw == _camera.yaw()._ && s_last_pitch == _camera.pitch()._;
+    s_last_cam_pos = _camera.position;
+    s_last_yaw = _camera.yaw()._;
+    s_last_pitch = _camera.pitch()._;
+    if (!cam_still)
+    {
+      s_last_mx = std::numeric_limits<float>::max(); // force a re-pick the instant the camera settles
+      return;
+    }
+    // PERF (2026-07-24): camera settled. While idle-hovering with no mouse button held, a still mouse cannot
+    // move the cursor, so the World::intersect pick is redundant -- skip it. This reclaims the same ~4-7ms
+    // (tick phase) when paused over a dense scene, on top of the fly-time skip above. A held button
+    // (painting/sculpting) always picks, and ANY mouse move re-picks on the next frame.
+    float const cur_mx = static_cast<float>(_last_mouse_pos.x());
+    float const cur_mz = static_cast<float>(_last_mouse_pos.y());
+    bool const mouse_still = cur_mx == s_last_mx && cur_mz == s_last_mz;
+    s_last_mx = cur_mx;
+    s_last_mz = cur_mz;
+    if (mouse_still && !leftMouse && !rightMouse)
+      return;
+  }
+
   static bool buffer_switch = false;
 
   if (false && terrainMode != editing_mode::holes) // figure out why this does not work on every hardware.
@@ -5446,6 +9439,19 @@ void MapView::update_cursor_pos()
     return;
   }
 
+  // Spawn tools aim at a SURFACE, not at the ground: the cursor must sit on a WMO floor/roof or a
+  // doodad when you hover one, so the aim circle is visible there and a click places the spawn there.
+  // The brush tools below stay terrain-only -- sculpting/painting acts on chunks, so a WMO hit would
+  // be meaningless for them.
+  if (terrainMode == editing_mode::creature || terrainMode == editing_mode::gameobject)
+  {
+    if (auto const surface = surface_pos_under_cursor())
+    {
+      _cursor_pos = *surface;
+    }
+    return;
+  }
+
   // use raycasting for holes
 
   selection_result results (intersect_result (true));
@@ -5481,7 +9487,7 @@ glm::mat4x4 MapView::model_view() const
 
 glm::mat4x4 MapView::projection() const
 {
-  float far_z = _settings->value("farZ", 2048).toFloat();
+  float far_z = _settings->value("farZ", 900).toFloat();
 
   if (_display_mode == display_mode::in_2D)
   {
@@ -5556,6 +9562,13 @@ void MapView::draw_map()
   case editing_mode::object:
     radius = objectEditor->brushRadius();
     break;
+  case editing_mode::creature:
+  case editing_mode::gameobject:
+    // No brush in the spawn tools -- show a fixed aim circle on the ground under the cursor.
+    // Small on purpose: it marks a placement POINT, so a wide ring just obscures what you are
+    // aiming at. (Was 3.5, then 0.7.)
+    radius = 0.4f;
+    break;
   case editing_mode::minimap:
     radius = minimapTool->brushRadius();
     break;
@@ -5568,19 +9581,36 @@ void MapView::draw_map()
   }
 
   //! \note Select terrain below mouse, if no item selected or the item is map.
-  if (!(_world->has_selection()
+  if (!_capture_probe
+    && !(_world->has_selection()
     || _locked_cursor_mode.get()))
   {
+    noggit::perf::Scoped _prof_sel(noggit::perf::Phase::Selection);
     doSelection(true);
   }
 
   if (_camera_moved_since_last_draw)
   {
-      _minimap->update();
+      // PERF (2026-07-21): _minimap->update() schedules a full repaint of the minimap widget, which Qt
+      // runs in the event loop BETWEEN paintGL calls -- i.e. inside the frame-to-frame gap, invisible to
+      // WorldDraw but counted in Frame. Firing it every camera-move frame (i.e. every frame while panning)
+      // is the "massive performance issues" flagged in tick() above. 4 Hz is ample for an overview marker.
+      static QElapsedTimer s_minimap_throttle;
+      if (!s_minimap_throttle.isValid() || s_minimap_throttle.elapsed() > 250)
+      {
+        _minimap->update();
+        s_minimap_throttle.restart();
+      }
   }
 
   bool classic_ui = _settings->value("classicUI", true).toBool();
   bool show_unpaintable = classic_ui ? texturingTool->show_unpaintable_chunks() : _left_sec_toolbar->showUnpaintableChunk();
+  // [VK-1c] NOGGIT_VK_FULL: preview mode where VULKAN renders the world -- skip the entire GL scene draw
+  // (the VK interop block below fills the viewport instead). Editor overlays/tools that live inside the GL
+  // draw are absent in this mode; it exists to fly the VK renderer and read its true frame cost.
+  static bool const s_vk_full_view = std::getenv("NOGGIT_VK") != nullptr
+                                  && std::getenv("NOGGIT_VK_FULL") != nullptr;
+  if (!s_vk_full_view)
   _world->renderer()->draw (
                  model_view()
                , projection()
@@ -5620,17 +9650,299 @@ void MapView::draw_map()
                , _draw_occlusion_boxes.get()
                ,false
                , _draw_wmo_exterior.get()
+               , _draw_bloom.get()
+               , _draw_ground_clutter.get()
                );
 
   // reset after each world::draw call
   _camera_moved_since_last_draw = false;
+
+#ifdef _WIN32
+  // [VULKAN PHASE 0 -- interop proof of life, 2026-08-07] NOGGIT_VK=1: bring up the Vulkan backend, share an
+  // image + semaphores with this GL context (EXT_memory_object_win32 / EXT_semaphore_win32), have VK clear it
+  // to an animated colour each frame and blit it into the viewport corner. Proves the whole VK->GL bridge the
+  // real scene passes will ride (VK renders, GL composites -- Qt UI untouched). Fails soft to pure GL.
+  {
+    static bool const s_vk_on = std::getenv("NOGGIT_VK") != nullptr;
+    if (s_vk_on)
+    {
+      struct VkInterop
+      {
+        Noggit::Rendering::VK::VulkanBackend backend;
+        GLuint memobj = 0, tex = 0, fbo = 0, sem_vk_done = 0, sem_gl_done = 0;
+        bool tried = false, ok = false, first_frame = true;
+        // EXT_memory_object / EXT_semaphore entry points (not in the gl wrapper)
+        void (QOPENGLF_APIENTRYP pCreateMemoryObjects)(GLsizei, GLuint*) = nullptr;
+        void (QOPENGLF_APIENTRYP pImportMemoryWin32Handle)(GLuint, GLuint64, GLenum, void*) = nullptr;
+        void (QOPENGLF_APIENTRYP pTexStorageMem2D)(GLenum, GLsizei, GLenum, GLsizei, GLsizei, GLuint, GLuint64) = nullptr;
+        void (QOPENGLF_APIENTRYP pGenSemaphores)(GLsizei, GLuint*) = nullptr;
+        void (QOPENGLF_APIENTRYP pImportSemaphoreWin32Handle)(GLuint, GLenum, void*) = nullptr;
+        void (QOPENGLF_APIENTRYP pWaitSemaphore)(GLuint, GLuint, const GLuint*, GLuint, const GLuint*, const GLenum*) = nullptr;
+        void (QOPENGLF_APIENTRYP pSignalSemaphore)(GLuint, GLuint, const GLuint*, GLuint, const GLuint*, const GLenum*) = nullptr;
+      };
+      static VkInterop s_vk;
+
+      constexpr GLenum GL_HANDLE_TYPE_OPAQUE_WIN32_EXT_ = 0x9587;
+      constexpr GLenum GL_LAYOUT_GENERAL_EXT_ = 0x958D;
+      // [VK-1c] viewport-sized shared image (queried once at init; a later window resize keeps rendering at
+      // the init size and scales in the blit -- proper swap-on-resize comes with the real integration).
+      static std::uint32_t VK_W = 512, VK_H = 512;
+
+      if (!s_vk.tried)
+      {
+        s_vk.tried = true;
+        {
+          GLint ivp[4] = {0, 0, 0, 0};
+          gl.getIntegerv(GL_VIEWPORT, ivp);
+          if (ivp[2] > 63 && ivp[3] > 63)
+          {
+            VK_W = static_cast<std::uint32_t>(ivp[2]);
+            VK_H = static_cast<std::uint32_t>(ivp[3]);
+          }
+        }
+        auto* ctx = QOpenGLContext::currentContext();
+        auto gp = [&](char const* n) { return ctx ? ctx->getProcAddress(n) : nullptr; };
+        s_vk.pCreateMemoryObjects = reinterpret_cast<decltype(s_vk.pCreateMemoryObjects)>(gp("glCreateMemoryObjectsEXT"));
+        s_vk.pImportMemoryWin32Handle = reinterpret_cast<decltype(s_vk.pImportMemoryWin32Handle)>(gp("glImportMemoryWin32HandleEXT"));
+        s_vk.pTexStorageMem2D = reinterpret_cast<decltype(s_vk.pTexStorageMem2D)>(gp("glTexStorageMem2DEXT"));
+        s_vk.pGenSemaphores = reinterpret_cast<decltype(s_vk.pGenSemaphores)>(gp("glGenSemaphoresEXT"));
+        s_vk.pImportSemaphoreWin32Handle = reinterpret_cast<decltype(s_vk.pImportSemaphoreWin32Handle)>(gp("glImportSemaphoreWin32HandleEXT"));
+        s_vk.pWaitSemaphore = reinterpret_cast<decltype(s_vk.pWaitSemaphore)>(gp("glWaitSemaphoreEXT"));
+        s_vk.pSignalSemaphore = reinterpret_cast<decltype(s_vk.pSignalSemaphore)>(gp("glSignalSemaphoreEXT"));
+
+        if (!s_vk.pCreateMemoryObjects || !s_vk.pImportMemoryWin32Handle || !s_vk.pTexStorageMem2D
+            || !s_vk.pGenSemaphores || !s_vk.pImportSemaphoreWin32Handle
+            || !s_vk.pWaitSemaphore || !s_vk.pSignalSemaphore)
+        {
+          LogError << "[VK] GL_EXT_memory_object_win32 / GL_EXT_semaphore_win32 not available -- interop off" << std::endl;
+        }
+        else if (s_vk.backend.init(VK_W, VK_H))
+        {
+          s_vk.pCreateMemoryObjects(1, &s_vk.memobj);
+          s_vk.pImportMemoryWin32Handle(s_vk.memobj, s_vk.backend.imageMemorySize(),
+                                        GL_HANDLE_TYPE_OPAQUE_WIN32_EXT_, s_vk.backend.imageMemoryHandle());
+          gl.genTextures(1, &s_vk.tex);
+          gl.bindTexture(GL_TEXTURE_2D, s_vk.tex);
+          s_vk.pTexStorageMem2D(GL_TEXTURE_2D, 1, GL_RGBA8, VK_W, VK_H, s_vk.memobj, 0);
+          gl.bindTexture(GL_TEXTURE_2D, 0);
+          s_vk.pGenSemaphores(1, &s_vk.sem_vk_done);
+          s_vk.pImportSemaphoreWin32Handle(s_vk.sem_vk_done, GL_HANDLE_TYPE_OPAQUE_WIN32_EXT_, s_vk.backend.vkDoneSemaphoreHandle());
+          s_vk.pGenSemaphores(1, &s_vk.sem_gl_done);
+          s_vk.pImportSemaphoreWin32Handle(s_vk.sem_gl_done, GL_HANDLE_TYPE_OPAQUE_WIN32_EXT_, s_vk.backend.glDoneSemaphoreHandle());
+          gl.genFramebuffers(1, &s_vk.fbo);
+          GLint prev_fbo = 0;
+          gl.getIntegerv(GL_FRAMEBUFFER_BINDING, &prev_fbo);
+          gl.bindFramebuffer(GL_FRAMEBUFFER, s_vk.fbo);
+          gl.framebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, s_vk.tex, 0);
+          gl.bindFramebuffer(GL_FRAMEBUFFER, static_cast<GLuint>(prev_fbo));
+          s_vk.ok = true;
+          LogError << "[VK] GL interop imported (memobj + texture + semaphores) -- proof-of-life overlay active" << std::endl;
+        }
+      }
+
+      if (s_vk.ok && s_vk.backend.ready())
+      {
+        // [VK-1b/1c] feed the REAL terrain to the backend: the nearest tile + its loaded 3x3 neighbourhood
+        // (rebuilt when the nearest tile changes). Chunk layout: 145 verts (9x9 outer + 8x8 centre,
+        // 17-stride interleave), 4 tris per cell.
+        static MapTile* s_vk_tile = nullptr;
+        MapTile* best = nullptr;
+        float bestd = std::numeric_limits<float>::max();
+        // distance computed HERE from the tile origin (xbase/zbase), NOT tile->camDist(): camDist is filled
+        // by the GL cull loop inside WorldRender::draw, which the VK_FULL mode skips entirely -- relying on
+        // it left every tile's distance frozen and picked a wrong/far tile (the "all blue" bug).
+        for (MapTile* t : _world->mapIndex.loaded_tiles())
+        {
+          if (!t || !t->finishedLoading())
+            continue;
+          float const cx = t->xbase + 266.6666f; // TILESIZE/2
+          float const cz = t->zbase + 266.6666f;
+          float const dx = _camera.position.x - cx;
+          float const dz = _camera.position.z - cz;
+          float const d2 = dx * dx + dz * dz;
+          if (d2 < bestd)
+          {
+            bestd = d2;
+            best = t;
+          }
+        }
+        // rebuild when the centre tile changes OR when more of its 3x3 neighbourhood finishes loading --
+        // building only on centre-change froze the mesh at ONE tile (built before the neighbours streamed
+        // in, never refreshed -> the world visibly ended at the tile border).
+        static std::size_t s_vk_tile_count = 0;
+        std::vector<MapTile*> vk_tiles;
+        vk_tiles.reserve(9);
+        if (best)
+        {
+          for (MapTile* t : _world->mapIndex.loaded_tiles())
+          {
+            if (t && t->finishedLoading()
+                && std::abs(static_cast<int>(t->index.x) - static_cast<int>(best->index.x)) <= 1
+                && std::abs(static_cast<int>(t->index.z) - static_cast<int>(best->index.z)) <= 1)
+            {
+              vk_tiles.push_back(t);
+            }
+          }
+        }
+        if (best && (best != s_vk_tile || vk_tiles.size() != s_vk_tile_count))
+        {
+          std::vector<float> vk_verts;
+          vk_verts.reserve(vk_tiles.size() * 256u * 145u * 3u);
+          std::vector<std::uint32_t> vk_idx;
+          vk_idx.reserve(vk_tiles.size() * 256u * 8u * 8u * 12u);
+          std::uint32_t tile_base = 0;
+          bool mesh_ok = !vk_tiles.empty();
+          for (MapTile* t : vk_tiles)
+          {
+            if (!mesh_ok) break;
+            for (unsigned cz = 0; cz < 16 && mesh_ok; ++cz)
+            {
+              for (unsigned cx = 0; cx < 16 && mesh_ok; ++cx)
+              {
+                MapChunk* ch = t->getChunk(cx, cz);
+                glm::vec3 const* hm = ch ? ch->getHeightmap() : nullptr;
+                if (!hm) { mesh_ok = false; break; }
+                std::uint32_t const base = tile_base + (cz * 16u + cx) * 145u;
+                for (unsigned i = 0; i < 145; ++i)
+                {
+                  vk_verts.push_back(hm[i].x);
+                  vk_verts.push_back(hm[i].y);
+                  vk_verts.push_back(hm[i].z);
+                }
+                for (unsigned r = 0; r < 8; ++r)
+                {
+                  for (unsigned c = 0; c < 8; ++c)
+                  {
+                    std::uint32_t const o00 = base + 17u * r + c;
+                    std::uint32_t const o01 = o00 + 1u;
+                    std::uint32_t const o10 = base + 17u * (r + 1u) + c;
+                    std::uint32_t const o11 = o10 + 1u;
+                    std::uint32_t const ctr = base + 17u * r + 9u + c;
+                    std::uint32_t const quad[12] = { o00, o01, ctr, o01, o11, ctr, o11, o10, ctr, o10, o00, ctr };
+                    vk_idx.insert(vk_idx.end(), quad, quad + 12);
+                  }
+                }
+              }
+            }
+            tile_base += 256u * 145u;
+          }
+          if (mesh_ok && s_vk.backend.setTerrainMesh(vk_verts.data(), vk_verts.size() / 3,
+                                                     vk_idx.data(), vk_idx.size()))
+          {
+            s_vk_tile = best;
+            s_vk_tile_count = vk_tiles.size();
+          }
+        }
+
+        // self-contained clock (this function has no `now` local)
+        static auto const s_vk_t0 = std::chrono::steady_clock::now();
+        float const vk_t = std::chrono::duration<float>(std::chrono::steady_clock::now() - s_vk_t0).count();
+        glm::mat4x4 const vk_mvp = projection() * model_view();
+        if (s_vk.backend.renderFrame(vk_t, !s_vk.first_frame, &vk_mvp[0][0]))
+        {
+          GLenum const layout = GL_LAYOUT_GENERAL_EXT_;
+          s_vk.pWaitSemaphore(s_vk.sem_vk_done, 0, nullptr, 1, &s_vk.tex, &layout);
+
+          GLint prev_read = 0, prev_draw = 0, vp[4] = {0, 0, 0, 0};
+          gl.getIntegerv(GL_READ_FRAMEBUFFER_BINDING, &prev_read);
+          gl.getIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prev_draw);
+          gl.getIntegerv(GL_VIEWPORT, vp);
+          gl.bindFramebuffer(GL_READ_FRAMEBUFFER, s_vk.fbo);
+          // [VK-1c] NOGGIT_VK_FULL: the VK image IS the viewport (the GL world draw is skipped in this mode);
+          // else the 192px bottom-right preview square.
+          static bool const s_vk_full_blit = std::getenv("NOGGIT_VK_FULL") != nullptr;
+          if (s_vk_full_blit)
+          {
+            gl.blitFramebuffer(0, 0, VK_W, VK_H, 0, 0, vp[2], vp[3], GL_COLOR_BUFFER_BIT, GL_LINEAR);
+          }
+          else
+          {
+            gl.blitFramebuffer(0, 0, VK_W, VK_H, vp[2] - 200, 8, vp[2] - 8, 200,
+                               GL_COLOR_BUFFER_BIT, GL_LINEAR);
+          }
+          gl.bindFramebuffer(GL_READ_FRAMEBUFFER, static_cast<GLuint>(prev_read));
+          gl.bindFramebuffer(GL_DRAW_FRAMEBUFFER, static_cast<GLuint>(prev_draw));
+
+          s_vk.pSignalSemaphore(s_vk.sem_gl_done, 0, nullptr, 1, &s_vk.tex, &layout);
+          s_vk.first_frame = false;
+        }
+      }
+    }
+  }
+#endif
+}
+
+void MapView::setCameraForCapture(glm::vec3 const& position, math::degrees yaw, math::degrees pitch)
+{
+  _camera.position = position;
+  _camera.yaw(yaw);
+  _camera.pitch(pitch);
+  _camera_moved_since_last_draw = true;
+  _needs_redraw = true;
+  update();
+}
+
+QImage MapView::grabRenderedFrameForCapture()
+{
+  if (width() <= 0 || height() <= 0)
+  {
+    return {};
+  }
+
+  if (capture_debug_enabled())
+  {
+    LogDebug << "MapView::grabRenderedFrameForCapture begin size="
+             << width() << "x" << height()
+             << " gl_initialized=" << _gl_initialized
+             << std::endl;
+  }
+  makeCurrent();
+  if (capture_debug_enabled())
+  {
+    LogDebug << "MapView::grabRenderedFrameForCapture after makeCurrent" << std::endl;
+  }
+  OpenGL::context::scoped_setter const _(::gl, context());
+  _needs_redraw = true;
+  if (capture_debug_enabled())
+  {
+    LogDebug << "MapView::grabRenderedFrameForCapture before paintGL" << std::endl;
+  }
+  paintGL();
+  if (capture_debug_enabled())
+  {
+    LogDebug << "MapView::grabRenderedFrameForCapture after paintGL" << std::endl;
+  }
+  glFinish();
+  if (capture_debug_enabled())
+  {
+    LogDebug << "MapView::grabRenderedFrameForCapture after glFinish" << std::endl;
+  }
+
+  QImage image(width(), height(), QImage::Format_RGBA8888);
+  if (!image.isNull())
+  {
+    gl.readPixels(0, 0, width(), height(), GL_RGBA, GL_UNSIGNED_BYTE, image.bits());
+    image = image.mirrored(false, true);
+  }
+  if (capture_debug_enabled())
+  {
+    LogDebug << "MapView::grabRenderedFrameForCapture after readPixels null=" << image.isNull() << std::endl;
+  }
+
+  doneCurrent();
+  if (capture_debug_enabled())
+  {
+    LogDebug << "MapView::grabRenderedFrameForCapture end" << std::endl;
+  }
+  return image;
 }
 
 bool MapView::event(QEvent* e)
 {
-  // Suppress shortcut triggers for Z/X while in creature editor mode so they
-  // can be used as hold-modifiers for arrow-key spawn nudging.
-  if (e->type() == QEvent::ShortcutOverride && terrainMode == editing_mode::creature)
+  // Suppress shortcut triggers for Z/X while in the creature/gameobject editor so they can raise/
+  // lower the selected spawn instead of firing their menu shortcuts.
+  if (e->type() == QEvent::ShortcutOverride
+      && (terrainMode == editing_mode::creature || terrainMode == editing_mode::gameobject))
   {
     auto* ke = static_cast<QKeyEvent*>(e);
     if (ke->key() == Qt::Key_Z || ke->key() == Qt::Key_X)
@@ -5642,8 +9954,61 @@ bool MapView::event(QEvent* e)
   return QOpenGLWidget::event(e);
 }
 
+bool MapView::eventFilter(QObject* obj, QEvent* e)
+{
+  // Keep the centred time globe from being shoved when the left secondary toolbar (patrol paths /
+  // creature info, terrain-mode options) appears at the far left of the globe's row: mirror its width
+  // into a spacer on the far right so the globe block stays centred on the true viewport centre.
+  if (_globe_balance_spacer && _viewport_overlay_ui
+      && obj == _viewport_overlay_ui->leftSecondaryToolbarHolder)
+  {
+    switch (e->type())
+    {
+      case QEvent::Resize:
+      case QEvent::Show:
+      case QEvent::Hide:
+      {
+        auto* holder = _viewport_overlay_ui->leftSecondaryToolbarHolder;
+        int const w = holder->isVisible() ? std::max(holder->width(), holder->sizeHint().width()) : 0;
+        if (_globe_balance_spacer->width() != w)
+        {
+          _globe_balance_spacer->setFixedWidth(w);
+        }
+        break;
+      }
+      default:
+        break;
+    }
+  }
+  return QOpenGLWidget::eventFilter(obj, e);
+}
+
 void MapView::keyPressEvent (QKeyEvent *event)
 {
+  // Creature / GameObject tools: X raises, Z lowers the selected spawn(s). Handled before the hotkey
+  // loop so X/Z don't trigger their menu shortcuts (e.g. texture browser) while editing spawns.
+  if ((terrainMode == editing_mode::creature || terrainMode == editing_mode::gameobject)
+      && (event->key() == Qt::Key_X || event->key() == Qt::Key_Z))
+  {
+    bool const has_selection = terrainMode == editing_mode::creature
+      ? _selected_creature_spawn_guid.has_value()
+      : _selected_gameobject_spawn_guid.has_value();
+
+    if (has_selection)
+    {
+      float const step = (event->modifiers() & Qt::ShiftModifier) ? 2.0f : 0.5f; // Shift = coarse
+      glm::vec3 const delta(0.0f, event->key() == Qt::Key_X ? step : -step, 0.0f); // X up, Z down
+
+      if (terrainMode == editing_mode::creature)
+        translateSelectedCreatureSpawns(delta);
+      else
+        translateSelectedGameObjectSpawns(delta);
+
+      _needs_redraw = true;
+      return;
+    }
+  }
+
   size_t const modifier
     ( ((event->modifiers() & Qt::ShiftModifier) ? MOD_shift : 0)
     | ((event->modifiers() & Qt::ControlModifier) ? MOD_ctrl : 0)
@@ -5670,41 +10035,6 @@ void MapView::keyPressEvent (QKeyEvent *event)
 
   if (event->key() == Qt::Key_Z) _mod_z_down = true;
   if (event->key() == Qt::Key_X) _mod_x_down = true;
-
-  // ΓöÇΓöÇ Creature spawn keyboard nudge (Z/X + arrow keys) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
-  // Z + Left/Right: move X axis  Z + Up/Down: move Y (height)
-  // X + Left/Right: rotate orientation  X + Up/Down: move Z axis (depth)
-  if (terrainMode == editing_mode::creature && _selected_creature_spawn_guid
-      && (_mod_z_down || _mod_x_down))
-  {
-    constexpr float pos_step = 0.5f;        // world units
-
-    bool handled = false;
-    glm::vec3 delta(0.0f);
-
-    if (_mod_z_down && !_mod_x_down)
-    {
-      if      (event->key() == Qt::Key_Left)  { delta.x -= pos_step; handled = true; }
-      else if (event->key() == Qt::Key_Right) { delta.x += pos_step; handled = true; }
-      else if (event->key() == Qt::Key_Up)    { delta.y += pos_step; handled = true; }
-      else if (event->key() == Qt::Key_Down)  { delta.y -= pos_step; handled = true; }
-    }
-    else if (_mod_x_down && !_mod_z_down)
-    {
-      if      (event->key() == Qt::Key_Up)    { delta.z += pos_step; handled = true; }
-      else if (event->key() == Qt::Key_Down)  { delta.z -= pos_step; handled = true; }
-      else if (event->key() == Qt::Key_Left)  { delta.x -= pos_step; handled = true; }
-      else if (event->key() == Qt::Key_Right) { delta.x += pos_step; handled = true; }
-    }
-
-    if (handled)
-    {
-      translateSelectedCreatureSpawns(delta);
-      _needs_redraw = true;
-      return;
-    }
-  }
-  // ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
   checkInputsSettings();
 
@@ -6001,15 +10331,32 @@ void MapView::mouseMoveEvent (QMouseEvent* event)
     _camera_moved_since_last_draw = true;
   }
 
-  if (_dragging_creature_spawn && leftMouse)
+  // Drag placement follows the nearest SOLID surface (WMO roof / doodad / terrain). Picked here
+  // rather than reusing _cursor_pos because the per-frame cursor update bails out while the camera is
+  // moving -- so dragging a spawn WHILE flying would otherwise freeze it at a stale point. The result
+  // is written back to _cursor_pos so the aim circle tracks the drag too.
+  if ((_dragging_creature_spawn || _dragging_gameobject_spawn) && leftMouse)
   {
-    updateSelectedCreatureSpawnPosition(_cursor_pos);
+    if (auto const surface = surface_pos_under_cursor())
+    {
+      _cursor_pos = *surface;
+    }
+
+    if (_dragging_creature_spawn)
+    {
+      updateSelectedCreatureSpawnPosition(_cursor_pos);
+    }
+    else
+    {
+      updateSelectedGameObjectSpawnPosition(_cursor_pos);
+    }
+
     _last_mouse_pos = event->pos();
     return;
   }
 
   if (leftMouse
-      && terrainMode == editing_mode::creature
+      && (terrainMode == editing_mode::creature || terrainMode == editing_mode::gameobject)
       && _area_selection->isVisible()
       && _display_mode == display_mode::in_3D
       && !ImGuizmo::IsUsing())
@@ -6019,6 +10366,7 @@ void MapView::mouseMoveEvent (QMouseEvent* event)
   }
 
   updateCreatureSpawnHover(event->globalPos());
+  updateGameObjectSpawnHover(event->globalPos());
 
   if (MoveObj)
   {
@@ -6370,6 +10718,22 @@ void MapView::mousePressEvent(QMouseEvent* event)
       return;
   }
 
+  if (leftMouse && terrainMode == editing_mode::gameobject)
+  {
+      if (_mod_shift_down)
+      {
+        _drag_start_pos = event->pos();
+        _needs_redraw = true;
+        _area_selection->setGeometry(QRect(_drag_start_pos, QSize()));
+        _area_selection->show();
+        return;
+      }
+
+      tryStartGameObjectSpawnDrag();
+      _area_selection->hide();
+      return;
+  }
+
   if (leftMouse && ((terrainMode == editing_mode::object || terrainMode == editing_mode::minimap) && !_mod_ctrl_down))
   {
       if (_mod_shift_down && tryStartCreatureSpawnDrag())
@@ -6396,6 +10760,23 @@ void MapView::wheelEvent (QWheelEvent* event)
   //! \todo: move the function call requiring a context in tick ?
   makeCurrent();
   OpenGL::context::scoped_setter const _ (::gl, context());
+
+  // While DRAGGING a spawn, the wheel rotates it instead of doing whatever the tool normally does.
+  // Every dragged spawn turns about its own centre, so a multi-selection keeps its layout and each
+  // member faces the new way. Wheel up = clockwise. Default 1 deg per notch, Shift = 10 deg,
+  // Ctrl = 45 deg.
+  if (_dragging_creature_spawn || _dragging_gameobject_spawn)
+  {
+    float const notches = static_cast<float>(event->angleDelta().y()) / 120.0f;
+    if (notches != 0.0f)
+    {
+      float const step = _mod_shift_down ? 10.0f : (_mod_ctrl_down ? 45.0f : 1.0f);
+      rotateDraggedSpawns(-notches * step); // negative: wheel up reads as clockwise on screen
+    }
+
+    event->accept();
+    return;
+  }
 
   auto&& delta_for_range
     ( [&] (float range)
@@ -6472,8 +10853,41 @@ void MapView::mouseReleaseEvent (QMouseEvent* event)
       leftMouse = false;
       _dragging_creature_spawn = false;
       _creature_drag_anchor_pos = std::optional<glm::vec3>();
+
+      // Only the dragged spawns changed, so retext just their rows. A full rebuild here was a ~1s
+      // freeze on mouse-up (it allocates an item per spawn in the world). Capture the guids before
+      // clearing the drag state.
+      std::vector<std::uint32_t> moved;
+      moved.reserve(_creature_drag_initial_positions.size());
+      for (auto const& drag_state : _creature_drag_initial_positions)
+      {
+        moved.push_back(drag_state.first);
+      }
       _creature_drag_initial_positions.clear();
+
       updateDatabaseStatus();
+      refreshCreatureBrowserItems(moved);
+      refreshCreatureEditorKnobs();
+      break;
+    }
+
+    if (_dragging_gameobject_spawn)
+    {
+      leftMouse = false;
+      _dragging_gameobject_spawn = false;
+      _gameobject_drag_anchor_pos = std::optional<glm::vec3>();
+
+      std::vector<std::uint32_t> moved;
+      moved.reserve(_gameobject_drag_initial_positions.size());
+      for (auto const& drag_state : _gameobject_drag_initial_positions)
+      {
+        moved.push_back(drag_state.first);
+      }
+      _gameobject_drag_initial_positions.clear();
+
+      updateGameObjectBrowserStatus();
+      refreshGameObjectBrowserItems(moved);
+      refreshGameObjectEditorKnobs();
       break;
     }
 
@@ -6511,6 +10925,37 @@ void MapView::mouseReleaseEvent (QMouseEvent* event)
       else
       {
         setSelectedCreatureSpawn(std::optional<std::uint32_t>());
+      }
+
+      break;
+    }
+
+    if (terrainMode == editing_mode::gameobject)
+    {
+      auto drag_end_pos = event->pos();
+
+      if (_area_selection->isVisible())
+      {
+        if (_drag_start_pos != drag_end_pos && !ImGuizmo::IsUsing())
+        {
+          selectGameObjectSpawnsInArea(QRect(_drag_start_pos, drag_end_pos), true);
+        }
+        else if (auto guid = findGameObjectSpawnAtCursor())
+        {
+          addGameObjectSpawnToSelection(*guid);
+        }
+
+        _area_selection->hide();
+        break;
+      }
+
+      if (auto guid = findGameObjectSpawnAtCursor())
+      {
+        setSelectedGameObjectSpawn(guid);
+      }
+      else
+      {
+        setSelectedGameObjectSpawn(std::optional<std::uint32_t>());
       }
 
       break;
@@ -6807,6 +11252,8 @@ void MapView::ShowContextMenu(QPoint pos)
     action_undo.setShortcut(QKeySequence::Undo);
     QObject::connect(&action_undo, &QAction::triggered, [=]()
         {
+            if (terrainMode == editing_mode::creature && undoLastCreatureDelete()) { return; }
+            if (terrainMode == editing_mode::gameobject && undoLastGameObjectDelete()) { return; }
             NOGGIT_ACTION_MGR->undo();
         });
     // Redo

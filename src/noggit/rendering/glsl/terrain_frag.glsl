@@ -11,7 +11,28 @@ layout (std140) uniform lighting
   vec4 OceanColorDark;
   vec4 RiverColorLight;
   vec4 RiverColorDark;
+  vec4 PointLightParams;     // .x = active point-light count
+  vec4 PointLightPos[16];    // xyz = world pos, w = radius
+  vec4 PointLightColor[16];  // xyz = colour * intensity
 };
+
+// Accumulated diffuse contribution of the emitter point lights (campfires etc.) at a world point.
+vec3 point_lights(vec3 world_pos, vec3 n)
+{
+  vec3 accum = vec3(0.0);
+  int count = int(PointLightParams.x);
+  for (int i = 0; i < count; ++i)
+  {
+    vec3 to_l = PointLightPos[i].xyz - world_pos;
+    float dist = length(to_l);
+    float radius = max(PointLightPos[i].w, 0.001);
+    float atten = clamp(1.0 - dist / radius, 0.0, 1.0);
+    atten *= atten;
+    float ndotl = max(dot(n, to_l / max(dist, 0.0001)), 0.0);
+    accum += PointLightColor[i].xyz * ndotl * atten;
+  }
+  return accum;
+}
 
 layout (std140) uniform overlay_params
 {
@@ -58,6 +79,10 @@ uniform sampler2DArray alphamap;
 uniform sampler2D stamp_brush;
 uniform sampler2DArray textures[11];
 uniform vec3 camera;
+
+// Terrain specular (client-exact): sun-band colour (LightIntBand band 9) + on/off from settings.
+uniform int draw_terrain_specular;
+uniform vec3 sun_spec_color;
 
 uniform int draw_cursor_circle;
 uniform vec3 cursor_position;
@@ -208,6 +233,13 @@ vec4 texture_blend()
   vec4 t3 = get_tex_color(vary_t3_uv, instances[instanceID].ChunkTextureSamplers.w, abs(instances[instanceID].ChunkTextureArrayIDs.w));
   t3.a = mix(t3.a, 0.f, int(instances[instanceID].ChunkTextureArrayIDs.w < 0));
 
+  // MCLY 0x80 overbright (bit 1 of ChunkTexDoAnim, RE_notes/21 A1): the layer renders ~2x brighter
+  // (client MOD2X) -- authored on lava-crack layers (MC / Searing Gorge / custom zones) to glow.
+  t0.rgb *= 1.0 + float((instances[instanceID].ChunkTexDoAnim.x >> 1) & 1);
+  t1.rgb *= 1.0 + float((instances[instanceID].ChunkTexDoAnim.y >> 1) & 1);
+  t2.rgb *= 1.0 + float((instances[instanceID].ChunkTexDoAnim.z >> 1) & 1);
+  t3.rgb *= 1.0 + float((instances[instanceID].ChunkTexDoAnim.w >> 1) & 1);
+
   return vec4 (t0 * (1.0 - (a0 + a1 + a2)) + t1 * a0 + t2 * a1 + t3 * a2);
 }
 
@@ -237,21 +269,51 @@ void main()
   vec3 accumlatedLight = vec3(1.0, 1.0, 1.0);
 
   vec3 normalized_normal = normalize(vary_normal);
-  float nDotL = clamp(dot(normalized_normal, -normalize(LightDir_FogRate.xyz)), 0.0, 1.0);
+  // Sun direction. The UBO carries dayDir in WOW z-up space. N.L is evaluated in RENDER space, so
+  // the light must be converted with the SAME frame the NORMALS use, not the world/position frame.
+  // MCNR normals are loaded as (x, z, y) with NO sign flip (MapChunk.cpp), whereas world POSITIONS
+  // flip the horizontal axes ((-y, z, -x), MapView.cpp wowToNoggit). Converting the light with the
+  // position frame (the old -normalize((-x,z,-y))) therefore lit slopes from the wrong compass
+  // direction -- 180 deg opposite the true sun in azimuth (elevation was still right, since "up"
+  // is unaffected, which is why the sun DISC looked correctly placed while the ground was lit from
+  // the opposite side). Matching the normal frame (x, z, y) fixes it.
+  vec3 to_light = -normalize(vec3(LightDir_FogRate.x, LightDir_FogRate.z, LightDir_FogRate.y));
+  float nDotL = clamp(dot(normalized_normal, to_light), 0.0, 1.0);
 
-  vec3 skyColor = (AmbientColor_FogEnd.xyz * 1.10000002);
-  vec3 groundColor = (AmbientColor_FogEnd.xyz * 0.699999988);
-
-  currColor = mix(groundColor, skyColor, 0.5 + (0.5 * nDotL));
+  // Client terrain lighting = fixed-function directional with a SINGLE FLAT ambient (LightIntBand[1]),
+  // NOT a sky/ground hemisphere. RE 2026-07-26: the 1.12 FF T&L path writes one D3DLIGHT ambient, and
+  // the 335a terrain vertex shader is `min(1, ambient + saturate(N.L)*diffuse)`. The old ambient*1.1
+  // sky / *0.7 ground mix (keyed on nDotL) was a noggit invention -- it tinted slopes brighter/darker
+  // than the client. See RE_notes/lighting/00_lighting_pipeline_RE.md 7.2.
+  currColor = AmbientColor_FogEnd.xyz;
   lDiffuse = DiffuseColor_FogStart.xyz * nDotL;
 
-  vec3 reflection = normalize(normalized_normal - (-LightDir_FogRate.xyz));
-  float specularFactor = max(dot(reflection, normalize(camera - vary_position)), 0.0);
+  // TERRAIN SPECULAR, CLIENT-EXACT (Westfall trace, 25.6k terrain draws + the terrain PS disasm):
+  // the client's FF vertex pipeline (SPECULARENABLE=1, LOCALVIEWER=1) computes Blinn specular with
+  // material Power = 20 and white material spec; the light's specular colour is the SUN band
+  // (LightIntBand band 9). The PS then ADDS v1 * litFactor * blendedLayerAlpha AFTER the diffuse
+  // modulate -- tileset ALPHA is the gloss mask, and the shadow map's lit factor gates it.
+  // Sun direction: to_light computed once above (shared with the diffuse -- audit complete).
+  // to_view comes from POSITIONS, which live in noggit's position frame (-wow.y, wow.z, -wow.x from
+  // wowToNoggit), whereas vary_normal and to_light live in the NORMAL frame (wow.x, wow.z, wow.y from
+  // the MCNR load). N.L was fine (both normal frame), but the Blinn half-vector mixes to_view's
+  // position frame with to_light's normal frame -> the specular highlight landed ~180 deg off. Convert
+  // to_view into the normal frame first (position frame -> wow -> normal frame): (-z, y, -x).
+  vec3 to_view_pos = normalize(camera - vary_position);
+  vec3 to_view = vec3(-to_view_pos.z, to_view_pos.y, -to_view_pos.x);
+  vec3 half_vec = normalize(to_light + to_view);
+  float spec_scalar = pow(clamp(dot(normalized_normal, half_vec), 0.0, 1.0), 20.0);
+
+  // one shadow sample, shared by the specular lit-mask here and the MCSH darkening below
+  float shadow_sample = draw_shadows != 0
+    ? texture(shadowmap, vec3(vary_texcoord / 8.0, instanceID)).r
+    : 0.0;
+  float lit_factor = clamp(1.0 - 3.0 * shadow_sample, 0.0, 1.0); // sample is 85/255 when shadowed
 
   // blend textures
   out_color = mix(vec4(1.0, 1.0, 1.0, 0.0), texture_blend(), int(instances[instanceID].ChunkHoles_DrawImpass_TexLayerCount_CantPaint.b > 0));
 
-  vec3 spc = out_color.a * out_color.rgb * pow(specularFactor, 8);
+  float blended_layer_alpha = out_color.a; // tileset alpha channels blended like the colours = gloss mask
   out_color.a = 1.0;
 
   // apply vertex color
@@ -260,8 +322,11 @@ void main()
     out_color.rgb *= vary_mccv;
   }
 
-  // apply world lighting
-  out_color.rgb = clamp(out_color.rgb * (currColor + lDiffuse + spc), 0.0, 1.0);
+  // apply world lighting (+ emitter point lights). CLIENT-EXACT combine order: clamp the LIGHT to [0,1]
+  // FIRST, then modulate the texture -- `tex * min(1, light)`, NOT `min(1, tex*light)`. The old outer-only
+  // clamp let bright sunlit surfaces clamp UP past the client (a white sunlit wall read hotter than in-game,
+  // exaggerating the city-vs-terrain contrast at e.g. the Stormwind harbor). RE 2026-07-26 (§7.2/§12b).
+  out_color.rgb = out_color.rgb * clamp(currColor + lDiffuse + point_lights(vary_position, normalized_normal), 0.0, 1.0);
 
   // apply overlays
   if(draw_paintability_overlay != 0 && instances[instanceID].ChunkHoles_DrawImpass_TexLayerCount_CantPaint.a != 0)
@@ -286,8 +351,18 @@ void main()
 
   if (draw_shadows != 0)
   {
-    float shadow_alpha = texture(shadowmap, vec3(vary_texcoord / 8.0, instanceID)).r;
-    out_color = vec4 (out_color.rgb * (1.0 - shadow_alpha), 1.0);
+    // MCSH blend, CLIENT-EXACT (disassembled from the 1.12 terrain pixel shaders, wow_cap_upstairs_day:
+    // every Terrain*.bls variant ends with `mad w, shadow, 0.3, 0.7; mul color, layers, w` -- a fully
+    // shadowed texel renders at exactly 70% brightness, hardcoded, NOT data-driven). Our shadowmap
+    // texture stores 85 for a set shadow bit (85/255 = 1/3), so scale by 0.9: 1 - 0.9*(85/255) = 0.7.
+    out_color = vec4 (out_color.rgb * (1.0 - 0.9 * shadow_sample), 1.0);
+  }
+
+  // Add the terrain specular LAST like the client PS (`mad final, diffusePart, v0, spec` -- spec is
+  // NOT texture-modulated and NOT darkened by the 0.7 shadow term; the lit factor gates it instead).
+  if (draw_terrain_specular != 0)
+  {
+    out_color.rgb = clamp(out_color.rgb + sun_spec_color * (spec_scalar * lit_factor * blended_layer_alpha), 0.0, 1.0);
   }
 
   if (draw_terrain_height_contour != 0)
@@ -443,4 +518,7 @@ void main()
     out_color.rgb = mix(cursor_color.rgb, out_color.rgb, alpha);*/
   }
 
+  // Terrain opts OUT of bloom: write alpha 0 as the bloom mask (the bright-pass keeps only alpha > 0).
+  // Bright/white ground then never blooms, while sky, models and light shafts (alpha > 0) still do.
+  out_color.a = 0.0;
 }

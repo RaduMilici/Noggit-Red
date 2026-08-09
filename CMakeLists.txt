@@ -188,6 +188,9 @@ INCLUDE_DIRECTORIES(PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 
 # And do the job.
 INCLUDE_DIRECTORIES("${CMAKE_SOURCE_DIR}/src")
+# [VULKAN PHASE 0] vendored Khronos Vulkan headers (loader is the driver's vulkan-1.dll, loaded dynamically --
+# no SDK dependency). See src/noggit/rendering/vulkan/VulkanBackend.hpp.
+INCLUDE_DIRECTORIES(SYSTEM "${CMAKE_SOURCE_DIR}/${EXTERNAL_SOURCE_DIR}/vulkan-headers/include")
 INCLUDE_DIRECTORIES("${CMAKE_SOURCE_DIR}/${EXTERNAL_SOURCE_DIR}/PNG2BLP" )
 INCLUDE_DIRECTORIES("${CMAKE_SOURCE_DIR}/${EXTERNAL_SOURCE_DIR}/PNG2BLP/libimagequant")
 INCLUDE_DIRECTORIES("${CMAKE_SOURCE_DIR}/${EXTERNAL_SOURCE_DIR}/PNG2BLP/libpng")
@@ -342,6 +345,14 @@ if (UNIX)
   TARGET_LINK_LIBRARIES (noggit ${BZIP2_LIBRARIES})
 ENDIF()
 
+# Emit PDB symbols even in Release so crash callstacks (StackWalker / dumps) can be symbolized.
+# /Zi adds debug info without changing codegen; /DEBUG emits the .pdb and /OPT:REF /OPT:ICF keep
+# the Release optimizations that /DEBUG would otherwise turn off.
+if(MSVC)
+  target_compile_options(noggit PRIVATE $<$<CONFIG:Release>:/Zi>)
+  target_link_options(noggit PRIVATE $<$<CONFIG:Release>:/DEBUG /OPT:REF /OPT:ICF>)
+endif()
+
 
 TARGET_LINK_LIBRARIES (noggit
   ${OPENGL_LIBRARIES}
@@ -397,6 +408,16 @@ add_custom_command(TARGET noggit POST_BUILD
 IF(WIN32)
   include(windeployqt)
   windeployqt(noggit)
+
+  # [VULKAN] compile the VK shaders to SPIR-V next to the exe (vendored glslang -- no SDK dependency).
+  # The backend loads them from <exe dir>/vk_shaders/ at init. Unconditional (unlike the unity-build block).
+  add_custom_command(TARGET noggit POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:noggit>/vk_shaders"
+    COMMAND "${CMAKE_SOURCE_DIR}/src/external/glslang-bin/glslang.exe" -V "${CMAKE_SOURCE_DIR}/src/noggit/rendering/vulkan/shaders/test.vert" -o "$<TARGET_FILE_DIR:noggit>/vk_shaders/test.vert.spv"
+    COMMAND "${CMAKE_SOURCE_DIR}/src/external/glslang-bin/glslang.exe" -V "${CMAKE_SOURCE_DIR}/src/noggit/rendering/vulkan/shaders/test.frag" -o "$<TARGET_FILE_DIR:noggit>/vk_shaders/test.frag.spv"
+    COMMAND "${CMAKE_SOURCE_DIR}/src/external/glslang-bin/glslang.exe" -V "${CMAKE_SOURCE_DIR}/src/noggit/rendering/vulkan/shaders/terrain.vert" -o "$<TARGET_FILE_DIR:noggit>/vk_shaders/terrain.vert.spv"
+    COMMAND "${CMAKE_SOURCE_DIR}/src/external/glslang-bin/glslang.exe" -V "${CMAKE_SOURCE_DIR}/src/noggit/rendering/vulkan/shaders/terrain.frag" -o "$<TARGET_FILE_DIR:noggit>/vk_shaders/terrain.frag.spv"
+    COMMENT "Compiling Vulkan shaders (glslang -> SPIR-V)")
 ENDIF()
 
 SET_PROPERTY(TARGET noggit PROPERTY AUTOMOC ON)
@@ -521,6 +542,7 @@ if(${FAST_BUILD_NOGGIT_JUMBO})
   set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/src/noggit/ui/tools/ViewToolbar/Ui/ViewToolbar.cpp" PROPERTIES SKIP_UNITY_BUILD_INCLUSION TRUE)
   set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/src/noggit/ui/tools/ViewportGizmo/ViewportGizmo.cpp" PROPERTIES SKIP_UNITY_BUILD_INCLUSION TRUE)
   set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/src/noggit/ui/tools/ViewportManager/ViewportManager.cpp" PROPERTIES SKIP_UNITY_BUILD_INCLUSION TRUE)
+  set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/src/noggit/ui/tools/TimeGlobe/TimeGlobeWidget.cpp" PROPERTIES SKIP_UNITY_BUILD_INCLUSION TRUE)
   set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/src/external/tracy/TracyClient.cpp" PROPERTIES SKIP_UNITY_BUILD_INCLUSION TRUE)
   set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/include/win/StackWalker.cpp" PROPERTIES SKIP_UNITY_BUILD_INCLUSION TRUE)
   set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/src/external/imguizmo/ImGuizmo.cpp" PROPERTIES SKIP_UNITY_BUILD_INCLUSION TRUE)

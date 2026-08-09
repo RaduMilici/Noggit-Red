@@ -23,6 +23,15 @@
         <file alias="icon-battle">../media/project-icon-battle.png</file>
         <file alias="icon-shadow">../media/project-icon-shadow.png</file>
     </qresource>
+    <qresource prefix="/timeglobe">
+        <file alias="frame-human">../media/timeglobe/frame-human.png</file>
+        <file alias="frame-orc">../media/timeglobe/frame-orc.png</file>
+        <file alias="frame-nightelf">../media/timeglobe/frame-nightelf.png</file>
+        <file alias="frame-undead">../media/timeglobe/frame-undead.png</file>
+        <file alias="globe">../media/timeglobe/globe.png</file>
+        <file alias="glow-stud">../media/timeglobe/glow-stud.png</file>
+        <file alias="glow-halo">../media/timeglobe/glow-halo.png</file>
+    </qresource>
     <qresource prefix="/shader">
       <file alias="m2_vs">../src/noggit/rendering/glsl/m2_vert.glsl</file>
       <file alias="m2_fs">../src/noggit/rendering/glsl/m2_frag.glsl</file>
@@ -32,12 +41,16 @@
       <file alias="particle_fs">../src/noggit/rendering/glsl/particle_frag.glsl</file>
       <file alias="ribbon_vs">../src/noggit/rendering/glsl/ribbon_vert.glsl</file>
       <file alias="ribbon_fs">../src/noggit/rendering/glsl/ribbon_frag.glsl</file>
+      <file alias="blob_shadow_vs">../src/noggit/rendering/glsl/blob_shadow_vert.glsl</file>
+      <file alias="blob_shadow_fs">../src/noggit/rendering/glsl/blob_shadow_frag.glsl</file>
       <file alias="terrain_vs">../src/noggit/rendering/glsl/terrain_vert.glsl</file>
       <file alias="terrain_fs">../src/noggit/rendering/glsl/terrain_frag.glsl</file>
       <file alias="wmo_vs">../src/noggit/rendering/glsl/wmo_vert.glsl</file>
       <file alias="wmo_fs">../src/noggit/rendering/glsl/wmo_frag.glsl</file>
       <file alias="liquid_vs">../src/noggit/rendering/glsl/liquid_vert.glsl</file>
       <file alias="liquid_fs">../src/noggit/rendering/glsl/liquid_frag.glsl</file>
+      <file alias="wmo_liquid_vs">../src/noggit/rendering/glsl/wmo_liquid_vert.glsl</file>
+      <file alias="wmo_liquid_fs">../src/noggit/rendering/glsl/wmo_liquid_frag.glsl</file>
       <file alias="mfbo_vs">../src/noggit/rendering/glsl/mfbo_vert.glsl</file>
       <file alias="mfbo_fs">../src/noggit/rendering/glsl/mfbo_frag.glsl</file>
       <file alias="cursor_vs">../src/noggit/rendering/glsl/cursor_vert.glsl</file>
@@ -56,9 +69,22 @@
       <file alias="square_fs">../src/noggit/rendering/glsl/square_frag.glsl</file>
     <file alias="circle_vs">../src/noggit/rendering/glsl/circle_vert.glsl</file>
     <file alias="circle_fs">../src/noggit/rendering/glsl/circle_frag.glsl</file>
+    <file alias="circle_decal_vs">../src/noggit/rendering/glsl/circle_decal_vert.glsl</file>
+    <file alias="circle_decal_fs">../src/noggit/rendering/glsl/circle_decal_frag.glsl</file>
+    <file alias="path_decal_vs">../src/noggit/rendering/glsl/path_decal_vert.glsl</file>
+    <file alias="path_decal_fs">../src/noggit/rendering/glsl/path_decal_frag.glsl</file>
+    <file alias="sun_vs">../src/noggit/rendering/glsl/sun_vert.glsl</file>
+    <file alias="sun_fs">../src/noggit/rendering/glsl/sun_frag.glsl</file>
+    <file alias="sunshaft_fs">../src/noggit/rendering/glsl/sunshaft_frag.glsl</file>
+    <file alias="moon_vs">../src/noggit/rendering/glsl/moon_vert.glsl</file>
+    <file alias="moon_fs">../src/noggit/rendering/glsl/moon_frag.glsl</file>
       <file alias="cylinder_vs">../src/noggit/rendering/glsl/cylinder_vert.glsl</file>
       <file alias="cylinder_fs">../src/noggit/rendering/glsl/cylinder_frag.glsl</file>
 	  <file alias="line_vs">../src/noggit/rendering/glsl/line_vert.glsl</file>
 	  <file alias="line_fs">../src/noggit/rendering/glsl/line_frag.glsl</file>
+      <file alias="bloom_quad_vs">../src/noggit/rendering/glsl/bloom_quad_vert.glsl</file>
+      <file alias="bloom_bright_fs">../src/noggit/rendering/glsl/bloom_bright_frag.glsl</file>
+      <file alias="bloom_blur_fs">../src/noggit/rendering/glsl/bloom_blur_frag.glsl</file>
+      <file alias="bloom_composite_fs">../src/noggit/rendering/glsl/bloom_composite_frag.glsl</file>
     </qresource>
 </RCC>

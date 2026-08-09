@@ -38,12 +38,14 @@ namespace Noggit
       QRegularExpression _wmo_group_and_lod_regex;
       MapView* _map_view;
       std::string _selected_path;
+      bool _preview_context_warmed = false;
 
       void updateModelData();
       void recurseDirectory(Model::TreeManager& tree_mgr, const QString& s_dir, const QString& project_dir);
 
     protected:
       void keyPressEvent(QKeyEvent* event) override;
+      void showEvent(QShowEvent* event) override;
 
       void setupConnectsCommon();
 

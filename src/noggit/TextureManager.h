@@ -16,6 +16,7 @@
 #include <QtOpenGL/QGLPixelBuffer>
 #include <optional>
 #include <map>
+#include <mutex>
 #include <unordered_map>
 #include <string>
 #include <vector>
@@ -45,6 +46,7 @@ struct blp_texture : public AsyncObject
   blp_texture (BlizzardArchive::Listfile::FileKey const& filename, Noggit::NoggitRenderContext context);
   void finishLoading() override;
   virtual void waitForChildrenLoaded() override {};
+  char const* async_object_type_name() const override { return "blp_texture"; }
 
   void loadFromUncompressedData(BLPHeader const* lHeader, char const* lData);
   void loadFromCompressedData(BLPHeader const* lHeader, char const* lData);
@@ -107,6 +109,10 @@ public:
   static void register_raw_texture(std::string const& filename, Noggit::NoggitRenderContext context, int width, int height, std::vector<uint32_t> data);
   static TexArrayParams& get_tex_array(int width, int height, int mip_level, Noggit::NoggitRenderContext context);
   static TexArrayParams& get_tex_array(GLint compression, int width, int height, int mip_level, std::map<int, std::vector<uint8_t>>& comp_data, Noggit::NoggitRenderContext context);
+  // Live-apply the render/anisotropic_filtering setting to every already-uploaded array (models,
+  // particles, tilesets). Needs a current GL context; called from WorldRender::draw on a change.
+  static void reapply_anisotropy();
+  static std::size_t loaded_count() { return _.size(); } // [mem-diag]
 
 private:
   friend struct scoped_blp_texture_reference;
@@ -121,6 +127,7 @@ private:
   static Noggit::AsyncObjectMultimap<blp_texture> _;
   static std::array<std::unordered_map<std::tuple<GLint, int, int, int>, TexArrayParams, tuple_hash>, 7> _tex_arrays;
   static std::map<std::pair<std::string, int>, raw_texture_data> _raw_textures;
+  static std::mutex _raw_textures_mutex;
 
 };
 

@@ -1241,7 +1241,7 @@
                <bool>false</bool>
               </property>
               <property name="title">
-               <string>MySQL (Noggit UID storage)</string>
+               <string>MySQL — world database (creature/object spawns + UID storage)</string>
               </property>
               <property name="alignment">
                <set>Qt::AlignCenter</set>
@@ -1326,12 +1326,16 @@
                       </size>
                      </property>
                      <property name="text">
-                      <string>Database</string>
+                      <string>World DB</string>
                      </property>
                     </widget>
                    </item>
                    <item>
-                    <widget class="QLineEdit" name="_mysql_db_field"/>
+                    <widget class="QLineEdit" name="_mysql_db_field">
+                     <property name="toolTip">
+                      <string>The world database Noggit reads creature/gameobject spawns from (and stores UIDs in). e.g. acore_world for AzerothCore/TrinityCore 3.3.5a, or tw_world / mangos for Turtle. Saved per project.</string>
+                     </property>
+                    </widget>
                    </item>
                   </layout>
                  </item>

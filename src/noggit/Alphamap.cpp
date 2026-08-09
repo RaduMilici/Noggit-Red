@@ -5,6 +5,7 @@
 #include <opengl/context.inl>
 #include <ClientFile.hpp>
 
+#include <algorithm>
 #include <optional>
 
 Alphamap::Alphamap()
@@ -54,9 +55,17 @@ void Alphamap::readCompressed(BlizzardArchive::ClientFile *f)
 {
   // compressed
   char const* input = f->getPointer();
+  // Never read past the file buffer, whatever the compressed stream claims.
+  char const* const input_end = input + (f->getSize() > f->getPos() ? f->getSize() - f->getPos() : 0);
 
   for (std::size_t offset_output(0); offset_output < 4096;)
   {
+    if (input >= input_end)
+    {
+      LogError << "MCAL: compressed alpha stream truncated, padding with zero." << std::endl;
+      break;
+    }
+
     compressed_mcal_entry const* e = reinterpret_cast<compressed_mcal_entry const*>(input);
 
     int count = e->count;
@@ -76,11 +85,23 @@ void Alphamap::readCompressed(BlizzardArchive::ClientFile *f)
 
     if (e->mode == compressed_mcal_entry::fill)
     {
+      if (input >= input_end)
+      {
+        LogError << "MCAL: compressed alpha stream truncated, padding with zero." << std::endl;
+        break;
+      }
       memset(&amap[offset_output], e->value[0], count);
       ++input;
     }
     else
     {
+      if (input_end - input < count)
+      {
+        LogError << "MCAL: compressed alpha stream truncated, padding with zero." << std::endl;
+        count = static_cast<int>(input_end - input);
+        memcpy(&amap[offset_output], e->value, count);
+        break;
+      }
       memcpy(&amap[offset_output], e->value, count);
       input += count;
     }
@@ -91,22 +112,35 @@ void Alphamap::readCompressed(BlizzardArchive::ClientFile *f)
 
 void Alphamap::readBigAlpha(BlizzardArchive::ClientFile *f)
 {
-  memcpy(amap, f->getPointer(), 64 * 64);
+  // Never read past the file buffer: a malformed map (e.g. a wrong MPHD big-alpha flag on a
+  // vanilla map whose alphas are 2048-byte 4-bit, or a truncated MCAL) would otherwise
+  // access-violate on the last chunk of a tile and fail the whole tile load.
+  std::size_t const remaining = f->getSize() > f->getPos() ? f->getSize() - f->getPos() : 0;
+  if (remaining < 64 * 64)
+  {
+    LogError << "MCAL: big alpha layer truncated (" << remaining << "/4096 bytes left in file), padding with zero." << std::endl;
+  }
+  memcpy(amap, f->getPointer(), std::min<std::size_t>(64 * 64, remaining));
   f->seekRelative(0x1000);
 }
 
 void Alphamap::readNotCompressed(BlizzardArchive::ClientFile *f, bool do_not_fix_alpha_map)
 {
+  std::size_t const remaining = f->getSize() > f->getPos() ? f->getSize() - f->getPos() : 0;
+  std::size_t const avail = std::min<std::size_t>(0x800, remaining);
+  if (avail < 0x800)
+  {
+    LogError << "MCAL: 4-bit alpha layer truncated (" << remaining << "/2048 bytes left in file), padding with zero." << std::endl;
+  }
   char const* abuf = f->getPointer();
 
-  for (std::size_t x(0); x < 64; ++x)
+  for (std::size_t k(0); k < avail; ++k)
   {
-    for (std::size_t y(0); y < 64; y += 2)
-    {
-      amap[x * 64 + y + 0] = ((*abuf & 0x0f) << 4) | (*abuf & 0x0f);
-      amap[x * 64 + y + 1] = ((*abuf & 0xf0) >> 4) | (*abuf & 0xf0);
-      ++abuf;
-    }
+    std::size_t const x = k / 32;
+    std::size_t const y = (k % 32) * 2;
+    amap[x * 64 + y + 0] = ((*abuf & 0x0f) << 4) | (*abuf & 0x0f);
+    amap[x * 64 + y + 1] = ((*abuf & 0xf0) >> 4) | (*abuf & 0xf0);
+    ++abuf;
   }
 
   if (!do_not_fix_alpha_map)

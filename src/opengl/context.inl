@@ -5,11 +5,14 @@
 
 #include <opengl/context.hpp>
 #include <noggit/Log.h>
+#include <noggit/errorHandling.h>
 #include <glm/vec2.hpp>
 #include <QtOpenGLExtensions/QOpenGLExtensions>
 #include <QtGui/QOpenGLFunctions>
+#include <QtGui/QOpenGLExtraFunctions>
 #include <util/CurrentFunction.hpp>
 #include <memory>
+#include <cstdlib>
 
 
 namespace
@@ -81,6 +84,22 @@ namespace
         return;
       }
 
+      // PERF (2026-07-23, SHIPPED default): the per-GL-call glGetError() below is a CPU<->driver round-trip
+      // on EVERY GL call (thousands/frame). Measured as HALF the frame in dense scenes -- SubmitIndiv 43->10ms,
+      // WorldDraw 80->24ms, ~2.5x fps -- while catching NOTHING in normal running (0 GL errors over a full
+      // dense session once the instanced-doodad path, its only error source, was made default-off). So the
+      // per-call glGetError is SKIPPED BY DEFAULT. NOTE: the CONTEXT-VALIDITY check in the ctor above is a
+      // SEPARATE, cheap (no round-trip) check and STILL RUNS -- it caught the real "no active context"
+      // teardown crashes. A single once-per-frame glGetError (OpenGL::context::check_gl_errors, called from
+      // WorldRender::draw) keeps the GL-API-error safety net: it flags any error the moment it appears, just
+      // not which exact call issued it. To PINPOINT a bad call, opt back into the per-call check with
+      // NOGGIT_GL_ERROR_CHECK_PER_CALL=1. (memory noggit-perf-and-glcheck-crash.)
+      static bool const s_per_call_gl_error_check = std::getenv("NOGGIT_GL_ERROR_CHECK_PER_CALL") != nullptr;
+      if (!s_per_call_gl_error_check)
+      {
+        return;
+      }
+
       std::string errors;
       std::size_t error_count = 0;
       while (GLenum error = glGetError())
@@ -114,6 +133,17 @@ namespace
         errors += _extra_info();
 #ifndef NOGGIT_DO_NOT_THROW_ON_OPENGL_ERRORS
         LogError << _function << ":" + errors << std::endl;
+        // One-shot caller identification for GL-error hunts (e.g. the map-switch stale-buffer
+        // GL_INVALID_OPERATION spam that precedes the sporadic nvoglv64 crashes): print the callstack
+        // for the first few errors so the log names WHO issued the bad call.
+        {
+          static int s_gl_error_stacks = 0;
+          if (s_gl_error_stacks < 3)
+          {
+            ++s_gl_error_stacks;
+            Noggit::printStacktrace();
+          }
+        }
 #else
         throw std::runtime_error (_function + ":" + errors);
 #endif
@@ -148,6 +178,53 @@ GLboolean OpenGL::context::isEnabled (GLenum target)
 #endif
   return _current_context->functions()->glIsEnabled (target);
 }
+void OpenGL::context::finish()
+{
+#ifndef NOGGIT_DO_NOT_CHECK_FOR_OPENGL_ERRORS
+  verify_context_and_check_for_gl_errors const _ (_current_context, NOGGIT_CURRENT_FUNCTION);
+#endif
+  return _current_context->functions()->glFinish();
+}
+
+inline void OpenGL::context::check_gl_errors (char const* where)
+{
+  // Once-per-frame GL-API-error safety net. The per-call glGetError() in the verify dtor is dropped by
+  // default for perf; this drains any accumulated GL error ONCE per frame instead of on every call -- one
+  // driver round-trip/frame, not thousands. It flags THAT an error happened (decimal GL code), not which
+  // call issued it -- set NOGGIT_GL_ERROR_CHECK_PER_CALL=1 to pinpoint. No verify wrapper here: this IS the
+  // error check.
+  if (!_current_context)
+  {
+    return;
+  }
+  auto* const functions = _current_context->functions();
+  std::string errors;
+  std::size_t count = 0;
+  while (GLenum const error = functions->glGetError())
+  {
+    errors += " " + std::to_string (static_cast<unsigned long> (error));
+    if (++count >= 10)
+    {
+      break;
+    }
+  }
+  if (!errors.empty())
+  {
+    static int s_logged = 0;
+    if (s_logged < 30)
+    {
+      ++s_logged;
+      LogError << "[GL-ERROR/frame] " << where << ":" << errors << std::endl;
+    }
+  }
+}
+void OpenGL::context::flush()
+{
+#ifndef NOGGIT_DO_NOT_CHECK_FOR_OPENGL_ERRORS
+  verify_context_and_check_for_gl_errors const _ (_current_context, NOGGIT_CURRENT_FUNCTION);
+#endif
+  return _current_context->functions()->glFlush();
+}
 void OpenGL::context::viewport (GLint x, GLint y, GLsizei width, GLsizei height)
 {
 #ifndef NOGGIT_DO_NOT_CHECK_FOR_OPENGL_ERRORS
@@ -175,6 +252,14 @@ void OpenGL::context::blendFunc (GLenum sfactor, GLenum dfactor)
   verify_context_and_check_for_gl_errors const _ (_current_context, NOGGIT_CURRENT_FUNCTION);
 #endif
   return _current_context->functions()->glBlendFunc (sfactor, dfactor);
+}
+
+void OpenGL::context::blendFuncSeparate (GLenum srcRGB, GLenum dstRGB, GLenum srcAlpha, GLenum dstAlpha)
+{
+#ifndef NOGGIT_DO_NOT_CHECK_FOR_OPENGL_ERRORS
+  verify_context_and_check_for_gl_errors const _ (_current_context, NOGGIT_CURRENT_FUNCTION);
+#endif
+  return _current_context->functions()->glBlendFuncSeparate (srcRGB, dstRGB, srcAlpha, dstAlpha);
 }
 
 void OpenGL::context::clear (GLenum target)
@@ -493,6 +578,16 @@ void OpenGL::context::drawElements (GLenum mode, GLsizei count, GLenum type, GLv
   verify_context_and_check_for_gl_errors const _ (_current_context, NOGGIT_CURRENT_FUNCTION);
 #endif
   return _current_context->functions()->glDrawElements (mode, count, type, indices);
+}
+// [perf 2026-08-05] Draw-call batching. `indirect` is a byte offset into the currently-bound
+// GL_DRAW_INDIRECT_BUFFER; each command is a DrawElementsIndirectCommand {count, instanceCount, firstIndex,
+// baseVertex, baseInstance}. Caller must check hasMultiDrawIndirect() first (null on a <4.3 context).
+void OpenGL::context::multiDrawElementsIndirect (GLenum mode, GLenum type, const void* indirect, GLsizei drawcount, GLsizei stride)
+{
+#ifndef NOGGIT_DO_NOT_CHECK_FOR_OPENGL_ERRORS
+  verify_context_and_check_for_gl_errors const _ (_current_context, NOGGIT_CURRENT_FUNCTION);
+#endif
+  return _4_3_core_func->glMultiDrawElementsIndirect (mode, type, indirect, drawcount, stride);
 }
 void OpenGL::context::drawElementsInstanced (GLenum mode, GLsizei count, GLenum type, GLvoid const* indices, GLsizei instancecount)
 {
@@ -946,6 +1041,20 @@ void OpenGL::context::renderbufferStorage (GLenum target, GLenum internalformat,
   verify_context_and_check_for_gl_errors const _ (_current_context, NOGGIT_CURRENT_FUNCTION);
 #endif
   return _current_context->functions()->glRenderbufferStorage (target, internalformat, width, height);
+}
+void OpenGL::context::renderbufferStorageMultisample (GLenum target, GLsizei samples, GLenum internalformat, GLsizei width, GLsizei height)
+{
+#ifndef NOGGIT_DO_NOT_CHECK_FOR_OPENGL_ERRORS
+  verify_context_and_check_for_gl_errors const _ (_current_context, NOGGIT_CURRENT_FUNCTION);
+#endif
+  return _current_context->extraFunctions()->glRenderbufferStorageMultisample (target, samples, internalformat, width, height);
+}
+void OpenGL::context::blitFramebuffer (GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1, GLint dstX0, GLint dstY0, GLint dstX1, GLint dstY1, GLbitfield mask, GLenum filter)
+{
+#ifndef NOGGIT_DO_NOT_CHECK_FOR_OPENGL_ERRORS
+  verify_context_and_check_for_gl_errors const _ (_current_context, NOGGIT_CURRENT_FUNCTION);
+#endif
+  return _current_context->extraFunctions()->glBlitFramebuffer (srcX0, srcY0, srcX1, srcY1, dstX0, dstY0, dstX1, dstY1, mask, filter);
 }
 void OpenGL::context::framebufferRenderbuffer (GLenum target, GLenum attachment, GLenum renderbuffertarget, GLuint renderbuffer)
 {

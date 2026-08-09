@@ -2,6 +2,7 @@
 #pragma once
 #include <noggit/DBCFile.h>
 #include <noggit/ModelInstance.h>
+#include <noggit/TextureManager.h>
 #include <noggit/ContextObject.hpp>
 #include <noggit/rendering/Primitives.hpp>
 #include <opengl/scoped.hpp>
@@ -11,6 +12,10 @@
 #include <string>
 #include <vector>
 
+
+// Circular piecewise-linear keyframe interpolation over (day-fraction, value) pairs -- the exact
+// evaluator the 1.12 client uses for its celestial paths (wow.exe 5875 FUN_006cf6c0).
+float sky_keyframe(std::pair<float, float> const* keys, int count, float t);
 
 struct OutdoorLightStats
 {
@@ -51,6 +56,13 @@ class SkyParam
 {
 public:
     std::optional<ModelInstance> skybox;
+    // LightSkybox.dbc flags (field 2, WotLK-only column -- 0 on 1.12, which has no such field).
+    // Determined empirically from the shipped 3.3.5a data (see 8.6): bit 0x1 = FULL-DAY skybox
+    // (StormPeaks / IceCrown / ZulDrak / Coldarra -- one M2 whose animation spans the whole day and
+    // is driven by time-of-day, not a free-running clock); bit 0x2 = an additive AURORA overlay
+    // (Aurora, DeathKnightFireSkyBox). NOTE the checklist row 8.6 had these backwards ("0x2 =
+    // full-day"); 0x1 is full-day.
+    int skybox_flags = 0;
     int Id;
 
     SkyParam() = default;
@@ -210,6 +222,7 @@ private:
   ModelInstance stars;
 
   int _last_time = -1;
+  float _celestial_flow = 0.f; // LightFloatBand[2] CELESTIAL_FLOW: dusk/dawn sky-glow weight (FUN_006d0f50)
   glm::vec3 _last_pos;
 
   float _river_shallow_alpha = 0.6f;
@@ -228,6 +241,7 @@ public:
   std::vector<glm::vec3> color_set = std::vector<glm::vec3>(NUM_SkyColorNames);
 
   explicit Skies(unsigned int mapid, Noggit::NoggitRenderContext context);
+  unsigned int _map_id = 0; // continent id (571 = Northrend); gates the gloomy Northrend sky-dome override
 
   Sky* findSkyWeights(glm::vec3 pos);
 
@@ -237,6 +251,11 @@ public:
   void setCurrentParam(int param_id);
   void setAreaLightId(int light_id);
   void update_sky_colors(glm::vec3 pos, int time);
+
+  // Positional zone-light evaluation WITHOUT touching the camera-based weights/color_set: the client
+  // lights each ENTITY by the zone light at ITS position (trace-proven: wow_cap_timbermaw shows
+  // different M2s carrying the zone SH scaled by different per-channel tints at the same instant).
+  void light_at(glm::vec3 const& pos, int time, glm::vec3* out_diffuse, glm::vec3* out_ambient) const;
 
   bool draw ( glm::mat4x4 const& model_view
             , glm::mat4x4 const& projection
@@ -271,12 +290,20 @@ public:
   float ocean_shallow_alpha() const { return _ocean_shallow_alpha; }
   float ocean_deep_alpha() const { return _ocean_deep_alpha; }
 
+  // LightFloatBand fog-distance -> world units: /36 (inches->yards) is CLIENT-CANON, proven by two
+  // traces: kara map 532 authored 13000 -> client FOGEND 361.1 (=13000/36); Deadwind authored 28000
+  // -> 777.8, farclip-clamped to the observed 777.0 (start -155.4 = -0.2*777.0 exactly). The /20
+  // that briefly lived here was an editor-comfort hand-tune and made every zone's fog reach too far.
   float fog_distance_end() const { return _fog_distance / 36.f; };
   float fog_distance_start() const { return _fog_multiplier; };
 
   float glow() const { return _glow; };
 
   float fogRate() const { return _fog_rate; }
+
+  // Sun (day) / moon (night) direction for the procedural cloud lighting -- fed each frame by
+  // WorldRender (which owns the celestial arc); one frame of lag is irrelevant.
+  void set_celestial_dir(glm::vec3 const& d) { _celestial_dir = d; }
 
   void unload();
 
@@ -299,6 +326,50 @@ private:
   GLuint const& _indices_vbo = _buffers[2];
 
   std::unique_ptr<OpenGL::program> _program;
+
+  // ===== Procedural cloud layer: byte-level RE of the 1.12 client's DayNight cloud system =====
+  // wow.exe 5875: regen FUN_006cffc0, per-texel lighting FUN_006cfb00, alloc FUN_006d09b0, dome
+  // mesh FUN_006d0530, alpha ramp FUN_006d0900, constants .rdata 0x811548..0x811614 + the classic
+  // Perlin permutation table at 0x86f2d0 + octave-step table 0x86f3dc. The client draws ONE
+  // zenith-centred polar-mapped dome (12 rows, per-row vertex alpha fading at the horizon)
+  // sampling ONE dynamic ARGB texture it regenerates 32 rows per 0.1s from 4-octave 3D value
+  // noise (x, y + a slow time axis: 1 lattice step per 256 full passes). Alpha = density pushed
+  // through an exponential ramp minus a coverage threshold from Light-DBC float band 3; RGB is
+  // lit per-texel from the density gradient vs the sun/moon direction with Light-DBC colors
+  // 10 (sun-facing highlight), 11 (density-shade tint) and 12 (dense-core base).
+  struct CloudGen
+  {
+    static constexpr int SIZE = 128;         // LOD 0 texture size (DAT_00811548[0])
+    static constexpr int ROWS_PER_TICK = 32; // rows regenerated per 0.1s tick (FUN_006d09b0 default 0x20)
+    std::vector<std::uint8_t> rgba;          // SIZE*SIZE*4
+    std::vector<float> partial;              // per-texel density partial sum (octaves 0..2) of the current rows
+    std::vector<glm::vec2> grad;             // per-texel (ddx, ddy) of that partial density
+    std::vector<float> prev_row;             // previous row's partial density per column (persists across ticks)
+    float value_table[256];                  // lattice values in [-1,1] (client fills from rand(), FUN_006d0c90)
+    float ease[256];                         // cosine ease LUT (1 - cos(i*pi/256)) * 0.5 (FUN_006d0c90)
+    std::uint8_t ramp[256];                  // alpha ramp 255 - 255 * 0.96^(0.6*i) (FUN_006d0900)
+    int row_cursor = 0;
+    unsigned pass_counter = 0;               // low byte -> eased time fraction, high byte -> z lattice cell
+    float timer = 0.f;
+    GLuint texture = 0;
+    bool initialized = false;
+  };
+  CloudGen _clouds;
+  // The cloud DOME is real geometry, exactly the client mesh (FUN_006d0530): one pole vertex +
+  // 11 rings x 17 columns on a cap flattened by cos(45deg), baked polar UVs (radius row/11*0.5)
+  // and per-row vertex alpha. Triangle interpolation of the UVs is what gives the client its
+  // soft patchy zenith -- any per-pixel analytic mapping degenerates to a point there.
+  std::unique_ptr<OpenGL::program> _cloud_program;
+  GLuint _cloud_vao = 0;
+  GLuint _cloud_vbo = 0;
+  GLuint _cloud_ibo = 0;
+  int _cloud_indices_count = 0;
+  void init_cloud_gen();
+  void tick_clouds(float dt_sec);
+  void draw_clouds(glm::mat4x4 const& mvp, glm::vec3 const& camera_pos, int animtime);
+  glm::vec3 _celestial_dir = glm::vec3(0.f, 1.f, 0.f); // sun by day / moon by night (WorldRender feeds this)
+  float _cloud_coverage = 0.f;               // Light-DBC float band 3 (cloud density), interpolated
+  int _last_cloud_animtime = 0;
 
   Noggit::NoggitRenderContext _context;
 

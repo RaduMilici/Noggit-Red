@@ -8,6 +8,7 @@
 
 #include <iomanip>
 #include <map>
+#include <random>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -55,7 +56,12 @@ namespace misc
 
   float frand()
   {
-    return rand() / static_cast<float>(RAND_MAX);
+    // Thread-safe RNG (2026-07-21): the parallel bone-animate / particle-sim pre-pass calls this from worker
+    // threads. C rand() shares global state -> data race -> SIGABRT. A per-thread engine is race-free; the
+    // per-thread sequence differs but particle randomness carries no determinism requirement.
+    static thread_local std::minstd_rand engine{ std::random_device{}() };
+    static thread_local std::uniform_real_distribution<float> dist(0.0f, 1.0f);
+    return dist(engine);
   }
 
   float randfloat(float lower, float upper)

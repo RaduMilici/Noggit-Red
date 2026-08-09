@@ -13,7 +13,7 @@ namespace math
     template<typename T>
     static T linear (const float& percentage, const T& start, const T& end)
     {
-      return T();
+      return start * (1.0f - percentage) + end * percentage;
     }
 
     /*

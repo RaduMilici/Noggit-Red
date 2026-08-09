@@ -199,15 +199,6 @@ void BuildMapListComponent::buildMapList(Noggit::Ui::Windows::NoggitWindow* pare
           map_list_data.expansion_id = std::stoi(columnValueOrDefault(record, "ExpansionID", "0"));
 
           auto editable_world = World::IsEditableWorld(record);
-          if (isTrackedTurtleMap(display_name) || isTrackedTurtleMap(directory))
-          {
-            LogDebug << "Tracked map row: id=" << map_list_data.map_id
-                     << " name='" << display_name << "'"
-                     << " directory='" << directory << "'"
-                     << " type=" << map_list_data.map_type_id
-                     << " expansion=" << map_list_data.expansion_id
-                     << " editable=" << editable_world << std::endl;
-          }
 
           if (map_list_data.map_type_id < 0 || map_list_data.map_type_id > 5 || !editable_world)
             continue;

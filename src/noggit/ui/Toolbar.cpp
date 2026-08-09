@@ -23,7 +23,8 @@ namespace Noggit
       add_tool_icon(editing_mode::water, tr("Water Editor"), FontNoggit::TOOL_WATER_EDITOR);
       add_tool_icon(editing_mode::mccv, tr("Vertex Painter"), FontNoggit::TOOL_VERTEX_PAINT);
       add_tool_icon(editing_mode::object, tr("Object Editor"), FontNoggit::TOOL_OBJECT_EDITOR);
-      add_tool_icon(editing_mode::creature, tr("Creature Editor"), FontNoggit::TOOL_OBJECT_EDITOR);
+      add_tool_icon(editing_mode::creature, tr("Creature Editor"), FontNoggit::CREATURE);
+      add_tool_icon(editing_mode::gameobject, tr("GameObject Editor"), FontNoggit::CUBE);
       add_tool_icon(editing_mode::minimap, tr("Minimap Editor"), FontNoggit::TOOL_MINIMAP_EDITOR);
       add_tool_icon(editing_mode::stamp, tr("Stamp Mode"), FontNoggit::TOOL_STAMP);
       add_tool_icon(editing_mode::light, tr("Light Editor"), FontNoggit::TOOL_LIGHT);
@@ -34,6 +35,9 @@ namespace Noggit
     void toolbar::add_tool_icon(editing_mode mode, const QString& name, const FontNoggit::Icons& icon)
     {
       auto action = addAction(FontNoggitIcon{icon}, name);
+      // Store the mode on the action so check_tool can find it regardless of toolbar button order
+      // (the button order no longer has to match the editing_mode enum values).
+      action->setData(static_cast<int>(mode));
       connect (action, &QAction::triggered, [this, mode] () {
         _set_editing_mode (mode);
       });
@@ -43,7 +47,14 @@ namespace Noggit
 
     void toolbar::check_tool(editing_mode mode)
     {
-      _tool_group.actions()[static_cast<std::size_t> (mode)]->setChecked(true);
+      for (auto* action : _tool_group.actions())
+      {
+        if (action->data().toInt() == static_cast<int>(mode))
+        {
+          action->setChecked(true);
+          return;
+        }
+      }
     }
   }
 }

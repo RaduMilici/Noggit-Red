@@ -7,5 +7,7 @@ out vec4 out_color;
 
 void main()
 {
-  out_color = vec4(color, 1.0);
+  // Alpha 0 = opt OUT of bloom (the bloom bright-pass keeps only alpha > 0). This distant low-res
+  // terrain is tinted toward the (bright) fog colour, so without this it blooms heavily under fog.
+  out_color = vec4(color, 0.0);
 }

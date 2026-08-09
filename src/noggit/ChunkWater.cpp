@@ -7,6 +7,8 @@
 #include <noggit/Misc.h>
 #include <ClientFile.hpp>
 
+#include <cmath>
+
 ChunkWater::ChunkWater(MapChunk* chunk, TileWater* water_tile, float x, float z, bool use_mclq_green_lava)
   : xbase(x)
   , zbase(z)
@@ -18,14 +20,20 @@ ChunkWater::ChunkWater(MapChunk* chunk, TileWater* water_tile, float x, float z,
 {
 }
 
-void ChunkWater::from_mclq(std::vector<mclq>& layers)
+void ChunkWater::from_mclq(std::vector<mclq>& layers, int mcnk_liquid_id)
 {
   glm::vec3 pos(xbase, 0.0f, zbase);
 
   if (!Render.has_value()) Render.emplace();
   for (mclq& liquid : layers)
   {
-    int liquid_id = 1;
+    // The MCNK header liquid flag is AUTHORITATIVE (e.g. Elwynn lakes/rivers carry lq_river/
+    // lq_ocean, so they stay water). Only when the header gives nothing (mcnk_liquid_id == 0 --
+    // custom/converted chunks like Draco'dar lava) fall back to the per-tile MCLQ nibble, where
+    // bit 0x04 = magma. This stops the over-eager nibble heuristic from turning Elwynn water into
+    // lava while still rescuing the flag-less Blackrock lava.
+    int liquid_id = mcnk_liquid_id > 0 ? mcnk_liquid_id : 1;
+    bool const derive_from_tiles = (mcnk_liquid_id <= 0);
     bool has_visible_liquid = false;
 
     for (int z = 0; z < 8; ++z)
@@ -43,17 +51,22 @@ void ChunkWater::from_mclq(std::vector<mclq>& layers)
         if (visible)
         {
           has_visible_liquid = true;
-          if (liquid_type == 6)
+          if (derive_from_tiles)
           {
-            liquid_id = 3;
-          }
-          else if (liquid_type == 3 && liquid_id != 3)
-          {
-            liquid_id = 4;
-          }
-          else if (liquid_type == 1 && liquid_id == 1)
-          {
-            liquid_id = 2;
+            // Fallback per-tile nibble: bit 0x04 = magma (Blackrock lava is types 4 AND 6),
+            // 3 = slime, 1 = ocean, else water.
+            if (liquid_type & 0x04)
+            {
+              liquid_id = 3;
+            }
+            else if (liquid_type == 3 && liquid_id != 3)
+            {
+              liquid_id = 4;
+            }
+            else if (liquid_type == 1 && liquid_id == 1)
+            {
+              liquid_id = 2;
+            }
           }
         }
       }
@@ -156,6 +169,112 @@ void ChunkWater::save(sExtendableArray& adt, int base_pos, int& header_pos, int&
   header_pos += sizeof(MH2O_Header);
 }
 
+
+void ChunkWater::removeDuplicateLayers()
+{
+  bool changed = false;
+  for (std::size_t i = 0; i < _layers.size(); )
+  {
+    bool dup = false;
+    for (std::size_t j = 0; j < i; ++j)
+    {
+      if (_layers[i].liquidID() == _layers[j].liquidID()
+          && _layers[i].getSubchunks() == _layers[j].getSubchunks()
+          && std::abs(_layers[i].min() - _layers[j].min()) < 0.5f
+          && std::abs(_layers[i].max() - _layers[j].max()) < 0.5f)
+      {
+        dup = true;
+        break;
+      }
+    }
+    if (dup)
+    {
+      _layers.erase(_layers.begin() + i);
+      changed = true;
+    }
+    else
+    {
+      ++i;
+    }
+  }
+  if (changed)
+  {
+    update_layers();
+  }
+}
+
+void ChunkWater::to_mclq(std::vector<mclq>& out) const
+{
+  // Vanilla MCLQ stores ONE block per liquid type (block count == set type-flag count). MH2O can
+  // hold several layers per chunk, but a strict 1.12 client expects a single block per category, so
+  // collapse same-category layers here: emit one block per present category (in lq_river/ocean/
+  // magma/slime bit order to match the header flags), built from the first layer of that category
+  // with the other same-category layers' coverage merged into its tile mask.
+  auto nibble_for_cat = [](int cat) -> std::uint8_t
+  {
+    switch (cat) { case 1: return 1; case 2: return 6; case 3: return 3; default: return 0; }
+  };
+
+  for (int cat = 0; cat < 4; ++cat) // 0 water, 1 ocean, 2 magma, 3 slime
+  {
+    int first = -1;
+    for (std::size_t i = 0; i < _layers.size(); ++i)
+    {
+      if (_layers[i].mclq_liquid_type() == cat) { first = static_cast<int>(i); break; }
+    }
+    if (first < 0)
+    {
+      continue;
+    }
+
+    mclq block{};
+    _layers[first].to_mclq(block);
+
+    std::uint8_t const nibble = nibble_for_cat(cat);
+    for (std::size_t k = first + 1; k < _layers.size(); ++k)
+    {
+      if (_layers[k].mclq_liquid_type() != cat)
+      {
+        continue;
+      }
+      for (int z = 0; z < 8; ++z)
+      {
+        for (int x = 0; x < 8; ++x)
+        {
+          if (_layers[k].hasSubchunk(x, z))
+          {
+            std::uint8_t* raw = reinterpret_cast<std::uint8_t*>(&block.tiles[z * 8 + x]);
+            if ((*raw & 0x0F) == 0x0F) // was no-render -> include this tile in the merged block
+            {
+              *raw = nibble;
+            }
+          }
+        }
+      }
+    }
+
+    out.push_back(block);
+  }
+}
+
+mcnk_flags ChunkWater::mclq_header_flags() const
+{
+  mcnk_flags flags;
+  flags.value = 0;
+
+  for (liquid_layer const& layer : _layers)
+  {
+    switch (layer.mclq_liquid_type())
+    {
+    case 1: flags.flags.lq_ocean = 1; break; // ocean
+    case 2: flags.flags.lq_magma = 1; break; // magma
+    case 3: flags.flags.lq_slime = 1; break; // slime
+    default: flags.flags.lq_river = 1; break; // water
+    }
+  }
+
+  return flags;
+}
 
 void ChunkWater::autoGen(MapChunk *chunk, float factor)
 {

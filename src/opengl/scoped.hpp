@@ -6,6 +6,7 @@
 #include <opengl/context.inl>
 #include <optional>
 #include <stdexcept>
+#include <QtGui/QOpenGLContext>
 
 namespace OpenGL
 {

@@ -12,9 +12,13 @@
   #include <mysql/mysql.h>
 #endif
 #include <noggit/map_index.hpp>
+#include <noggit/MySqlSettings.hpp>
 #include <noggit/uid_storage.hpp>
 #include <noggit/application/NoggitApplication.hpp>
+#include <noggit/frame_profiler.hpp>
 #include <ClientFile.hpp>
+
+#include <chrono>
 
 #include <QtCore/QSettings>
 #include <QByteArray>
@@ -22,6 +26,9 @@
 #include <QRegExp>
 #include <QFile>
 
+#include <algorithm>
+#include <chrono>
+#include <vector>
 #include <forward_list>
 #include <cstdlib>
 
@@ -41,7 +48,7 @@ MapIndex::MapIndex (const std::string &pBasename, int map_id, World* world,
 {
 
   QSettings settings;
-  _unload_interval = settings.value("unload_interval", 5).toInt();
+  _unload_interval = settings.value("unload_interval", 3).toInt();
   _unload_dist = settings.value("unload_dist", 5).toInt();
 
   if (create_empty)
@@ -94,7 +101,18 @@ MapIndex::MapIndex (const std::string &pBasename, int map_id, World* world,
   theFile.read(&mphd, sizeof(MPHD));
 
   mHasAGlobalWMO = mphd.flags & FLAG_GLOBAL_OBJECT;
-  mBigAlpha = mphd.flags & FLAG_BIG_ALPHA;
+  // The 1.12 client never reads MPHD flags -- "big alpha" (uncompressed 8-bit alphamaps)
+  // only exists from WotLK on, where the client checks flag 0x4. Some Turtle custom maps
+  // (e.g. Karazahn40, flags=0xE) carry garbage MPHD flags while their MCAL data is regular
+  // 2048-byte 4-bit; trusting the bit makes the alpha reader consume 4096 bytes per layer,
+  // which misreads texture blends on every chunk and runs past the file buffer on the last
+  // chunk of a tile (access violation -> whole tile fails to load).
+  mBigAlpha = (mphd.flags & FLAG_BIG_ALPHA)
+           && Noggit::Project::CurrentProject::get()->projectVersion != Noggit::Project::ProjectVersion::CLASSIC;
+  if ((mphd.flags & FLAG_BIG_ALPHA) && !mBigAlpha)
+  {
+    LogDebug << "WDT \"" << basename << "\" sets MPHD big-alpha flag on a classic project; ignoring it (1.12 client behavior)." << std::endl;
+  }
   _sort_models_by_size_class = mphd.flags & FLAG_DOODADS_SORT;
 
   if (!(mphd.flags & FLAG_SHADING))
@@ -275,26 +293,67 @@ void MapIndex::save()
 
 void MapIndex::enterTile(const TileIndex& tile)
 {
-  if (!hasTile(tile))
-  {
-    noadt = true;
-    return;
-  }
-
-  noadt = false;
+  noadt = !hasTile(tile);
   int cx = static_cast<int>(tile.x);
   int cz = static_cast<int>(tile.z);
 
-  for (int pz = std::max(cz - 1, 0); pz < std::min(cz + 2, 63); ++pz)
+  // Prefetch the (2r+1)x(2r+1) grid of tiles around the camera. User-configurable (Settings -> "ADT
+  // loading radius"), default 1 = 3x3 to match the reference build. A larger radius streams content in
+  // earlier (smoother as you move) but keeps more tiles resident -> more terrain/objects/WMOs to draw
+  // every frame -> lower fps. Read live so the slider takes effect on the next tile crossing.
+  int const radius = std::max(0, QSettings().value("loading_radius", 1).toInt());
+
+  // [perf 2026-08-05] BUDGET main-thread MapTile creation. Each new tile costs a MapTile ctor + an MPQ
+  // exists() on the MAIN thread; with loading_radius=4 (81-tile grid) a fast fly crosses a ~9-tile edge per
+  // boundary, so creating them all in one frame stalled `tick` ~110ms (measured [TICK-STALL]). Cap NEW
+  // creations per call and take the NEAREST first (content appears where the camera is heading); the rest
+  // are created over the next frames -- the async loader still streams their heavy data in the background,
+  // and already-resident tiles are untouched. NOGGIT_TILE_LOAD_BUDGET overrides (0 = unlimited = old).
+  static int const s_load_budget = []
   {
-    for (int px = std::max(cx - 1, 0); px < std::min(cx + 2, 63); ++px)
+    char const* v = std::getenv("NOGGIT_TILE_LOAD_BUDGET");
+    return v ? std::atoi(v) : 3;
+  }();
+
+  // Collect only the tiles that still need CREATING (skip resident / awaiting / failed / absent -- those
+  // are cheap no-ops in loadTile anyway), nearest-first.
+  std::vector<std::pair<float, TileIndex>> pending;
+  for (int pz = std::max(cz - radius, 0); pz <= std::min(cz + radius, 63); ++pz)
+  {
+    for (int px = std::max(cx - radius, 0); px <= std::min(cx + radius, 63); ++px)
     {
-      loadTile(TileIndex(px, pz));
+      TileIndex const t(static_cast<std::size_t>(px), static_cast<std::size_t>(pz));
+      if (!hasTile(t) || tileLoaded(t) || tileAwaitingLoading(t) || tileLoadFailed(t))
+      {
+        continue;
+      }
+      pending.emplace_back(tile.dist(t), t);
     }
+  }
+
+  if (s_load_budget > 0 && static_cast<int>(pending.size()) > s_load_budget)
+  {
+    std::partial_sort(pending.begin(), pending.begin() + s_load_budget, pending.end(),
+                      [](auto const& a, auto const& b) { return a.first < b.first; });
+  }
+  else
+  {
+    std::sort(pending.begin(), pending.end(), [](auto const& a, auto const& b) { return a.first < b.first; });
+  }
+
+  int created = 0;
+  for (auto const& p : pending)
+  {
+    if (s_load_budget > 0 && created >= s_load_budget)
+    {
+      break;
+    }
+    loadTile(p.second);
+    ++created;
   }
 }
 
-void MapIndex::update_model_tile(const TileIndex& tile, model_update type, SceneObject* instance)
+void MapIndex::update_model_tile(const TileIndex& tile, model_update type, SceneObject* instance, bool mark_changed)
 {
   MapTile* adt = loadTile(tile);
 
@@ -302,7 +361,13 @@ void MapIndex::update_model_tile(const TileIndex& tile, model_update type, Scene
     return;
 
   adt->wait_until_loaded();
-  adt->changed = true;
+  // [perf 2026-08-05] Only flag the tile dirty for REAL edits. The load-time path (UID-collision reassignment
+  // / tile reload) passes mark_changed=false so streamed-in tiles are NOT pinned resident (changed tiles never
+  // unload -> unbounded memory growth on a long fly = the original "eats RAM & crashes"). See queue_update.
+  if (mark_changed)
+  {
+    adt->changed = true;
+  }
 
   if (type == model_update::add)
   {
@@ -380,11 +445,13 @@ MapTile* MapIndex::loadTile(const TileIndex& tile, bool reloading, bool load_mod
   std::stringstream filename;
   filename << "World\\Maps\\" << basename << "\\" << basename << "_" << tile.x << "_" << tile.z << ".adt";
 
-  if (!Noggit::Application::NoggitApplication::instance()->clientData()->exists(filename.str()))
-  {
-    LogError << "The requested tile \"" << filename.str() << "\" does not exist! Oo" << std::endl;
-    return nullptr;
-  }
+  // [perf 2026-08-05] The MPQ clientData()->exists() check that used to be here was measured at 4-9ms per
+  // tile ([LOADTILE] split) -- the ENTIRE enterTile main-thread stall (the ctor is ~0.03ms). It is
+  // REDUNDANT: loadTile already returned above unless hasTile(tile) is true, and hasTile is the WDT
+  // tile-present flag (mTiles[..].flags & 1) -- the map's own authoritative record of which ADTs exist. A
+  // WDT-present-but-file-missing tile (corrupt custom data) is handled downstream: MapTile::finishLoading on
+  // the loader thread throws FileReadFailedError -> AsyncLoader marks it loading_failed (tileLoadFailed),
+  // exactly as a failed exists() would have rejected it, just off the main thread. So skip the scan.
 
   mTiles[tile.z][tile.x].tile = std::make_unique<MapTile> (static_cast<int>(tile.x), static_cast<int>(tile.z), filename.str(),
      mBigAlpha, load_models, use_mclq_green_lava(), reloading, _world, _context, tile_mode::edit, load_textures);
@@ -393,6 +460,14 @@ MapTile* MapIndex::loadTile(const TileIndex& tile, bool reloading, bool load_mod
 
   AsyncLoader::instance().queue_for_load(adt);
   _n_loaded_tiles++;
+
+  // [TILE] streaming trace (NOGGIT_FRAME_PROFILE): pair with the [FRAME-SPIKE]/TileStream numbers to see
+  // whether a hitch lines up with a tile being queued (main-thread MapTile ctor above) or, a few frames
+  // later, its first-draw GPU upload. loaded=count lets you watch the working set grow/shrink.
+  if (noggit::perf::FrameProfiler::get().on)
+  {
+    LogError << "[TILE] queue " << tile.x << "_" << tile.z << "  loaded=" << _n_loaded_tiles << std::endl;
+  }
 
   return adt;
 }
@@ -408,21 +483,118 @@ void MapIndex::reloadTile(const TileIndex& tile)
 
 void MapIndex::unloadTiles(const TileIndex& tile)
 {
-  if (((clock() / CLOCKS_PER_SEC) - _last_unload_time) > _unload_interval)
+  // [perf 2026-08-06] Fine (ms) unload cadence -- was a ~1s clock()-seconds gate, which then dumped a whole
+  // batch of tile teardowns (~8ms/tile) at once = a ~48ms hitch once a second. Running often + freeing few per
+  // pass SPREADS that O(instances) teardown across frames. NOGGIT_UNLOAD_INTERVAL_MS tunes it (default 16 ~= per
+  // frame @60fps); pairs with the low NOGGIT_MAX_UNLOAD_PER_PASS below.
+  static int const s_unload_interval_ms = []
   {
+    char const* v = std::getenv("NOGGIT_UNLOAD_INTERVAL_MS");
+    int const m = v ? std::atoi(v) : 16;
+    return m > 0 ? m : 16;
+  }();
+  static std::chrono::steady_clock::time_point s_last_unload_pass{};
+  if (std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - s_last_unload_pass).count() >= s_unload_interval_ms)
+  {
+    // [CRASH FIX 2026-08-04] Collect the tiles to unload FIRST, then unload them AFTER the loop.
+    // unloadTile() sets mTiles[..].tile = nullptr, which mutates the very container loaded_tiles()
+    // iterates -> iterator invalidation / use-after-free (0xC0000005 in unloadTile). Latent for years
+    // because with unload_dist large nothing ever crossed the threshold; it fires the moment tiles
+    // actually unload (sane unload_dist + fast movement) -> "it crashes when it goes too fast".
+    unsigned resident = 0, far_count = 0, far_blocked_changed = 0, far_kept_visible = 0;
+    std::vector<TileIndex> to_unload;
     for (MapTile* adt : loaded_tiles())
     {
+      ++resident;
       if (tile.dist(adt->index) > _unload_dist)
       {
-        //Only unload adts not marked to save
-        if (!adt->changed.load())
+        ++far_count;
+        // [2026-08-06] NEVER unload a tile that is still on screen. The renderer sets rendered_recently for
+        // every in-frustum tile each frame; exchange(false) reads AND clears it so a tile that has since LEFT
+        // the frustum (flag no longer re-set) unloads on a later pass. This keeps visible far tiles (ocean at
+        // render distance rendered as empty flat quads otherwise) resident, while residency stays bounded to
+        // ~frustum coverage -- the unload_dist band alone was smaller than the render distance.
+        if (adt->rendered_recently.exchange(false, std::memory_order_relaxed))
         {
-          unloadTile(adt->index);
+          ++far_kept_visible;
+        }
+        else if (!adt->changed.load()) //Only unload adts not marked to save
+        {
+          to_unload.push_back(adt->index);
+        }
+        else
+        {
+          ++far_blocked_changed;
         }
       }
     }
+    // [perf 2026-08-05] Free at most N tiles per pass. Freeing needs the loader quiescent for crash-safety (a
+    // loader finishing a model/WMO writes tile-owned state -> feeds SceneObject instances into MapTile::
+    // object_instances -> freeing that tile mid-load = UAF in AsyncLoader::process -> finishLoading, confirmed
+    // in the VEH callstack; the AsyncObjectMultimap::erase re-check closes the refcount-revive race but NOT
+    // this one). ScopedPause gives that quiescence BOUNDED (waits only for the in-flight loads). But the FREE
+    // ITSELF is O(tiles): each tile tears down hundreds of instances, so freeing a big backlog at once = a ~1s
+    // stall (a prior "defer then batch-free 46-52 tiles" attempt hit 1152ms). So cap the free per pass and let
+    // a backlog drain over the next passes. NOGGIT_MAX_UNLOAD_PER_PASS overrides (0 = unlimited).
+    static unsigned const s_max_unload_per_pass = []
+    {
+      char const* v = std::getenv("NOGGIT_MAX_UNLOAD_PER_PASS");
+      return v ? static_cast<unsigned>(std::max(0, std::atoi(v))) : 1u; // [2026-08-06] 6->1: teardown ~8ms/tile,
+      // so free ONE per (now per-frame) pass to spread it; raise via env if the far-tile backlog can't keep up.
+    }();
+    // [perf 2026-08-06] STUTTER FIX: never pause a BUSY loader just to unload. The ScopedPause below waits for
+    // the loader's in-flight model/WMO load to finish; while you fly the loader is ALWAYS busy, so freeing every
+    // pass paid a 15-35ms wait = the recurring Overlays/tick hitch seen in [TICK-STALL]. Now: free ONLY when the
+    // loader is IDLE (the pause is then instant -> zero wait), deferring far tiles to the loader's next lull (you
+    // slow / stop). Force a capped free ONLY when the reclaimable backlog grows past a HARD cap, so memory stays
+    // bounded -- a RARE forced stall instead of one every pass. Free is still capped per pass (teardown is
+    // O(instances) per tile). NOGGIT_UNLOAD_HARD_BACKLOG tunes the memory cap (0 = never force).
+    static unsigned const s_hard_backlog = []
+    {
+      char const* v = std::getenv("NOGGIT_UNLOAD_HARD_BACKLOG");
+      return v ? static_cast<unsigned>(std::max(0, std::atoi(v))) : 64u;
+    }();
+    bool const loader_busy = AsyncLoader::instance().is_loading();
+    bool const force_free = s_hard_backlog > 0 && to_unload.size() > s_hard_backlog;
+    bool const do_free = !to_unload.empty() && (!loader_busy || force_free);
+    bool const deferred = !to_unload.empty() && !do_free;
+    unsigned unloaded = 0;
+    double pause_ms = 0.0, free_ms = 0.0; // split diagnostic: pause-wait vs O(instances) teardown
+    if (do_free)
+    {
+      // Collect-first still required (unloadTile nulls mTiles[..] mid-iteration of loaded_tiles() -> iterator
+      // invalidation). ScopedPause = loader quiescence for a race-free free -- INSTANT when the loader is idle
+      // (the common path now); only the rare forced free (busy + huge backlog) actually waits on an in-flight load.
+      auto const _t0 = std::chrono::steady_clock::now();
+      AsyncLoader::ScopedPause const loader_pause;
+      auto const _t1 = std::chrono::steady_clock::now();
+      pause_ms = std::chrono::duration<double, std::milli>(_t1 - _t0).count();
+      for (TileIndex const& idx : to_unload)
+      {
+        if (s_max_unload_per_pass > 0 && unloaded >= s_max_unload_per_pass)
+        {
+          break;
+        }
+        unloadTile(idx);
+        ++unloaded;
+      }
+      free_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _t1).count();
+    }
+    if (noggit::perf::FrameProfiler::get().on)
+    {
+      LogError << "[UNLOAD] resident=" << resident << " far=" << far_count
+               << " far_blocked_changed=" << far_blocked_changed
+               << " far_kept_visible=" << far_kept_visible
+               << " unloaded=" << unloaded << "/" << to_unload.size()
+               << (deferred ? " DEFERRED(loader busy)" : "")
+               << (force_free ? " FORCED(backlog>cap)" : "")
+               << " pause_ms=" << pause_ms << " free_ms=" << free_ms
+               << " maxPerPass=" << s_max_unload_per_pass << " hardBacklog=" << s_hard_backlog
+               << " unload_dist=" << _unload_dist
+               << " loading_radius=" << QSettings().value("loading_radius", 1).toInt() << std::endl;
+    }
 
-    _last_unload_time = clock() / CLOCKS_PER_SEC;
+    s_last_unload_pass = std::chrono::steady_clock::now();
   }
 }
 
@@ -434,6 +606,10 @@ void MapIndex::unloadTile(const TileIndex& tile)
     Log << "Unload Tile " << tile.x << "-" << tile.z << std::endl;
     mTiles[tile.z][tile.x].tile = nullptr;
     _n_loaded_tiles--;
+    if (noggit::perf::FrameProfiler::get().on)
+    {
+      LogError << "[TILE] unload " << tile.x << "_" << tile.z << "  loaded=" << _n_loaded_tiles << std::endl;
+    }
   }
 }
 
@@ -705,7 +881,7 @@ uint32_t MapIndex::newGUID()
 #ifdef USE_MYSQL_UID_STORAGE
   QSettings settings;
 
-  if (settings.value ("project/mysql/enabled", false).toBool())
+  if (Noggit::mysqlSetting("enabled", false).toBool())
   {
     mysql::updateUIDinDB(_map_id, highestGUID + 1); // update the highest uid in db, note that if the user don't save these uid won't be used (not really a problem tho) 
   }
@@ -1053,7 +1229,7 @@ void MapIndex::saveMaxUID()
 #ifdef USE_MYSQL_UID_STORAGE
   QSettings settings;
 
-  if (settings.value ("project/mysql/enabled", false).toBool())
+  if (Noggit::mysqlSetting("enabled", false).toBool())
   {
     if (mysql::hasMaxUIDStoredDB(_map_id))
     {
@@ -1075,7 +1251,7 @@ void MapIndex::loadMaxUID()
 #ifdef USE_MYSQL_UID_STORAGE
   QSettings settings;
 
-  if (settings.value ("project/mysql/enabled", false).toBool())
+  if (Noggit::mysqlSetting("enabled", false).toBool())
   {
     highestGUID = std::max(mysql::getGUIDFromDB(_map_id), highestGUID);
     // save to make sure the db and disk uid are synced

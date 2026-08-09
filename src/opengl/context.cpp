@@ -16,9 +16,13 @@ namespace OpenGL
     : _context (context_)
     , _old_context (_context._current_context)
     , _old_core_func (context_._4_1_core_func)
+    , _old_core_func_4_3 (context_._4_3_core_func)
   {
     _context._current_context = current_context;
     _context._4_1_core_func = current_context->versionFunctions<QOpenGLFunctions_4_1_Core>();
+    // [perf 2026-08-05] 4.3 for glMultiDrawElementsIndirect. Nullable -- do NOT throw: if the context is <4.3
+    // the batching path just falls back to per-model draws (hasMultiDrawIndirect() == false).
+    _context._4_3_core_func = current_context->versionFunctions<QOpenGLFunctions_4_3_Core>();
 
     if (!_context._4_1_core_func)
     {
@@ -29,6 +33,7 @@ namespace OpenGL
   {
     _context._current_context = _old_context;
     _context._4_1_core_func = _old_core_func;
+    _context._4_3_core_func = _old_core_func_4_3;
   }
   context::save_current_context::save_current_context (context& context_)
     : _is_current ( context_._current_context

@@ -32,7 +32,11 @@ namespace OpenGL
   }
   shader::~shader()
   {
-    gl.deleteShader (_handle);
+    // teardown-safe: never let a GL call throw from a destructor (see program::~program).
+    if (_handle && QOpenGLContext::currentContext())
+    {
+      try { gl.deleteShader (_handle); } catch (...) {}
+    }
   }
 
   std::string shader::src_from_qrc(std::string const& shader_alias)
@@ -118,9 +122,13 @@ namespace OpenGL
   }
   program::~program()
   {
-    if (_handle)
+    // teardown-safe: never let a GL call throw from a destructor -> std::terminate (e.g. the
+    // BLPRenderer atexit dtor, or Circle::_decal_program destroyed at process teardown, when the
+    // owning context is gone OR a different context is current). Swallow any throw; the program dies
+    // with its context anyway. (See scoped.ipp deferred_upload_buffers dtor for the full rationale.)
+    if (_handle && QOpenGLContext::currentContext())
     {
-      gl.deleteProgram (*_handle);
+      try { gl.deleteProgram (*_handle); } catch (...) {}
     }
   }
 
@@ -161,7 +169,10 @@ namespace OpenGL
 
     void use_program::uniform (std::string const& name, GLint value)
     {
-      GLuint loc = uniform_location (name);
+      // glGetUniformLocation returns -1 for a missing/optimised-out uniform. Capture it SIGNED: the old
+      // code used GLuint, so `loc < 0` was always false and a missing uniform fell through to a
+      // glUniform*(0xFFFFFFFF, ...) call that silently does nothing. [2026-07-30]
+      GLint loc = static_cast<GLint> (uniform_location (name));
       if (loc < 0)
         return;
 
@@ -173,7 +184,10 @@ namespace OpenGL
     }
     void use_program::uniform (std::string const& name, GLfloat value)
     {
-      GLuint loc = uniform_location (name);
+      // glGetUniformLocation returns -1 for a missing/optimised-out uniform. Capture it SIGNED: the old
+      // code used GLuint, so `loc < 0` was always false and a missing uniform fell through to a
+      // glUniform*(0xFFFFFFFF, ...) call that silently does nothing. [2026-07-30]
+      GLint loc = static_cast<GLint> (uniform_location (name));
       if (loc < 0)
         return;
 
@@ -185,7 +199,10 @@ namespace OpenGL
     }
     void use_program::uniform (std::string const& name, bool value)
     {
-      GLuint loc = uniform_location (name);
+      // glGetUniformLocation returns -1 for a missing/optimised-out uniform. Capture it SIGNED: the old
+      // code used GLuint, so `loc < 0` was always false and a missing uniform fell through to a
+      // glUniform*(0xFFFFFFFF, ...) call that silently does nothing. [2026-07-30]
+      GLint loc = static_cast<GLint> (uniform_location (name));
       if (loc < 0)
         return;
 
@@ -197,7 +214,10 @@ namespace OpenGL
     }
     void use_program::uniform_cached(std::string const& name, GLint value)
     {
-      GLuint loc = uniform_location (name);
+      // glGetUniformLocation returns -1 for a missing/optimised-out uniform. Capture it SIGNED: the old
+      // code used GLuint, so `loc < 0` was always false and a missing uniform fell through to a
+      // glUniform*(0xFFFFFFFF, ...) call that silently does nothing. [2026-07-30]
+      GLint loc = static_cast<GLint> (uniform_location (name));
       if (loc < 0)
         return;
 
@@ -211,7 +231,10 @@ namespace OpenGL
     }
     void use_program::uniform_cached(std::string const& name, GLfloat value)
     {
-      GLuint loc = uniform_location (name);
+      // glGetUniformLocation returns -1 for a missing/optimised-out uniform. Capture it SIGNED: the old
+      // code used GLuint, so `loc < 0` was always false and a missing uniform fell through to a
+      // glUniform*(0xFFFFFFFF, ...) call that silently does nothing. [2026-07-30]
+      GLint loc = static_cast<GLint> (uniform_location (name));
       if (loc < 0)
         return;
 
@@ -225,7 +248,10 @@ namespace OpenGL
     }
     void use_program::uniform_cached(std::string const& name, bool value)
     {
-      GLuint loc = uniform_location (name);
+      // glGetUniformLocation returns -1 for a missing/optimised-out uniform. Capture it SIGNED: the old
+      // code used GLuint, so `loc < 0` was always false and a missing uniform fell through to a
+      // glUniform*(0xFFFFFFFF, ...) call that silently does nothing. [2026-07-30]
+      GLint loc = static_cast<GLint> (uniform_location (name));
       if (loc < 0)
         return;
 
@@ -244,7 +270,10 @@ namespace OpenGL
     }
     void use_program::uniform (std::string const& name, std::vector<int> const& value)
     {
-      GLuint loc = uniform_location (name);
+      // glGetUniformLocation returns -1 for a missing/optimised-out uniform. Capture it SIGNED: the old
+      // code used GLuint, so `loc < 0` was always false and a missing uniform fell through to a
+      // glUniform*(0xFFFFFFFF, ...) call that silently does nothing. [2026-07-30]
+      GLint loc = static_cast<GLint> (uniform_location (name));
       if (loc < 0)
         return;
 
@@ -252,7 +281,10 @@ namespace OpenGL
     }
     void use_program::uniform (std::string const& name, int const* data, std::size_t size)
     {
-      GLuint loc = uniform_location (name);
+      // glGetUniformLocation returns -1 for a missing/optimised-out uniform. Capture it SIGNED: the old
+      // code used GLuint, so `loc < 0` was always false and a missing uniform fell through to a
+      // glUniform*(0xFFFFFFFF, ...) call that silently does nothing. [2026-07-30]
+      GLint loc = static_cast<GLint> (uniform_location (name));
       if (loc < 0)
         return;
 
@@ -260,7 +292,10 @@ namespace OpenGL
     }
     void use_program::uniform (std::string const& name, glm::vec3 const* data, std::size_t size)
     {
-      GLuint loc = uniform_location (name);
+      // glGetUniformLocation returns -1 for a missing/optimised-out uniform. Capture it SIGNED: the old
+      // code used GLuint, so `loc < 0` was always false and a missing uniform fell through to a
+      // glUniform*(0xFFFFFFFF, ...) call that silently does nothing. [2026-07-30]
+      GLint loc = static_cast<GLint> (uniform_location (name));
       if (loc < 0)
         return;
 
@@ -272,7 +307,10 @@ namespace OpenGL
     }
     void use_program::uniform (std::string const& name, std::vector<glm::vec3> const& value)
     {
-      GLuint loc = uniform_location (name);
+      // glGetUniformLocation returns -1 for a missing/optimised-out uniform. Capture it SIGNED: the old
+      // code used GLuint, so `loc < 0` was always false and a missing uniform fell through to a
+      // glUniform*(0xFFFFFFFF, ...) call that silently does nothing. [2026-07-30]
+      GLint loc = static_cast<GLint> (uniform_location (name));
       if (loc < 0)
         return;
 
@@ -288,7 +326,10 @@ namespace OpenGL
     }
     void use_program::uniform_chunk_textures (std::string const& name, std::array<std::array<std::array<int, 2>, 4>, 256> const& value)
     {
-      GLuint loc = uniform_location (name);
+      // glGetUniformLocation returns -1 for a missing/optimised-out uniform. Capture it SIGNED: the old
+      // code used GLuint, so `loc < 0` was always false and a missing uniform fell through to a
+      // glUniform*(0xFFFFFFFF, ...) call that silently does nothing. [2026-07-30]
+      GLint loc = static_cast<GLint> (uniform_location (name));
       if (loc < 0)
         return;
 
@@ -304,7 +345,10 @@ namespace OpenGL
     }
     void use_program::uniform (std::string const& name, glm::vec2 const& value)
     {
-      GLuint loc = uniform_location (name);
+      // glGetUniformLocation returns -1 for a missing/optimised-out uniform. Capture it SIGNED: the old
+      // code used GLuint, so `loc < 0` was always false and a missing uniform fell through to a
+      // glUniform*(0xFFFFFFFF, ...) call that silently does nothing. [2026-07-30]
+      GLint loc = static_cast<GLint> (uniform_location (name));
       if (loc < 0)
         return;
 
@@ -316,7 +360,10 @@ namespace OpenGL
     }
     void use_program::uniform (std::string const& name, glm::vec3 const& value)
     {
-      GLuint loc = uniform_location (name);
+      // glGetUniformLocation returns -1 for a missing/optimised-out uniform. Capture it SIGNED: the old
+      // code used GLuint, so `loc < 0` was always false and a missing uniform fell through to a
+      // glUniform*(0xFFFFFFFF, ...) call that silently does nothing. [2026-07-30]
+      GLint loc = static_cast<GLint> (uniform_location (name));
       if (loc < 0)
         return;
 
@@ -328,7 +375,10 @@ namespace OpenGL
     }
     void use_program::uniform (std::string const& name, glm::vec4 const& value)
     {
-      GLuint loc = uniform_location (name);
+      // glGetUniformLocation returns -1 for a missing/optimised-out uniform. Capture it SIGNED: the old
+      // code used GLuint, so `loc < 0` was always false and a missing uniform fell through to a
+      // glUniform*(0xFFFFFFFF, ...) call that silently does nothing. [2026-07-30]
+      GLint loc = static_cast<GLint> (uniform_location (name));
       if (loc < 0)
         return;
 

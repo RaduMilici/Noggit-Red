@@ -1,4 +1,6 @@
 #include <noggit/ui/windows/about/About.h>
+#include <noggit/MySqlSettings.hpp>
+#include <noggit/AsyncLoader.h>
 #include <noggit/DBC.h>
 #include <noggit/DBCFile.h>
 #include <noggit/Log.h>
@@ -16,6 +18,9 @@
 #include <noggit/ui/tools/UiCommon/StackedWidget.hpp>
 #include <BlizzardDatabase.h>
 #include <QtGui/QCloseEvent>
+#include <QtGui/QImage>
+#include <QtGui/QScreen>
+#include <QtWidgets/QApplication>
 #include <QtWidgets/QHBoxLayout>
 #include <QtWidgets/QListWidget>
 #include <QtWidgets/QMenuBar>
@@ -29,11 +34,16 @@
 #include <noggit/ui/windows/noggitWindow/widgets/MapListItem.hpp>
 #include <noggit/ui/windows/noggitWindow/widgets/MapBookmarkListItem.hpp>
 #include <QtNetwork/QTcpSocket>
+#include <cstdlib>
+#include <cstring>
+#include <fstream>
 #include <sstream>
 #include <QSysInfo>
 #include <QStandardPaths>
 #include <QDir>
 #include <QIcon>
+#include <QThread>
+#include <QtCore/QSettings>
 #include <noggit/ui/windows/noggitWindow/components/BuildMapListComponent.hpp>
 #include <noggit/application/Utils.hpp>
 
@@ -51,6 +61,55 @@
 
 namespace Noggit::Ui::Windows
 {
+  namespace
+  {
+    bool imageLooksBlank(QImage const& image, bool includes_window_chrome = false)
+    {
+      if (image.isNull())
+      {
+        return true;
+      }
+
+      QRect sample_rect(0, 0, image.width(), image.height());
+      if (includes_window_chrome)
+      {
+        int const left = std::min(96, image.width() / 4);
+        int const top = std::min(72, image.height() / 4);
+        sample_rect = QRect(left, top, image.width() - left, image.height() - top);
+      }
+
+      int const step_x = std::max(1, sample_rect.width() / 64);
+      int const step_y = std::max(1, sample_rect.height() / 64);
+      int non_dark = 0;
+      int sampled = 0;
+
+      for (int y = sample_rect.top(); y < sample_rect.bottom(); y += step_y)
+      {
+        for (int x = sample_rect.left(); x < sample_rect.right(); x += step_x)
+        {
+          QColor const color(image.pixel(x, y));
+          if (color.red() > 8 || color.green() > 8 || color.blue() > 8)
+          {
+            ++non_dark;
+          }
+          ++sampled;
+        }
+      }
+
+      return sampled == 0 || non_dark < sampled / 100;
+    }
+
+    bool captureLightingTraceEnabled()
+    {
+      if (char const* value = std::getenv("NOGGIT_CAPTURE_LIGHTING_TRACE"))
+      {
+        return std::string(value) != "0";
+      }
+
+      return false;
+    }
+  }
+
   void NoggitWindow::ensureSettingsWindow()
   {
     if (_settings)
@@ -194,7 +253,7 @@ namespace Noggit::Ui::Windows
   {
     QSettings settings;
 #ifdef USE_MYSQL_UID_STORAGE
-    bool use_mysql = settings.value("project/mysql/enabled", false).toBool();
+    bool use_mysql = Noggit::mysqlSetting("enabled", false).toBool();
 
     bool valid_conn = false;
     if (use_mysql)
@@ -240,7 +299,8 @@ namespace Noggit::Ui::Windows
 
   void
   NoggitWindow::enterMapAt(glm::vec3 pos, math::degrees camera_pitch, math::degrees camera_yaw, uid_fix_mode uid_fix,
-                           bool from_bookmark
+                           bool from_bookmark,
+                           bool capture_probe
   )
   {
       LogDebug << "NoggitWindow::enterMapAt begin" << std::endl;
@@ -269,7 +329,7 @@ namespace Noggit::Ui::Windows
     if (_map_creation_wizard)
       _map_creation_wizard->destroyFakeWorld();
   LogDebug << "NoggitWindow::enterMapAt before MapView ctor" << std::endl;
-    _map_view = (new MapView(camera_yaw, camera_pitch, pos, this, _project, std::move(_world), uid_fix, from_bookmark));
+    _map_view = (new MapView(camera_yaw, camera_pitch, pos, this, _project, std::move(_world), uid_fix, from_bookmark, capture_probe));
   LogDebug << "NoggitWindow::enterMapAt after MapView ctor" << std::endl;
     connect(_map_view, &MapView::uid_fix_failed, [this]()
     { promptUidFixFailure(); });
@@ -311,7 +371,13 @@ namespace Noggit::Ui::Windows
               item_widget->setHidden(true);
           }
 
-            if (!wmo_maps && widget->wmo_map())
+            // The "Display WMO maps (No terrain)" toggle is meant to hide terrain-less *world* maps
+            // (clutter / test continents). Instanced content (dungeons, raids, BGs, arenas) is usually
+            // WMO-only too -- e.g. Deadmines, Blackrock Depths, Gnomeregan -- and must NOT be hidden by
+            // this toggle, otherwise selecting "Dungeon" drops every WMO dungeon and switching back to
+            // "All" loses them as well (the initial list shows them, but any filter pass would hide them).
+            // So only gate WMO *world* maps (type 0) on the checkbox.
+            if (!wmo_maps && widget->wmo_map() && widget->type() == 0)
           {
               item_widget->setHidden(true);
           }
@@ -363,6 +429,201 @@ namespace Noggit::Ui::Windows
     }
 
     check_uid_then_enter_map(pos, camera_pitch, camera_yaw, from_bookmark);
+  }
+
+  bool NoggitWindow::captureMapCreaturesToPng(int map_id,
+                                              QString const& output_path,
+                                              int width,
+                                              int height,
+                                              std::optional<glm::vec3> camera_position,
+                                              math::degrees camera_yaw,
+                                              math::degrees camera_pitch)
+  {
+    setAnimated(false);
+    setDockOptions(AllowNestedDocks | AllowTabbedDocks | GroupedDragging);
+    QApplication::setEffectEnabled(Qt::UI_AnimateMenu, false);
+    QApplication::setEffectEnabled(Qt::UI_FadeMenu, false);
+    QApplication::setEffectEnabled(Qt::UI_AnimateCombo, false);
+    QApplication::setEffectEnabled(Qt::UI_AnimateTooltip, false);
+    QApplication::setEffectEnabled(Qt::UI_FadeTooltip, false);
+    QApplication::setEffectEnabled(Qt::UI_AnimateToolBox, false);
+    resize(width, height);
+    show();
+    qApp->processEvents();
+
+    loadMap(map_id);
+    if (!_world)
+    {
+      LogError << "capture-world-creatures: failed to load mapId=" << map_id << std::endl;
+      return false;
+    }
+
+    LogDebug << "capture-world-creatures: enter map begin" << std::endl;
+    enterMapAt(camera_position.value_or(glm::vec3(0.f, 50.f, 0.f)),
+               camera_position ? camera_pitch : math::degrees(25.f),
+               camera_position ? camera_yaw : math::degrees(0.f),
+               uid_fix_mode::none,
+               camera_position.has_value(),
+               true);
+    LogDebug << "capture-world-creatures: enter map done" << std::endl;
+    if (!_map_view)
+    {
+      LogError << "capture-world-creatures: failed to create map view mapId=" << map_id << std::endl;
+      return false;
+    }
+
+    bool const capture_creatures = []()
+    {
+      char const* value = std::getenv("NOGGIT_CAPTURE_CREATURES");
+      return !value || !*value || std::strcmp(value, "0") != 0;
+    }();
+
+    bool loaded = !capture_creatures;
+    if (capture_creatures)
+    {
+      _map_view->_draw_creature_spawns.set(true);
+      _map_view->getWorld()->setDrawCreatureSpawns(true);
+
+      loaded = !_map_view->getWorld()->creatureSpawns().empty();
+      if (loaded)
+      {
+        LogDebug << "capture-world-creatures: reusing loaded creature spawns count="
+                 << _map_view->getWorld()->creatureSpawns().size() << std::endl;
+      }
+      else
+      {
+        LogDebug << "capture-world-creatures: reload creature spawns begin" << std::endl;
+        loaded = _map_view->getWorld()->reloadCreatureSpawns();
+        LogDebug << "capture-world-creatures: reload creature spawns done loaded=" << loaded << std::endl;
+      }
+    }
+    else
+    {
+      _map_view->_draw_creature_spawns.set(false);
+      _map_view->getWorld()->setDrawCreatureSpawns(false);
+      LogDebug << "capture-world-creatures: creature overlay disabled by NOGGIT_CAPTURE_CREATURES=0" << std::endl;
+    }
+    LogDebug << "capture-world-creatures: wait async begin" << std::endl;
+    AsyncLoader::instance().wait_until_idle();
+    LogDebug << "capture-world-creatures: wait async done" << std::endl;
+
+    if (!loaded)
+    {
+      LogError << "capture-world-creatures: failed to load creature spawns mapId=" << map_id
+               << " status='" << _map_view->getWorld()->creatureSpawnStatus() << "'" << std::endl;
+      return false;
+    }
+
+    auto const& spawns = _map_view->getWorld()->creatureSpawns();
+    if (camera_position)
+    {
+      _map_view->setCameraForCapture(*camera_position, camera_yaw, camera_pitch);
+      LogDebug << "capture-world-creatures camera explicit position=("
+               << camera_position->x << ", " << camera_position->y << ", " << camera_position->z
+               << ") yaw=" << camera_yaw._ << " pitch=" << camera_pitch._ << std::endl;
+    }
+    else if (!spawns.empty())
+    {
+      auto const target = spawns.front().pos;
+      _map_view->setCameraForCapture(target + glm::vec3(0.f, 12.f, -35.f),
+                                     math::degrees(0.f),
+                                     math::degrees(18.f));
+      LogDebug << "capture-world-creatures camera firstSpawn guid=" << spawns.front().guid
+               << " target=(" << target.x << ", " << target.y << ", " << target.z << ")"
+               << " camera=(" << target.x << ", " << (target.y + 12.f) << ", " << (target.z - 35.f) << ")"
+               << std::endl;
+    }
+
+    if (char const* value = std::getenv("NOGGIT_CAPTURE_DRAW_FOG"))
+    {
+      _map_view->_draw_fog.set(std::string(value) != "0");
+    }
+
+    if (camera_position)
+    {
+      unsigned int const wmo_area_id = _map_view->getWorld()->getWMOAreaID(*camera_position);
+      unsigned int const terrain_area_id = _map_view->getWorld()->getAreaID(*camera_position);
+      unsigned int const area_id = wmo_area_id != static_cast<unsigned int>(-1) ? wmo_area_id : terrain_area_id;
+      int area_light_id = 0;
+
+      if (area_id != static_cast<unsigned int>(-1)
+          && gAreaDB.getFieldCount() > AreaDB::LightId
+          && gAreaDB.CheckIfIdExists(area_id))
+      {
+        area_light_id = gAreaDB.getByID(area_id).getInt(AreaDB::LightId);
+      }
+
+      std::ofstream trace("I:\\Twow-local\\server_dev\\noggit_captures\\lighting_trace.txt", std::ios::app);
+      trace << "capture-pre-render"
+            << " trace_env=" << (captureLightingTraceEnabled() ? 1 : 0)
+            << " pos=(" << camera_position->x << "," << camera_position->y << "," << camera_position->z << ")"
+            << " draw_fog=" << (_map_view->_draw_fog.get() ? 1 : 0)
+            << " wmo_area=" << wmo_area_id
+            << " terrain_area=" << terrain_area_id
+            << " final_area=" << area_id
+            << " area_light=" << area_light_id
+            << '\n';
+    }
+
+    LogDebug << "capture-world-creatures: render frame begin" << std::endl;
+    bool const capture_debug = []()
+    {
+      if (char const* value = std::getenv("NOGGIT_CAPTURE_DEBUG"))
+      {
+        return std::string(value) != "0";
+      }
+      return false;
+    }();
+    if (capture_debug)
+    {
+      LogDebug << "capture-world-creatures direct framebuffer render" << std::endl;
+    }
+    _map_view->setCameraDirty();
+    for (int i = 0; i < 40; ++i)
+    {
+      _map_view->getWorld()->animtime += 100.0f;
+      _map_view->getWorld()->update_models_emitters(0.1f);
+      qApp->processEvents();
+    }
+    _map_view->setCameraDirty();
+    LogDebug << "capture-world-creatures: render frame done" << std::endl;
+
+    QImage image = _map_view->grabRenderedFrameForCapture();
+    char const* capture_source = "mapview-readpixels";
+
+    if (imageLooksBlank(image))
+    {
+      if (auto* screen = _map_view->screen())
+      {
+        image = screen->grabWindow(_map_view->winId()).toImage();
+        capture_source = "screen-map-view";
+      }
+    }
+
+    if (image.isNull())
+    {
+      LogError << "capture-world-creatures: framebuffer capture was empty mapId=" << map_id << std::endl;
+      return false;
+    }
+
+    if (imageLooksBlank(image))
+    {
+      LogError << "capture-world-creatures: captured image is blank mapId=" << map_id
+               << " source=" << capture_source << std::endl;
+      return false;
+    }
+
+    bool const saved = image.save(output_path);
+    LogDebug << "capture-world-creatures result mapId=" << map_id
+             << " saved=" << saved
+             << " source=" << capture_source
+             << " path='" << output_path.toStdString() << "'"
+             << " size=" << image.width() << "x" << image.height()
+             << " status='" << _map_view->getWorld()->creatureSpawnStatus() << "'"
+             << " importantObjectFailed=" << AsyncLoader::instance().important_object_failed_loading()
+             << std::endl;
+
+    return saved && !AsyncLoader::instance().important_object_failed_loading();
   }
 
   void NoggitWindow::buildMenu()
@@ -472,6 +733,43 @@ namespace Noggit::Ui::Windows
     _buildMapListComponent->buildMapList(this);
     LogDebug << "NoggitWindow::buildMenu after buildMapList" << std::endl;
 
+    if (char const* autoload_map = std::getenv("NOGGIT_AUTOLOAD_MAP"))
+    {
+      QString const autoload_value = QString::fromUtf8(autoload_map).trimmed();
+      int autoload_map_id = -1;
+
+      bool ok = false;
+      int const parsed_id = autoload_value.toInt(&ok);
+      if (ok)
+      {
+        autoload_map_id = parsed_id;
+      }
+      else
+      {
+        for (DBCFile::Iterator it = gMapDB.begin(); it != gMapDB.end(); ++it)
+        {
+          QString const internal_name = QString::fromUtf8(it->getString(MapDB::InternalName));
+          if (internal_name.compare(autoload_value, Qt::CaseInsensitive) == 0)
+          {
+            autoload_map_id = it->getInt(MapDB::MapID);
+            break;
+          }
+        }
+      }
+
+      if (autoload_map_id >= 0)
+      {
+        QTimer::singleShot(0, this, [this, autoload_map_id]
+        {
+          loadMap(autoload_map_id);
+          if (_world)
+          {
+            check_uid_then_enter_map(glm::vec3(0.0f, 0.0f, 0.0f), math::degrees(30.f), math::degrees(90.f), false);
+          }
+        });
+      }
+    }
+
     qulonglong bookmark_index(0);
     for (auto entry: _project->Bookmarks)
     {
@@ -573,7 +871,23 @@ namespace Noggit::Ui::Windows
     } else
     {
       event->accept();
+      // No map open (project menu) -> nothing to save, so exit the process for real. Closing the
+      // window alone was leaving the app running in the background on some systems.
+      forceQuit();
     }
+  }
+
+  void NoggitWindow::forceQuit()
+  {
+    // Flush user settings (volume, window state, etc.) to disk while we still can. QSettings normally
+    // syncs on destruction, which the hard exit below skips.
+    QSettings().sync();
+
+    // Terminate immediately. This kills the render-loop timer, the AsyncLoader worker threads, and the
+    // QMediaPlayer DirectShow/WMF audio thread all at once -- none of them can keep the process alive or
+    // keep growing memory once the process is gone. std::_Exit runs no destructors (so no GL-context or
+    // async-loader teardown can hang), and we already persisted what matters above.
+    std::_Exit(0);
   }
 
   void NoggitWindow::handleEventMapListContextMenuPinMap(int mapId, std::string MapName)
@@ -616,9 +930,11 @@ namespace Noggit::Ui::Windows
         map_loaded = false;
         break;
       case QMessageBox::DestructiveRole:
-        Noggit::Ui::Tools::ViewportManager::ViewportManager::unloadAll();
-        setCentralWidget(_null_widget = new QWidget(this));
+        // User chose Exit (unsaved changes already warned as lost). Don't rely on the Qt/GL teardown to
+        // unwind cleanly -- it has been leaving the process alive in the background, leaking memory and
+        // still playing zone music. Just terminate the process.
         event->accept();
+        forceQuit();
         break;
       default:
         event->ignore();

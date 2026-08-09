@@ -44,6 +44,11 @@ public:
 
   void save(sExtendableArray& adt, int base_pos, int& info_pos, int& current_pos) const;
 
+  // Fill a vanilla MCLQ block (the exact inverse of the mclq read constructor).
+  void to_mclq(mclq& out) const;
+  // Resolved vanilla liquid type for this layer: 0 water, 1 ocean, 2 magma, 3 slime.
+  int mclq_liquid_type() const;
+
   void changeLiquidID(int id);
 
   void crop(MapChunk* chunk);
@@ -56,6 +61,8 @@ public:
   float min() const { return _minimum; }
   float max() const { return _maximum; }
   int liquidID() const { return _liquid_id; }
+  // Centre vertex of the 9x9 liquid grid (world space) -- used to place a synthetic light at lava surfaces.
+  glm::vec3 centerVertex() const { return _vertices[40]; }
 
   bool hasSubchunk(int x, int z, int size = 1) const;
   void setSubchunk(int x, int z, bool water);

@@ -8,8 +8,12 @@
 #include <opengl/shader.hpp>
 #include <array>
 
+#include <external/tsl/robin_map.h>
+#include <glm/mat4x4.hpp>
+
 class MapTile;
 class MapChunk;
+class Model;
 
 namespace Noggit::Rendering
 {
@@ -59,7 +63,25 @@ namespace Noggit::Rendering
 
     [[nodiscard]]
     bool isOverridingOcclusionCulling() const { return _tile_occlusion_cull_override; };
-    void setOverrideOcclusionCulling(bool state) { _tile_frustum_culled = state; };
+    void setOverrideOcclusionCulling(bool state) { _tile_occlusion_cull_override = state; };
+
+    // [perf 2026-08-05] Persistent per-model doodad instance buffers. A tile's static (non-per-instance-
+    // animated) M2 doodads are uploaded ONCE per model to a GPU buffer here and reused every frame -- the
+    // renderer draws the whole bucket (tile-level cull + shader slice_dist clip) instead of re-culling +
+    // re-uploading every instance per frame. Rebuilt lazily from MapTile::object_instances whenever the
+    // tile's object set changes (MapTile::doodadBuffersDirty()); freed in unload().
+    struct DoodadInstanceBuffer
+    {
+      GLuint transform_vbo = 0;
+      GLuint interior_vbo = 0;   // per-instance interior (all-zero for outdoor tile doodads; kept for WMO reuse)
+      GLsizei count = 0;
+      // [perf 2026-08-05] CPU copy of the same transforms (already computed during the rebuild) retained so the
+      // MDI doodad batcher can concatenate a model's instances across tiles into one indirect-draw instance
+      // buffer without a GPU readback or a per-frame transformMatrix() recompute. Unused when MDI is off.
+      std::vector<glm::mat4x4> cpu_transforms;
+    };
+    // Rebuilds if the tile's object set changed since the last build; returns the current per-model buffers.
+    [[nodiscard]] tsl::robin_map<Model*, DoodadInstanceBuffer> const& doodadInstanceBuffers();
 
   private:
 
@@ -74,6 +96,20 @@ namespace Noggit::Rendering
     bool _requires_sampler_reset = false;
     bool _requires_paintability_recalc = true;
     bool _texture_not_loaded = false;
+    // [wrong-texture fix 2026-08-07] PERSISTENT retry latch. _texture_not_loaded is a per-UPDATE-PASS working
+    // flag (reset each pass), so with LAZY streaming a texture miss in an early window was forgotten by the
+    // final window: the tile flag got cleared with no re-arm, orphaning the chunk's re-registered ALPHAMAP
+    // retry -> its sampler entry stayed the -1 sentinel, which the shader reads as a VALID "non-specular
+    // layer 1" of sampler slot 0 -> a whole section rendered the WRONG texture until reload. This latch stays
+    // set until a full (non-lazy) update pass resolves every pending chunk with no misses.
+    bool _pending_tex_retry = false;
+
+    // [perf 2026-08-06] Lazy per-chunk terrain streaming (NOGGIT_LAZY_CHUNK_UPLOAD). A freshly-loaded tile
+    // uploads its 256 chunks a BUDGET at a time over several frames -- drawing only the ready prefix meanwhile
+    // -- instead of all 256 in one frame, spreading the ~30-80ms TileStream spike into small per-frame costs
+    // (client-like progressive fill). Falls back to all-at-once for split-sampler tiles / edits / special passes.
+    bool _lazy_streaming = false;
+    int  _lazy_cursor = 0; // chunks uploaded so far during the current lazy stream (0..256)
 
     // culling
     unsigned _objects_frustum_cull_test = 0;
@@ -97,6 +133,11 @@ namespace Noggit::Rendering
 
     GLuint const& _chunk_instance_data_ubo = _buffers[0];
     OpenGL::ChunkInstanceDataUniformBlock _chunk_instance_data[256];
+
+    // persistent per-model doodad instance buffers (raw GL names -- lifetime managed by rebuild/free below)
+    tsl::robin_map<Model*, DoodadInstanceBuffer> _doodad_instance_buffers;
+    void rebuildDoodadInstanceBuffers();
+    void freeDoodadInstanceBuffers();
 
   };
 }

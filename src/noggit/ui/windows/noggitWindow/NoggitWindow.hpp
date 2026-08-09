@@ -13,10 +13,12 @@
 #include <QtWidgets/QStackedWidget>
 #include <string>
 #include <memory>
+#include <optional>
 #include <unordered_set>
 #include <QWidget>
 
 class StackedWidget;
+class QString;
 
 namespace Noggit::Ui
 {
@@ -38,12 +40,26 @@ namespace Noggit::Ui::Windows
           std::shared_ptr<Noggit::Project::NoggitProject> project);
 
       void promptExit(QCloseEvent* event);
+
+      // Persist settings, silence audio, then terminate the process outright. Used on the user-confirmed
+      // exit paths. The normal Qt/OpenGL/AsyncLoader teardown has repeatedly failed to actually exit on
+      // Windows -- the event loop kept running so memory grew and zone music kept playing in the
+      // background after the window "closed". A hard exit once the user has committed to quitting is the
+      // one thing that can't get stuck. (Return-to-menu does NOT go through here -- only real exit does.)
+      [[noreturn]] void forceQuit();
       void promptUidFixFailure();
       void jumpToMapPosition(int map_id,
                              glm::vec3 pos,
                              math::degrees camera_pitch = math::degrees(30.f),
                              math::degrees camera_yaw = math::degrees(90.f),
                              bool from_bookmark = false);
+      bool captureMapCreaturesToPng(int map_id,
+                                    QString const& output_path,
+                                    int width = 1280,
+                                    int height = 800,
+                                    std::optional<glm::vec3> camera_position = std::nullopt,
+                                    math::degrees camera_yaw = math::degrees(90.f),
+                                    math::degrees camera_pitch = math::degrees(30.f));
 
       QMenuBar* _menuBar;
 
@@ -77,6 +93,7 @@ namespace Noggit::Ui::Windows
                       , math::degrees camera_yaw
                       , uid_fix_mode uid_fix = uid_fix_mode::none
                       , bool from_bookmark = false
+                      , bool capture_probe = false
                       );
 
       minimap_widget* _minimap;

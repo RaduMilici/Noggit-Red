@@ -100,6 +100,13 @@ public:
 
   std::atomic<bool> changed;
 
+  // [perf 2026-08-06] Set by the renderer for every IN-FRUSTUM tile each frame; read by MapIndex::unloadTiles so
+  // a tile still on screen is NEVER unloaded even when it sits beyond unload_dist. Without this, visible far
+  // tiles (e.g. ocean at render distance) unload and render as empty flat quads -- the bug the pinned-changed
+  // memory leak used to mask. unloadTiles clears it each pass; the next frame's render re-sets it while the tile
+  // stays visible, so residency is bounded to ~frustum coverage (no unbounded growth).
+  std::atomic<bool> rendered_recently{false};
+
 
   bool intersect (math::ray const&, selection_result*) const;
 
@@ -160,6 +167,28 @@ public:
   [[nodiscard]]
   tsl::robin_map<AsyncObject*, std::vector<SceneObject*>> const& getObjectInstances() const { return object_instances; };
 
+  // Per-chunk object buckets (client MCRF semantics, checklist D1): render-only acceleration.
+  // Each of the 16x16 chunk cells lists the instances whose AABB overlaps it, plus the union AABB
+  // of those instances (can exceed the cell: objects overhang). On a partially-visible tile the
+  // renderer frustum-tests the ~33yd buckets and only per-instance-tests survivors, instead of
+  // testing every instance on the tile. Rebuilt lazily on the render thread whenever the tile's
+  // object set changes (add/remove/move all re-register through add_model/remove_model).
+  struct ObjectBucket
+  {
+    std::vector<std::pair<AsyncObject*, SceneObject*>> instances;
+    glm::vec3 aabb_min = glm::vec3(0.0f);
+    glm::vec3 aabb_max = glm::vec3(0.0f);
+  };
+
+  std::array<ObjectBucket, 256> const& getObjectBuckets();
+
+  // [perf 2026-08-05] Persistent per-model doodad instance buffers (TileRender). This dirty flag rides the
+  // SAME add/remove/move signal as _object_buckets_dirty (moves = remove+add through updateTilesEntry), so
+  // an edit that invalidates the cull buckets also invalidates the persistent GPU buffers -- TileRender
+  // rebuilds them lazily on next draw. No new invalidation surface.
+  bool doodadBuffersDirty() const { return _doodad_instance_buffers_dirty; }
+  void clearDoodadBuffersDirty() { _doodad_instance_buffers_dirty = false; }
+
   float camDist() { return _cam_dist; }
   void calcCamDist(glm::vec3 const& camera);
   void markExtentsDirty() { _extents_dirty = true; }
@@ -201,6 +230,11 @@ private:
   
   std::vector<uint32_t> uids;
   tsl::robin_map<AsyncObject*, std::vector<SceneObject*>> object_instances; // only includes M2 and WMO. perhaps a medium common ancestor then?
+
+  std::array<ObjectBucket, 256> _object_buckets;
+  bool _object_buckets_dirty = true;
+  bool _doodad_instance_buffers_dirty = true; // persistent per-model doodad buffers (TileRender); see doodadBuffersDirty()
+  void rebuildObjectBuckets();
 
   std::unique_ptr<MapChunk> mChunks[16][16];
   std::array<float, 145 * 256 * 4> _chunk_heightmap_buffer;
