@@ -812,6 +812,15 @@ uint32_t MapIndex::getHighestGUIDFromFile(const std::string& pFilename) const
 {
 	uint32_t highGUID = 0;
 
+    // [2026-08-10 crash fix] a WDT can flag tiles whose ADT files don't exist (common in custom /
+    // WMO-only maps); ClientFile THROWS on a missing file, which killed the whole map open from
+    // searchMaxUID (MapView::initializeGL -> uncaught std::exception). A missing tile simply
+    // contributes no GUIDs.
+    if (!Noggit::Application::NoggitApplication::instance()->clientData()->exists(pFilename))
+    {
+      return highGUID;
+    }
+
     BlizzardArchive::ClientFile theFile(pFilename, Noggit::Application::NoggitApplication::instance()->clientData());
     if (theFile.isEof())
     {

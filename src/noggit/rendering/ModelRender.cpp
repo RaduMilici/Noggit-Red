@@ -1861,13 +1861,21 @@ void ModelRender::hideEmitterPlaceholderCards()
   // (4-vert quad), BlackrockStatueLavaSplash (9-vert fan), LavaSteam -- every one is a 1-pass model whose
   // only mesh is a trivial opaque sheet; the particles are the visual. BlackRockLavaFalls01/02 (6-8
   // passes, 183+ verts, real geometry) must stay -- hence the pass-count and vertex-span guards.
+  //
+  // [2026-08-10 THRESHOLD FIX -- cost two days] the original <=24-vert gate ALSO swallowed the ACTIVE
+  // VolcanicVent cones (21 verts, 1 pass, own emitters). Their smoke then rose from an invisible cone
+  // while the emitterless *Off01 variants (no emitters -> never hidden) stood ~10yd away -- read in the
+  // field as "smoke misplaced off the chimneys" and hunted through the entire particle pipeline, which
+  // was correct the whole time. Real placeholder cards are 4-9 verts (flat sheets); real small meshes
+  // start ~20. The gate is now <=10 verts. If a placeholder ever exceeds 10, prefer a flatness test
+  // (degenerate extent on one axis) over raising this back.
   if (_model->_particles.empty() || _render_passes.size() > 2)
     return;
   for (auto const& pass : _render_passes)
   {
     if (pass.blend_mode <= 1
         && pass.vertex_end > pass.vertex_start
-        && static_cast<int>(pass.vertex_end) - static_cast<int>(pass.vertex_start) <= 24
+        && static_cast<int>(pass.vertex_end) - static_cast<int>(pass.vertex_start) <= 10
         && pass.submesh < _model->showGeosets.size())
     {
       _model->showGeosets[pass.submesh] = false;

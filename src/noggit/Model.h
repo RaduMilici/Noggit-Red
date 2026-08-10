@@ -66,8 +66,12 @@ public:
   } bone_flags;
 
   bone_flags flags;
-  glm::mat4x4 mat = glm::mat4x4();
-  glm::mat4x4 mrot = glm::mat4x4();
+  // IDENTITY defaults, not value-init: static WotLK models (trackless bones -> animBones=false) never
+  // run the bone calc, so these defaults ARE the runtime matrices. M2 bind pose = identity (vertices
+  // stored posed); value-init zeroed them, which collapsed every particle spawn basis to the model
+  // origin -- MC VolcanicVent tip smoke pooled at the cone base instead of the tip.
+  glm::mat4x4 mat = glm::mat4x4(1.0f);
+  glm::mat4x4 mrot = glm::mat4x4(1.0f);
 
   // For billboard glow cards: the card's local-space basis derived from its geometry + UVs at load, so the
   // screen-aligned billboard can align the TEXTURE's authored up/right with screen up/right (cards are
