@@ -9,6 +9,8 @@
 #include <math/trig.hpp>
 
 #include <set>
+#include <map>
+#include <functional>
 
 namespace math { class frustum; } // referenced by the animated-MDI batching (drawDoodadsBatched/fillMdiBones)
 
@@ -230,7 +232,7 @@ namespace Noggit::Rendering
     // so file-keying is both correct and deduplicating.
     std::unordered_map<std::string, MdiArenaSlot> _mdi_slots;     // arena location per model FILE (append-only)
     std::unordered_map<Model*, std::uint8_t> _mdi_batched_models; // per-frame: models the MDI pass drew (skip elsewhere)
-    OpenGL::Scoped::deferred_upload_buffers<7> _mdi_buffers;      // 0 arena_vbo 1 arena_ibo 2 inst_tf 3 inst_interior 4 inst_tex 5 indirect 6 bone_ssbo
+    OpenGL::Scoped::deferred_upload_buffers<8> _mdi_buffers;      // 0 arena_vbo 1 arena_ibo 2 inst_tf 3 inst_interior 4 inst_tex 5 indirect 6 bone_ssbo 7 inst_cull_class
     OpenGL::Scoped::deferred_upload_vertex_arrays<1> _mdi_vao_arr;
     bool _mdi_ready = false;
     GLsizeiptr _mdi_arena_vbo_cap = 0, _mdi_arena_ibo_cap = 0;
@@ -240,6 +242,7 @@ namespace Noggit::Rendering
     std::vector<glm::mat4x4> _mdi_scratch_tf;                     // per-frame scratch (retained to avoid re-alloc)
     std::vector<glm::vec4>   _mdi_scratch_interior;
     std::vector<glm::ivec4>  _mdi_scratch_tex;
+    std::vector<float>       _mdi_scratch_class;                  // per-instance size class 0-4 (size-class draw distance)
     std::vector<OpenGL::DrawElementsIndirectCommand> _mdi_scratch_cmds;
     // [animated MDI 2026-08-07] SHARED-pose animated batched models: each gets a FIXED bone-block slot in the
     // batched bone SSBO (buffer 6), so inst_tex.z (block base) / inst_tex.w (bone count) are STABLE across
@@ -298,6 +301,46 @@ namespace Noggit::Rendering
                             std::set<Model*> const& go_buckets,
                             glm::mat4x4 const& model_view, int animtime, bool draw_hidden_models);
 
+    // [creature MDI 2026-08-18] PHASE A: fold the far/simple instanced creature groups (creature_instanced,
+    // keyed by (Model*, display_id)) through the same per-frame pib-MDI machinery as drawDynamicBatched --
+    // one shared bone block per model + one MDI draw per state group, replacing the per-group animate() +
+    // bone-TBO STREAM churn that dominates M2Creatures. Each group carries its REPRESENTATIVE instance so the
+    // replaceable skin (array,layer) + geoset visibility resolve (resolveStaticBatch's rep path). Groups that
+    // don't fully resolve (hidden geoset, animated-uv pass, mid-fade, unresolved skin) are left OUT of
+    // out_batched so the classic loop below still draws them. Toggle NOGGIT_CREATURE_MDI (default off until
+    // validated); out_batched tells the classic loop which groups to skip.
+    std::set<std::pair<Model*, std::uint32_t>> _creature_batched;
+    void drawCreaturesBatched(
+        std::map<std::pair<Model*, std::uint32_t>, std::vector<glm::mat4x4>> const& creatures,
+        std::map<std::pair<Model*, std::uint32_t>, ModelInstance const*> const& reps,
+        std::map<std::pair<Model*, std::uint32_t>, std::vector<float>>& fades,
+        std::function<glm::vec4(glm::vec3 const&)> const& interior_at,
+        glm::mat4x4 const& model_view, int animtime, bool draw_hidden_models,
+        std::set<std::pair<Model*, std::uint32_t>>& out_batched);
+
+    // [creature body MDI 2026-08-18] PHASE A (real): fold the INDIVIDUAL creature BODY draws (the near/complex
+    // pool creature_spawn_instances_to_draw) through the pib-MDI machinery with PER-INSTANCE bone blocks (each
+    // near creature has its own live pose). Kills the per-creature draw-call + bone-TBO-upload storm that
+    // dominates M2Creatures+IndivDraw in a crowd. BODIES ONLY -- mounts / attachments / particle creatures /
+    // mid-fade / tinted / translucent stay on the individual path; a body that doesn't fully resolve
+    // (hidden-geoset-only, animated-uv/blend pass, unresolved skin, arena-full) also stays individual. Toggle
+    // NOGGIT_CREATURE_BODY_MDI (default off). World-free item struct so the hpp needn't include World.h (which
+    // already includes this header -> circular); the call site fills it where World is visible.
+    struct CreatureBodyBatchItem
+    {
+      ModelInstance* instance = nullptr;
+      std::uint32_t display_id = 0;
+      int anim_time_offset = 0;
+      float fade = 1.0f;
+      bool has_mount = false;
+    };
+    std::set<ModelInstance const*> _creature_body_batched; // bodies the batch drew; the classic loop skips them
+    void drawCreatureBodiesBatched(
+        std::vector<CreatureBodyBatchItem> const& items,
+        std::function<glm::vec4(glm::vec3 const&)> const& interior_at,
+        glm::mat4x4 const& model_view, int animtime, bool draw_hidden_models,
+        std::set<ModelInstance const*>& out_batched);
+
     // [perf 2026-08-06] AMORTIZATION: the assembled batch is cached across frames and rebuilt ONLY when the
     // visible doodad set changes (cheap per-frame signature over persistent_doodad_draws + the texture-upload
     // epoch). On a cache hit the GPU instance/indirect buffers still hold the last upload, so per-frame work
@@ -345,6 +388,25 @@ namespace Noggit::Rendering
     GLuint _bloom_fbo[2] = {0, 0};
     GLuint _bloom_tex[2] = {0, 0};
 
+    // 3.3.5a-style dynamic shadow map (client extShadowQuality 0-5, RE doc 35): a single directional
+    // depth map rendered from the scene light at END of draw() over the unit caster list (creatures +
+    // game character; environmental casters = next stage), PCF-sampled by terrain/wmo/m2 next frame.
+    // Level 0 = off (blob shadows, the client's own level-0 behaviour). Map size by level:
+    // 1/3 -> 1024, 2/4 -> 2048, 5 -> 4096 (single-map stand-in for the client's cascades).
+    void ensureShadowTarget(int size);
+    int shadowQuality() const { return _shadow_quality; }
+    bool _shadow_initialized = false;
+    GLuint _shadow_fbo = 0, _shadow_tex = 0;         // UNIT map (client: +-20yd player bubble)
+    GLuint _shadow_env_fbo = 0, _shadow_env_tex = 0; // ENVIRONMENTAL map (client: ring cascade)
+    int _shadow_size = 0;
+    int _shadow_quality = 0;              // cached from settings each frame
+    bool _shadow_map_valid = false;       // a map was rendered last frame -> receivers may sample
+    bool _shadow_env_valid = false;       // env map rendered (levels >= 3)
+    glm::mat4 _shadow_matrix{1.0f};       // world -> [0,1]^3 of the LAST rendered unit map
+    glm::vec4 _shadow_center_range{0.f};  // xyz = map world center, w = half-range (distance fade)
+    glm::mat4 _shadow_env_matrix{1.0f};
+    glm::vec4 _shadow_env_center_range{0.f};
+
     // horizon && skies && lighting
     std::unique_ptr<Noggit::map_horizon::render> _horizon_render;
     std::unique_ptr<OutdoorLighting> _outdoor_lighting;
@@ -358,6 +420,9 @@ namespace Noggit::Rendering
     Noggit::Rendering::Primitives::Line _line_render;
     Noggit::Rendering::Primitives::Circle _circle_render;
     Noggit::Rendering::Primitives::PathDecal _path_decal_render; // creature patrol routes
+    Noggit::Rendering::Primitives::WeatherEffect _weather_effect; // rain / snow precipitation
+    // GEOMETRY-MODEL particle models (checklist 12.2), lazily loaded + cached by normalized path.
+    std::unordered_map<std::string, scoped_model_reference> _geometry_particle_models;
 
     // Patrol routes DRAPED onto the walkable surface. The authored waypoints are only corner points,
     // so the straight chord between two of them cuts under a bridge deck and through a hill crest.
@@ -440,6 +505,19 @@ namespace Noggit::Rendering
     float _int_fog_end = 0.f;
     float _int_fog_start = 0.f;
     bool _int_fog_valid = false;
+    // [fog transition 2026-08-18] Temporally EASED scene fog. The TARGET (color/end/start) is recomputed each
+    // frame from the character's placement; the DISPLAYED fog fades toward it over ~NOGGIT_FOG_FADE_SECONDS so
+    // crossing the indoor/outdoor boundary animates instead of snapping. Snapped on the first frame / after a
+    // pause or teleport (frame dt out of range) so it never fades in from a stale state.
+    glm::vec3 _fog_eased_color = glm::vec3(0.f);
+    float _fog_eased_end = 0.f;
+    float _fog_eased_start = 0.f;
+    bool _fog_eased_valid = false;
+    // [fog transition 2026-08-18] Temporally eased fog-distance SCALE only (the fog colour is unchanged across
+    // a WMO boundary; only the band scales, e.g. Stormwind exterior 4x -> interior 1x). Easing just the scale
+    // fades that band without adding any lag to maps whose scale never flips (Timbermaw's MFOG-sphere fog).
+    float _fog_scale_eased = 1.f;
+    bool _fog_scale_eased_valid = false;
 
     // buffers
     OpenGL::Scoped::deferred_upload_buffers<8> _buffers;
@@ -455,8 +533,29 @@ namespace Noggit::Rendering
     // uniform blocks
     OpenGL::MVPUniformBlock _mvp_ubo_data;
     OpenGL::LightingUniformBlock _lighting_ubo_data;
+
+    // [20.4 light-collection cache] uids of instances that carry authored point lights, so the
+    // per-rebuild collection walks only them instead of every instance. pending_* = instances whose
+    // model (or a WMO's doodad models) had not finished async-loading at classification time --
+    // re-checked each rebuild until final. Valid while storage.light_epoch() == epoch; any instance
+    // add/move/remove bumps the epoch and forces a full re-derive (which costs exactly the old walk).
+    struct PointLightRegistry
+    {
+      std::vector<std::uint32_t> m2_uids;
+      std::vector<std::uint32_t> pending_m2;
+      std::vector<std::uint32_t> wmo_uids;
+      std::vector<std::uint32_t> pending_wmo;
+      std::uint64_t epoch = ~0ull;
+    };
+    PointLightRegistry _point_light_registry;
     bool _point_lights_scoped = false; // true while the UBO carries a WMO group's MOLR set
     bool _camera_inside_wmo = false;   // cached per frame; drives the WMO shader's camera_inside_wmo uniform
+    float _camera_wmo_interior_factor = 0.0f; // continuous 0..1 = depth into the WMO room over the fog falloff
+                                              // band; blends the interior fog in by distance (client-spatial)
+                                              // instead of the binary _camera_inside_wmo snap
+    glm::vec3 _fog_probe_pos = glm::vec3(0.0f); // position the fog is SELECTED from: the game character in
+                                               // 3rd person (so orbiting the camera never changes the fog),
+                                               // else the camera (editor / 1st person). Set each frame.
     OpenGL::TerrainParamsUniformBlock _terrain_params_ubo_data;
 
 

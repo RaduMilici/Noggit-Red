@@ -23,6 +23,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <vector>
 
 namespace Noggit::Rendering::VK
 {
@@ -41,15 +42,42 @@ namespace Noggit::Rendering::VK
     // (depth-tested); before any mesh it draws the ring-pattern skeleton test. False on submit failure.
     bool renderFrame(float time_seconds, bool wait_gl_done, float const* mvp16);
 
-    // [VK-1b] upload/replace the terrain mesh (position-only vertices + uint32 indices). Host-visible
-    // one-shot upload; called from the GL side when the camera's tile changes. Waits the queue idle first
-    // (tiny mesh, editor cadence -- streaming-friendly staging comes with the real pass).
-    bool setTerrainMesh(float const* xyz, std::size_t vertex_count,
+    // [VK-1] upload/replace the terrain mesh. Vertices are INTERLEAVED pos.xyz + smooth normal.xyz +
+    // MCCV colour.rgb (9 floats / 36 bytes each); uint32 indices. Host-visible one-shot upload; called from
+    // the GL side when the camera's tile neighbourhood changes. Waits the queue idle first (editor cadence).
+    bool setTerrainMesh(float const* pos_normal_interleaved, std::size_t vertex_count,
                         std::uint32_t const* indices, std::size_t index_count);
+
+    // [overnight stage 3] liquid surface mesh, SAME 36B format (colour = 1,1,1); translucent after terrain.
+    bool setWaterMesh(float const* pos_normal_interleaved, std::size_t vertex_count,
+                      std::uint32_t const* indices, std::size_t index_count);
+
+    // [overnight stage 4] instanced M2 doodads (clay). Geometry = concatenated per-model pos+normal verts +
+    // uint32 indices; instances = one mat4 (16 floats) per instance, all models' instances in one stream;
+    // draws = per-model ranges into all three. Replaced wholesale on neighbourhood change.
+    struct DoodadDraw
+    {
+      std::uint32_t first_index = 0;
+      std::uint32_t index_count = 0;
+      std::int32_t base_vertex = 0;
+      std::uint32_t first_instance = 0;
+      std::uint32_t instance_count = 0;
+    };
+    bool setDoodads(float const* pn_verts, std::size_t vertex_count,
+                    std::uint32_t const* indices, std::size_t index_count,
+                    float const* instance_mat4s, std::size_t instance_count,
+                    DoodadDraw const* draws, std::size_t draw_count);
+
+    // [overnight 04:11, DORMANT until called] replace the sampled ground texture with caller-provided RGBA8
+    // pixels (e.g. a decoded BLP). Creates a fresh image via the same staging path, repoints the descriptor,
+    // destroys the old image after a queue idle. Daylight BLP wiring becomes one call.
+    bool setGroundTexture(std::uint32_t const* rgba, std::uint32_t width, std::uint32_t height);
 
     // Win32 HANDLEs for the GL import (opaque win32; ownership stays with VK).
     [[nodiscard]] void* imageMemoryHandle() const { return _image_mem_handle; }
     [[nodiscard]] std::uint64_t imageMemorySize() const { return _image_mem_size; }
+    [[nodiscard]] void* depthMemoryHandle() const { return _depth_mem_handle; }   // null when export failed
+    [[nodiscard]] std::uint64_t depthMemorySize() const { return _depth_mem_size; }
     [[nodiscard]] void* vkDoneSemaphoreHandle() const { return _vk_done_handle; }
     [[nodiscard]] void* glDoneSemaphoreHandle() const { return _gl_done_handle; }
     [[nodiscard]] std::uint32_t width() const { return _width; }
@@ -106,11 +134,14 @@ namespace Noggit::Rendering::VK
     VkFramebuffer _framebuffer = VK_NULL_HANDLE;
     VkPipelineLayout _pipe_layout = VK_NULL_HANDLE;
     VkPipeline _pipeline = VK_NULL_HANDLE;
+    VkPipeline _sky_pipeline = VK_NULL_HANDLE; // fullscreen zenith->horizon gradient behind the terrain
 
     // [VK-1b] depth target + terrain mesh + terrain pipeline
     VkImage _depth_image = VK_NULL_HANDLE;
     VkDeviceMemory _depth_mem = VK_NULL_HANDLE;
     VkImageView _depth_view = VK_NULL_HANDLE;
+    std::uint64_t _depth_mem_size = 0;   // exported for the GL depth-compose route (optional)
+    void* _depth_mem_handle = nullptr;
     VkPipelineLayout _terrain_layout = VK_NULL_HANDLE; // mat4 mvp (vert) + time (frag) push block
     VkPipeline _terrain_pipeline = VK_NULL_HANDLE;
     VkBuffer _terrain_vbo = VK_NULL_HANDLE;
@@ -118,6 +149,37 @@ namespace Noggit::Rendering::VK
     VkBuffer _terrain_ibo = VK_NULL_HANDLE;
     VkDeviceMemory _terrain_ibo_mem = VK_NULL_HANDLE;
     std::uint32_t _terrain_index_count = 0;
+
+    // [overnight stage 6] DESCRIPTOR infrastructure (the gateway to all texturing): sampler + set layout +
+    // pool + one set pointing at a generated ground texture (staging-uploaded OPTIMAL image). The terrain
+    // pipeline layout includes the set; terrain.frag samples by world XZ. Real BLPs replace the image later.
+    bool createTextureInfra();
+    VkSampler _sampler = VK_NULL_HANDLE;
+    VkDescriptorSetLayout _dsl = VK_NULL_HANDLE;
+    VkDescriptorPool _dpool = VK_NULL_HANDLE;
+    VkDescriptorSet _dset = VK_NULL_HANDLE;
+    VkImage _ground_image = VK_NULL_HANDLE;
+    VkDeviceMemory _ground_mem = VK_NULL_HANDLE;
+    VkImageView _ground_view = VK_NULL_HANDLE;
+
+    // [overnight stage 4] doodads: instanced pipeline + geometry/instance buffers + per-model draw ranges
+    bool createDoodadPipeline();
+    VkPipeline _doodad_pipeline = VK_NULL_HANDLE;
+    VkBuffer _doodad_vbo = VK_NULL_HANDLE;
+    VkDeviceMemory _doodad_vbo_mem = VK_NULL_HANDLE;
+    VkBuffer _doodad_ibo = VK_NULL_HANDLE;
+    VkDeviceMemory _doodad_ibo_mem = VK_NULL_HANDLE;
+    VkBuffer _doodad_inst = VK_NULL_HANDLE;
+    VkDeviceMemory _doodad_inst_mem = VK_NULL_HANDLE;
+    std::vector<DoodadDraw> _doodad_draws;
+
+    // [overnight stage 3] water: terrain-pipeline clone with blending on / depth-write off + its own mesh
+    VkPipeline _water_pipeline = VK_NULL_HANDLE;
+    VkBuffer _water_vbo = VK_NULL_HANDLE;
+    VkDeviceMemory _water_vbo_mem = VK_NULL_HANDLE;
+    VkBuffer _water_ibo = VK_NULL_HANDLE;
+    VkDeviceMemory _water_ibo_mem = VK_NULL_HANDLE;
+    std::uint32_t _water_index_count = 0;
 
     // --- dynamically loaded entry points (driver's vulkan-1.dll; VK_NO_PROTOTYPES) ---
     PFN_vkGetInstanceProcAddr _vkGetInstanceProcAddr = nullptr;
@@ -182,6 +244,16 @@ namespace Noggit::Rendering::VK
     PFN_vkCmdBindIndexBuffer vkCmdBindIndexBuffer = nullptr;
     PFN_vkCmdDrawIndexed vkCmdDrawIndexed = nullptr;
     PFN_vkQueueWaitIdle vkQueueWaitIdle = nullptr;
+    PFN_vkCreateSampler vkCreateSampler = nullptr;
+    PFN_vkDestroySampler vkDestroySampler = nullptr;
+    PFN_vkCreateDescriptorSetLayout vkCreateDescriptorSetLayout = nullptr;
+    PFN_vkDestroyDescriptorSetLayout vkDestroyDescriptorSetLayout = nullptr;
+    PFN_vkCreateDescriptorPool vkCreateDescriptorPool = nullptr;
+    PFN_vkDestroyDescriptorPool vkDestroyDescriptorPool = nullptr;
+    PFN_vkAllocateDescriptorSets vkAllocateDescriptorSets = nullptr;
+    PFN_vkUpdateDescriptorSets vkUpdateDescriptorSets = nullptr;
+    PFN_vkCmdBindDescriptorSets vkCmdBindDescriptorSets = nullptr;
+    PFN_vkCmdCopyBufferToImage vkCmdCopyBufferToImage = nullptr;
   };
 }
 

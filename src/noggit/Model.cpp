@@ -23,6 +23,7 @@
 #include <limits>
 #include <map>
 #include <optional>
+#include <random>
 #include <string>
 #include <glm/gtx/euler_angles.hpp>
 #include <glm/gtx/quaternion.hpp>
@@ -84,7 +85,11 @@ namespace
     auto const& path = file_key.filepath();
     return path.find("elementalearth") != std::string::npos
         || path.find("firelord") != std::string::npos
-        || path.find("darkironnode") != std::string::npos;
+        || path.find("darkironnode") != std::string::npos
+        // [2026-08-21 Vultros] carrionbird: v256 loads clean (header/passes/bones/transparency all
+        // verified sane offline, wolf-identical) yet the creature never draws -- log its classic
+        // skin/pass pipeline to find where it dies. Remove when solved.
+        || path.find("carrionbird") != std::string::npos;
   }
 
   bool classic_m2_debug_enabled()
@@ -1070,6 +1075,33 @@ namespace
 
 void Model::initCommon(const BlizzardArchive::ClientFile& f)
 {
+  // M2 COLLISION MESH (see Model.h): in initCommon so EVERY model loads it -- it sat in
+  // initAnimated first, which static doodads (rocks, fences, many trees) never run, leaving them
+  // walk-through. Both eras (the classic header copy includes the bounding fields).
+  // nBoundingTriangles counts INDICES (client convention).
+  if (header.nBoundingTriangles && header.nBoundingVertices
+      && range_fits(f, header.ofsBoundingVertices, header.nBoundingVertices, sizeof(glm::vec3))
+      && range_fits(f, header.ofsBoundingTriangles, header.nBoundingTriangles, sizeof(uint16_t)))
+  {
+    auto const* bv = reinterpret_cast<glm::vec3 const*>(f.getBuffer() + header.ofsBoundingVertices);
+    _collision_vertices.reserve(header.nBoundingVertices);
+    for (std::size_t i = 0; i < header.nBoundingVertices; ++i)
+    {
+      _collision_vertices.push_back(fixCoordSystem(bv[i]));
+    }
+    auto const* bt = reinterpret_cast<uint16_t const*>(f.getBuffer() + header.ofsBoundingTriangles);
+    _collision_indices.assign(bt, bt + (header.nBoundingTriangles / 3) * 3);
+    for (auto const idx : _collision_indices)
+    {
+      if (idx >= _collision_vertices.size()) // corrupt-data guard: drop the mesh entirely
+      {
+        _collision_indices.clear();
+        _collision_vertices.clear();
+        break;
+      }
+    }
+  }
+
   // vertices, normals, texcoords
   _vertices = M2Array<ModelVertex>(f, header.ofsVertices, header.nVertices);
 
@@ -1903,6 +1935,21 @@ void Model::initAnimated(const BlizzardArchive::ClientFile& f)
         _animation_length[anim.animID] += anim.length;
         _animations_seq_per_id[anim.animID][anim.subAnimID] = anim;
 
+        // Idle-variation scheduler data for WOTLK models too (it only ran for classic conversions,
+        // so a wotlk character marched through ALL Stand variations back-to-back in a fixed reel
+        // instead of the client's frequency roulette). Field names are shifted vs the real v264
+        // layout (see the .anim comment above): flags@16 = frequency+padding, uid = replayMin,
+        // d2 = replayMax, playSpeed = blendTime. Verified against extracted HumanMale.M2 (v264):
+        // Stand subs 0-3 blend=500, varNext chain 0->22->23->136.
+        _anim_variations[anim.animID].push_back(
+          AnimVariation{ static_cast<int>(seq_index)
+                       , anim.length
+                       , static_cast<uint16_t>(anim.flags & 0x7FFF) // frequency
+                       , anim.uid                                    // replayMin
+                       , anim.d2                                     // replayMax
+                       , anim.playSpeed                              // blendTime ms
+                       });
+
         // ONLY sequences WITHOUT M2Sequence flag 0x20 ("primary bone sequence") keep their keyframes in an
         // external .anim; a 0x20 sequence's track offsets point INSIDE the M2 instead.
         //
@@ -2050,6 +2097,43 @@ void Model::initAnimated(const BlizzardArchive::ClientFile& f)
         {
           _hand_overlay_bones.push_back(static_cast<uint16_t>(i));
           _hand_overlay_bone_is_off.push_back(static_cast<uint8_t>(side)); // 1 = offhand/left
+        }
+      }
+
+      // [game mode] strafe twist support: mark the SpineLow (keybone 4) and Head (keybone 6)
+      // subtrees. Client distribution (RE'd 3.3.5a FUN_0073dab0 tail): body renders fully turned
+      // toward the strafe; SpineLow counter-rotates by HALF the angle (clamp 45 deg, quat keybone 4)
+      // and Head by the REMAINDER (clamp 45 deg, keybone 6) -- 90 deg strafe = legs 90 / chest 45 /
+      // head straight ahead.
+      _twist_upper_bone.assign(bones.size(), 0);
+      _twist_head_subtree.assign(bones.size(), 0);
+      for (size_t i = 0; i < bones.size(); ++i)
+      {
+        if (key_bone_ids[i] == 4 && _twist_anchor_bone < 0)
+        {
+          _twist_anchor_bone = static_cast<int>(i);
+          _twist_upper_bone[i] = 1;
+        }
+        else
+        {
+          int const parent = bones[i].parent;
+          if (parent >= 0 && static_cast<size_t>(parent) < i && _twist_upper_bone[parent])
+          {
+            _twist_upper_bone[i] = 1;
+          }
+        }
+        if (key_bone_ids[i] == 6 && _twist_head_bone < 0)
+        {
+          _twist_head_bone = static_cast<int>(i);
+          _twist_head_subtree[i] = 1;
+        }
+        else
+        {
+          int const parent = bones[i].parent;
+          if (parent >= 0 && static_cast<size_t>(parent) < i && _twist_head_subtree[parent])
+          {
+            _twist_head_subtree[i] = 1;
+          }
         }
       }
     }
@@ -2313,6 +2397,9 @@ void Model::calcBones(glm::mat4x4 const& model_view
                      , int _anim
                      , int time
                      , int animation_time
+                     , int blend_anim
+                     , int blend_time
+                     , float blend_w
                      )
 {
   // Derive each billboard glow card's local texture basis (normal / up / right) from its geometry + UVs,
@@ -2410,7 +2497,8 @@ void Model::calcBones(glm::mat4x4 const& model_view
                << std::endl;
     }
 
-    bones[i].calcMatrix(model_view, bones.data(), _file_key.stringRepr(), i, _anim, time, animation_time);
+    bones[i].calcMatrix(model_view, bones.data(), _file_key.stringRepr(), i, _anim, time, animation_time,
+                        blend_anim, blend_time, blend_w);
 
     if (capture_m2_animation_debug_enabled()
         && _file_key.filepath().find("gnomemachine") != std::string::npos)
@@ -2559,12 +2647,18 @@ bool Model::advanceIdleSchedule(int anim_id, long long anim_time,
 
   // (Re)initialise on first use or when the played animation id changes. Seed a per-instance PRNG from
   // the instance key so different spawns follow different variation timelines (no synchronized leaning).
+  // Seed ONLY ONCE per instance: reseeding on every anim-id change made the first roll after each
+  // switch deterministic -- the game character (fixed uid) rolled the IDENTICAL variation on every
+  // entry of an anim id, e.g. always the same jump.
   if (!st.init || st.anim_id != anim_id)
   {
-    std::uint64_t z = _active_idle_key * 0x9E3779B97F4A7C15ull + 0x123456789abcdefull;
-    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
-    z = (z ^ (z >> 27));
-    st.rng = static_cast<uint32_t>(z ^ (z >> 32)) | 1u; // non-zero for xorshift
+    if (!st.init)
+    {
+      std::uint64_t z = _active_idle_key * 0x9E3779B97F4A7C15ull + 0x123456789abcdefull;
+      z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+      z = (z ^ (z >> 27));
+      st.rng = static_cast<uint32_t>(z ^ (z >> 32)) | 1u; // non-zero for xorshift
+    }
     st.init = true;
     st.anim_id = anim_id;
     st.cur_seq = -1;
@@ -2584,22 +2678,22 @@ bool Model::advanceIdleSchedule(int anim_id, long long anim_time,
     return x;
   };
 
-  uint32_t freq_sum = 0;
-  for (auto const& v : vars) { freq_sum += v.frequency; }
-
   auto roll_variation = [&]() -> AnimVariation const&
   {
-    if (vars.size() == 1 || freq_sum == 0)
+    // CLIENT-EXACT pick (RE'd 12340 FUN_00826e60): roll = rand() in [0, 0x7FFF]; walk the
+    // variation chain -- roll < frequency plays that sequence, else subtract and step to the
+    // next; falling off the end keeps variation 0 (frequencies are authored to sum to 0x7FFF).
+    if (vars.size() == 1)
     {
-      return vars[next_rand() % vars.size()];
+      return vars.front();
     }
-    uint32_t roll = next_rand() % freq_sum;            // roulette over the frequency chain (client-exact)
+    uint32_t roll = next_rand() & 0x7FFF;
     for (auto const& v : vars)
     {
       if (roll < v.frequency) { return v; }
       roll -= v.frequency;
     }
-    return vars.back();
+    return vars.front();
   };
 
   // Advance the schedule to cover anim_time. Usually 0-1 iterations; more only after the instance was
@@ -2648,6 +2742,88 @@ bool Model::advanceIdleSchedule(int anim_id, long long anim_time,
   }
 
   return true;
+}
+
+namespace
+{
+  // The client treats these as one-shots: play once on the sequence-local clock, hold the last
+  // frame, completion hands back to the movement selector (RE'd 12340 FUN_0073bff0 ids).
+  bool is_one_shot_anim(int anim_id)
+  {
+    return anim_id == 1 || anim_id == 37 || anim_id == 39 || anim_id == 187;
+  }
+}
+
+void Model::rollForcedAnimVariation(std::uint64_t key, int anim_id)
+{
+  if (key == 0 || !finishedLoading())
+  {
+    return;
+  }
+  if (!is_one_shot_anim(anim_id))
+  {
+    // keep the last roll: the stored variation stays queryable until the NEXT one-shot entry
+    // (mid-flight the anim is Jump 38 but MapView still windows on JumpStart 37's ROLLED
+    // length -- clearing here reverted it to the base length and could flap 38 back into 37)
+    return;
+  }
+  auto& st = _anim_switch_states[key];
+  st.oneshot_anim_id = -1;
+  st.oneshot_seq = -1;
+  st.oneshot_len = 0;
+  auto const vit = _anim_variations.find(static_cast<uint16_t>(anim_id));
+  if (vit == _anim_variations.end() || vit->second.empty())
+  {
+    return;
+  }
+  std::vector<AnimVariation> const& vars = vit->second;
+  AnimVariation const* pick = &vars.front();
+  if (vars.size() > 1)
+  {
+    // CLIENT-EXACT pick (RE'd 12340 FUN_00826e60, CM2Model::SetAnimation with variation -1):
+    // roll = rand() in [0, 0x7FFF]; walk the variation chain -- roll < frequency plays that
+    // sequence, else subtract and step to variationNext; falling off the end keeps variation 0.
+    // Frequencies are authored to sum to 0x7FFF. Fresh roll per entry = the night elf / blood
+    // elf alternate jump fires at its authored odds instead of the same variation every time
+    // (the idle scheduler used to reseed its PRNG from the constant instance uid each switch,
+    // making every jump's "roll" identical).
+    if (st.oneshot_rng == 0)
+    {
+      st.oneshot_rng = static_cast<uint32_t>(std::random_device{}()) | 1u; // session entropy, like srand
+    }
+    uint32_t x = st.oneshot_rng;
+    x ^= x << 13; x ^= x >> 17; x ^= x << 5; // xorshift32
+    st.oneshot_rng = x;
+    uint32_t roll = x & 0x7FFF;
+    for (auto const& v : vars)
+    {
+      if (roll < v.frequency)
+      {
+        pick = &v;
+        break;
+      }
+      roll -= v.frequency;
+    }
+  }
+  st.oneshot_anim_id = anim_id;
+  st.oneshot_seq = pick->seq_index;
+  st.oneshot_len = static_cast<int>(std::max<uint32_t>(1, pick->length));
+}
+
+int Model::forcedAnimVariationLengthMs(std::uint64_t key, int anim_id)
+{
+  auto const it = _anim_switch_states.find(key);
+  if (it != _anim_switch_states.end()
+      && it->second.oneshot_anim_id == anim_id && it->second.oneshot_len > 0)
+  {
+    return it->second.oneshot_len;
+  }
+  auto const sit = _animations_seq_per_id.find(static_cast<uint16_t>(anim_id));
+  if (sit == _animations_seq_per_id.end() || sit->second.empty())
+  {
+    return 0;
+  }
+  return static_cast<int>(std::max<uint32_t>(1, sit->second.begin()->second.length));
 }
 
 void Model::animate(glm::mat4x4 const& model_view, int anim_id, int anim_time, bool upload_bones)
@@ -2724,6 +2900,57 @@ void Model::animate(glm::mat4x4 const& model_view, int anim_id, int anim_time, b
       }
     }
   }
+  // SEQUENCE-LOCAL CLOCK (client behaviour): when this INSTANCE's animation id switches, the new
+  // sequence starts at ITS OWN time 0 -- the global-clock modulo above lands mid-phase, which made
+  // JumpStart/JumpEnd begin half-played. Play-once sequences (Death, JumpStart, JumpEnd) HOLD their
+  // last frame past the end instead of wrapping (the wrap was the visible hand-snap restart);
+  // looping ones wrap locally. Applies to the per-instance forced-anim path; the classic
+  // idle-variation scheduler below keeps its own timeline.
+  AnimSwitchState* switch_st = nullptr;
+  if (anim_transition_blend_enabled() && animBones && _active_idle_key != 0)
+  {
+    auto& st = _anim_switch_states[_active_idle_key];
+    switch_st = &st;
+    if (st.last_anim_id != anim_id)
+    {
+      if (st.last_anim_id >= 0)
+      {
+        st.from_seq = st.last_seq;
+        st.from_time = st.last_seq_time;
+        st.switch_time = static_cast<long long>(anim_time);
+        // authored per-sequence blendTime, but capped: the client's movement switches ride the
+        // no-blend/fast flag path in SetAnimation (RE FUN_00832ab0 param_7) -- the 500ms Stand
+        // blendTime is for IDLE-VARIATION fades (the scheduler still uses it); a run-stop
+        // swinging limbs for half a second reads wrong vs the game.
+        st.blend_ms = std::min(animationBlendTimeMs(anim_id), 200);
+      }
+      st.anim_start = static_cast<long long>(anim_time);
+      st.last_anim_id = anim_id;
+    }
+    if (st.anim_start >= 0)
+    {
+      // _anim_time_scale: playback-rate scale (client "sprint" = Run at unit_speed / moveSpeed)
+      long long const local = std::max<long long>(
+        0, static_cast<long long>(static_cast<double>(static_cast<long long>(anim_time) - st.anim_start)
+                                  * static_cast<double>(_anim_time_scale)));
+      if (is_one_shot_anim(anim_id)) // Death, JumpStart, JumpEnd, JumpLandRun: play once, hold
+      {
+        // hold at the end of the sequence actually PLAYING: the rolled variation's length when
+        // one is stored (tmax sums ALL variations -- a two-variation JumpStart held on tmax ran
+        // past its rolled sequence instead of freezing on its last frame)
+        int const hold_len = (st.oneshot_anim_id == anim_id && st.oneshot_len > 0)
+                           ? st.oneshot_len
+                           : static_cast<int>(std::max<uint32_t>(
+                               1, _animations_seq_per_id[anim_id].begin()->second.length));
+        t = static_cast<int>(std::min<long long>(local, hold_len - 1));
+      }
+      else
+      {
+        t = static_cast<int>(local % tmax);
+      }
+    }
+  }
+
   int current_sub_anim = 0;
   int time_for_anim = t;
   bool do_blend = false;
@@ -2740,7 +2967,22 @@ void Model::animate(glm::mat4x4 const& model_view, int anim_id, int anim_time, b
   // authored blendTime (500ms for Stand). Per-instance state keeps spawns desynced.
   int sched_seq = 0;
   int sched_time = 0;
-  if (_uses_classic_layout && animBones && anim_transition_blend_enabled()
+  // era-gate removed [2026-08-10]: wotlk models now carry variation data too (loader above), so
+  // both eras get the client's frequency-roulette idle scheduling; models without variation data
+  // return false here and fall to the legacy path as before.
+  if (switch_st && is_one_shot_anim(anim_id))
+  {
+    // ONE-SHOT PATH (client SetAnimation semantics, RE'd FUN_00832ab0/FUN_00826e60): the
+    // variation was rolled ONCE at entry (rollForcedAnimVariation) and plays on the
+    // sequence-local clock computed above, holding its last frame. The idle scheduler must NOT
+    // serve these ids: its timeline wraps (a restart instead of the hold) and it re-rolls at
+    // play_end (a different jump variation switching in mid-air).
+    _current_anim_seq = (switch_st->oneshot_anim_id == anim_id && switch_st->oneshot_seq >= 0)
+                      ? switch_st->oneshot_seq
+                      : subs.begin()->second.Index;
+    _anim_time = t;
+  }
+  else if (animBones && anim_transition_blend_enabled()
       && advanceIdleSchedule(anim_id, static_cast<long long>(anim_time),
                              sched_seq, sched_time, do_blend, blend_seq_from, blend_time_from, blend_w))
   {
@@ -2807,55 +3049,131 @@ void Model::animate(glm::mat4x4 const& model_view, int anim_id, int anim_time, b
 
   _global_animtime = anim_time;
 
+  // CROSS-ANIM-ID BLEND: cross-fade whenever this INSTANCE's animation id changes (Stand->Run,
+  // Run->Jump, Jump->Stand...). The client blends every sequence switch over the M2 blendTime
+  // (typically 150 ms), FROM the old sequence frozen at its last sampled frame (1.12 RE: anim slot
+  // +0xC4 blend-from time/seq + 0x10C weight). Takes precedence over the intra-id variation fade
+  // during its window. Switch detection ran above (sequence-local clock); here we record the pose
+  // to blend FROM next switch and apply the fade window.
+  if (switch_st)
+  {
+    auto& st = *switch_st;
+    st.last_seq = _current_anim_seq;
+    st.last_seq_time = _anim_time;
+    if (st.switch_time >= 0)
+    {
+      long long const elapsed = static_cast<long long>(anim_time) - st.switch_time;
+      if (elapsed >= 0 && elapsed < st.blend_ms)
+      {
+        do_blend = true;
+        blend_seq_from = st.from_seq;
+        blend_time_from = st.from_time;
+        float const x = static_cast<float>(elapsed) / static_cast<float>(st.blend_ms);
+        blend_w = x * x * (3.0f - 2.0f * x); // weight of the TO (new) pose
+      }
+      else
+      {
+        st.switch_time = -1;
+      }
+    }
+  }
+
   if (animBones)
   {
     if (do_blend)
     {
-      // FROM pose (previous sequence at its end) -> snapshot -> TO pose (current) -> lerp in place.
-      calcBones(model_view, blend_seq_from, blend_time_from, _global_animtime);
-      if (_blend_scratch.size() != bones.size())
-      {
-        _blend_scratch.resize(bones.size());
-      }
-      for (std::size_t i = 0; i < bones.size(); ++i)
-      {
-        _blend_scratch[i] = bones[i].mat;
-      }
-      calcBones(model_view, _current_anim_seq, _anim_time, _global_animtime);
-      float const w_to = blend_w;
-      // Rigid TRS blend of the two posed skeletons. The previous component-wise matrix lerp
-      // (from*(1-w) + to*w) is NOT a valid rotation interpolation: blending two rotation matrices
-      // linearly shrinks the determinant/scale (90 deg -> ~0.707, 180 deg -> collapse), so limbs
-      // visibly shrank and detached from their parents during every idle-variation cross-fade -- the
-      // NPC animation jitter/stutter. Decompose each bone into translation + per-axis scale + rotation,
-      // SLERP the rotation and LERP translation/scale, so the blend stays rigid. (Only fires on the
-      // classic idle-variation blend path -- wotlk models use the legacy concatenation path.)
-      auto const blend_bone = [](glm::mat4x4 const& a, glm::mat4x4 const& b, float w) -> glm::mat4x4
-      {
-        float const eps = 1e-6f;
-        glm::vec3 const sa(glm::length(glm::vec3(a[0])), glm::length(glm::vec3(a[1])), glm::length(glm::vec3(a[2])));
-        glm::vec3 const sb(glm::length(glm::vec3(b[0])), glm::length(glm::vec3(b[1])), glm::length(glm::vec3(b[2])));
-        glm::mat3 const ra(glm::vec3(a[0]) / std::max(sa.x, eps), glm::vec3(a[1]) / std::max(sa.y, eps), glm::vec3(a[2]) / std::max(sa.z, eps));
-        glm::mat3 const rb(glm::vec3(b[0]) / std::max(sb.x, eps), glm::vec3(b[1]) / std::max(sb.y, eps), glm::vec3(b[2]) / std::max(sb.z, eps));
-        glm::quat qa = glm::quat_cast(ra);
-        glm::quat qb = glm::quat_cast(rb);
-        if (glm::dot(qa, qb) < 0.0f) { qb = -qb; } // shortest-arc
-        glm::quat const q = glm::normalize(glm::slerp(qa, qb, w));
-        glm::vec3 const t = glm::mix(glm::vec3(a[3]), glm::vec3(b[3]), w);
-        glm::vec3 const s = glm::mix(sa, sb, w);
-        glm::mat4x4 m = glm::mat4_cast(q);
-        m[0] *= s.x; m[1] *= s.y; m[2] *= s.z;
-        m[3] = glm::vec4(t, 1.0f);
-        return m;
-      };
-      for (std::size_t i = 0; i < bones.size(); ++i)
-      {
-        bones[i].mat = blend_bone(_blend_scratch[i], bones[i].mat, w_to);
-      }
+      // TRACK-LEVEL cross-fade (the client's anim-slot architecture, 1.12 RE): every bone samples
+      // BOTH sequences' raw translation/rotation/scale, mixes them (lerp/slerp), and builds ONE
+      // matrix -- see Bone::calcMatrix. The previous approach blended finished bone MATRICES,
+      // which desyncs bones from their joint pivots mid-fade however it is factored (object-space
+      // OR joint-local): the stretched-fingers / extended-arm one-frame artifacts on Stand->Run
+      // and Run->Jump. Blending the track values before the pivot conjugation is artifact-free by
+      // construction.
+      calcBones(model_view, _current_anim_seq, _anim_time, _global_animtime,
+                blend_seq_from, blend_time_from, blend_w);
     }
     else
     {
       calcBones(model_view, _current_anim_seq, _anim_time, _global_animtime);
+    }
+  }
+
+  // STRAFE TWIST (client-exact, RE'd 3.3.5a FUN_0073dab0 tail): the whole posed skeleton rotates
+  // to the strafe angle; SpineLow (keybone 4) counter-rotates by HALF the angle clamped to 45 deg,
+  // and Head (keybone 6) by the REMAINDER clamped to 45 deg. A hard 90 deg strafe reads legs 90 /
+  // chest 45 / head straight ahead; a 45 deg diagonal reads legs 45 / chest 22.5 / head ahead.
+  // Post-pose left-multiplies, so the hierarchy needs no surgery. No-op at twist 0.
+  if (_lower_body_twist != 0.0f && animBones && !bones.empty())
+  {
+    // BILLBOARD bones must NOT be rotated by the twist: their orientation is camera-locked (the
+    // billboard alignment ran in calcMatrix), and post-rotating them here swept the wotlk
+    // HumanMale's head cards visibly whenever the twist/yaw spring moved -- the "weird limb spin"
+    // on every start/stop/turn (classic-era models have no such cards, hence turtle was clean).
+    // They take only the twist's POSITION change below.
+    std::vector<std::pair<std::size_t, glm::mat4x4>> billboard_pre;
+    for (std::size_t i = 0; i < bones.size(); ++i)
+    {
+      if (bones[i].flags.billboard
+          || bones[i].flags.cylindrical_billboard_lock_x
+          || bones[i].flags.cylindrical_billboard_lock_y
+          || bones[i].flags.cylindrical_billboard_lock_z)
+      {
+        billboard_pre.emplace_back(i, bones[i].mat);
+      }
+    }
+
+    float const theta = _lower_body_twist;
+    float const sign = theta >= 0.0f ? 1.0f : -1.0f;
+    float const a_spine = sign * std::min(std::fabs(theta) * 0.5f, 0.7853982f);       // client 0.5, clamp pi/4
+    float const a_head = sign * std::min(std::fabs(theta) - std::fabs(a_spine), 0.7853982f);
+
+    auto const pivot_rot = [](glm::vec3 const& pivot, float angle) -> glm::mat4x4
+    {
+      return glm::translate(glm::mat4x4(1.0f), pivot)
+           * glm::rotate(glm::mat4x4(1.0f), angle, glm::vec3(0.0f, 1.0f, 0.0f))
+           * glm::translate(glm::mat4x4(1.0f), -pivot);
+    };
+
+    glm::mat4x4 const rot_all = glm::rotate(glm::mat4x4(1.0f), theta, glm::vec3(0.0f, 1.0f, 0.0f));
+    for (auto& bone : bones)
+    {
+      bone.mat = rot_all * bone.mat;
+    }
+    if (_twist_anchor_bone >= 0 && static_cast<size_t>(_twist_anchor_bone) < bones.size() && a_spine != 0.0f)
+    {
+      glm::vec3 const spine_pos =
+        glm::vec3(bones[_twist_anchor_bone].mat * glm::vec4(bones[_twist_anchor_bone].pivot, 1.0f));
+      glm::mat4x4 const rot_spine = pivot_rot(spine_pos, -a_spine);
+      for (size_t i = 0; i < bones.size(); ++i)
+      {
+        if (i < _twist_upper_bone.size() && _twist_upper_bone[i])
+        {
+          bones[i].mat = rot_spine * bones[i].mat;
+        }
+      }
+    }
+    if (_twist_head_bone >= 0 && static_cast<size_t>(_twist_head_bone) < bones.size() && a_head != 0.0f)
+    {
+      glm::vec3 const head_pos =
+        glm::vec3(bones[_twist_head_bone].mat * glm::vec4(bones[_twist_head_bone].pivot, 1.0f));
+      glm::mat4x4 const rot_head = pivot_rot(head_pos, -a_head);
+      for (size_t i = 0; i < bones.size(); ++i)
+      {
+        if (i < _twist_head_subtree.size() && _twist_head_subtree[i])
+        {
+          bones[i].mat = rot_head * bones[i].mat;
+        }
+      }
+    }
+
+    // billboard bones: restore the camera-locked ORIENTATION, keep the twisted PIVOT position
+    for (auto const& [bi, pre] : billboard_pre)
+    {
+      glm::vec3 const p_new(bones[bi].mat * glm::vec4(bones[bi].pivot, 1.0f));
+      glm::vec3 const p_old(pre * glm::vec4(bones[bi].pivot, 1.0f));
+      glm::mat4x4 m = pre;
+      m[3] += glm::vec4(p_new - p_old, 0.0f);
+      bones[bi].mat = m;
     }
   }
 
@@ -3138,6 +3456,9 @@ void Bone::calcMatrix(glm::mat4x4 const& model_view
                      , int anim
                      , int time
                      , int animtime
+                     , int blend_anim
+                     , int blend_time
+                     , float blend_w
                      )
 {
 
@@ -3145,7 +3466,10 @@ void Bone::calcMatrix(glm::mat4x4 const& model_view
 
   glm::mat4x4 m = glm::mat4x4(1);
   glm::mat4x4 mr = glm::mat4x4(1);
-  bool const has_rotation = _uses_classic_rotation ? classic_rot.uses(anim) : rot.uses(anim);
+  bool const blending = blend_anim >= 0 && blend_w < 1.0f;
+  bool const has_rotation = _uses_classic_rotation
+    ? (classic_rot.uses(anim) || (blending && classic_rot.uses(blend_anim)))
+    : (rot.uses(anim) || (blending && rot.uses(blend_anim)));
 
   if ( flags.transformed
     || flags.billboard
@@ -3157,21 +3481,16 @@ void Bone::calcMatrix(glm::mat4x4 const& model_view
   	m = glm::translate(m, pivot);
 
 
-    if (trans.uses(anim))
+    if (trans.uses(anim) || (blending && trans.uses(blend_anim)))
     {
-      if (capture_m2_animation_debug_enabled()
-          && model_name.find("gnomemachine") != std::string::npos)
+      glm::vec3 v = trans.uses(anim) ? trans.getValue(anim, time, animtime) : glm::vec3(0.0f);
+      if (blending)
       {
-        LogDebug << "Bone::calcMatrix translation begin model='" << model_name
-                 << "' bone=" << bone_index << std::endl;
+        glm::vec3 const v_from =
+          trans.uses(blend_anim) ? trans.getValue(blend_anim, blend_time, animtime) : glm::vec3(0.0f);
+        v = glm::mix(v_from, v, blend_w);
       }
-      m = glm::translate(m, trans.getValue (anim, time, animtime));
-      if (capture_m2_animation_debug_enabled()
-          && model_name.find("gnomemachine") != std::string::npos)
-      {
-        LogDebug << "Bone::calcMatrix translation end model='" << model_name
-                 << "' bone=" << bone_index << std::endl;
-      }
+      m = glm::translate(m, v);
     }
 
     if (has_rotation)
@@ -3185,7 +3504,15 @@ void Bone::calcMatrix(glm::mat4x4 const& model_view
                  << std::endl;
       }
       glm::quat ref = glm::quat_cast(glm::mat4x4(1));
-      glm::quat q = _uses_classic_rotation ? classic_rot.getValue(anim, time, animtime) : rot.getValue(anim, time, animtime);
+      bool const cur_has_rot = _uses_classic_rotation ? classic_rot.uses(anim) : rot.uses(anim);
+      glm::quat q = cur_has_rot
+        ? (_uses_classic_rotation ? classic_rot.getValue(anim, time, animtime) : rot.getValue(anim, time, animtime))
+        : glm::quat(1.0f, 0.0f, 0.0f, 0.0f);
+      // NOTE on blending: do NOT slerp the RAW track quats here. The euler-angle conversion below
+      // is discontinuous (equivalent-representation flips): each sequence's own samples convert
+      // consistently, but a quat slerped BETWEEN two sequences can cross a flip boundary -- the
+      // rendered bone snapped 180 deg (random leg/body backflips during every cross-fade). The
+      // blend instead slerps the two CONVERTED rotations after this block.
       if (capture_m2_animation_debug_enabled()
           && model_name.find("gnomemachine") != std::string::npos)
       {
@@ -3194,32 +3521,63 @@ void Bone::calcMatrix(glm::mat4x4 const& model_view
                  << " quat=(" << q.w << "," << q.x << "," << q.y << "," << q.z << ")"
                  << std::endl;
       }
-      glm::vec3 rot_euler = glm::eulerAngles(q);
+      if (cur_has_rot)
+      {
+        glm::vec3 rot_euler = glm::eulerAngles(q);
 
-      glm::vec3 test_rot_vec = glm::vec3(rot_euler[2],
-        -(rot_euler[1] + glm::radians(180.f)),
-        -(rot_euler[0] + glm::radians(180.f)));
+        glm::vec3 test_rot_vec = glm::vec3(rot_euler[2],
+          -(rot_euler[1] + glm::radians(180.f)),
+          -(rot_euler[0] + glm::radians(180.f)));
 
-      mr = glm::eulerAngleXYZ(test_rot_vec.x, test_rot_vec.y, test_rot_vec.z);
+        mr = glm::eulerAngleXYZ(test_rot_vec.x, test_rot_vec.y, test_rot_vec.z);
+      }
+      else
+      {
+        // UNKEYED in the current sequence = TRUE identity. The euler mangling above maps the
+        // identity QUAT to a 180-deg rotation -- feeding it made every cross-fade blend toward an
+        // upside-down target for bones the new anim doesn't key, then SNAP 180 deg the frame the
+        // fade ended (the whole-skeleton flip / legs-over-head). Wotlk-only in practice: classic
+        // tracks report keys for every anim, the per-sequence wotlk layout exposes the unkeyed
+        // case.
+        mr = glm::mat4x4(1.0f);
+      }
+
+      if (blending)
+      {
+        // FROM rotation built through the exact same (per-input stable) conversion pipeline, then
+        // the two finished local rotations slerp -- continuous, flip-free.
+        bool const from_has_rot = _uses_classic_rotation ? classic_rot.uses(blend_anim) : rot.uses(blend_anim);
+        glm::mat4x4 mr_from(1.0f);
+        if (from_has_rot)
+        {
+          glm::quat const qf = _uses_classic_rotation
+            ? classic_rot.getValue(blend_anim, blend_time, animtime)
+            : rot.getValue(blend_anim, blend_time, animtime);
+          glm::vec3 const ef = glm::eulerAngles(qf);
+          mr_from = glm::eulerAngleXYZ(ef[2], -(ef[1] + glm::radians(180.f)), -(ef[0] + glm::radians(180.f)));
+        }
+        glm::quat qa = glm::quat_cast(glm::mat3(mr_from));
+        glm::quat const qb = glm::quat_cast(glm::mat3(mr));
+        if (glm::dot(qa, qb) < 0.0f)
+        {
+          qa = -qa; // shortest arc
+        }
+        mr = glm::mat4_cast(glm::normalize(glm::slerp(qa, qb, blend_w)));
+      }
 
       m = m * mr;
     }
 
-    if (scale.uses(anim))
+    if (scale.uses(anim) || (blending && scale.uses(blend_anim)))
     {
-      if (capture_m2_animation_debug_enabled()
-          && model_name.find("gnomemachine") != std::string::npos)
+      glm::vec3 s = scale.uses(anim) ? scale.getValue(anim, time, animtime) : glm::vec3(1.0f);
+      if (blending)
       {
-        LogDebug << "Bone::calcMatrix scale begin model='" << model_name
-                 << "' bone=" << bone_index << std::endl;
+        glm::vec3 const s_from =
+          scale.uses(blend_anim) ? scale.getValue(blend_anim, blend_time, animtime) : glm::vec3(1.0f);
+        s = glm::mix(s_from, s, blend_w);
       }
-      m = glm::scale(m, scale.getValue (anim, time, animtime));
-      if (capture_m2_animation_debug_enabled()
-          && model_name.find("gnomemachine") != std::string::npos)
-      {
-        LogDebug << "Bone::calcMatrix scale end model='" << model_name
-                 << "' bone=" << bone_index << std::endl;
-      }
+      m = glm::scale(m, s);
     }
 
     m = glm::translate(m, -pivot);
@@ -3227,7 +3585,8 @@ void Bone::calcMatrix(glm::mat4x4 const& model_view
 
   if (parent >= 0)
   {
-    allbones[parent].calcMatrix (model_view, allbones, model_name, static_cast<size_t>(parent), anim, time, animtime);
+    allbones[parent].calcMatrix (model_view, allbones, model_name, static_cast<size_t>(parent), anim, time, animtime,
+                                 blend_anim, blend_time, blend_w);
     mat = allbones[parent].mat * m;
   }
   else
@@ -3301,14 +3660,54 @@ void Bone::calcMatrix(glm::mat4x4 const& model_view
         || flags.cylindrical_billboard_lock_y
         || flags.cylindrical_billboard_lock_z)
   {
-    // Cylindrical lock-Z geometry in 1.12 is thin VERTICAL structural mesh -- the LavaPots forge CHAINS
-    // (MELTINGPOTCHAIN) and candle threads -- NOT flames (flames are SPHERICAL 0x8, handled above; noggit's
-    // old comment claiming torches/candles are lock-Z was wrong). In-game these read as STATIC: the client's
-    // cylindrical spin around vertical is imperceptible on them, whereas ANY noggit billboard -- the old
-    // flame-card-basis remap OR a clean bone-axis spin -- visibly swung the multi-quad chain to face the
-    // camera (reported: forge chains "rotate and change orientation"). User-confirmed that rendering them in
-    // their authored REST pose matches in-game exactly. So do not billboard cylindrical-lock bones; `mat`
-    // already holds the rest pose here.
+    // [2026-08-19 client parity] Cylindrical billboards DO rotate in the client -- around the locked
+    // axis only. The previous "render rest pose" shortcut was validated on the forge CHAINS
+    // (MELTINGPOTCHAIN), which are radially symmetric tubes: a Z-spin is invisible on them, so rest
+    // pose LOOKED client-identical. But it froze cylindrical models with a distinct FRONT: the mage
+    // portals' ROOT bone is lock-Z (verified MagePortal_*.m2 b0 flags=0x40), so portals stopped
+    // turning to face the player. Lock-Z: keep model +Z as the card's up, aim the card's local X
+    // (the M2 card normal, same convention as the spherical branch) at the camera's horizontal
+    // direction, preserve pivot and hierarchy scale. Chains keep looking identical (radial symmetry);
+    // portals face the viewer like in-game. Lock-X/Y stay in rest pose until a model needing them
+    // is identified.
+    if (flags.cylindrical_billboard_lock_z)
+    {
+      // Same machinery as the spherical branch (cam basis x authored card basis via refix/canonicalize),
+      // but the camera basis is constrained to YAW ONLY: noggit model space is Y-UP (see the basis
+      // derivation comment in calcBones -- "tipping bb_local_up from vertical (0,1,0)"), so "horizontal"
+      // = the X/Z plane and the locked vertical axis is +Y. The first cut used Z-up and pitched the
+      // portals 90 degrees forward ("bowing").
+      glm::vec3 const camFwdFull = glm::normalize(glm::vec3(model_view[0][2], model_view[1][2], model_view[2][2]));
+      glm::vec3 h(camFwdFull.x, 0.0f, camFwdFull.z);
+      float const hl = glm::length(h);
+      if (hl > 1e-4f)
+      {
+        h /= hl;
+        glm::vec3 const upY(0.0f, 1.0f, 0.0f);
+        glm::vec3 const rightH = glm::normalize(glm::cross(upY, h));
+        glm::vec4 const world_pivot = mat * glm::vec4(pivot, 1.0f);
+        glm::mat3 const cam(h, rightH, upY); // columns: view axis (horizontal), screen right, vertical
+
+        bool const refix = std::abs(bb_local_up.y) < std::abs(bb_local_right.y);
+        glm::vec3 l_normal = refix ? fixCoordSystem(bb_local_normal) : bb_local_normal;
+        glm::vec3 l_right  = refix ? fixCoordSystem(bb_local_right)  : bb_local_right;
+        glm::vec3 l_up     = refix ? fixCoordSystem(bb_local_up)     : bb_local_up;
+        if (l_up.y < 0.0f) { l_up = -l_up; l_right = -l_right; }
+        glm::mat3 const local(l_normal, l_right, l_up);
+        glm::mat3 const bb3 = cam * glm::transpose(local);
+
+        glm::vec3 const bone_scale(glm::length(glm::vec3(mat[0])),
+                                   glm::length(glm::vec3(mat[1])),
+                                   glm::length(glm::vec3(mat[2])));
+        glm::mat4x4 bb(1.0f);
+        bb[0] = glm::vec4(bb3[0] * bone_scale.x, 0.0f);
+        bb[1] = glm::vec4(bb3[1] * bone_scale.y, 0.0f);
+        bb[2] = glm::vec4(bb3[2] * bone_scale.z, 0.0f);
+        glm::vec4 const rotated_pivot = bb * glm::vec4(pivot, 1.0f);
+        bb[3] = glm::vec4(glm::vec3(world_pivot) - glm::vec3(rotated_pivot), 1.0f);
+        mat = bb;
+      }
+    }
     (void)model_view;
   }
 
@@ -3387,7 +3786,20 @@ std::vector<std::pair<float, std::tuple<int, int, int>>> Model::intersect (glm::
 
   if (animated && (!animcalc || _per_instance_animation))
   {
+    // PICKING animate must not run with another instance's per-draw modifiers left on the shared
+    // Model: with the game character's _active_idle_key still set, a probe-ray animate (anim 0)
+    // advanced the CHARACTER's cross-fade state mid-run -- constant fade restarts / corrupted
+    // switch tracking on any model shared between the character and nearby scenery/NPCs.
+    std::uint64_t const saved_key = _active_idle_key;
+    float const saved_twist = _lower_body_twist;
+    float const saved_scale = _anim_time_scale;
+    _active_idle_key = 0;
+    _lower_body_twist = 0.0f;
+    _anim_time_scale = 1.0f;
     animate (model_view, 0, animtime);
+    _active_idle_key = saved_key;
+    _lower_body_twist = saved_twist;
+    _anim_time_scale = saved_scale;
     animcalc = true;
   }
 
@@ -3459,6 +3871,51 @@ void Model::swapInstanceEmitterState(std::uint64_t instance_key)
   for (std::size_t i = 0; i < _particles.size(); ++i)
   {
     _particles[i].swapLiveState(states[i]);
+  }
+
+  // ParticleColor.dbc recolor: entering a recolored spawn's state applies its colour sets to the
+  // indexed emitters; leaving (the symmetric second call) restores the authored colours so the
+  // shared state never keeps one spawn's tint.
+  bool const swapping_in = (_live_emitter_state_key != instance_key);
+  _live_emitter_state_key = swapping_in ? instance_key : 0;
+  auto const color_sets = _instance_particle_color_sets.find(instance_key);
+  for (auto& particle : _particles)
+  {
+    auto const color_index = particle.particleColorIndex();
+    if (swapping_in
+        && color_sets != _instance_particle_color_sets.end()
+        && color_index >= 11 && color_index <= 13)
+    {
+      particle.setColorOverride(color_sets->second[color_index - 11]);
+    }
+    else
+    {
+      particle.clearColorOverride();
+    }
+  }
+}
+
+bool Model::hasGeometryParticles() const
+{
+  for (auto const& p : _particles)
+  {
+    if (p.hasGeometryModel())
+    {
+      return true;
+    }
+  }
+  return false;
+}
+
+void Model::appendGeometryParticleTransforms(glm::mat4x4 const& host_transform,
+                                             std::unordered_map<std::string, std::vector<glm::mat4x4>>& out) const
+{
+  for (auto const& p : _particles)
+  {
+    if (p.hasGeometryModel())
+    {
+      p.appendGeometryParticleTransforms(host_transform, out[p.geometryModelPath()]);
+    }
   }
 }
 

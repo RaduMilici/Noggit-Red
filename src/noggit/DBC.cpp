@@ -54,6 +54,7 @@ ItemDisplayInfoDB gItemDisplayInfoDB;
 CharacterFacialHairStylesDB gCharacterFacialHairStylesDB;
 CharacterHairGeosetsDB gCharacterHairGeosetsDB;
 HelmetGeosetVisDataDB gHelmetGeosetVisDataDB;
+ParticleColorDB gParticleColorDB;
 CharacterSectionsDB gCharacterSectionsDB;
 WMOAreaTableDB gWMOAreaTableDB;
 GameObjectDisplayInfoDB gGameObjectDisplayInfoDB;
@@ -89,6 +90,7 @@ namespace
 size_t CreatureDisplayInfoExtraDB::BakedTexture() { return wotlkDbcLayout() ? 20 : 18; }
 // The cape slot WotLK added at 18; Classic has no such column (18 is BakeName there). See DBC.h.
 size_t CreatureDisplayInfoExtraDB::CapeDisplayID() { return wotlkDbcLayout() ? 18 : 0; }
+size_t CreatureDisplayInfoDB::ParticleColorID() { return wotlkDbcLayout() ? 12 : 0; }
 
 // GroundEffectTexture.dbc grew a 4-column weight array in WotLK (7 columns -> 11), pushing the
 // density and terrain-type columns back by 4. Reading the 1.12 index on WotLK data lands on
@@ -183,6 +185,7 @@ void OpenDBs(std::shared_ptr<BlizzardArchive::ClientData> clientData)
   try
   {
     gHelmetGeosetVisDataDB.open(clientData);
+    gParticleColorDB.open(clientData); // wotlk-only file; logs + stays empty on 1.12 data
   }
   catch (std::exception const& e)
   {

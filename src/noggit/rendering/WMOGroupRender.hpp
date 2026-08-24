@@ -45,7 +45,10 @@ namespace Noggit::Rendering
     // The material declares Env/EnvMetal but ships NO environment map (empty MOTX second entry). The env
     // term must not sample a texture -- noggit used to substitute the green shanecube placeholder there,
     // which the additive env term then painted over the surface (Stormwind harbour's docked ship).
-    eWMOBatch_NoEnvTexture = 0x800
+    eWMOBatch_NoEnvTexture = 0x800,
+    // group ships the dedicated mocv2 blend chunk -> two-layer blend reads the separate
+    // f_blend_alpha stream. Absent on stock groups, which keep the legacy f_vertex_color.a.
+    eWMOBatch_BlendStream = 0x1000
   };
 
   // One member batch of a combined draw call: its (contiguous) index span and its local-space AABB,
@@ -105,7 +108,7 @@ namespace Noggit::Rendering
 
     OpenGL::Scoped::deferred_upload_vertex_arrays<1> _vertex_array;
     GLuint const& _vao = _vertex_array[0];
-    OpenGL::Scoped::deferred_upload_buffers<8> _buffers;
+    OpenGL::Scoped::deferred_upload_buffers<9> _buffers;
     GLuint const& _vertices_buffer = _buffers[0];
     GLuint const& _normals_buffer = _buffers[1];
     GLuint const& _texcoords_buffer = _buffers[2];
@@ -114,6 +117,8 @@ namespace Noggit::Rendering
     GLuint const& _indices_buffer = _buffers[5];
     GLuint const& _render_batch_mapping_buffer = _buffers[6];
     GLuint const& _render_batch_tex_buffer = _buffers[7];
+    GLuint const& _blend_alphas_buffer = _buffers[8];
+    bool _has_blend_alphas = false;
 
     GLuint _render_batch_tex;
 

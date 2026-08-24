@@ -284,6 +284,13 @@ void OpenGL::context::readBuffer (GLenum target)
 #endif
   return _4_1_core_func->glReadBuffer (target);
 }
+void OpenGL::context::drawBuffer (GLenum target)
+{
+#ifndef NOGGIT_DO_NOT_CHECK_FOR_OPENGL_ERRORS
+  verify_context_and_check_for_gl_errors const _ (_current_context, NOGGIT_CURRENT_FUNCTION);
+#endif
+  return _4_1_core_func->glDrawBuffer (target);
+}
 void OpenGL::context::readPixels (GLint x, GLint y, GLsizei width, GLsizei height, GLenum format, GLenum type, GLvoid* data)
 {
 #ifndef NOGGIT_DO_NOT_CHECK_FOR_OPENGL_ERRORS
@@ -588,6 +595,20 @@ void OpenGL::context::multiDrawElementsIndirect (GLenum mode, GLenum type, const
   verify_context_and_check_for_gl_errors const _ (_current_context, NOGGIT_CURRENT_FUNCTION);
 #endif
   return _4_3_core_func->glMultiDrawElementsIndirect (mode, type, indirect, drawcount, stride);
+}
+void OpenGL::context::dispatchCompute (GLuint num_groups_x, GLuint num_groups_y, GLuint num_groups_z)
+{
+#ifndef NOGGIT_DO_NOT_CHECK_FOR_OPENGL_ERRORS
+  verify_context_and_check_for_gl_errors const _ (_current_context, NOGGIT_CURRENT_FUNCTION);
+#endif
+  return _4_3_core_func->glDispatchCompute (num_groups_x, num_groups_y, num_groups_z);
+}
+void OpenGL::context::memoryBarrier (GLbitfield barriers)
+{
+#ifndef NOGGIT_DO_NOT_CHECK_FOR_OPENGL_ERRORS
+  verify_context_and_check_for_gl_errors const _ (_current_context, NOGGIT_CURRENT_FUNCTION);
+#endif
+  return _4_3_core_func->glMemoryBarrier (barriers);
 }
 void OpenGL::context::drawElementsInstanced (GLenum mode, GLsizei count, GLenum type, GLvoid const* indices, GLsizei instancecount)
 {

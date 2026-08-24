@@ -2,6 +2,7 @@
 
 #include "WMORender.hpp"
 #include <noggit/WMO.h>
+#include <math/ray.hpp>
 #include <noggit/Log.h>
 #include <noggit/rendering/WorldRender.hpp>
 #include <noggit/project/CurrentProject.hpp>
@@ -53,7 +54,7 @@ namespace
     static bool value = true;
     if (!timer.isValid() || timer.elapsed() > 500)
     {
-      value = QSettings().value("render/wmo_portal_culling", false).toBool();
+      value = QSettings().value("render/wmo_portal_culling", true).toBool();
       timer.restart();
     }
     return value;
@@ -82,21 +83,40 @@ namespace
 
     glm::vec3 const cam_local = glm::vec3(glm::inverse(transform) * glm::vec4(camera_world, 1.0f));
 
-    // 1. Which interior group is the camera standing in? (smallest containing box)
+    // 1. Which interior group is the camera standing IN? [fix 2026-08-17] A point-in-AABB test (even with
+    // an enclose margin) mis-fires for a 3rd-person BOOM camera outside a building: the axis-aligned
+    // interior-group AABB is LOOSE, so a camera hovering over the street behind the player -- or pressed
+    // against / clipping an exterior wall -- lands inside the box and portal-culled the whole structure
+    // (floor + walls) while the player was OUTSIDE. Port the client's discriminator (FUN_007d59b0, see
+    // noggit-wmo-portal-culling-client-valid): cast a DOWNWARD ray from the camera; you are genuinely inside
+    // a room only if the NEAREST surface directly below the camera belongs to an INTERIOR group (its floor).
+    // Over open street the nearest thing below is terrain -> not a WMO group -> no hit -> outside. Against an
+    // exterior wall or above the roof the nearest surface below is an EXTERIOR group -> outside. Fails toward
+    // start = -1 (draw everything), so it never hides on-screen geometry. The downward ray's grid query is
+    // just the camera's XZ column, so this is ~1 cheap ray-cast per group the camera stands over.
     int start = -1;
-    float best_vol = std::numeric_limits<float>::max();
-    for (std::size_t g = 0; g < ng; ++g)
     {
-      if (!groups[g].is_indoor()) { continue; }
-      glm::vec3 const mn = glm::min(groups[g].BoundingBoxMin, groups[g].BoundingBoxMax);
-      glm::vec3 const mx = glm::max(groups[g].BoundingBoxMin, groups[g].BoundingBoxMax);
-      if (cam_local.x >= mn.x && cam_local.x <= mx.x
-        && cam_local.y >= mn.y && cam_local.y <= mx.y
-        && cam_local.z >= mn.z && cam_local.z <= mx.z)
+      math::ray const down(cam_local, glm::vec3(0.0f, -1.0f, 0.0f));
+      float constexpr max_below = 500.0f;
+      float nearest = std::numeric_limits<float>::max();
+      for (std::size_t g = 0; g < ng; ++g)
       {
-        glm::vec3 const s = mx - mn;
-        float const vol = s.x * s.y * s.z;
-        if (vol < best_vol) { best_vol = vol; start = static_cast<int>(g); }
+        glm::vec3 const mn = glm::min(groups[g].BoundingBoxMin, groups[g].BoundingBoxMax);
+        glm::vec3 const mx = glm::max(groups[g].BoundingBoxMin, groups[g].BoundingBoxMax);
+        // A straight-down ray can only hit this group if the camera's XZ sits over its footprint and the
+        // camera is at/above the group's top.
+        if (cam_local.x < mn.x || cam_local.x > mx.x || cam_local.z < mn.z || cam_local.z > mx.z) { continue; }
+        if (cam_local.y < mn.y) { continue; }
+        std::vector<float> hits;
+        groups[g].intersect(down, &hits, max_below);
+        for (float const h : hits)
+        {
+          if (h > 0.01f && h < nearest) // nearest surface below the camera
+          {
+            nearest = h;
+            start = (groups[g].is_indoor() && !groups[g].is_exterior()) ? static_cast<int>(g) : -1;
+          }
+        }
       }
     }
 
@@ -119,7 +139,23 @@ namespace
     std::fill(visible.begin(), visible.end(), uint8_t(0));
     for (std::size_t g = 0; g < ng; ++g)
     {
-      if (!groups[g].is_indoor() || groups[g].is_exterior()) { visible[g] = 1; } // shell / outdoor: always
+      // Always-visible groups (never portal-culled), matching the client's interior PVS marking:
+      //   * exterior shell / outdoor groups (the flood never needs them)
+      //   * SKYBOX groups (MOGP 0x40000): the interior sky/backdrop mesh, which the client always draws
+      //   * ALWAYS_DRAW groups (MOGP 0x10000): e.g. Stormwind's cathedral banners/glass (gid 18970+) --
+      //     unreachable via portals (no incoming portal ref) yet flagged always-draw, so the client shows them.
+      // DO NOT force-draw a group merely because portal_count==0. portal_count is a group's OUTGOING portals;
+      // a group with zero of them is STILL reached as a flood TARGET when another room's portal points at it
+      // (the `visible[neighbour]=1` marking below). Exempting portal_count==0 kept Stormwind's portal-culled
+      // interior rooms -- and the cathedral -- permanently drawn even from outside/below. A genuinely
+      // unreachable, non-always-draw interior room (e.g. a custom group) draws only when the camera stands in
+      // it (start=g -> visible[g]=1), exactly like the client. Timbermaw's backdrop is handled by the
+      // start-group down-ray finder above, NOT here (none of its groups are skybox/always-draw/portal-less).
+      if (!groups[g].is_indoor() || groups[g].is_exterior() || groups[g].has_skybox()
+          || groups[g].always_draw())
+      {
+        visible[g] = 1;
+      }
     }
 
     // Project portal vertices EXACTLY like wmo_vert.glsl does, or the screen rects are wrong and it culls
@@ -252,6 +288,12 @@ void WMORender::draw(OpenGL::Scoped::use_program& wmo_shader
   }
 
   wmo_shader.uniform("ambient_color",glm::vec3(_wmo->ambient_light_color));
+
+  // UNIFIED RENDER PATH (MOHD flag 0x2): the client hard-branches on this flag to the additive
+  // MapObjU shaders (interior = MOHD ambient + baked MOCV). Set per-WMO from its own flag so stock
+  // WMOs (flags 0x0) get 0 and the shader's interior branch stays byte-identical; only the retail
+  // ports and stock Stormwind carry the flag. See noggit-wmo-unified-render-path.
+  wmo_shader.uniform("wmo_unified", _wmo->flags.use_unified_render_path ? 1 : 0);
 
   // While the camera is inside a WMO, its exterior-lit + portal-spill faces are lit from THIS WMO's own
   // interior context (MOHD ambient + baked MOCV), not the outdoor map light -- there is no Light.dbc row

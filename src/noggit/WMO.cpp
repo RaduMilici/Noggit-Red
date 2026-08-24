@@ -84,9 +84,15 @@ void WMO::finishLoading ()
 
   f.seekRelative (2);
 
-  ambient_light_color.x = static_cast<float>(ambient_color.r) / 255.f;
+  // MOHD ambColor is a D3DCOLOR stored **BGRA** in the file, so the bytes land in CArgb (declared
+  // r,g,b,a) as r=Blue, b=Red -- the true linear RGB is (b, g, r). Same convention already used for
+  // the WMO liquid MOMT diffColor below. PROVEN by the Ascension apitrace (2026-08-12): the client
+  // lights that interior with ambient (0.1843,0.1216,0.0863) = (47,31,22) WARM BROWN, while these
+  // very bytes were being read as (22,31,47) COLD BLUE -- the interiors were tinted the exact
+  // inverse of the authored colour. Stormwind's (33,33,33) is grey so it never exposed this.
+  ambient_light_color.x = static_cast<float>(ambient_color.b) / 255.f;
   ambient_light_color.y = static_cast<float>(ambient_color.g) / 255.f;
-  ambient_light_color.z = static_cast<float>(ambient_color.b) / 255.f;
+  ambient_light_color.z = static_cast<float>(ambient_color.r) / 255.f;
   ambient_light_color.w = static_cast<float>(ambient_color.a) / 255.f;
 
   // - MOTX ----------------------------------------------
@@ -461,7 +467,7 @@ void WMO::waitForChildrenLoaded()
   }
 }
 
-std::vector<float> WMO::intersect (math::ray const& ray, bool do_exterior) const
+std::vector<float> WMO::intersect (math::ray const& ray, bool do_exterior, float max_dist) const
 {
   std::vector<float> results;
 
@@ -475,7 +481,7 @@ std::vector<float> WMO::intersect (math::ray const& ray, bool do_exterior) const
     if (!do_exterior && !group.is_indoor())
           continue;
 
-    group.intersect (ray, &results);
+    group.intersect (ray, &results, max_dist);
   }
 
   if (!do_exterior && results.size())
@@ -1111,18 +1117,18 @@ void WMOGroup::load()
     {
       std::vector<CImVector> mocv_2(size / sizeof(CImVector));
       f.read(mocv_2.data(), size);
+      _blend_alphas.resize(mocv_2.size());
 
       for (int i = 0; i < mocv_2.size(); ++i)
       {
         float alpha = static_cast<float>(mocv_2[i].a) / 255.f;
 
-        // the second mocv is used for texture blending only
-        if (header.flags.has_vertex_color)
+        // the second mocv is texture-blend ONLY -> its own stream, so it no longer clobbers .w
+        // (which carries the portal-openness doorway fade for indoor groups)
+        _blend_alphas[i] = alpha;
+        if (!header.flags.has_vertex_color)
         {
-          _vertex_colors[i].w = alpha;
-        }
-        else // no vertex coloring, only texture blending with the alpha
-        {
+          // no lighting MOCV: keep a placeholder colour (rgb unused; HasMOCV stays off)
           _vertex_colors.emplace_back(0.f, 0.f, 0.f, alpha);
         }
       }
@@ -1220,16 +1226,18 @@ bool WMOGroup::sample_ground_color(glm::vec3 const& local_pos, glm::vec3* out, f
   }
 
   float const top = local_pos.y + 1.0f;
-  float const bottom = local_pos.y - 12.0f;
-  float best_y = bottom;
+  float best_y = local_pos.y - 12.0f;
   bool found = false;
 
-  for (std::size_t i = 0; i + 2 < _indices.size(); i += 3)
+  // One floor-triangle test (the client's SampleGroundColor barycentric interpolation). Kept as a lambda so
+  // it can be driven from either the collision-grid cell (fast) or the full triangle list (fallback).
+  auto const test_tri = [&](std::size_t i)
   {
+    if (i + 2 >= _indices.size()) { return; }
     std::uint16_t const ia = _indices[i], ib = _indices[i + 1], ic = _indices[i + 2];
     if (ia >= _vertices.size() || ib >= _vertices.size() || ic >= _vertices.size())
     {
-      continue;
+      return;
     }
     glm::vec3 const& a = _vertices[ia];
     glm::vec3 const& b = _vertices[ib];
@@ -1240,20 +1248,20 @@ bool WMOGroup::sample_ground_color(glm::vec3 const& local_pos, glm::vec3* out, f
     float const den = (b.z - c.z) * (a.x - c.x) + (c.x - b.x) * (a.z - c.z);
     if (std::abs(den) < 1e-6f)
     {
-      continue; // vertical face (wall): no horizontal footprint to stand on
+      return; // vertical face (wall): no horizontal footprint to stand on
     }
     float const l0 = ((b.z - c.z) * (local_pos.x - c.x) + (c.x - b.x) * (local_pos.z - c.z)) / den;
     float const l1 = ((c.z - a.z) * (local_pos.x - c.x) + (a.x - c.x) * (local_pos.z - c.z)) / den;
     float const l2 = 1.f - l0 - l1;
     if (l0 < -0.001f || l1 < -0.001f || l2 < -0.001f)
     {
-      continue;
+      return;
     }
 
     float const y = l0 * a.y + l1 * b.y + l2 * c.y;
     if (y > top || y <= best_y)
     {
-      continue; // above the entity's feet, below the 12-unit reach, or below a closer floor already found
+      return; // above the entity's feet, below the 12-unit reach, or below a closer floor already found
     }
 
     // The client clamps the fixed-point barycentrics to [0,256]; mirror with a [0,1] clamp.
@@ -1273,6 +1281,38 @@ bool WMOGroup::sample_ground_color(glm::vec3 const& local_pos, glm::vec3* out, f
     }
     best_y = y;
     found = true;
+  };
+
+  // [perf 2026-08-18] Query only the floor triangles in the collision grid's cell under local_pos.xz instead
+  // of scanning EVERY triangle of the group. This was the dominant interior-lighting cost (sample_ground_color
+  // ran O(all group triangles) per unit per frame -- BucketInterior ~20ms in a WMO crowd, ~4ms after the
+  // per-frame cache; this finishes it). The grid buckets each COLLIDABLE triangle into every cell its XZ AABB
+  // overlaps, so the single containing cell holds every candidate whose footprint could contain the point --
+  // and the client itself samples the collidable floor (a downward collision ray), so this is client-faithful.
+  // Falls back to the full scan only when the grid is unavailable (degenerate group).
+  if (!_collision_grid_built)
+  {
+    buildCollisionGrid();
+  }
+  if (_collision_grid_cell > 0.0f)
+  {
+    float const inv = 1.0f / _collision_grid_cell;
+    int const cx = std::clamp(static_cast<int>((local_pos.x - _collision_grid_origin.x) * inv),
+                              0, _collision_grid_nx - 1);
+    int const cz = std::clamp(static_cast<int>((local_pos.z - _collision_grid_origin.y) * inv),
+                              0, _collision_grid_nz - 1);
+    for (std::uint32_t const i : _collision_grid[static_cast<std::size_t>(cz)
+                                                 * static_cast<std::size_t>(_collision_grid_nx) + cx])
+    {
+      test_tri(i);
+    }
+  }
+  else
+  {
+    for (std::size_t i = 0; i + 2 < _indices.size(); i += 3)
+    {
+      test_tri(i);
+    }
   }
 
   if (found && out_floor_y)
@@ -1339,6 +1379,7 @@ void WMOGroup::load_mocv(BlizzardArchive::ClientFile& f, uint32_t size)
   }
 
   compute_portal_openness();
+
 
   // there's no read so this is required
   f.seekRelative(size);
@@ -1460,8 +1501,11 @@ void WMOGroup::compute_portal_openness()
   // is the "doesn't blend with the outside light" the user saw. The portal-distance falloff and the
   // exterior-target-portal test below already scope the spill to real openings, so honouring the flag here
   // was pure regression.
+  // NOTE: the `use_mocv2_for_texture_blending` bail was REMOVED (2026-08-12). It existed only
+  // because the mocv2 blend alpha shared .w; it now has its own stream (_blend_alphas), so these
+  // groups can get their doorway fade like every other indoor group. That bail was the reason
+  // Ascension interiors hard-cut at the door while stock blended (branch-visualiser: no BLUE).
   if (!header.flags.indoor
-      || header.flags.use_mocv2_for_texture_blending
       || header.portal_count == 0
       || _vertices.empty()
       || _vertex_colors.size() < _vertices.size())
@@ -1703,20 +1747,217 @@ bool WMOGroup::is_visible( glm::mat4x4 const& transform
 }
 
 
-void WMOGroup::intersect (math::ray const& ray, std::vector<float>* results) const
+std::optional<float> WMOGroup::liquidHeightAtLocal(glm::vec3 const& p) const
+{
+  if (!lq)
+  {
+    return std::nullopt;
+  }
+  if (p.x < VertexBoxMin.x - 1.0f || p.x > VertexBoxMax.x + 1.0f
+      || p.y < VertexBoxMin.y - 1.0f || p.y > VertexBoxMax.y + 1.0f
+      || p.z < VertexBoxMin.z - 1.0f || p.z > VertexBoxMax.z + 1.0f)
+  {
+    return std::nullopt;
+  }
+  return lq->heightAtLocal(p);
+}
+
+// [perf 2026-08-17] Build the lazy 2D (XZ) collision grid over this group's COLLIDABLE triangles. See
+// WMO.h. Called once on the first reach-limited physics probe; on any degenerate/absurd bounds it leaves
+// _collision_grid_cell == 0 so intersect() transparently falls back to the full batch walk.
+void WMOGroup::buildCollisionGrid() const
+{
+  _collision_grid_built = true;
+  _collision_grid_cell = 0.0f; // 0 => unavailable; intersect() uses the batch walk instead
+
+  if (_indices.size() < 3 || _vertices.empty())
+  {
+    return;
+  }
+
+  glm::vec3 const mn(glm::min(VertexBoxMin, VertexBoxMax));
+  glm::vec3 const mx(glm::max(VertexBoxMin, VertexBoxMax));
+  float const sx = mx.x - mn.x;
+  float const sz = mx.z - mn.z;
+  if (!(sx > 0.001f && sz > 0.001f && sx < 1.0e7f && sz < 1.0e7f))
+  {
+    return; // degenerate / absurd bounds -> keep the batch-walk fallback
+  }
+
+  float constexpr cell = 4.0f; // ~4yd cells: short physics rays (<=~2yd) touch ~1-4 cells
+  int const nx = static_cast<int>(sx / cell) + 1;
+  int const nz = static_cast<int>(sz / cell) + 1;
+  if (static_cast<long long>(nx) * static_cast<long long>(nz) > 2000000LL)
+  {
+    return; // pathological extent -> fall back rather than allocate a giant grid
+  }
+
+  _collision_grid_origin = glm::vec2(mn.x, mn.z);
+  _collision_grid_cell = cell;
+  _collision_grid_nx = nx;
+  _collision_grid_nz = nz;
+  _collision_grid.assign(static_cast<std::size_t>(nx) * static_cast<std::size_t>(nz), {});
+
+  std::size_t const tri_count = _indices.size() / 3;
+  _collision_grid_visit.assign(tri_count, 0u);
+  _collision_grid_query = 0u;
+
+  float const inv = 1.0f / cell;
+  for (std::size_t tri = 0; tri < tri_count; ++tri)
+  {
+    // Only COLLIDABLE faces (same rule the physics batch walk applies) so the query needs no recheck.
+    if (tri < _material_infos.size()
+        && !const_cast<wmo_triangle_material_info&>(_material_infos[tri]).isCollidable())
+    {
+      continue;
+    }
+    std::size_t const i = tri * 3;
+    glm::vec3 const& a = _vertices[_indices[i + 0]];
+    glm::vec3 const& b = _vertices[_indices[i + 1]];
+    glm::vec3 const& c = _vertices[_indices[i + 2]];
+    int cx0 = static_cast<int>((std::min({a.x, b.x, c.x}) - mn.x) * inv);
+    int cx1 = static_cast<int>((std::max({a.x, b.x, c.x}) - mn.x) * inv);
+    int cz0 = static_cast<int>((std::min({a.z, b.z, c.z}) - mn.z) * inv);
+    int cz1 = static_cast<int>((std::max({a.z, b.z, c.z}) - mn.z) * inv);
+    cx0 = std::clamp(cx0, 0, nx - 1); cx1 = std::clamp(cx1, 0, nx - 1);
+    cz0 = std::clamp(cz0, 0, nz - 1); cz1 = std::clamp(cz1, 0, nz - 1);
+    for (int cz = cz0; cz <= cz1; ++cz)
+    {
+      for (int cx = cx0; cx <= cx1; ++cx)
+      {
+        _collision_grid[static_cast<std::size_t>(cz) * static_cast<std::size_t>(nx) + cx]
+          .push_back(static_cast<uint32_t>(i));
+      }
+    }
+  }
+}
+
+void WMOGroup::intersect (math::ray const& ray, std::vector<float>* results, float max_dist) const
 {
   if (!ray.intersect_bounds (VertexBoxMin, VertexBoxMax))
   {
     return;
   }
 
+  // Short physics probes (game mode): skip groups farther than max_dist from the probe origin.
+  // Without this every probe ray triangle-walks EVERY group whose box the infinite ray crosses --
+  // in a city WMO that's the whole city per ray, the game-mode framerate collapse. 0 = unlimited.
+  if (max_dist > 0.0f)
+  {
+    glm::vec3 const closest(glm::clamp(ray.origin(), VertexBoxMin, VertexBoxMax));
+    if (glm::distance(closest, ray.origin()) > max_dist)
+    {
+      return;
+    }
+  }
+
+  // [perf 2026-08-17] Physics probes: use the lazy collision grid so a SHORT ray tests only the triangles
+  // in the few cells its span crosses, instead of every triangle of every near batch (measured ~15ms/frame
+  // -- the game-view bottleneck). Conservative (a triangle is bucketed into every cell its XZ AABB overlaps,
+  // and we gather the ray-span AABB + a 1-cell margin), so it can never miss a triangle the batch walk would
+  // hit -> identical collision. Falls through to the batch walk below only if the grid is unavailable.
+  if (max_dist > 0.0f)
+  {
+    if (!_collision_grid_built)
+    {
+      buildCollisionGrid();
+    }
+    if (_collision_grid_cell > 0.0f)
+    {
+      glm::vec3 const o(ray.origin());
+      glm::vec3 const e(ray.position(max_dist)); // ray reach endpoint (origin + dir*max_dist)
+      float const inv = 1.0f / _collision_grid_cell;
+      auto const cell_x = [&](float x)
+      { return std::clamp(static_cast<int>((x - _collision_grid_origin.x) * inv), 0, _collision_grid_nx - 1); };
+      auto const cell_z = [&](float z)
+      { return std::clamp(static_cast<int>((z - _collision_grid_origin.y) * inv), 0, _collision_grid_nz - 1); };
+      int const cx0 = cell_x(std::min(o.x, e.x) - _collision_grid_cell);
+      int const cx1 = cell_x(std::max(o.x, e.x) + _collision_grid_cell);
+      int const cz0 = cell_z(std::min(o.z, e.z) - _collision_grid_cell);
+      int const cz1 = cell_z(std::max(o.z, e.z) + _collision_grid_cell);
+      ++_collision_grid_query;
+      std::uint32_t const q = _collision_grid_query;
+      for (int cz = cz0; cz <= cz1; ++cz)
+      {
+        for (int cx = cx0; cx <= cx1; ++cx)
+        {
+          for (uint32_t const i : _collision_grid[static_cast<std::size_t>(cz) * static_cast<std::size_t>(_collision_grid_nx) + cx])
+          {
+            std::uint32_t const tri = i / 3u;
+            if (tri < _collision_grid_visit.size())
+            {
+              if (_collision_grid_visit[tri] == q) { continue; } // already tested this query (spans cells)
+              _collision_grid_visit[tri] = q;
+            }
+            if ( auto&& distance
+               = ray.intersect_triangle ( _vertices[_indices[i + 0]]
+                                        , _vertices[_indices[i + 1]]
+                                        , _vertices[_indices[i + 2]]
+                                        )
+               )
+            {
+              results->emplace_back (*distance);
+            }
+          }
+        }
+      }
+      return;
+    }
+  }
+
+  // Lazy per-batch AABBs (see WMO.h): computed once from the converted vertices, then every
+  // reach-limited probe rejects whole batches by distance before touching a single triangle.
+  if (max_dist > 0.0f && !_batch_bounds_computed)
+  {
+    _batch_bounds.reserve(_batches.size());
+    for (auto const& batch : _batches)
+    {
+      glm::vec3 bmin(std::numeric_limits<float>::max());
+      glm::vec3 bmax(std::numeric_limits<float>::lowest());
+      for (size_t i (batch.index_start); i < batch.index_start + batch.index_count; ++i)
+      {
+        glm::vec3 const& v = _vertices[_indices[i]];
+        bmin = glm::min(bmin, v);
+        bmax = glm::max(bmax, v);
+      }
+      _batch_bounds.emplace_back(bmin, bmax);
+    }
+    _batch_bounds_computed = true;
+  }
+
   //! \todo Also allow clicking on doodads and liquids.
+  std::size_t batch_index = 0;
   for (auto&& batch : _batches)
   {
+    std::size_t const bi = batch_index++;
+    if (max_dist > 0.0f)
+    {
+      if (batch.index_count == 0)
+      {
+        continue;
+      }
+      auto const& bounds = _batch_bounds[bi];
+      glm::vec3 const closest(glm::clamp(ray.origin(), bounds.first, bounds.second));
+      if (glm::distance(closest, ray.origin()) > max_dist)
+      {
+        continue;
+      }
+    }
     for (size_t i (batch.index_start); i < batch.index_start + batch.index_count; i += 3)
     {
-      // TODO : only intersect visible triangles
-      // TODO : option to only check collision
+      // PHYSICS probes (max_dist > 0) use the CLIENT's face-collision rule: a face collides when
+      // MOPY flags say collision, or render-without-detail (isCollidable). DETAIL faces (grates,
+      // vines, door decor -- e.g. the Blackrock doorway pieces) are walk-through in the game;
+      // colliding with them made invisible walls. Editor picking (max_dist == 0) keeps every face.
+      if (max_dist > 0.0f)
+      {
+        size_t const tri = i / 3;
+        if (tri < _material_infos.size()
+            && !const_cast<wmo_triangle_material_info&>(_material_infos[tri]).isCollidable())
+        {
+          continue;
+        }
+      }
       if ( auto&& distance
          = ray.intersect_triangle ( _vertices[_indices[i + 0]]
                                   , _vertices[_indices[i + 1]]

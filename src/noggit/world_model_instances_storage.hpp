@@ -59,6 +59,44 @@ namespace Noggit
 
     unsigned int getTotalModelsCount() const { return _m2s.size() + _wmos.size(); };
 
+    // [20.4 light-collection cache] Monotonic counter bumped on any instance mutation reaching
+    // World::updateTilesModel/updateTilesWMO (add/move/remove/doodad-set change) plus clear().
+    // WorldRender's point-light registry re-derives its uid lists only when this changes; on
+    // unchanged epochs the light collection walks ONLY registered light carriers instead of
+    // every instance. Relaxed atomics: a late-observed bump just delays the re-derive one tick.
+    void bump_light_epoch() { _light_epoch.fetch_add(1, std::memory_order_relaxed); }
+    std::uint64_t light_epoch() const { return _light_epoch.load(std::memory_order_relaxed); }
+
+    // Locked uid-list visitors for the registry walks. Missing uids are skipped (a delete always
+    // bumps the epoch, so stale entries only survive until the next registry re-derive).
+    template<typename Fun>
+      void visit_m2_uids(std::vector<std::uint32_t> const& uids, Fun&& fn)
+    {
+      std::unique_lock<std::mutex> const lock (_mutex);
+      for (auto const uid : uids)
+      {
+        auto it = _m2s.find(uid);
+        if (it != _m2s.end())
+        {
+          fn(it->second);
+        }
+      }
+    }
+
+    template<typename Fun>
+      void visit_wmo_uids(std::vector<std::uint32_t> const& uids, Fun&& fn)
+    {
+      std::unique_lock<std::mutex> const lock (_mutex);
+      for (auto const uid : uids)
+      {
+        auto it = _wmos.find(uid);
+        if (it != _wmos.end())
+        {
+          fn(it->second);
+        }
+      }
+    }
+
   private: // private functions aren't thread safe
     inline bool unsafe_uid_is_used(std::uint32_t uid) const;
 
@@ -110,6 +148,7 @@ namespace Noggit
     World* _world;
     std::mutex _mutex;
     std::atomic<bool> _uid_duplicates_found = {false};
+    std::atomic<std::uint64_t> _light_epoch = {0};
 
     m2_instance_umap _m2s;
     wmo_instance_umap _wmos;

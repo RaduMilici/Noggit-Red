@@ -134,7 +134,13 @@ namespace Noggit::Rendering
     // for_pib widens the gate for the billboard-doodad (per-instance-animation) batch: additive/alpha blends
     // (2..4) and unfogged/unlit passes become batchable (carried per-group in the key). Default keeps the
     // strict tile-doodad subset.
-    [[nodiscard]] bool resolveStaticBatch(Model* m, StaticBatchKey& out, bool for_pib = false) const;
+    // [creature MDI 2026-08-18] `rep` = the representative instance for a creature batch. When non-null the
+    // classifier resolves the group's REPLACEABLE skin (array,layer) from rep->replaceTextures() instead of
+    // rejecting special textures, filters passes by rep's geoset visibility instead of m->showGeosets, and
+    // skips the "creature model" reject -- so shared-pose creature groups can fold into the pib-style MDI.
+    // rep == nullptr keeps the exact doodad behaviour (special tex -> reject, m->showGeosets, creature reject).
+    [[nodiscard]] bool resolveStaticBatch(Model* m, StaticBatchKey& out, bool for_pib = false,
+                                          ModelInstance const* rep = nullptr) const;
 
     bool operator< (const ModelRenderPass &m) const
     {

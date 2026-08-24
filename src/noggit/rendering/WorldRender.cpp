@@ -6,6 +6,7 @@
 #include <optional>
 #include <math/ray.hpp>
 #include <noggit/Log.h>
+#include <noggit/render_thread_pool.hpp>
 #include <noggit/World.h>
 #include <noggit/TileWater.hpp>
 #include <noggit/ChunkWater.hpp>
@@ -805,6 +806,13 @@ bool WorldRender::mdiEnsureModelInArena(Model* m)
 // signature so a model that becomes batchable once its texture loads correctly forces a rebuild.
 extern std::atomic<unsigned long long> g_texture_upload_epoch;
 
+// Defined in ModelRender.cpp -- controlled-geoset hide test with the model-aware bare-arm fallback (Jaina fix):
+// a controlled family whose selected id is absent from the model (human sleeve default 801) falls back to the
+// model's lowest existing variant instead of culling the real arm geometry. Shared so the batch filters below
+// match the individual draw path exactly.
+bool noggit_geoset_hidden_by_controlled_family(Model* m, std::vector<std::uint16_t> const& controlled_families,
+                                               std::vector<std::uint16_t> const& visible_ids, std::uint16_t geoset_id);
+
 void WorldRender::drawDoodadsBatched(
     std::vector<std::pair<Model*, TileRender::DoodadInstanceBuffer const*>> const& draws,
     glm::mat4x4 const& model_view, bool draw_hidden_models,
@@ -1062,6 +1070,12 @@ void WorldRender::drawMdiGroups()
   batched.uniform("unlit", 0);
   batched.uniform("masked_additive", 0);
   batched.uniform("detail_doodad", -1);
+  // NOTE (2026-08-14): tree/doodad A2C on the batched draws was REVERTED -- enabling
+  // GL_SAMPLE_ALPHA_TO_COVERAGE across the batched pass punched black holes in canopies and let
+  // A2C bleed onto other geometry (the "black world"). foliage_aa stays 0 here; only the ground-
+  // clutter grass (detail_doodad path, ModelRender) keeps the distance threshold fix, which is
+  // MSAA-independent and safe. Tree canopy AA needs a scoped per-blend-mode approach (TODO).
+  batched.uniform("foliage_aa", 0);
   batched.uniform("water_surface_effect", -1);
   batched.uniform("creature_bloom", -1);
   batched.uniform("mesh_color", glm::vec4(1.0f));
@@ -1359,6 +1373,7 @@ void WorldRender::drawPibBatched(std::vector<PibGroup>& groups)
   batched.uniform("slice_dist", 0.0f); // WMO doodads: no distance slice (matches the old pib path)
   batched.uniform("masked_additive", 0);
   batched.uniform("detail_doodad", -1);
+  batched.uniform("foliage_aa", 0); // A2C reverted (black-canopy/black-world regression)
   batched.uniform("water_surface_effect", -1);
   batched.uniform("creature_bloom", -1);
   batched.uniform("mesh_color", glm::vec4(1.0f));
@@ -1612,6 +1627,7 @@ void WorldRender::drawDynamicBatched(tsl::robin_map<Model*, std::vector<glm::mat
   batched.uniform("slice_dist", s_no_dist_fade ? 0.0f : _cull_distance); // dynamic doodads slice like the loop
   batched.uniform("masked_additive", 0);
   batched.uniform("detail_doodad", -1);
+  batched.uniform("foliage_aa", 0); // A2C reverted (black-canopy/black-world regression)
   batched.uniform("water_surface_effect", -1);
   batched.uniform("creature_bloom", -1);
   batched.uniform("mesh_color", glm::vec4(1.0f));
@@ -1690,6 +1706,699 @@ void WorldRender::drawDynamicBatched(tsl::robin_map<Model*, std::vector<glm::mat
   gl.enable(GL_CULL_FACE);
 }
 
+// [creature MDI 2026-08-18] PHASE A. Fold the far/simple instanced creature groups through the SAME per-frame
+// pib-MDI machinery as drawDynamicBatched: one shared bone block per model + one MDI draw per state group,
+// replacing the per-(model,display) animate() + bone-TBO STREAM upload churn that dominates M2Creatures. Each
+// group carries its representative instance (rep) so resolveStaticBatch can resolve the replaceable skin
+// (array,layer) and per-display geoset visibility. A group that doesn't FULLY resolve (hidden geoset,
+// unbatchable pass, mid-fade, unresolved skin) is left OUT of out_batched so the classic loop still draws it.
+void WorldRender::drawCreaturesBatched(
+    std::map<std::pair<Model*, std::uint32_t>, std::vector<glm::mat4x4>> const& creatures,
+    std::map<std::pair<Model*, std::uint32_t>, ModelInstance const*> const& reps,
+    std::map<std::pair<Model*, std::uint32_t>, std::vector<float>>& fades,
+    std::function<glm::vec4(glm::vec3 const&)> const& interior_at,
+    glm::mat4x4 const& model_view, int animtime, bool draw_hidden_models,
+    std::set<std::pair<Model*, std::uint32_t>>& out_batched)
+{
+  out_batched.clear();
+  if (creatures.empty())
+    return;
+
+  ensureMdiArena();
+  ensurePibMdi();
+
+  _pib_scratch_tf.clear();
+  _pib_scratch_interior.clear();
+  _pib_scratch_tex.clear();
+  _pib_scratch_cmds.clear();
+  _pib_scratch_bones.clear();
+
+  // The classic creature loop resets animcalc=false per group at DRAW time so the shared pose is recomputed
+  // this frame; we run before it, and a creature model that is ONLY ever batched is reset nowhere else -- so
+  // reset up front here. animate() in the loop below then latches once per model (all its display groups share
+  // the pose). model_animtime is frozen when animations are toggled off, so a re-animate there is idempotent
+  // (same frozen pose). Without this a batched-only creature animates once and then freezes forever.
+  for (auto const& e : creatures)
+    if (e.first.first) { e.first.first->animcalc = false; }
+
+  std::map<StaticBatchKey, std::vector<OpenGL::DrawElementsIndirectCommand>> keyed;
+  std::size_t batched_groups = 0, batched_instances = 0;
+
+  for (auto const& entry : creatures)
+  {
+    Model* const m = entry.first.first;
+    auto const& transforms = entry.second;
+    if (!m || transforms.empty())
+      continue;
+    if (!m->finishedLoading() || m->loading_failed())
+      continue;
+    if (!draw_hidden_models && m->is_hidden())
+      continue;
+    // any instance mid-distance-fade -> whole group falls back (the constant-alpha batch can't fade)
+    {
+      auto const fit = fades.find(entry.first);
+      if (fit != fades.end())
+      {
+        bool fading = false;
+        for (float f : fit->second)
+          if (f < 0.999f) { fading = true; break; }
+        if (fading)
+          continue;
+      }
+    }
+    auto const rep_it = reps.find(entry.first);
+    ModelInstance const* const rep = rep_it != reps.end() ? rep_it->second : nullptr;
+    if (!rep)
+      continue; // a creature group needs its representative instance to resolve the skin + geosets
+    if (!mdiEnsureModelInArena(m))
+      continue;
+    auto const& passes = m->renderer()->renderPasses();
+    if (passes.empty())
+      continue;
+    // Per-display geoset visibility (mirror prepareDraw): a pass whose geoset this DISPLAY hides is simply not
+    // drawn (skipped) -- it is NOT a reason to fail the whole group. Creatures routinely hide geosets, so the
+    // doodad-style "any pass fails -> fall the whole group back" would batch almost nothing. Only a genuinely
+    // UNBATCHABLE visible pass (animated-uv, disallowed blend, z_buffered, unresolved skin) drops the whole
+    // group to the classic per-group path.
+    std::vector<bool> const& vis =
+      !rep->geosetVisibility().empty() ? rep->geosetVisibility() : m->showGeosets;
+    std::vector<std::pair<std::uint32_t, StaticBatchKey>> pass_keys;
+    pass_keys.reserve(passes.size());
+    bool all_ok = true;
+    for (std::uint32_t pi = 0; pi < passes.size(); ++pi)
+    {
+      ModelRenderPass const& p = passes[pi];
+      if (p.submesh >= vis.size() || !vis[p.submesh])
+        continue; // geoset hidden for this display -> don't draw this pass (not a group failure)
+      if (!rep->controlledGeosetFamilies().empty()
+          && noggit_geoset_hidden_by_controlled_family(m, rep->controlledGeosetFamilies(),
+                                                       rep->visibleGeosetIds(), static_cast<std::uint16_t>(p.geoset_id)))
+        continue; // controlled family hides this geoset id (with bare-arm fallback) -> don't draw this pass
+      StaticBatchKey k;
+      if (!p.resolveStaticBatch(m, k, /*for_pib=*/ true, rep)) { all_ok = false; break; }
+      pass_keys.emplace_back(pi, k);
+    }
+    if (!all_ok || pass_keys.empty())
+      continue; // unbatchable visible pass -> classic per-group draw; or nothing visible -> nothing to batch
+
+    auto const slot_it = _mdi_slots.find(m->file_key().stringRepr());
+    if (slot_it == _mdi_slots.end() || !slot_it->second.ok)
+      continue;
+    MdiArenaSlot const& slot = slot_it->second;
+
+    // SHARED pose: one animate per model per frame (animcalc latch), one bone block all its instances share.
+    // Different display groups of the same model share the animation (only the skin differs). This matches the
+    // classic instanced creature draw, which also animates the model once and reuses the pose for the group.
+    std::uint32_t bone_base = 0, bone_count = 0;
+    if (m->animBones)
+    {
+      if (!m->animcalc)
+      {
+        m->animate(model_view, 0, animtime);
+        m->animcalc = true;
+      }
+      if (!m->bone_matrices.empty())
+      {
+        bone_count = static_cast<std::uint32_t>(m->bone_matrices.size());
+        bone_base = static_cast<std::uint32_t>(_pib_scratch_bones.size());
+        _pib_scratch_bones.insert(_pib_scratch_bones.end(), m->bone_matrices.begin(), m->bone_matrices.end());
+      }
+    }
+
+    // Interior light per INSTANCE (once), not per pass -- interior_at is a real spatial volume lookup, so
+    // calling it passes*instances times (the naive nested form) is a large hidden cost on creatures.
+    std::vector<glm::vec4> inter(transforms.size());
+    for (std::size_t i = 0; i < transforms.size(); ++i)
+      inter[i] = interior_at ? interior_at(glm::vec3(transforms[i][3])) : glm::vec4(0.0f);
+
+    for (auto const& pk : pass_keys)
+    {
+      ModelRenderPass const& pass = passes[pk.first];
+      StaticBatchKey const& key = pk.second;
+      OpenGL::DrawElementsIndirectCommand cmd;
+      cmd.count = pass.index_count;
+      cmd.instanceCount = static_cast<GLuint>(transforms.size());
+      cmd.firstIndex = slot.index_base + pass.index_start;
+      cmd.baseVertex = slot.base_vertex;
+      cmd.baseInstance = static_cast<GLuint>(_pib_scratch_tf.size());
+      keyed[key].push_back(cmd);
+
+      glm::ivec4 const tex(key.layer0, key.layer1,
+                           static_cast<int>(bone_base), static_cast<int>(bone_count));
+      for (std::size_t i = 0; i < transforms.size(); ++i)
+      {
+        _pib_scratch_tf.push_back(transforms[i]);
+        _pib_scratch_interior.push_back(inter[i]);
+        _pib_scratch_tex.push_back(tex);
+      }
+    }
+    out_batched.insert(entry.first);
+    ++batched_groups;
+    batched_instances += transforms.size();
+    _world->_n_rendered_objects += transforms.size();
+  }
+
+  // [CRE-MDI diag] coverage: how many (model,display) groups + instances actually folded into the batch vs
+  // fell back to the classic per-group path. Throttled; only runs when NOGGIT_CREATURE_MDI is on.
+  {
+    static int s_diag_tick = 0;
+    if ((s_diag_tick++ % 120) == 0)
+      LogError << "[CRE-MDI] batched " << batched_groups << "/" << creatures.size() << " groups, "
+               << batched_instances << " instances, " << keyed.size() << " state-groups" << std::endl;
+  }
+
+  if (keyed.empty())
+    return;
+
+  // Command layout: opaque/alpha-key groups first, then blended (identical to drawDynamicBatched).
+  struct CreDrawGroup { StaticBatchKey key; std::uint32_t first_cmd; std::uint32_t cmd_count; };
+  std::vector<CreDrawGroup> draw_groups;
+  draw_groups.reserve(keyed.size());
+  for (int blended = 0; blended <= 1; ++blended)
+  {
+    for (auto const& kv : keyed)
+    {
+      bool const is_blended = kv.first.blend_mode >= 2;
+      if (static_cast<int>(is_blended) != blended)
+        continue;
+      CreDrawGroup dg;
+      dg.key = kv.first;
+      dg.first_cmd = static_cast<std::uint32_t>(_pib_scratch_cmds.size());
+      _pib_scratch_cmds.insert(_pib_scratch_cmds.end(), kv.second.begin(), kv.second.end());
+      dg.cmd_count = static_cast<std::uint32_t>(kv.second.size());
+      draw_groups.push_back(dg);
+    }
+  }
+
+  // Upload (bufferData orphaning -> safe to reuse the pib buffers; the later pib pass re-orphans them).
+  gl.bindBuffer(GL_ARRAY_BUFFER, _pib_buffers[0]);
+  gl.bufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(_pib_scratch_tf.size() * sizeof(glm::mat4x4)), _pib_scratch_tf.data(), GL_STREAM_DRAW);
+  gl.bindBuffer(GL_ARRAY_BUFFER, _pib_buffers[1]);
+  gl.bufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(_pib_scratch_interior.size() * sizeof(glm::vec4)), _pib_scratch_interior.data(), GL_STREAM_DRAW);
+  gl.bindBuffer(GL_ARRAY_BUFFER, _pib_buffers[2]);
+  gl.bufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(_pib_scratch_tex.size() * sizeof(glm::ivec4)), _pib_scratch_tex.data(), GL_STREAM_DRAW);
+  gl.bindBuffer(GL_ARRAY_BUFFER, 0);
+  gl.bindBuffer(GL_DRAW_INDIRECT_BUFFER, _pib_buffers[3]);
+  gl.bufferData(GL_DRAW_INDIRECT_BUFFER, static_cast<GLsizeiptr>(_pib_scratch_cmds.size() * sizeof(OpenGL::DrawElementsIndirectCommand)), _pib_scratch_cmds.data(), GL_STREAM_DRAW);
+
+  constexpr GLenum SSBO_TARGET = 0x90D2;
+  if (!_pib_scratch_bones.empty())
+  {
+    GLsizeiptr const bone_bytes = static_cast<GLsizeiptr>(_pib_scratch_bones.size() * sizeof(glm::mat4x4));
+    gl.bindBuffer(SSBO_TARGET, _pib_buffers[4]);
+    gl.bufferData(SSBO_TARGET, bone_bytes, _pib_scratch_bones.data(), GL_STREAM_DRAW);
+    gl.bindBuffer(SSBO_TARGET, 0);
+    gl.bindBufferRange(SSBO_TARGET, 0, _pib_buffers[4], 0, bone_bytes);
+  }
+
+  OpenGL::Scoped::use_program batched {*_m2_batched_program.get()};
+  batched.uniform("model_origin", glm::vec3(0.0f));
+  batched.uniform("slice_dist", 0.0f); // creatures fade by OPACITY, never pixel-slice (mirror the classic loop)
+  batched.uniform("masked_additive", 0);
+  batched.uniform("detail_doodad", -1);
+  batched.uniform("foliage_aa", 0);
+  batched.uniform("water_surface_effect", -1);
+  batched.uniform("creature_bloom", -1);
+  batched.uniform("mesh_color", glm::vec4(1.0f));
+  batched.uniform("anim_bones", false);
+  batched.uniform("bone_matrix_count", 0);
+  batched.uniform("per_instance_bone_stride", 0);
+  batched.uniform("tex_matrix_1", glm::mat4x4(1.0f));
+  batched.uniform("tex_matrix_2", glm::mat4x4(1.0f));
+
+  gl.depthMask(GL_TRUE);
+
+  gl.bindVertexArray(_pib_vao_arr[0]);
+  gl.bindBuffer(GL_DRAW_INDIRECT_BUFFER, _pib_buffers[3]);
+
+  int last_cull = -1, last_blend = -1, last_ps = -1, last_tu0 = -1, last_tu1 = -1, last_c0 = -1, last_c1 = -1;
+  int last_unfogged = -1, last_unlit = -1;
+  GLuint last_a0 = 0xFFFFFFFFu, last_a1 = 0xFFFFFFFFu;
+  for (CreDrawGroup const& gr : draw_groups)
+  {
+    int const want_cull = gr.key.backface_cull ? 1 : 0;
+    if (want_cull != last_cull)
+    {
+      if (want_cull) gl.enable(GL_CULL_FACE); else gl.disable(GL_CULL_FACE);
+      last_cull = want_cull;
+    }
+    if (static_cast<int>(gr.key.blend_mode) != last_blend)
+    {
+      switch (static_cast<M2Blend>(gr.key.blend_mode))
+      {
+        default:
+        case M2Blend::Opaque:
+        case M2Blend::Alpha_Key:
+          gl.disable(GL_BLEND);
+          break;
+        case M2Blend::Alpha:
+          gl.enable(GL_BLEND);
+          gl.blendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+          break;
+        case M2Blend::No_Add_Alpha:
+        case M2Blend::Add:
+          gl.enable(GL_BLEND);
+          gl.blendFunc(GL_ONE, GL_ONE);
+          break;
+      }
+      batched.uniform("blend_mode", static_cast<int>(gr.key.blend_mode));
+      last_blend = static_cast<int>(gr.key.blend_mode);
+    }
+    if (static_cast<int>(gr.key.unfogged) != last_unfogged)
+    { batched.uniform("unfogged", static_cast<int>(gr.key.unfogged)); last_unfogged = static_cast<int>(gr.key.unfogged); }
+    if (static_cast<int>(gr.key.unlit) != last_unlit)
+    { batched.uniform("unlit", static_cast<int>(gr.key.unlit)); last_unlit = static_cast<int>(gr.key.unlit); }
+    if (gr.key.pixel_shader != last_ps)
+    { batched.uniform("pixel_shader", gr.key.pixel_shader); last_ps = gr.key.pixel_shader; }
+    if (gr.key.tu_lookup0 != last_tu0)
+    { batched.uniform("tex_unit_lookup_1", gr.key.tu_lookup0); last_tu0 = gr.key.tu_lookup0; }
+    if (gr.key.tu_lookup1 != last_tu1)
+    { batched.uniform("tex_unit_lookup_2", gr.key.tu_lookup1); last_tu1 = gr.key.tu_lookup1; }
+    if (gr.key.tex_clamp0 != last_c0)
+    { batched.uniform("tex1_clamp", gr.key.tex_clamp0); last_c0 = gr.key.tex_clamp0; }
+    if (gr.key.tex_clamp1 != last_c1)
+    { batched.uniform("tex2_clamp", gr.key.tex_clamp1); last_c1 = gr.key.tex_clamp1; }
+    if (gr.key.tex_array0 != last_a0)
+    { gl.activeTexture(static_cast<GLenum>(GL_TEXTURE0 + 1)); gl.bindTexture(GL_TEXTURE_2D_ARRAY, gr.key.tex_array0); last_a0 = gr.key.tex_array0; }
+    if (gr.key.tex_array1 && gr.key.tex_array1 != last_a1)
+    { gl.activeTexture(static_cast<GLenum>(GL_TEXTURE0 + 2)); gl.bindTexture(GL_TEXTURE_2D_ARRAY, gr.key.tex_array1); last_a1 = gr.key.tex_array1; }
+
+    gl.multiDrawElementsIndirect(GL_TRIANGLES, GL_UNSIGNED_SHORT,
+        reinterpret_cast<void*>(static_cast<std::size_t>(gr.first_cmd) * sizeof(OpenGL::DrawElementsIndirectCommand)),
+        static_cast<GLsizei>(gr.cmd_count), 0);
+  }
+
+  gl.bindVertexArray(0);
+  gl.bindBuffer(GL_DRAW_INDIRECT_BUFFER, 0);
+  gl.disable(GL_BLEND);
+  gl.depthMask(GL_TRUE);
+  gl.enable(GL_CULL_FACE);
+}
+
+// [creature body MDI 2026-08-18] PHASE A (real). Batch the INDIVIDUAL creature BODY draws with PER-INSTANCE
+// bone blocks -- mirrors drawPibBatched's per-instance-bone MDI + drawCreaturesBatched's rep skin/geoset
+// resolve, but animates each body itself (the individual pre-pass recipe) so every near creature keeps its own
+// live pose. BODIES ONLY; the caller keeps mounts/attachments/particles/mid-fade on the classic path and
+// restores each batched body's _animation_bones before its attachment draws (attachment placement reads it).
+void WorldRender::drawCreatureBodiesBatched(
+    std::vector<CreatureBodyBatchItem> const& items,
+    std::function<glm::vec4(glm::vec3 const&)> const& interior_at,
+    glm::mat4x4 const& model_view, int animtime, bool draw_hidden_models,
+    std::set<ModelInstance const*>& out_batched)
+{
+  out_batched.clear();
+  if (items.empty())
+    return;
+
+  ensureMdiArena();
+  ensurePibMdi();
+
+  // 1) Classify the batchable BODIES. Anything rejected stays on the individual path (safe fallback).
+  struct BItem { ModelInstance* inst; Model* m; std::uint32_t display_id; int anim_time_offset; };
+  std::vector<BItem> batchable;
+  batchable.reserve(items.size());
+  // [CRE-BODY-DIAG 2026-08-19] tally WHY bodies reject (all 0/N -> find the universal gate). Remove once fixed.
+  int cr_null=0, cr_load=0, cr_hidden=0, cr_fade=0, cr_alpha=0, cr_tint=0, cr_mount=0, cr_part=0, cr_bones=0;
+  for (auto const& it : items)
+  {
+    ModelInstance* const inst = it.instance;
+    if (!inst) { ++cr_null; continue; }
+    Model* const m = inst->model.get();
+    if (!m || !m->finishedLoading() || m->loading_failed()) { ++cr_load; continue; }
+    if (!draw_hidden_models && m->is_hidden()) { ++cr_hidden; continue; }
+    if (it.fade < 0.999f) { ++cr_fade; continue; }                  // mid-fade -> constant-alpha batch can't fade
+    if (inst->model_alpha < 0.999f) { ++cr_alpha; continue; }       // translucent creature
+    if (inst->model_tint != glm::vec3(1.0f)) { ++cr_tint; continue; } // tinted creature
+    if (it.has_mount) { ++cr_mount; continue; }                     // mounted -> individual (seat bones)
+    if (!m->_particles.empty() || !m->_ribbons.empty()) { ++cr_part; continue; } // particle/ribbon body
+    if (!m->animBones) { ++cr_bones; continue; }                    // no skeleton -> not this path
+    batchable.push_back({inst, m, it.display_id, it.anim_time_offset});
+  }
+  {
+    static int s_cd_tick = 0;
+    if ((s_cd_tick++ % 120) == 0)
+      LogError << "[CRE-BODY-CLASS] items=" << items.size() << " batchable=" << batchable.size()
+               << " rej: null=" << cr_null << " load=" << cr_load << " hidden=" << cr_hidden
+               << " fade=" << cr_fade << " alpha=" << cr_alpha << " tint=" << cr_tint
+               << " mount=" << cr_mount << " particle=" << cr_part << " bones=" << cr_bones << std::endl;
+  }
+  if (batchable.empty())
+    return;
+
+  // 2) PER-INSTANCE animate (the individual pre-pass recipe, upload_bones=false = CPU only, no GL on workers).
+  //    Grouped BY MODEL so same-model instances stay serial (animate() mutates shared Model state); distinct
+  //    models run across the pool. Store each pose locally AND into inst->_animation_bones -- the attachment
+  //    placement + shadow pass read that, so a batched body still seats its gear and casts a correct shadow.
+  std::vector<std::vector<glm::mat4x4>> per_instance_bones(batchable.size());
+  {
+    noggit::perf::Scoped _prof_ca(noggit::perf::Phase::AnimateCPU);
+    std::unordered_map<Model*, std::vector<std::size_t>> by_model;
+    for (std::size_t i = 0; i < batchable.size(); ++i) { by_model[batchable[i].m].push_back(i); }
+    std::vector<std::pair<Model*, std::vector<std::size_t>>> groups(by_model.begin(), by_model.end());
+    auto const animate_group = [&](std::pair<Model*, std::vector<std::size_t>>& grp)
+    {
+      Model* const m = grp.first;
+      for (std::size_t idx : grp.second)
+      {
+        ModelInstance* const inst = batchable[idx].inst;
+        int const c_animtime = animtime + batchable[idx].anim_time_offset;
+        int anim_id = inst->forcedAnimationId() >= 0 ? inst->forcedAnimationId() : 0;
+        if (anim_id != 0 && !m->hasAnimationId(anim_id)) { anim_id = 0; }
+        m->_hand_overlay_active_main = inst->closeHandMain();
+        m->_hand_overlay_active_off = inst->closeHandOff();
+        m->_lower_body_twist = inst->lower_body_twist;
+        m->_anim_time_scale = inst->anim_time_scale;
+        m->_active_idle_key = static_cast<std::uint64_t>(inst->uid);
+        m->animcalc = false;
+        m->animate(model_view * inst->transformMatrix(), anim_id, c_animtime, /*upload_bones=*/false);
+        per_instance_bones[idx] = m->bone_matrices;
+        inst->_animation_bones = m->bone_matrices; // client-parity: the unit OWNS its bones
+      }
+    };
+    if (auto* tp = noggit::render_pool())
+      tp->parallel_for(groups.size(), [&](std::size_t gi) { animate_group(groups[gi]); });
+    else
+      for (auto& g : groups) { animate_group(g); }
+  }
+
+  // 3) Group by (model, display_id): one skin + geoset per group, PER-INSTANCE bones.
+  std::map<std::pair<Model*, std::uint32_t>, std::vector<std::size_t>> grouped;
+  for (std::size_t i = 0; i < batchable.size(); ++i)
+    grouped[std::make_pair(batchable[i].m, batchable[i].display_id)].push_back(i);
+
+  _pib_scratch_tf.clear();
+  _pib_scratch_interior.clear();
+  _pib_scratch_tex.clear();
+  _pib_scratch_cmds.clear();
+  _pib_scratch_bones.clear();
+  std::map<StaticBatchKey, std::vector<OpenGL::DrawElementsIndirectCommand>> keyed;
+  std::size_t batched_bodies = 0;
+  // [CRE-BODY-DIAG] per-group reject tally + resolveStaticBatch reject-code histogram (see log below).
+  extern thread_local int g_last_static_batch_reject; // set by ModelRenderPass::resolveStaticBatch's rej()
+  int g_arena=0, g_passes=0, g_resolve=0, g_novis=0, g_slot=0, g_bones=0;
+  int resolve_codes[16] = {0};
+
+  for (auto const& gkv : grouped)
+  {
+    Model* const m = gkv.first.first;
+    auto const& idxs = gkv.second;
+    ModelInstance* const rep = batchable[idxs[0]].inst; // skin + geoset representative for the group
+    if (!mdiEnsureModelInArena(m)) { ++g_arena; continue; }
+    auto const& passes = m->renderer()->renderPasses();
+    if (passes.empty()) { ++g_passes; continue; }
+
+    // visible batchable passes (rep skin/geoset) -- same rule as drawCreaturesBatched.
+    std::vector<bool> const& vis = !rep->geosetVisibility().empty() ? rep->geosetVisibility() : m->showGeosets;
+    std::vector<std::pair<std::uint32_t, StaticBatchKey>> pass_keys;
+    pass_keys.reserve(passes.size());
+    bool all_ok = true;
+    for (std::uint32_t pi = 0; pi < passes.size(); ++pi)
+    {
+      ModelRenderPass const& p = passes[pi];
+      if (p.submesh >= vis.size() || !vis[p.submesh])
+        continue; // geoset hidden -> don't draw this pass (not a group failure)
+      if (!rep->controlledGeosetFamilies().empty()
+          && noggit_geoset_hidden_by_controlled_family(m, rep->controlledGeosetFamilies(),
+                                                       rep->visibleGeosetIds(), static_cast<std::uint16_t>(p.geoset_id)))
+        continue;
+      StaticBatchKey k;
+      if (!p.resolveStaticBatch(m, k, /*for_pib=*/ true, rep))
+      { all_ok = false; resolve_codes[g_last_static_batch_reject & 15]++; break; }
+      pass_keys.emplace_back(pi, k);
+    }
+    if (!all_ok || pass_keys.empty())
+    { if (!all_ok) { ++g_resolve; } else { ++g_novis; } continue; } // unbatchable pass / nothing visible
+
+    auto const slot_it = _mdi_slots.find(m->file_key().stringRepr());
+    if (slot_it == _mdi_slots.end() || !slot_it->second.ok) { ++g_slot; continue; }
+    MdiArenaSlot const& slot = slot_it->second;
+
+    // PER-INSTANCE bone blocks: append each instance's own pose; inst_tex.z indexes its block base.
+    std::uint32_t const bone_count = static_cast<std::uint32_t>(m->bone_matrices.size());
+    std::uint32_t const group_bone_base = static_cast<std::uint32_t>(_pib_scratch_bones.size());
+    bool bones_ok = bone_count > 0;
+    for (std::size_t gi = 0; gi < idxs.size() && bones_ok; ++gi)
+    {
+      auto const& bones = per_instance_bones[idxs[gi]];
+      if (bones.size() != bone_count) { bones_ok = false; break; }
+      _pib_scratch_bones.insert(_pib_scratch_bones.end(), bones.begin(), bones.end());
+    }
+    if (!bones_ok) { ++g_bones; continue; } // pose missing / size mismatch -> group stays individual (rare)
+
+    // interior light per INSTANCE (once, not per pass) -- interior_at is a real spatial lookup.
+    std::vector<glm::vec4> inter(idxs.size());
+    for (std::size_t gi = 0; gi < idxs.size(); ++gi)
+    {
+      glm::mat4x4 const tf = batchable[idxs[gi]].inst->transformMatrix();
+      inter[gi] = interior_at ? interior_at(glm::vec3(tf[3])) : glm::vec4(0.0f);
+    }
+
+    for (auto const& pk : pass_keys)
+    {
+      ModelRenderPass const& pass = passes[pk.first];
+      StaticBatchKey const& key = pk.second;
+      OpenGL::DrawElementsIndirectCommand cmd;
+      cmd.count = pass.index_count;
+      cmd.instanceCount = static_cast<GLuint>(idxs.size());
+      cmd.firstIndex = slot.index_base + pass.index_start;
+      cmd.baseVertex = slot.base_vertex;
+      cmd.baseInstance = static_cast<GLuint>(_pib_scratch_tf.size());
+      keyed[key].push_back(cmd);
+
+      for (std::size_t gi = 0; gi < idxs.size(); ++gi)
+      {
+        _pib_scratch_tf.push_back(batchable[idxs[gi]].inst->transformMatrix());
+        _pib_scratch_interior.push_back(inter[gi]);
+        _pib_scratch_tex.push_back(glm::ivec4(key.layer0, key.layer1,
+            static_cast<int>(group_bone_base + static_cast<std::uint32_t>(gi) * bone_count),
+            static_cast<int>(bone_count)));
+      }
+    }
+    for (std::size_t gi = 0; gi < idxs.size(); ++gi)
+    {
+      out_batched.insert(batchable[idxs[gi]].inst);
+      ++batched_bodies;
+      ++_world->_n_rendered_objects;
+    }
+  }
+
+  {
+    static int s_diag_tick = 0;
+    if ((s_diag_tick++ % 120) == 0)
+      LogError << "[CRE-BODY-MDI] batched " << batched_bodies << "/" << items.size()
+               << " bodies, " << keyed.size() << " state-groups; groups=" << grouped.size()
+               << " grej: arena=" << g_arena << " passes=" << g_passes << " resolve=" << g_resolve
+               << " novis=" << g_novis << " slot=" << g_slot << " bones=" << g_bones
+               << " | resolve-code: blend(3)=" << resolve_codes[3] << " flags(4)=" << resolve_codes[4]
+               << " color(5)=" << resolve_codes[5] << " alpha(7)=" << resolve_codes[7]
+               << " tex0(12)=" << resolve_codes[12] << " tex1(13)=" << resolve_codes[13]
+               << " animuv(14)=" << resolve_codes[14] << std::endl;
+  }
+
+  if (keyed.empty())
+    return;
+
+  // Command layout: opaque/alpha-key groups first, then blended (identical to drawCreaturesBatched).
+  struct BodyDrawGroup { StaticBatchKey key; std::uint32_t first_cmd; std::uint32_t cmd_count; };
+  std::vector<BodyDrawGroup> draw_groups;
+  draw_groups.reserve(keyed.size());
+  for (int blended = 0; blended <= 1; ++blended)
+  {
+    for (auto const& kv : keyed)
+    {
+      bool const is_blended = kv.first.blend_mode >= 2;
+      if (static_cast<int>(is_blended) != blended)
+        continue;
+      BodyDrawGroup dg;
+      dg.key = kv.first;
+      dg.first_cmd = static_cast<std::uint32_t>(_pib_scratch_cmds.size());
+      _pib_scratch_cmds.insert(_pib_scratch_cmds.end(), kv.second.begin(), kv.second.end());
+      dg.cmd_count = static_cast<std::uint32_t>(kv.second.size());
+      draw_groups.push_back(dg);
+    }
+  }
+
+  gl.bindBuffer(GL_ARRAY_BUFFER, _pib_buffers[0]);
+  gl.bufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(_pib_scratch_tf.size() * sizeof(glm::mat4x4)), _pib_scratch_tf.data(), GL_STREAM_DRAW);
+  gl.bindBuffer(GL_ARRAY_BUFFER, _pib_buffers[1]);
+  gl.bufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(_pib_scratch_interior.size() * sizeof(glm::vec4)), _pib_scratch_interior.data(), GL_STREAM_DRAW);
+  gl.bindBuffer(GL_ARRAY_BUFFER, _pib_buffers[2]);
+  gl.bufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(_pib_scratch_tex.size() * sizeof(glm::ivec4)), _pib_scratch_tex.data(), GL_STREAM_DRAW);
+  gl.bindBuffer(GL_ARRAY_BUFFER, 0);
+  gl.bindBuffer(GL_DRAW_INDIRECT_BUFFER, _pib_buffers[3]);
+  gl.bufferData(GL_DRAW_INDIRECT_BUFFER, static_cast<GLsizeiptr>(_pib_scratch_cmds.size() * sizeof(OpenGL::DrawElementsIndirectCommand)), _pib_scratch_cmds.data(), GL_STREAM_DRAW);
+
+  constexpr GLenum SSBO_TARGET = 0x90D2;
+  if (!_pib_scratch_bones.empty())
+  {
+    GLsizeiptr const bone_bytes = static_cast<GLsizeiptr>(_pib_scratch_bones.size() * sizeof(glm::mat4x4));
+    gl.bindBuffer(SSBO_TARGET, _pib_buffers[4]);
+    gl.bufferData(SSBO_TARGET, bone_bytes, _pib_scratch_bones.data(), GL_STREAM_DRAW);
+    gl.bindBuffer(SSBO_TARGET, 0);
+    gl.bindBufferRange(SSBO_TARGET, 0, _pib_buffers[4], 0, bone_bytes);
+  }
+
+  OpenGL::Scoped::use_program batched {*_m2_batched_program.get()};
+  batched.uniform("model_origin", glm::vec3(0.0f));
+  batched.uniform("slice_dist", 0.0f); // creatures fade by OPACITY, never pixel-slice
+  batched.uniform("masked_additive", 0);
+  batched.uniform("detail_doodad", -1);
+  batched.uniform("foliage_aa", 0);
+  batched.uniform("water_surface_effect", -1);
+  batched.uniform("creature_bloom", -1);
+  batched.uniform("mesh_color", glm::vec4(1.0f));
+  batched.uniform("anim_bones", false);
+  batched.uniform("bone_matrix_count", 0);
+  batched.uniform("per_instance_bone_stride", 0);
+  batched.uniform("tex_matrix_1", glm::mat4x4(1.0f));
+  batched.uniform("tex_matrix_2", glm::mat4x4(1.0f));
+
+  gl.depthMask(GL_TRUE);
+  gl.bindVertexArray(_pib_vao_arr[0]);
+  gl.bindBuffer(GL_DRAW_INDIRECT_BUFFER, _pib_buffers[3]);
+
+  int last_cull = -1, last_blend = -1, last_ps = -1, last_tu0 = -1, last_tu1 = -1, last_c0 = -1, last_c1 = -1;
+  int last_unfogged = -1, last_unlit = -1;
+  GLuint last_a0 = 0xFFFFFFFFu, last_a1 = 0xFFFFFFFFu;
+  for (BodyDrawGroup const& gr : draw_groups)
+  {
+    int const want_cull = gr.key.backface_cull ? 1 : 0;
+    if (want_cull != last_cull)
+    {
+      if (want_cull) gl.enable(GL_CULL_FACE); else gl.disable(GL_CULL_FACE);
+      last_cull = want_cull;
+    }
+    if (static_cast<int>(gr.key.blend_mode) != last_blend)
+    {
+      switch (static_cast<M2Blend>(gr.key.blend_mode))
+      {
+        default:
+        case M2Blend::Opaque:
+        case M2Blend::Alpha_Key:
+          gl.disable(GL_BLEND);
+          break;
+        case M2Blend::Alpha:
+          gl.enable(GL_BLEND);
+          gl.blendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+          break;
+        case M2Blend::No_Add_Alpha:
+        case M2Blend::Add:
+          gl.enable(GL_BLEND);
+          gl.blendFunc(GL_ONE, GL_ONE);
+          break;
+      }
+      batched.uniform("blend_mode", static_cast<int>(gr.key.blend_mode));
+      last_blend = static_cast<int>(gr.key.blend_mode);
+    }
+    if (static_cast<int>(gr.key.unfogged) != last_unfogged)
+    { batched.uniform("unfogged", static_cast<int>(gr.key.unfogged)); last_unfogged = static_cast<int>(gr.key.unfogged); }
+    if (static_cast<int>(gr.key.unlit) != last_unlit)
+    { batched.uniform("unlit", static_cast<int>(gr.key.unlit)); last_unlit = static_cast<int>(gr.key.unlit); }
+    if (gr.key.pixel_shader != last_ps)
+    { batched.uniform("pixel_shader", gr.key.pixel_shader); last_ps = gr.key.pixel_shader; }
+    if (gr.key.tu_lookup0 != last_tu0)
+    { batched.uniform("tex_unit_lookup_1", gr.key.tu_lookup0); last_tu0 = gr.key.tu_lookup0; }
+    if (gr.key.tu_lookup1 != last_tu1)
+    { batched.uniform("tex_unit_lookup_2", gr.key.tu_lookup1); last_tu1 = gr.key.tu_lookup1; }
+    if (gr.key.tex_clamp0 != last_c0)
+    { batched.uniform("tex1_clamp", gr.key.tex_clamp0); last_c0 = gr.key.tex_clamp0; }
+    if (gr.key.tex_clamp1 != last_c1)
+    { batched.uniform("tex2_clamp", gr.key.tex_clamp1); last_c1 = gr.key.tex_clamp1; }
+    if (gr.key.tex_array0 != last_a0)
+    { gl.activeTexture(static_cast<GLenum>(GL_TEXTURE0 + 1)); gl.bindTexture(GL_TEXTURE_2D_ARRAY, gr.key.tex_array0); last_a0 = gr.key.tex_array0; }
+    if (gr.key.tex_array1 && gr.key.tex_array1 != last_a1)
+    { gl.activeTexture(static_cast<GLenum>(GL_TEXTURE0 + 2)); gl.bindTexture(GL_TEXTURE_2D_ARRAY, gr.key.tex_array1); last_a1 = gr.key.tex_array1; }
+
+    gl.multiDrawElementsIndirect(GL_TRIANGLES, GL_UNSIGNED_SHORT,
+        reinterpret_cast<void*>(static_cast<std::size_t>(gr.first_cmd) * sizeof(OpenGL::DrawElementsIndirectCommand)),
+        static_cast<GLsizei>(gr.cmd_count), 0);
+  }
+
+  gl.bindVertexArray(0);
+  gl.bindBuffer(GL_DRAW_INDIRECT_BUFFER, 0);
+  gl.disable(GL_BLEND);
+  gl.depthMask(GL_TRUE);
+  gl.enable(GL_CULL_FACE);
+}
+
+namespace
+{
+  // [GPU-driven 2026-08-17] ONE-TIME validation that GL compute shaders actually run + produce correct
+  // results on THIS GPU/driver, logged before we build GPU skeleton animation on top of them. Compiles a
+  // trivial compute program that writes a known pattern to an SSBO, dispatches it, reads it back, verifies.
+  // If this logs FAIL we know not to trust the compute path on this machine (rather than shipping broken
+  // animation). Runs exactly once. Result in log.txt: "[compute-validate] PASS" / "FAIL".
+  void validate_compute_shader_once()
+  {
+    static bool ran = false;
+    if (ran) { return; }
+    ran = true;
+
+    if (!gl.hasComputeShaders())
+    {
+      LogError << "[compute-validate] SKIP: GL context < 4.3 -- no compute shaders on this context."
+               << std::endl;
+      return;
+    }
+
+    constexpr GLenum COMPUTE_SHADER = 0x91B9;     // GL_COMPUTE_SHADER
+    constexpr GLenum SSBO = 0x90D2;               // GL_SHADER_STORAGE_BUFFER
+    constexpr GLbitfield SSBO_BARRIER = 0x2000;   // GL_SHADER_STORAGE_BARRIER_BIT
+    constexpr GLenum READ_ONLY = 0x88B8;          // GL_READ_ONLY
+    constexpr GLenum DYNAMIC_DRAW = 0x88E8;       // GL_DYNAMIC_DRAW
+    constexpr int N = 256;
+
+    char const* const src =
+      "#version 430 core\n"
+      "layout(local_size_x = 64) in;\n"
+      "layout(std430, binding = 0) buffer Out { uint result[]; };\n"
+      "void main() {\n"
+      "  uint i = gl_GlobalInvocationID.x;\n"
+      "  result[i] = i * 2u + 7u;\n"
+      "}\n";
+
+    try
+    {
+      OpenGL::program prog({ { COMPUTE_SHADER, std::string(src) } });
+
+      GLuint ssbo = 0;
+      gl.genBuffers(1, &ssbo);
+      gl.bindBuffer(SSBO, ssbo);
+      gl.bufferData(SSBO, N * sizeof(std::uint32_t), nullptr, DYNAMIC_DRAW);
+      gl.bindBufferRange(SSBO, 0, ssbo, 0, N * sizeof(std::uint32_t));
+
+      {
+        OpenGL::Scoped::use_program use(prog);
+        gl.dispatchCompute(N / 64, 1, 1);
+      }
+      gl.memoryBarrier(SSBO_BARRIER);
+
+      gl.bindBuffer(SSBO, ssbo);
+      auto const* p = static_cast<std::uint32_t const*>(gl.mapBuffer(SSBO, READ_ONLY));
+      bool ok = (p != nullptr);
+      if (ok)
+      {
+        for (int i = 0; i < N; ++i)
+        {
+          if (p[i] != static_cast<std::uint32_t>(i) * 2u + 7u) { ok = false; break; }
+        }
+      }
+      gl.unmapBuffer(SSBO);
+      gl.bindBuffer(SSBO, 0);
+      gl.deleteBuffers(1, &ssbo);
+
+      LogError << "[compute-validate] " << (ok ? "PASS" : "FAIL")
+               << " -- GPU compute shaders " << (ok ? "work" : "did NOT produce correct results")
+               << " on this GPU (GPU skeleton animation " << (ok ? "can proceed)." : "would be unsafe).")
+               << std::endl;
+    }
+    catch (std::exception const& e)
+    {
+      LogError << "[compute-validate] FAIL: compute program build/dispatch threw: " << e.what() << std::endl;
+    }
+  }
+}
+
 void WorldRender::draw (glm::mat4x4 const& model_view
     , glm::mat4x4 const& projection
     , glm::vec3 const& cursor_pos
@@ -1735,6 +2444,9 @@ void WorldRender::draw (glm::mat4x4 const& model_view
 
   ZoneScoped;
   noggit::perf::Scoped _prof_world(noggit::perf::Phase::WorldDraw);
+
+  // [GPU-driven 2026-08-17] validate the compute pipeline once (logs PASS/FAIL to log.txt) -- see below.
+  validate_compute_shader_once();
 
   // [localize the ~12ms unprofiled-in-WorldDraw 2026-08-07] time everything from here up to the Terrain
   // block (frustum-cull loop, tile sort, camera-volume walks, lighting/bloom setup, clears). Manual timer
@@ -1797,18 +2509,84 @@ void WorldRender::draw (glm::mat4x4 const& model_view
   // daylight because no Light.dbc row sits inside a city WMO. Guarded like the sibling camera_is_* calls,
   // which can throw while a tile streams in. Computed BEFORE updateLightingUniformBlock (2026-07-25) so the
   // fog block picks the INTERIOR vs OUTDOOR fog-distance scale for THIS frame, not a frame stale.
+  // [fog anchor 2026-08-18, user] The indoor/outdoor state must follow the CHARACTER's placement, NOT the
+  // camera: in 3rd person the camera orbits (and can clip through a wall) while the character stands still,
+  // and the fog must NOT change just because the camera crossed a boundary. Probe from the game character's
+  // position when it is active (3rd person / game view); fall back to the camera in the editor and 1st person
+  // (where the camera already sits at the character). Every fog SELECTION below (interior test, sphere blend,
+  // global-WMO override) uses this probe; the per-pixel fog DISTANCE still comes from the real camera.
+  // [fog transition 2026-08-18] The indoor/outdoor fog follows the CHARACTER, not the camera. RE-diagnosis
+  // (FOGFINAL trace, Stormwind): a 3rd-person camera orbiting across a building's WMO boundary FLICKERED the
+  // interior test on/off frame-to-frame while the character stood still, and with the exterior/interior fog
+  // scales differing (4x vs 1x) that slammed the fog band back and forth = the snap. Probing from the
+  // character's position makes the interior test stable (only the character's own crossing moves it). Editor /
+  // 1st person: no visible character -> falls back to the camera (which already sits at the character there).
+  // Opt out with NOGGIT_NO_FOG_TRANSITION=1 (restores camera-anchored + binary-snap behaviour).
+  static bool const s_no_fog_transition = std::getenv("NOGGIT_NO_FOG_TRANSITION") != nullptr;
+  _fog_probe_pos = (!s_no_fog_transition && _world->_game_character_visible
+                    && _world->_game_character.model_instance.has_value())
+                 ? _world->_game_character.model_instance->get_pos()
+                 : camera_pos;
   _camera_inside_wmo = false;
+  float wmo_interior_depth = 0.0f;
   if (!minimap_render)
   {
     noggit::perf::Scoped _prof_camvol(noggit::perf::Phase::CamVolume); // localize: per-frame WMO-containment walk
-    try { _camera_inside_wmo = _world->camera_is_inside_wmo(camera_pos); }
-    catch (...) { _camera_inside_wmo = false; }
+    try { _camera_inside_wmo = _world->camera_is_inside_wmo(_fog_probe_pos, &wmo_interior_depth); }
+    catch (...) { _camera_inside_wmo = false; wmo_interior_depth = 0.0f; }
   }
+  // [fog transition 2026-08-18] The client selects fog by the camera's WMO area but hides the source switch
+  // behind a DISTANCE falloff -- so the visible fog eases as you move into the room, it does not snap. RE'd
+  // from wow335a.exe (fog area DAT_00cd8794 switches instantly in FUN_00790920, but the fog value is blended
+  // by the camera's signed depth into the fog volume; no temporal timer -- the "rate" _DAT_009e8d2c is a
+  // sin-approx constant, not a fade). We reproduce that spatially: ramp a 0..1 factor over the first
+  // `falloff` yards INSIDE the room and lerp the interior fog in by it, replacing the binary snap. The
+  // client uses portal geometry for the depth; we use the horizontal depth into the room's AABB (the
+  // available proxy). Falloff yards tunable via NOGGIT_FOG_INTERIOR_FALLOFF.
+  static float const s_fog_interior_falloff = []
+  {
+    char const* const e = std::getenv("NOGGIT_FOG_INTERIOR_FALLOFF");
+    float const v = e ? static_cast<float>(std::atof(e)) : 8.0f;
+    return v > 0.25f ? v : 8.0f;
+  }();
+  _camera_wmo_interior_factor = glm::clamp(wmo_interior_depth / s_fog_interior_falloff, 0.0f, 1.0f);
+
+  // 3.3.5a-style shadow quality (client extShadowQuality 0-5, RE doc 35). Level 0 = the client's own
+  // "LOWEST" = baked terrain + BLOB unit shadows (the 1.12 look). >=1 renders the dynamic unit shadow
+  // map at end-of-frame (sampled NEXT frame via the lighting UBO ShadowMatrix). Read per-frame like
+  // the msaa setting so the Graphics dropdown applies live.
+  _shadow_quality = minimap_render ? 0 : QSettings().value("graphics/shadow_quality", 3).toInt();
+  if (_shadow_quality < 0 || _shadow_quality > 5) { _shadow_quality = 3; }
+  // Hardware gate: the shadow sampler lives on texture unit 16, which only exists when the driver
+  // exposes >16 fragment texture units. On a 16-unit driver the sampler uniform is rejected and
+  // stays 0 -> mixed sampler TYPES on unit 0 -> every terrain/M2/WMO draw INVALID_OPERATION =
+  // skipped geometry (black holes). Force the feature off there.
+  {
+    static GLint s_max_frag_units = [] {
+      GLint v = 0;
+      gl.getIntegerv(GL_MAX_TEXTURE_IMAGE_UNITS, &v);
+      LogDebug << "GL_MAX_TEXTURE_IMAGE_UNITS = " << v
+               << (v < 18 ? " -> dynamic shadows DISABLED (need units 16/17)" : "") << std::endl;
+      return v;
+    }();
+    if (s_max_frag_units < 18) { _shadow_quality = 0; }
+  }
+  if (_shadow_quality < 1) { _shadow_map_valid = false; } // dropdown to 0 -> stop sampling immediately
 
   if (!minimap_render)
     updateLightingUniformBlock(draw_fog, camera_pos);
   else
     updateLightingUniformBlockMinimap(minimap_render_settings);
+
+  // Bind the (last frame's) shadow maps for every receiver shader; units 16/17 are reserved.
+  if (_shadow_initialized && _shadow_quality >= 1)
+  {
+    gl.activeTexture(GL_TEXTURE0 + 16);
+    gl.bindTexture(GL_TEXTURE_2D, _shadow_tex);
+    gl.activeTexture(GL_TEXTURE0 + 17);
+    gl.bindTexture(GL_TEXTURE_2D, _shadow_env_tex);
+    gl.activeTexture(GL_TEXTURE0);
+  }
 
   // Bloom: render the whole 3D scene into an offscreen colour target first, so afterwards we can pull
   // out the bright areas, blur them and add them back (the glow/bleed of bright sky openings, light
@@ -1954,6 +2732,13 @@ void WorldRender::draw (glm::mat4x4 const& model_view
   {
     ZoneScopedN("World::draw() : Draw skies");
     OpenGL::Scoped::use_program m2_shader {*_m2_program.get()};
+
+    // [A2C leak fix 2026-08-18] The grass/detail-doodad path enables GL_SAMPLE_ALPHA_TO_COVERAGE, and it can
+    // persist to the END of a frame (the env shadow-caster pass re-enables it after the last defensive disable
+    // at ~5954) -> the NEXT frame's SKY + CLOUDS, drawn HERE (first, before the pre-terrain disable at ~2750),
+    // inherit it. With A2C on: the sky dome writes alpha 0 -> 0 coverage -> BLACK sky; the cloud dome's
+    // fractional alpha -> an ordered coverage "dots on a grid" dither. Force A2C off before any sky draw.
+    gl.disable(GL_SAMPLE_ALPHA_TO_COVERAGE);
 
     bool hadSky = false;
 
@@ -2293,6 +3078,14 @@ void WorldRender::draw (glm::mat4x4 const& model_view
     noggit::perf::Scoped _prof_terrain(noggit::perf::Phase::Terrain);
 
     gl.disable(GL_BLEND);
+    // ★★★ BLACK-WORLD FIX (2026-08-14): the detail-doodad GRASS path enables GL_SAMPLE_ALPHA_TO_COVERAGE
+    // and (being state-tracked on a per-scope M2RenderState) LEAVES IT ON at frame end. Terrain writes
+    // out_color.a = 0.0 (its bloom-opt-out mask, terrain_frag ~576) -- with A2C on, alpha 0 -> ZERO sample
+    // coverage -> the terrain fragment is fully masked and writes NOTHING = the intermittent "black world".
+    // The earlier defensive disables (post-grass ~4470, pre-shadow ~5420) run AFTER terrain in frame order,
+    // so they never protect the NEXT frame's terrain, which draws FIRST. Disabling it HERE, before any
+    // terrain draw, closes the cross-frame leak for good (grass re-enables it per-draw). No-op without MSAA.
+    gl.disable(GL_SAMPLE_ALPHA_TO_COVERAGE);
 
     {
       OpenGL::Scoped::use_program mcnk_shader{ *_mcnk_program.get() };
@@ -2573,9 +3366,19 @@ void WorldRender::draw (glm::mat4x4 const& model_view
   // stored and reused. cache=false for MOVING objects (creatures/mounts/attachments): they land in a new
   // grid cell every frame, so storing would grow the cache without bound (the RAM blowup, 2026-08-04) --
   // they compute fresh each frame and are NOT budget-gated (they need their light every frame).
-  auto interior_light_at = [this, &camera_pos, cam_light_sum, zone_tint_time]
+  // [perf 2026-08-18] Per-FRAME cache for MOVING objects (cache=false: creatures/mounts/attachments). They
+  // cannot use the persistent _interior_light_cache (their cell changes every frame -> unbounded RAM), but the
+  // EXPENSIVE part -- WMOGroup::sample_ground_color's O(WMO-triangle) floor scan -- is IDENTICAL for every
+  // query landing in the same 1-unit cell key THIS frame: a creature's body + ALL its attachments + any other
+  // creature sharing that cell. Deduping them was the whole M2Creatures cost (measured interior_light_at ~20ms
+  // for ~25 creatures, dominated by re-scanning the WMO floor per body+attachment). Local -> reset free each
+  // frame, bounded by the number of distinct occupied cells.
+  std::unordered_map<std::int64_t, glm::vec4> interior_frame_cache;
+  auto interior_light_at = [this, &camera_pos, cam_light_sum, zone_tint_time, &interior_frame_cache]
     (glm::vec3 const& pos, bool cache = true) -> glm::vec4
   {
+    // [CRE-PROFILE 2026-08-18 TEMP] all interior-light lookups (creatures call it cache=false per draw).
+    noggit::perf::Scoped _prof_int(noggit::perf::Phase::BucketInterior);
     std::int64_t const kx = static_cast<std::int64_t>(std::floor(pos.x));
     std::int64_t const ky = static_cast<std::int64_t>(std::floor(pos.y));
     std::int64_t const kz = static_cast<std::int64_t>(std::floor(pos.z));
@@ -2584,6 +3387,14 @@ void WorldRender::draw (glm::mat4x4 const& model_view
     if (it != _interior_light_cache.end())
     {
       return it->second;
+    }
+    if (!cache)
+    {
+      auto const fit = interior_frame_cache.find(key);
+      if (fit != interior_frame_cache.end())
+      {
+        return fit->second;
+      }
     }
     if (cache)
     {
@@ -2647,9 +3458,13 @@ void WorldRender::draw (glm::mat4x4 const& model_view
       }
     }
 
-    if (cache) // moving objects never populate the cache (would grow it unbounded per frame)
+    if (cache) // static objects: persistent cache (their cell is stable)
     {
       _interior_light_cache.emplace(key, light);
+    }
+    else // moving objects: per-frame cache -> body + attachments + cell-neighbours reuse this scan this frame
+    {
+      interior_frame_cache.emplace(key, light);
     }
     return light;
   };
@@ -2761,8 +3576,22 @@ void WorldRender::draw (glm::mat4x4 const& model_view
   // view distance), radius-extended so a model is gathered while ANY part of it is inside the
   // boundary; the fragment-shader slice (slice_dist) then clips its pixels at the exact distance,
   // so trees slice in/out of view the same way terrain does at the far plane -- never as a whole.
+  // [client cull 2026-08-16] The client's placed-doodad (MDDF/M2) distance cull+fade (FUN_00791cb0 +
+  // FUN_007bdb10), byte-exact per-instance port -- see ModelInstance::doodadCullFade /
+  // twmoa-335a-client-doodad-cull.md. Returns a fade alpha; 0 drops the instance at the GATHER (a real
+  // CPU win, not a mere fragment discard), >0..1 feeds the doodad's opacity fade. Controlled by the
+  // Performance-tab toggle "render/gv_doodad_cull" (DEFAULT ON -> applies in ALL views incl. the editor,
+  // so it's immediately visible/testable); OFF restores the old see-all _cull_distance envelope. (NB it
+  // is NOT gated on game view anymore: _game_character_visible is only true in 3rd-person game view, so
+  // gating on it silently disabled the cull in 1st person / the editor.)
+  bool const use_client_doodad_cull = _world->_settings->value("render/gv_doodad_cull", true).toBool();
   auto m2_dist_envelope = [&](ModelInstance* mi) -> float
   {
+    if (use_client_doodad_cull && display == display_mode::in_3D)
+    {
+      return mi->doodadCullFade(camera_pos, 1.0f); // environmentDetail default 1.0 (@0x009e1340)
+    }
+
     float const radius = mi->model->rad * mi->scale;
     float const dist = (display == display_mode::in_3D
                         ? glm::distance(camera_pos, mi->pos)
@@ -2879,19 +3708,45 @@ void WorldRender::draw (glm::mat4x4 const& model_view
         float const tile_dist = tile->camDist();
         for (auto const& kv : b)
         {
-          // Size-weighted HARD cap (fully gone), pushed ~1.5x so doodads reach further; SOFT cap = 90% of it.
-          // The bucket fades by TILE distance over [soft, hard] (fade -> extra_alpha -> smooth alpha blend in
-          // the draw loop). Keep it collected until past hard + a tile-edge margin (a tile is culled by its
-          // CENTRE, its near instances sit ~half a diagonal closer), so it's already invisible before it drops.
-          float const weighted = std::min(1.0f, s_cull_base + kv.first->rad * s_cull_per_rad);
-          float const hard = std::min(_cull_distance, _cull_distance * weighted * 1.5f);
-          float const soft = hard * 0.9f;
-          if (tile_dist > hard + 380.0f)
+          float fade;
+          if (use_client_doodad_cull)
           {
-            continue; // fully faded and past the tile-edge margin -> drop
+            // [client cull 2026-08-16] CLIENT per-class doodad cull (FUN_00791cb0 tables), byte-exact
+            // distances. The persistent bucket is per-(model,tile) and dropped by TILE distance -- a
+            // noggit batching construct with no client equivalent -- so we apply the client's exact
+            // cull_far/fade_band for the bucket's class (MAX class over its instances) to the bucket's
+            // NEAREST possible instance distance (tile centre minus half an ADT diagonal, 377y: the most
+            // any instance can sit closer than the tile centre). Conservative: never drops a bucket while
+            // any instance could still be within the client's cull_far -> no popping. envDetail = 1.0
+            // (client default @0x009e1340). See twmoa-335a-client-doodad-cull.md.
+            float cull_far, band;
+            ModelInstance::doodadCullParams(kv.second.cull_class, 1.0f, cull_far, band);
+            float const near_dist = tile_dist - 377.0f;
+            if (near_dist > cull_far)
+            {
+              continue; // whole bucket past the client cull distance -> drop (draw-call CPU win)
+            }
+            fade = (near_dist <= (cull_far - band)) ? 1.0f
+              : std::clamp((cull_far - near_dist) / band, 0.0f, 1.0f);
           }
-          float const fade = (hard <= soft) ? 1.0f
-            : std::clamp((hard - tile_dist) / (hard - soft), 0.0f, 1.0f);
+          else
+          {
+            // EDITOR view: noggit's own perf cull (NOT client-exact -- an editor convenience so authors
+            // aren't drawing 37k objects). Size-weighted HARD cap (fully gone), pushed ~1.5x so doodads
+            // reach further; SOFT cap = 90% of it. The bucket fades by TILE distance over [soft, hard]
+            // (fade -> extra_alpha -> smooth alpha blend in the draw loop). Keep it collected until past
+            // hard + a tile-edge margin (a tile is culled by its CENTRE, its near instances sit ~half a
+            // diagonal closer), so it's already invisible before it drops.
+            float const weighted = std::min(1.0f, s_cull_base + kv.first->rad * s_cull_per_rad);
+            float const hard = std::min(_cull_distance, _cull_distance * weighted * 1.5f);
+            float const soft = hard * 0.9f;
+            if (tile_dist > hard + 380.0f)
+            {
+              continue; // fully faded and past the tile-edge margin -> drop
+            }
+            fade = (hard <= soft) ? 1.0f
+              : std::clamp((hard - tile_dist) / (hard - soft), 0.0f, 1.0f);
+          }
           persistent_doodad_draws.emplace_back(kv.first, &kv.second);
           persistent_doodad_fades.push_back(fade);
         }
@@ -2947,15 +3802,17 @@ void WorldRender::draw (glm::mat4x4 const& model_view
               continue;
             }
 
-            // Tile doodads carry NO opacity fade (fade is a creature/GO mechanic): they are gathered
-            // while ANY part is inside the boundary and the shader's per-pixel slice (slice_dist)
-            // clips them at the object cull distance exactly like the far plane clips terrain.
-            bool const drawable = m2_instance->model->finishedLoading()
-                               && m2_dist_envelope(m2_instance) > 0.0f;
+            // [game-view cull 2026-08-15] In game view m2_dist_envelope returns the client's per-class
+            // doodad fade alpha (0 = hard-culled, dropped here; <1 = fading over the class band, which
+            // the translucent-promote path honours as opacity -- client behaviour, FUN_00791cb0). In
+            // the editor it stays the flat see-all envelope (fade == 1) and the shader's per-pixel
+            // slice (slice_dist) clips at _cull_distance like the far plane clips terrain.
+            float const fade = m2_dist_envelope(m2_instance);
+            bool const drawable = m2_instance->model->finishedLoading() && fade > 0.0f;
             if (drawable && m2_instance->isInFrustum(frustum))
             {
               models_to_draw[reinterpret_cast<Model*>(obj)].push_back(m2_instance->transformMatrix());
-              models_to_draw_fades[reinterpret_cast<Model*>(obj)].push_back(1.0f);
+              models_to_draw_fades[reinterpret_cast<Model*>(obj)].push_back(fade);
               models_to_draw_interior[reinterpret_cast<Model*>(obj)].push_back(glm::vec4(0.0f)); // tile doodad = outdoor (client MDDF)
             }
           }
@@ -3026,16 +3883,18 @@ void WorldRender::draw (glm::mat4x4 const& model_view
             continue;
           }
 
-          // tile doodads: no fade (creature/GO mechanic) -- per-pixel slice clips at the boundary
-          bool const drawable = m2_instance->model->finishedLoading()
-                             && (minimap_render
-                                 ? m2_instance->isInRenderDist(_cull_distance, camera_pos, display)
-                                 : m2_dist_envelope(m2_instance) > 0.0f);
+          // [game-view cull 2026-08-15] game view: m2_dist_envelope returns the client per-class doodad
+          // fade (0 = hard-culled here, <1 = client fade band via the translucent promote). Editor /
+          // minimap keep the flat boundary (fade == 1) + per-pixel slice.
+          float const fade = minimap_render
+                             ? (m2_instance->isInRenderDist(_cull_distance, camera_pos, display) ? 1.0f : 0.0f)
+                             : m2_dist_envelope(m2_instance);
+          bool const drawable = m2_instance->model->finishedLoading() && fade > 0.0f;
           if (drawable
               && (tile->renderer()->objectsFrustumCullTest() > 1 || m2_instance->isInFrustum(frustum)))
           {
             instances.push_back(m2_instance->transformMatrix());
-            fades.push_back(1.0f);
+            fades.push_back(fade);
             interiors.push_back(glm::vec4(0.0f)); // tile doodad = outdoor (client MDDF)
           }
 
@@ -3318,6 +4177,27 @@ void WorldRender::draw (glm::mat4x4 const& model_view
   bool draw_gameobject_spawns = !minimap_render && (_world->drawCreatureSpawns() || _world->drawGameObjectSpawns());
   float const creature_spawn_model_distance = creature_spawn_model_draw_distance();
   float const creature_spawn_marker_distance = creature_spawn_marker_draw_distance();
+
+  // [game-view cull 2026-08-16] CLIENT unit cull (wow335a.exe FUN_00791cb0), byte-exact. RE proved a
+  // CGUnit's M2 is an ordinary CM2 scene node in the SAME grid as static doodads and goes through the
+  // IDENTICAL size-class distance cull as MDDF doodads -- there is NO unitDrawDistance CVar; a unit's
+  // draw distance is its SIZE CLASS's cull distance ({30,100,200,750,1250}, humanoid extent ~2-3y ->
+  // class 1 -> ~100y). We cull off the unit's LIVE position (client node +0x38, updated as it moves),
+  // NOT the possibly-stale AABB centre. Controlled by the Performance-tab toggle "render/gv_creature_cull"
+  // (DEFAULT ON -> applies in ALL views so it's immediately visible/testable); OFF restores the flat
+  // creature_spawn_model_distance (500y). See twmoa-335a-client-doodad-cull.md.
+  bool const use_client_creature_cull = _world->_settings->value("render/gv_creature_cull", true).toBool();
+  auto unit_dist_alpha = [&](ModelInstance& u) -> float
+  {
+    u.ensureExtents(); // guarantees _cull_class is computed (bbox x scale x rotation -> class)
+    float cull_far, band;
+    ModelInstance::doodadCullParams(u._cull_class, 1.0f, cull_far, band); // envDetail 1.0 (@0x009e1340)
+    float const d = glm::distance(camera_pos, u.pos);
+    if (d > cull_far) return 0.0f;                 // FUN_00791cb0: dist > cull_far[class] -> cull
+    if (d <= cull_far - band) return 1.0f;
+    float const a = 1.0f - (d - (cull_far - band)) / band;
+    return a < 0.01f ? 0.0f : a;                   // min-alpha cull floor (_DAT_009f1968)
+  };
   // Capture the world-only depth HERE, between the WMO pass and the M2 pass: terrain and buildings
   // are in the depth buffer, nothing model-shaped is yet. The ground decals drawn later (selection
   // circles, patrol routes) need this to tell "the ground at this pixel" apart from "whatever model
@@ -3565,16 +4445,16 @@ void WorldRender::draw (glm::mat4x4 const& model_view
             }
           };
 
-          std::vector<std::thread> workers;
-          workers.reserve(N - 1);
-          for (std::size_t k = 1; k < N; ++k)
+          // [threading 2026-08-18] persistent pool instead of per-frame std::thread spawns; each of the N
+          // static ranges is one work item (run_range(k) fills results[k], lock-free). Serial fallback when
+          // the pool is disabled (NOGGIT_NO_THREAD_POOL).
+          if (auto* tp = noggit::render_pool())
           {
-            workers.emplace_back(run_range, k);
+            tp->parallel_for(N, [&](std::size_t k) { run_range(k); });
           }
-          run_range(0); // the main thread processes chunk 0
-          for (auto& w : workers)
+          else
           {
-            w.join();
+            for (std::size_t k = 0; k < N; ++k) { run_range(k); }
           }
 
           // PHASE C (SERIAL MERGE, this thread): append each chunk's results in ascending index order.
@@ -3739,8 +4619,13 @@ void WorldRender::draw (glm::mat4x4 const& model_view
 
         // BINARY range test (client model, user-confirmed): inside the knob -> play the 2 s fade-in
         // to FULL and stay full; outside -> play the 2 s fade-out to zero. No distance-proportional
-        // alpha -- stopping mid-flight never leaves a half-faded creature.
-        float const creature_fade = cull_fade_alpha(&mi, true, creature_in_range ? 1.0f : 0.0f);
+        // alpha -- stopping mid-flight never leaves a half-faded creature. [game-view cull 2026-08-16]
+        // In game view the range test is the CLIENT size-class unit cull (unit_dist_alpha, FUN_00791cb0)
+        // instead of the flat editor distance; the 2 s fade still rides on top.
+        float const creature_dist_alpha = use_client_creature_cull
+          ? unit_dist_alpha(mi)
+          : (creature_in_range ? 1.0f : 0.0f);
+        float const creature_fade = cull_fade_alpha(&mi, true, creature_dist_alpha);
         _creature_fade_by_guid[spawn.guid] = creature_fade; // for the selection circle fade
         if (creature_fade <= 0.0f)
         {
@@ -3816,8 +4701,12 @@ void WorldRender::draw (glm::mat4x4 const& model_view
         auto& fmi = *spawnp->model_instance;
         Model* const fmodel = fmi.model.get();
         // second cull_fade_alpha call this frame is a stable read (same frame timestamp)
+        // [game-view cull 2026-08-16] same client size-class unit cull as the primary path above.
         bool const f_in_range = glm::distance(camera_pos, spawnp->pos) <= creature_spawn_model_distance;
-        float const f_fade = cull_fade_alpha(&fmi, true, f_in_range ? 1.0f : 0.0f);
+        float const f_dist_alpha = use_client_creature_cull
+          ? unit_dist_alpha(fmi)
+          : (f_in_range ? 1.0f : 0.0f);
+        float const f_fade = cull_fade_alpha(&fmi, true, f_dist_alpha);
         _creature_fade_by_guid[spawnp->guid] = f_fade; // for the selection circle fade
         if (models_drawn_individually.find(fmodel) != models_drawn_individually.end())
         {
@@ -3927,7 +4816,26 @@ void WorldRender::draw (glm::mat4x4 const& model_view
         {
           mi.model->animcalc = false;
         }
-        if (go_fade < 0.999f)
+        // [2026-08-20 billboard parity] Cylindrical-billboard models (mage portals: root bone lock-Z)
+        // must draw INDIVIDUALLY: the instanced bucket computes ONE shared bone set, so every GO
+        // instance reused a billboard yaw computed for a single transform -- portals tracked the camera
+        // but with a constant per-instance yaw error ("facing sideways"). The individual path re-animates
+        // with this instance's own model_view, so the lock-Z spin is exact per portal. Direct bone-flag
+        // scan (no cache: Model* reuse could alias); cylindrical models are rare (portals, forge chains)
+        // so the perf cost is negligible -- spherical flame cards stay instanced as before.
+        bool go_needs_per_instance_billboard = false;
+        for (auto const& bone : mi.model->bones)
+        {
+          if (bone.flags.cylindrical_billboard_lock_x
+              || bone.flags.cylindrical_billboard_lock_y
+              || bone.flags.cylindrical_billboard_lock_z)
+          {
+            go_needs_per_instance_billboard = true;
+            break;
+          }
+        }
+
+        if (go_fade < 0.999f || go_needs_per_instance_billboard)
         {
           // mid-fade: EXACT creature treatment (individual draw, continuous alpha) -- see the
           // dedicated loop after the creature spawn draws
@@ -3954,6 +4862,9 @@ void WorldRender::draw (glm::mat4x4 const& model_view
     // on near terrain and feed them into the instanced-M2 buckets below. Client-faithful in WHICH
     // models appear and their density; drawn only within a short radius of the camera (the client
     // fades clutter out at close range too) and behind a toggle (default on -- the client shows it).
+    // Hoisted for the instanced-M2 uniform setup below (the clutter block is its own scope): the
+    // groundEffectDist fed to the shader's client-exact per-vertex fade ramp.
+    float clutter_detail_dist = 0.0f;
     {
       // Density (0..100, like the in-game slider) + draw distance come from the graphics settings;
       // the on/off is the toolbar/menu toggle passed in as draw_ground_clutter. Read live each frame
@@ -3963,6 +4874,7 @@ void WorldRender::draw (glm::mat4x4 const& model_view
       // Client-matching default: 3.3.5a ships groundEffectDist at 70.0 (string at 0x00a3f2ec).
       // The slider still reaches 500 so the editor can see further than the client does.
       float const clutter_dist = clutter_settings.value("render/ground_clutter_distance", 70.0f).toFloat();
+      clutter_detail_dist = clutter_dist;
 
       auto dist2 = [](glm::vec3 const& a, glm::vec3 const& b)
       {
@@ -3973,7 +4885,6 @@ void WorldRender::draw (glm::mat4x4 const& model_view
       if (draw_ground_clutter && clutter_density > 0.0f && draw_models && !minimap_render)
       {
         noggit::perf::Scoped _prof_clutter(noggit::perf::Phase::Clutter); // M2 spike hunt: ground-clutter inject
-        float const clutter_dist2 = clutter_dist * clutter_dist;
         // Density-parity diagnostics (Westfall tile 30_52 ground truth = ~426 instances/chunk,
         // simulated from the ADT+DBC): log the funnel every ~5s so instance loss is attributable.
         static int clutter_dbg_frame = 0;
@@ -4041,37 +4952,19 @@ void WorldRender::draw (glm::mat4x4 const& model_view
               auto const& doodads = chunk->detailDoodads();
               ++dbg_chunks;
               dbg_placed += static_cast<int>(doodads.size());
-              // Interior chunks (entirely inside the pre-fade radius) skip ALL per-instance
-              // distance/fade math -- with frillDensity-level counts (up to ~2k/chunk) the
-              // per-instance work is the CPU cost, so pay it only in the outer fade band.
-              bool const chunk_in_fade_band =
-                dist2(camera_pos, ccenter) > (clutter_dist * 0.75f - 24.0f) * (clutter_dist * 0.75f - 24.0f);
               // CLIENT-EXACT density model (wow.exe FUN_006b2b80/FUN_006bfc10): grass draws at FULL
               // authored density across the whole radius -- the client NEVER drops instances by
-              // distance. It only ALPHA-FADES the outer quarter of the radius (fade ramp scale
-              // 1/(radius*0.25), .rdata 0x867958/0x810c68). The old random distance-thinning is what
-              // made our fields read sparse vs the game. The density slider remains as a uniform
-              // user override (100% = client).
+              // distance. The density slider remains as a uniform user override (100% = client).
+              // [2026-08-20 CLIENT-EXACT FADE] There is NO per-blade CPU fade or distance cull here
+              // any more: the 3.3.5a client computes the clutter fade PER VERTEX in the DetailDoodad
+              // vertex shader -- alpha = clamp((dist - viewZ)/(0.15*dist), 0, 1), a view-depth ramp
+              // over the last 15% of groundEffectDist (FUN_007b15d0 c9; fade start 0.85 @ 0x9f23d0).
+              // m2_vert now computes exactly that (detail_dist uniform below); every CPU band/gate
+              // variant produced visible chunk seams or brightening lines. Blades past the distance
+              // fade to alpha 0 in-shader; the chunk-centre gate above bounds the overdraw.
               std::size_t idx = 0;
               for (auto const& dd : doodads)
               {
-                float fade_alpha = 1.0f;
-                if (chunk_in_fade_band)
-                {
-                  glm::vec3 const dpos(dd.transform[3]);
-                  float const dd2 = dist2(camera_pos, dpos);
-                  if (dd2 > clutter_dist2)
-                  {
-                    ++dbg_far;
-                    continue;
-                  }
-                  // client fade: alpha ramp over the last quarter of the clutter radius
-                  float const dfrac = std::sqrt(dd2 / clutter_dist2);
-                  if (dfrac > 0.75f)
-                  {
-                    fade_alpha = glm::clamp((1.0f - dfrac) * 4.0f, 0.0f, 1.0f);
-                  }
-                }
                 if (clutter_density < 1.0f)
                 {
                   std::uint32_t const cut = static_cast<std::uint32_t>(clutter_density * 65536.0f);
@@ -4105,8 +4998,12 @@ void WorldRender::draw (glm::mat4x4 const& model_view
                   dd.cached_model = m; // loaded -> cache so this doodad never string-hashes again
                 }
                 models_to_draw[m].push_back(dd.transform);
-                models_to_draw_fades[m].push_back(fade_alpha); // client edge fade (last 25% of radius)
-                models_to_draw_interior[m].push_back(glm::vec4(0.0f)); // ground clutter = outdoor
+                models_to_draw_fades[m].push_back(1.0f); // fade is per-vertex in the shader (client c9 ramp)
+                // For the detail_doodad shader path this attribute carries the PACKED per-blade bake
+                // (MapChunk::computeDetailDoodads): x = mccv_r*256+g, y = b*2+shadowBit+1024 (marker),
+                // z/w = ground-normal x/z. Only the detail branch decodes it; clutter never takes the
+                // interior branch.
+                models_to_draw_interior[m].push_back(dd.tint);
                 ++dbg_submitted;
               }
             }
@@ -4191,6 +5088,49 @@ void WorldRender::draw (glm::mat4x4 const& model_view
                              draw_hidden_models);
         }
 
+        // [creature MDI 2026-08-18] PHASE A: batch the far/simple creature groups here too, BEFORE the
+        // m2_shader scope opens (program scopes must not nest). The classic creature loop below skips groups
+        // recorded in _creature_batched. Toggle NOGGIT_CREATURE_MDI (default off until validated); scoped as
+        // M2Creatures so the profiler shows the cost move off the per-group animate()/TBO path.
+        static bool const s_creature_mdi = std::getenv("NOGGIT_CREATURE_MDI") != nullptr;
+        _creature_batched.clear();
+        if (s_creature_mdi && draw_models)
+        {
+          noggit::perf::Scoped _prof_crembatch(noggit::perf::Phase::M2Creatures);
+          drawCreaturesBatched(creature_instanced, creature_instanced_rep, creature_instanced_fades,
+                               [&](glm::vec3 const& p) { return interior_light_at(p, false); },
+                               model_view, static_cast<int>(_world->model_animtime), draw_hidden_models,
+                               _creature_batched);
+        }
+
+        // [creature body MDI 2026-08-18] PHASE A (real): batch the INDIVIDUAL creature BODY draws with
+        // per-instance bones, BEFORE the m2_shader scope opens. The classic loop below skips a batched body's
+        // OWN animate + body-draw but still draws its mount/attachments/particles/shadow (and restores its
+        // _animation_bones so gear seats correctly). The game character is pushed to the vector AFTER this
+        // point -> never batched (stays individual). Toggle NOGGIT_CREATURE_BODY_MDI (default off).
+        static bool const s_creature_body_mdi = std::getenv("NOGGIT_CREATURE_BODY_MDI") != nullptr;
+        _creature_body_batched.clear();
+        if (s_creature_body_mdi && draw_models && draw_model_animations)
+        {
+          std::vector<CreatureBodyBatchItem> body_items;
+          body_items.reserve(creature_spawn_instances_to_draw.size());
+          for (auto const& di : creature_spawn_instances_to_draw)
+          {
+            CreatureBodyBatchItem bi;
+            bi.instance = di.instance;
+            bi.fade = di.fade;
+            bi.display_id = di.spawn ? di.spawn->display_id : 0;
+            bi.anim_time_offset = di.spawn ? di.spawn->animation_time_offset : 0;
+            bi.has_mount = di.spawn && di.spawn->mount_instance.has_value();
+            body_items.push_back(bi);
+          }
+          noggit::perf::Scoped _prof_body(noggit::perf::Phase::M2Creatures);
+          drawCreatureBodiesBatched(body_items,
+                                    [&](glm::vec3 const& p) { return interior_light_at(p, false); },
+                                    model_view, static_cast<int>(_world->model_animtime), draw_hidden_models,
+                                    _creature_body_batched);
+        }
+
         OpenGL::Scoped::use_program m2_shader {*_m2_instanced_program.get()};
 
         OpenGL::M2RenderState model_render_state;
@@ -4211,6 +5151,9 @@ void WorldRender::draw (glm::mat4x4 const& model_view
         // Terrain-parity boundary for tile doodads: pixels past the object cull distance are
         // discarded in the fragment shader, slicing models in/out like the far plane does terrain.
         m2_shader.uniform("slice_dist", s_no_dist_fade ? 0.0f : _cull_distance);
+        // CLIENT clutter fade distance (m2_vert c9-equivalent view-depth ramp over the last 15% of
+        // groundEffectDist). Only the detail_doodad frag path reads the resulting fade.
+        m2_shader.uniform("detail_dist", clutter_detail_dist);
 
         {
         noggit::perf::Scoped _prof_ddraw(noggit::perf::Phase::DoodadDraw); // M2 spike hunt: instanced doodad buckets only
@@ -4429,12 +5372,25 @@ void WorldRender::draw (glm::mat4x4 const& model_view
         // the rest of this program's draws (occlusion/other passes inherit 0 = off too).
         m2_shader.uniform("slice_dist", 0.0f);
 
+        // [CRE-GATE diag 2026-08-18] definitive: how many creature groups are in the INSTANCED pool (what
+        // Phase A can batch) vs how many the batch actually consumed. Fires from the loop that always runs.
+        {
+          static int s_gate_tick = 0;
+          if ((s_gate_tick++ % 120) == 0)
+            LogError << "[CRE-GATE] mdi=" << (s_creature_mdi ? 1 : 0) << " draw_models=" << (draw_models ? 1 : 0)
+                     << " creature_instanced=" << creature_instanced.size()
+                     << " batched=" << _creature_batched.size()
+                     << " individual=" << creature_spawn_instances_to_draw.size() << std::endl;
+        }
+
         // Instanced creature batches, grouped by (model, display) so each call is a single skin. Same
         // instanced program/state as the doodad buckets above, but each gets its group's REPRESENTATIVE
         // instance so the replaceable creature skin texture + geoset selection resolve -- without it the
         // instanced path can't see per-spawn textures and every far creature rendered invisible.
         for (auto& entry : creature_instanced)
         {
+          if (_creature_batched.count(entry.first))
+            continue; // consumed by the creature MDI batch above (NOGGIT_CREATURE_MDI)
           Model* const m = entry.first.first;
           auto const& transforms = entry.second;
           if (transforms.empty() || (!draw_hidden_models && m->is_hidden()))
@@ -4612,13 +5568,19 @@ void WorldRender::draw (glm::mat4x4 const& model_view
           for (ModelInstance* _dptr : per_instance_wmo_doodads)
             pib_sig ^= (reinterpret_cast<std::uintptr_t>(_dptr) * 1099511628211ull);
           pib_sig ^= draw_hidden_models ? 0x9E3779B97F4A7C15ull : 0ull;
-          // [2026-08-09 visual-first] cache OPT-IN via NOGGIT_PIB_PREP_CACHE: the signature can't see
-          // per-model STATE changes (a model finishing its async load, hidden-flag flips) -- the pointer
-          // set is unchanged, so a cached group built while a model was still loading excludes it
-          // FOREVER. Until the signature includes those, default to rebuilding every frame (the
-          // pre-cache behaviour, ~1.7ms in heavy city scenes).
-          static bool const s_pib_prep_cache = std::getenv("NOGGIT_PIB_PREP_CACHE") != nullptr;
-          if (!s_pib_prep_cache || !_pib_groups_valid || pib_sig != _pib_groups_sig)
+          // [perf 2026-08-19] Fold the texture-upload epoch into the signature, exactly like the
+          // drawDoodadsBatched cache (~line 835): when a model finishes its async load its textures upload and
+          // the epoch bumps, invalidating this cache so the now-loaded model's doodads get re-gathered. This
+          // closes the old "a group built while a model was still loading excludes it FOREVER" gap that had
+          // kept the whole prep opt-in and rebuilding every frame (~2.3ms in heavy city scenes).
+          pib_sig = (pib_sig ^ g_texture_upload_epoch.load(std::memory_order_relaxed)) * 1099511628211ull;
+          // With the epoch in the signature the cache is safe to default ON in GAME VIEW: WMO doodads are
+          // position-static and their baked interior light is time-invariant, so a cache hit reproduces the
+          // gather exactly. In the EDITOR a user can toggle a model's hidden flag (not captured by the
+          // signature), so keep rebuilding every frame there. NOGGIT_PIB_PREP_CACHE forces it on for A/B.
+          static bool const s_pib_prep_cache_env = std::getenv("NOGGIT_PIB_PREP_CACHE") != nullptr;
+          bool const pib_prep_cache_on = s_pib_prep_cache_env || _world->_game_character_visible;
+          if (!pib_prep_cache_on || !_pib_groups_valid || pib_sig != _pib_groups_sig)
           {
             _pib_groups_cache.clear();
             // Group visible (deduped-by-placement) doodads by model.
@@ -4708,28 +5670,15 @@ void WorldRender::draw (glm::mat4x4 const& model_view
             // TBO). User-validated at Karazhan: no crash. Opt OUT with NOGGIT_NO_PARALLEL_PIB_ANIMATE=1.
             static bool const s_parallel_pib = std::getenv("NOGGIT_NO_PARALLEL_PIB_ANIMATE") == nullptr;
             std::size_t const ng = pib_groups.size();
-            unsigned const hw = std::max(2u, std::thread::hardware_concurrency());
-            std::size_t const nthreads = (!s_parallel_pib || ng <= 1) ? 1 : std::min<std::size_t>(hw, ng);
-            if (nthreads <= 1)
+            // [threading 2026-08-18] persistent pool instead of per-frame std::thread spawns.
+            auto* const tp = s_parallel_pib ? noggit::render_pool() : nullptr;
+            if (tp)
             {
-              for (auto& g : pib_groups) { animate_group(g); }
+              tp->parallel_for(ng, [&](std::size_t gi) { animate_group(pib_groups[gi]); });
             }
             else
             {
-              std::atomic<std::size_t> next{0};
-              std::vector<std::thread> pool;
-              pool.reserve(nthreads);
-              for (std::size_t t = 0; t < nthreads; ++t)
-              {
-                pool.emplace_back([&]
-                {
-                  for (std::size_t gi = next.fetch_add(1); gi < ng; gi = next.fetch_add(1))
-                  {
-                    animate_group(pib_groups[gi]);
-                  }
-                });
-              }
-              for (auto& th : pool) { th.join(); }
+              for (auto& g : pib_groups) { animate_group(g); }
             }
           }
 
@@ -4802,6 +5751,19 @@ void WorldRender::draw (glm::mat4x4 const& model_view
 
     }
 
+    // [game mode] the Game View player character rides the per-instance creature path (own animation
+    // pose, skin, attachments, blob shadow) -- independent of the creature-spawns overlay toggle.
+    if (!minimap_render && _world->_game_character_visible && _world->_game_character.model_instance.has_value())
+    {
+      auto& char_mi = *_world->_game_character.model_instance;
+      if (char_mi.model->finishedLoading() && !char_mi.model->loading_failed()
+          && char_mi.isInFrustum(frustum))
+      {
+        creature_spawn_instances_to_draw.push_back(
+          {_world->_game_character.guid, &char_mi, &_world->_game_character, 1.0f});
+      }
+    }
+
     if (!creature_spawn_instances_to_draw.empty())
     {
       // Times the whole near/individual creature-draw region (shadow blobs + mesh + attachments).
@@ -4838,6 +5800,9 @@ void WorldRender::draw (glm::mat4x4 const& model_view
       // Doodads don't get this (they use baked MCSH). Drawn first so creature meshes sit on top;
       // depth-tested against terrain with depth-write off. (Client refinement not replicated:
       // terrain-triangle projection + height-fade ramp; ours is a flat decal at foot height.)
+      // Client rule (wow335a.exe FUN_007e49e0): the blob decal draws ONLY at extShadowQuality < 1 --
+      // at >=1 the dynamic unit shadow map replaces it.
+      if (_shadow_quality < 1)
       {
         if (!_shadow_blob_texture)
         {
@@ -4995,6 +5960,7 @@ void WorldRender::draw (glm::mat4x4 const& model_view
           auto const& di = creature_spawn_instances_to_draw[i];
           auto* inst = di.instance;
           if (!inst || inst->model->loading_failed()) { continue; }
+          if (_creature_body_batched.count(inst)) { continue; } // body already animated + drawn by the MDI batch
           Model* m = inst->model.get();
           if (!m->animated || !m->animBones) { continue; }                   // nothing to compute
           if (di.spawn && di.spawn->mount_instance.has_value()) { continue; } // mount: serial (seat bones)
@@ -5018,45 +5984,29 @@ void WorldRender::draw (glm::mat4x4 const& model_view
             if (anim_id != 0 && !m->hasAnimationId(anim_id)) { anim_id = 0; }
             m->_hand_overlay_active_main = inst->closeHandMain();
             m->_hand_overlay_active_off = inst->closeHandOff();
+            m->_lower_body_twist = inst->lower_body_twist;
+            m->_anim_time_scale = inst->anim_time_scale;
             m->_active_idle_key = static_cast<std::uint64_t>(inst->uid);
             m->animcalc = false;
             m->animate(model_view * inst->transformMatrix(), anim_id, c_animtime, /*upload_bones=*/false);
             creature_precomputed_bones[idx] = m->bone_matrices; // per-instance copy of the computed result
+            inst->_animation_bones = m->bone_matrices;          // client-parity: unit OWNS its bones (shadow/attachment read this)
             creature_bones_ready[idx] = 1;
           }
         };
         std::size_t const ng = creature_groups.size();
-        unsigned const hw = std::max(2u, std::thread::hardware_concurrency());
-        // Don't over-spawn: this pool is created+joined EVERY frame and each std::thread costs ~50-100us to
-        // spawn on Windows, so for small creature counts the churn exceeds the compute it saves. Give each
-        // worker >= ~8 items of work; tiny counts fall to the serial path (nthreads==1). Compute can't beat
-        // the largest model-group anyway (same-model instances are serial -- animate() writes shared Model
-        // state), and the work-stealing queue balances the rest. [2026-07-25 perf]
-        std::size_t grouped_items = 0;
-        for (auto const& g : creature_groups) { grouped_items += g.second.size(); }
-        std::size_t const by_work = grouped_items / 8;
-        std::size_t const nthreads =
-          (ng <= 1) ? 1 : std::min<std::size_t>({static_cast<std::size_t>(hw), ng, std::max<std::size_t>(1, by_work)});
-        if (nthreads <= 1)
+        // [threading 2026-08-18] Persistent worker pool instead of spawning + joining a fresh std::thread
+        // vector EVERY frame (the ~50-100us/thread Windows spawn churn the old code warned about, on a
+        // 24-thread CPU that noggit barely used). Work unit = one creature GROUP (a model's instances):
+        // same-model instances stay serial inside the group (animate() writes shared Model state), distinct
+        // models run in parallel across the pool + the calling thread. NOGGIT_NO_THREAD_POOL=1 -> serial.
+        if (auto* tp = noggit::render_pool())
         {
-          for (auto& g : creature_groups) { animate_creature_group(g); }
+          tp->parallel_for(ng, [&](std::size_t gi) { animate_creature_group(creature_groups[gi]); });
         }
         else
         {
-          std::atomic<std::size_t> next{0};
-          std::vector<std::thread> pool;
-          pool.reserve(nthreads);
-          for (std::size_t t = 0; t < nthreads; ++t)
-          {
-            pool.emplace_back([&]
-            {
-              for (std::size_t gi = next.fetch_add(1); gi < ng; gi = next.fetch_add(1))
-              {
-                animate_creature_group(creature_groups[gi]);
-              }
-            });
-          }
-          for (auto& th : pool) { th.join(); }
+          for (auto& g : creature_groups) { animate_creature_group(g); }
         }
       }
 
@@ -5068,6 +6018,10 @@ void WorldRender::draw (glm::mat4x4 const& model_view
         {
           continue;
         }
+        // [creature body MDI 2026-08-18] this body was drawn (and animated) by the per-instance-bone MDI batch
+        // above -> skip its body draw + particle sim here, but STILL draw its mount/attachments below and
+        // restore its own pose into the shared bone buffer so attachment placement + shadow seat correctly.
+        bool const body_batched = _creature_body_batched.count(instance) != 0;
 
         if (draw_hidden_models || !instance->model->is_hidden())
         {
@@ -5112,7 +6066,7 @@ void WorldRender::draw (glm::mat4x4 const& model_view
                 mount_model->animcalc = false;
               }
               mount_model->renderer()->draw(model_view, mount, m2_shader, model_render_state, frustum,
-                _cull_distance, camera_pos, creature_animtime, display, /*no_cull*/ false,
+                _cull_distance, camera_pos, creature_animtime, display, /*no_cull*/ true, // GPU-clip, no bbox snap
                 /*bloom_mask_only*/ false, interior_light_at(mount.get_pos(), false), creature_fade);
               ++_world->_n_rendered_objects;
 
@@ -5134,6 +6088,8 @@ void WorldRender::draw (glm::mat4x4 const& model_view
             }
           }
 
+          if (!body_batched)
+          {
           // Parallel-animate: if this instance's bones were pre-computed on a worker thread, restore them
           // and draw with skip_animate (upload + draw, no main-thread recompute). Else the serial path.
           bool const use_precomputed_bones = _ci < creature_bones_ready.size() && creature_bones_ready[_ci];
@@ -5150,7 +6106,12 @@ void WorldRender::draw (glm::mat4x4 const& model_view
             , camera_pos
             , creature_animtime
             , display
-            , /*no_cull*/ false
+            // [fix 2026-08-18] no_cull=TRUE: the body's bounding-box frustum cull SNAPS the whole body off the
+            // instant its box crosses the screen edge, even while part of the body -- or an attachment offset
+            // from it (weapon/helm/shoulder, drawn no_cull) -- is still on screen. Let the GPU clip the body
+            // per-triangle instead so it slides off smoothly WITH its gear. Off-screen bodies are already
+            // bounded away by the gather's 64yd frustum pre-cull, so this adds no unbounded draw work.
+            , /*no_cull*/ true
             , /*bloom_mask_only*/ false
             , interior_light_at(instance->get_pos(), false) // moving (creature/attachment) -> no cache
             , creature_fade
@@ -5158,12 +6119,38 @@ void WorldRender::draw (glm::mat4x4 const& model_view
           );
           ++_world->_n_rendered_objects;
 
+          // Client-parity per-instance bones: the pre-pass already stored _animation_bones for the
+          // parallelised majority. For instances it SKIPPED (mounts with seat bones, particle
+          // creatures, or the whole serial path) the in-draw animate() above just left THIS unit's
+          // pose in the shared model buffer -- capture it onto the instance now so the shadow pass and
+          // attachment placement can read the unit's OWN pose (not the next-drawn instance's). One
+          // per-instance palette, computed once, read by both passes -- the client's model.
+          if (!use_precomputed_bones && instance->model->animated
+              && !instance->model->bone_matrices.empty())
+          {
+            instance->_animation_bones = instance->model->bone_matrices;
+          }
+          }
+          else
+          {
+            // [creature body MDI] the body was drawn by the per-instance-bone MDI batch above. Restore THIS
+            // instance's captured pose into the shared model bone buffer so the attachment placement below
+            // (reads parent_model->bone_matrices[attachment_def->bone]) and the shadow pass seat on the RIGHT
+            // pose -- not whichever instance the batch's parallel animate wrote last.
+            if (instance->model->animated && !instance->_animation_bones.empty()
+                && instance->_animation_bones.size() == instance->model->bone_matrices.size())
+            {
+              instance->model->bone_matrices = instance->_animation_bones;
+            }
+          }
+
           // Advance THIS spawn's OWN particle simulation now, while animate() (inside draw() above) has the
           // shared bones + emitter setup at this instance's animation phase. Each spawn keeps its own live
           // particle state (keyed by guid) so its particles stay glued to its own animated body instead of
           // matching only the last-drawn spawn (the shared/global state still updates in tick() for
           // doodads/preview). Gated on animations so particles freeze in place when animations are off.
-          if (draw_model_animations && draw_item.spawn)
+          // Batched bodies are particle-less by predicate, so skip (they never ran the body draw/animate here).
+          if (!body_batched && draw_model_animations && draw_item.spawn)
           {
             if (Model* pmodel = instance->model.get())
             {
@@ -5320,6 +6307,15 @@ void WorldRender::draw (glm::mat4x4 const& model_view
               );
               ++_world->_n_rendered_objects;
 
+              // Capture this attachment's own bones (animated weapons/effect models) so the shadow pass
+              // can redraw it in the SAME pose. Static equipment (no bones) leaves this empty and the
+              // shadow draw treats it as rigid.
+              if (attachment_instance.model->animated
+                  && !attachment_instance.model->bone_matrices.empty())
+              {
+                attachment_instance._animation_bones = attachment_instance.model->bone_matrices;
+              }
+
               // Advance this attachment's OWN particle simulation (aura effect models like the
               // arcane chest sparkle are pure particle emitters). Same per-instance scheme as the
               // body above, keyed by (guid, attachment slot) so shared effect models (many creatures
@@ -5349,6 +6345,331 @@ void WorldRender::draw (glm::mat4x4 const& model_view
     gl.disable(GL_BLEND);
     gl.enable(GL_CULL_FACE);
     gl.depthMask(GL_TRUE);
+    // DEFENSIVE (2026-08-14): the detail-doodad grass path toggles GL_SAMPLE_ALPHA_TO_COVERAGE via
+    // state tracking and can leave it ENABLED if grass was the last M2 drawn. Now that the grass
+    // shader emits REAL sub-1 coverage (the mesh_color.a-vs-texture-alpha fix), a leaked A2C can
+    // punch coverage holes into the shadow depth render + subsequent passes = the intermittent
+    // "black world". Force it off before the shadow pass and keep it off for the rest of the frame;
+    // the grass path re-enables it per-draw as needed.
+    gl.disable(GL_SAMPLE_ALPHA_TO_COVERAGE);
+
+    // ---- 3.3.5a dynamic UNIT shadow map (client extShadowQuality >= 1, RE doc 35) ----
+    // Renders this frame's visible units (creatures + the game character; the list above) into a
+    // directional depth map from the scene light; terrain/WMO/M2 receivers PCF-sample it NEXT frame
+    // (1-frame latency by design -- the receiver draws already happened this frame). Level 0 = off
+    // (blob decals above, the client's own level-0 behaviour). Environmental casters (WMO/doodads,
+    // client levels 3-5 -- e.g. the Stormwind bank door) are the next stage; levels 3-5 currently
+    // raise resolution/range only.
+    if (_shadow_quality >= 1 && !minimap_render && display == display_mode::in_3D
+        && (!creature_spawn_instances_to_draw.empty() || _shadow_quality >= 3))
+    {
+      // CLIENT-EXACT sizes (wow335a.exe FUN_00875d30 @0x875d32: size = 0x400; quality>3 or ==2 ->
+      // 0x800): 1024 at levels 1/3, 2048 at 2/4/5 (level 5 = same 2048 rings, round-robin CSM).
+      int const shadow_size = (_shadow_quality == 2 || _shadow_quality >= 4) ? 2048 : 1024;
+      // CLIENT-SPLIT maps: UNIT bubble (client 20yd around the PLAYER, DAT_009f281c; the flying
+      // editor camera gets 60yd) + ENVIRONMENTAL ring (middle of the client's 40/160/640 cascade,
+      // DAT_00b1d520) at levels >= 3. Separate maps so a unit's shadow MULTIPLIES on top of a
+      // building's (the client projects each map as its own Mod pass, FUN_00875f80/FUN_00874fb0).
+      bool const have_game_char =
+          _world->_game_character_visible && _world->_game_character.model_instance.has_value();
+      glm::vec3 const unit_center = have_game_char
+          ? _world->_game_character.model_instance->get_pos() : camera_pos;
+      float const unit_range = have_game_char ? 20.0f : 60.0f;
+      float const env_range = 160.0f;
+      bool const do_env = _shadow_quality >= 3;
+      ensureShadowTarget(shadow_size);
+
+      // Toward-sun in the POSITION frame (vary_position/f_position/m2_world_pos). dayDir is the wow-
+      // space travel direction; position frame = (-wow.y, wow.z, -wow.x) (terrain_frag spec note), so
+      // toward-sun = (dayDir.y, -dayDir.z, dayDir.x).
+      glm::vec3 day = _outdoor_light_stats.dayDir;
+      // CLIENT shadow-sun STEEPEN (wow.exe FUN_007bb570 @0x7bb570, the shadow driver): the 3.3.5
+      // shadow light is NOT the raw scene light. The client scales the light direction's VERTICAL
+      // component x5 and clamps it to >= -1.2, THEN renormalizes -- lifting the sun so shadows are
+      // steeper/shorter than the flat 1.12 scene light. RE-proven against
+      // wow_cap_stormwind_shadows_130pm.trace: at 1:30pm the traced shadow/lighting sun basis is
+      // ~46 deg elevation, while the flat scene-light law (FUN_007eea90, phi 110-127 @ az 225 --
+      // which noggit copies into dayDir) sits at only ~33 deg. Constants are exact:
+      // _DAT_009ebf34 = 5.0 (vertical scale), _DAT_00a400fc = -1.2 (floor). dayDir.z = cos(phi) is
+      // the wow-frame vertical (points down for a sun above, so it is negative; x5 then clamp makes
+      // it steeper). Without this, our shadows tracked the flat light and never matched the game.
+      day.z = std::max(day.z * 5.0f, -1.2f);
+      float const day_len = glm::length(day);
+      day = day_len > 1e-4f ? day / day_len : glm::vec3(0.0f, -1.0f, 0.0f);
+      glm::vec3 const to_sun = glm::normalize(glm::vec3(day.y, -day.z, day.x));
+      glm::vec3 const up = (std::abs(to_sun.y) > 0.98f) ? glm::vec3(1.0f, 0.0f, 0.0f) : glm::vec3(0.0f, 1.0f, 0.0f);
+
+      // Build a TEXEL-SNAPPED light VP (client-exact mechanism, FUN_00875f80: the projected offset
+      // is floor(size*x+0.5)/size -- the map translates in whole-texel steps as the center moves, so
+      // shadow edges don't crawl/"chainsaw" while moving). World-anchored: snap the world origin's
+      // light-view position to the texel grid.
+      auto const build_snapped_vp = [&](glm::vec3 const& center, float range) -> glm::mat4
+      {
+        float const eye_dist = range * 2.0f + 200.0f;
+        glm::mat4 const lv = glm::lookAt(center + to_sun * eye_dist, center, up);
+        glm::mat4 const lp = glm::ortho(-range, range, -range, range, 1.0f, eye_dist + range * 2.0f);
+        float const texel = (2.0f * range) / static_cast<float>(shadow_size);
+        glm::vec4 const o_lv = lv * glm::vec4(0.0f, 0.0f, 0.0f, 1.0f);
+        glm::vec3 const snap(std::fmod(o_lv.x, texel), std::fmod(o_lv.y, texel), 0.0f);
+        return lp * glm::translate(glm::mat4(1.0f), -snap) * lv;
+      };
+      glm::mat4 const shadow_vp = build_snapped_vp(unit_center, unit_range);
+      glm::mat4 const shadow_env_vp = build_snapped_vp(camera_pos, env_range);
+
+      // m2_vert computes vertex = view_rot * (world - cam), gl_Position = projection * vertex. With
+      // projection := shadow_vp * T(cam) * view_rotT the SAME vertex path lands in light clip space --
+      // bones, billboards and camera-relative precision all reused untouched.
+      glm::mat4 view_rot4 = model_view;
+      view_rot4[3] = glm::vec4(0.0f, 0.0f, 0.0f, 1.0f);
+      glm::mat4 const cam_unview = glm::translate(glm::mat4(1.0f), camera_pos) * glm::transpose(view_rot4);
+      glm::mat4 const shadow_proj_override = shadow_vp * cam_unview;
+      glm::mat4 const shadow_env_proj_override = shadow_env_vp * cam_unview;
+      math::frustum const light_frustum {shadow_vp};
+      math::frustum const light_env_frustum {shadow_env_vp};
+
+      GLint prev_fbo = 0;
+      GLint prev_vp[4] = {0, 0, 0, 0};
+      gl.getIntegerv(GL_FRAMEBUFFER_BINDING, &prev_fbo);
+      gl.getIntegerv(GL_VIEWPORT, prev_vp);
+
+      // FEEDBACK-LOOP GUARD (GL spec): the shadow textures must NOT stay bound for sampling on
+      // units 16/17 while they are this pass's depth attachments -- undefined behaviour, and the
+      // observed driver-dependent "world turns black" corruption. Unbind for the pass, rebind after.
+      gl.activeTexture(GL_TEXTURE0 + 16);
+      gl.bindTexture(GL_TEXTURE_2D, 0);
+      gl.activeTexture(GL_TEXTURE0 + 17);
+      gl.bindTexture(GL_TEXTURE_2D, 0);
+      gl.activeTexture(GL_TEXTURE0);
+
+      gl.bindFramebuffer(GL_FRAMEBUFFER, _shadow_fbo);
+      gl.viewport(0, 0, shadow_size, shadow_size);
+      gl.clear(GL_DEPTH_BUFFER_BIT);
+      gl.enable(GL_POLYGON_OFFSET_FILL);
+      gl.polygonOffset(2.0f, 4.0f); // depth bias against acne (the client biases via hwPCF/lod too)
+      gl.disable(GL_CULL_FACE);     // thin/one-sided caster geometry still occludes
+
+      {
+        updateMVPUniformBlock(model_view, shadow_proj_override, camera_pos);
+
+        OpenGL::Scoped::use_program shadow_m2_shader {*_m2_program.get()};
+        OpenGL::M2RenderState shadow_render_state;
+        shadow_render_state.tex_arrays = {0, 0};
+        shadow_render_state.tex_indices = {0, 0};
+        shadow_render_state.tex_unit_lookups = {0, 0};
+        shadow_m2_shader.uniform("blend_mode", 0);
+        shadow_m2_shader.uniform("unfogged", 1);
+        shadow_m2_shader.uniform("unlit", 1);
+        shadow_m2_shader.uniform("tex_unit_lookup_1", 0);
+        shadow_m2_shader.uniform("tex_unit_lookup_2", 0);
+        shadow_m2_shader.uniform("pixel_shader", 0);
+        shadow_m2_shader.uniform("model_origin", glm::vec3(0.0f));
+        shadow_m2_shader.uniform("slice_dist", 0.0f);
+
+        for (std::size_t si = 0; si < creature_spawn_instances_to_draw.size(); ++si)
+        {
+          auto const& draw_item = creature_spawn_instances_to_draw[si];
+          ModelInstance* instance = draw_item.instance;
+          if (!instance || !instance->model.get() || instance->model->loading_failed()
+              || !instance->model->finishedLoading())
+          {
+            continue;
+          }
+          if (!draw_hidden_models && instance->model->is_hidden())
+          {
+            continue;
+          }
+          // [perf 2026-08-15] CULL casters outside the UNIT shadow box. The unit map only covers ~20yd
+          // around the player, but creature_spawn_instances_to_draw holds every creature visible in the
+          // MAIN camera -- in a crowded city that's dozens of NPCs, nearly all of them outside the box.
+          // We were submitting them ALL (body + equipment + per-instance bone restore) every frame; the
+          // light-frustum vertex clip then threw the geometry away = pure wasted CPU submission. An
+          // explicit AABB-vs-light-frustum test skips them before any of that work. (Game view sits the
+          // camera in the crowd, so this is where its extra shadow cost came from.)
+          if (!instance->isInFrustum(light_frustum))
+          {
+            continue;
+          }
+          int const c_animtime = draw_item.spawn
+            ? static_cast<int>(_world->model_animtime) + draw_item.spawn->animation_time_offset
+            : static_cast<int>(_world->model_animtime);
+          Model* const parent_model = instance->model.get();
+          // CLIENT-PARITY: draw the shadow from THIS unit's OWN per-instance bone palette (filled during
+          // the per-frame animate; the client stores bones on the instance and both the color pass and
+          // this depth pass read them -- it never separately animates shadows). Restoring the instance
+          // palette makes the shadow byte-identical to the on-screen silhouette: idle NPCs stay idle, the
+          // running player runs. Fallback to an in-draw re-animate only when the palette is empty (unit
+          // main-pass culled but inside the light frustum, or a non-per-instance static model).
+          bool const has_bones = instance->_animation_bones.size() == parent_model->bone_matrices.size()
+                                 && !instance->_animation_bones.empty() && parent_model->animated;
+          if (has_bones)
+          {
+            parent_model->bone_matrices = instance->_animation_bones;
+          }
+          parent_model->renderer()->draw(model_view, *instance, shadow_m2_shader,
+                                            shadow_render_state, light_frustum,
+                                            100000.0f /*no dist cull; the light frustum culls*/,
+                                            camera_pos, c_animtime,
+                                            display, true /*no_cull: light frustum differs*/,
+                                            false, glm::vec4(0.0f), 1.0f, has_bones /*skip_animate: use palette*/);
+
+          // EQUIPMENT casts shadow too (helmet / shoulders / weapon / aura kits). Each attachment is
+          // placed on the PARENT's bone at its attach point (parent_model->bone_matrices, just restored
+          // to this unit's pose above) exactly like the main pass, then drawn from its OWN captured
+          // palette. Mirrors the color-pass attachment block so the shadow silhouette includes gear.
+          if (draw_item.spawn)
+          {
+            for (auto& attachment : draw_item.spawn->attachment_models)
+            {
+              if (!attachment.model_instance.has_value()) { continue; }
+              auto& att_inst = *attachment.model_instance;
+              Model* const att_model = att_inst.model.get();
+              if (!att_model || !att_model->finishedLoading() || att_model->loading_failed()
+                  || (!draw_hidden_models && att_model->is_hidden()))
+              {
+                continue;
+              }
+              auto const* att_def = find_attachment_def(parent_model, attachment.attachment_id);
+              if (!att_def && attachment.attachment_id == 34) { att_def = find_attachment_def(parent_model, 15); }
+              if (!att_def && attachment.attachment_id == 20) { att_def = find_attachment_def(parent_model, 11); }
+              if (!att_def) { continue; }
+              att_inst.setTransformMatrix(attachment_world_matrix(*instance, parent_model, att_def));
+              bool const att_has_bones = att_inst._animation_bones.size() == att_model->bone_matrices.size()
+                                         && !att_inst._animation_bones.empty() && att_model->animated;
+              if (att_has_bones)
+              {
+                att_model->bone_matrices = att_inst._animation_bones;
+              }
+              att_model->renderer()->draw(model_view, att_inst, shadow_m2_shader,
+                                          shadow_render_state, light_frustum,
+                                          100000.0f, camera_pos, c_animtime,
+                                          display, true /*no_cull*/, false,
+                                          glm::vec4(0.0f), 1.0f, att_has_bones /*skip_animate*/);
+            }
+          }
+        }
+      }
+
+      // ---- ENVIRONMENTAL casters (client levels 3-5: "Full environmental and PC/NPC shadows") ----
+      // The client's SEPARATE env map (its ring cascade): WMOs + the batched M2 doodad buckets
+      // depth-only. wmo_vert uses the IDENTICAL camera-relative chain as m2_vert, so the same kind
+      // of projection override lands them in light clip space. Separate from the unit map so unit
+      // shadows MULTIPLY on top of building shadows like the client's per-map Mod passes.
+      if (do_env)
+      {
+        gl.bindFramebuffer(GL_FRAMEBUFFER, _shadow_env_fbo);
+        gl.viewport(0, 0, shadow_size, shadow_size);
+        gl.clear(GL_DEPTH_BUFFER_BIT);
+        updateMVPUniformBlock(model_view, shadow_env_proj_override, camera_pos);
+        if (!wmos_to_draw.empty())
+        {
+          OpenGL::Scoped::use_program shadow_wmo_shader {*_wmo_program.get()};
+          shadow_wmo_shader.uniform("camera", glm::vec3(camera_pos.x, camera_pos.y, camera_pos.z));
+          for (auto& winst : wmos_to_draw)
+          {
+            if (!winst->wmo->finishedLoading() || winst->wmo->loading_failed())
+            {
+              continue;
+            }
+            if (!draw_hidden_models && winst->wmo->is_hidden())
+            {
+              continue;
+            }
+            winst->draw(shadow_wmo_shader
+                , nullptr /*no liquid in the shadow map*/
+                , nullptr
+                , model_view
+                , shadow_env_proj_override
+                , light_env_frustum
+                , 100000.0f /*no dist cull; the light frustum culls*/
+                , camera_pos
+                , false /*force_box*/
+                , false /*draw_doodads: WMO doodads ride the m2 buckets below*/
+                , false /*draw_fog*/
+                , {} /*selection*/
+                , _world->animtime
+                , false /*world_has_skies*/
+                , display
+                , false /*no_cull: light frustum culls*/
+                , true  /*draw_exterior*/
+                , nullptr /*world_renderer: no point-light scoping / deferred liquid in this pass*/
+            );
+          }
+        }
+
+        // batched doodads/gameobjects: this frame's visible instance buckets, depth-only re-draw
+        {
+          OpenGL::Scoped::use_program shadow_m2i {*_m2_instanced_program.get()};
+          OpenGL::M2RenderState env_state;
+          env_state.tex_arrays = {0, 0};
+          env_state.tex_indices = {0, 0};
+          env_state.tex_unit_lookups = {0, 0};
+          shadow_m2i.uniform("blend_mode", 0);
+          shadow_m2i.uniform("unfogged", 1);
+          shadow_m2i.uniform("unlit", 1);
+          shadow_m2i.uniform("tex_unit_lookup_1", 0);
+          shadow_m2i.uniform("tex_unit_lookup_2", 0);
+          shadow_m2i.uniform("pixel_shader", 0);
+          shadow_m2i.uniform("model_origin", glm::vec3(0.0f));
+          shadow_m2i.uniform("slice_dist", 0.0f);
+          std::vector<glm::vec4> env_interior;
+          std::vector<float> env_fades;
+          for (auto& pair : models_to_draw)
+          {
+            Model* m = pair.first;
+            if (!m || !m->finishedLoading() || m->loading_failed() || pair.second.empty())
+            {
+              continue;
+            }
+            if (!draw_hidden_models && m->is_hidden())
+            {
+              continue;
+            }
+            env_interior.assign(pair.second.size(), glm::vec4(0.0f));
+            env_fades.assign(pair.second.size(), 1.0f);
+            m->renderer()->draw(model_view, pair.second, shadow_m2i, env_state, light_env_frustum,
+                                100000.0f /*no dist cull*/, camera_pos,
+                                static_cast<int>(_world->model_animtime),
+                                false /*boxes*/, model_boxes_to_draw, display,
+                                false /*no_cull: light frustum culls*/,
+                                nullptr /*representative*/, env_interior, env_fades);
+          }
+        }
+      }
+
+      updateMVPUniformBlock(model_view, projection, camera_pos); // restore the camera matrices
+
+      gl.disable(GL_POLYGON_OFFSET_FILL);
+      gl.enable(GL_CULL_FACE);
+      gl.bindFramebuffer(GL_FRAMEBUFFER, static_cast<GLuint>(prev_fbo));
+      gl.viewport(prev_vp[0], prev_vp[1], prev_vp[2], prev_vp[3]);
+
+      // safe to re-bind for the remaining shadow-sampling draws this frame (fading GOs etc.);
+      // the maps are no longer the active render targets
+      gl.activeTexture(GL_TEXTURE0 + 16);
+      gl.bindTexture(GL_TEXTURE_2D, _shadow_tex);
+      gl.activeTexture(GL_TEXTURE0 + 17);
+      gl.bindTexture(GL_TEXTURE_2D, _shadow_env_tex);
+      gl.activeTexture(GL_TEXTURE0);
+
+      // world -> [0,1]^3 for next frame's receiver sampling
+      glm::mat4 const bias(0.5f, 0.0f, 0.0f, 0.0f,
+                           0.0f, 0.5f, 0.0f, 0.0f,
+                           0.0f, 0.0f, 0.5f, 0.0f,
+                           0.5f, 0.5f, 0.5f, 1.0f);
+      _shadow_matrix = bias * shadow_vp;
+      _shadow_center_range = glm::vec4(unit_center, unit_range);
+      _shadow_env_matrix = bias * shadow_env_vp;
+      _shadow_env_center_range = glm::vec4(camera_pos, env_range);
+      _shadow_env_valid = do_env;
+      _shadow_map_valid = true;
+    }
+    else
+    {
+      // pass skipped (level 0, minimap, non-3D display or no units) -> next frame must not sample
+      // a stale map (departed units would leave frozen shadows)
+      _shadow_map_valid = false;
+      _shadow_env_valid = false;
+    }
 
     // FADING gameobjects: the same individual body draw creatures get, so gameobject fades are
     // EXACTLY the creature fade -- continuous alpha (no instanced quantization), depth prepass,
@@ -5546,6 +6867,18 @@ void WorldRender::draw (glm::mat4x4 const& model_view
         }
         color.a *= spawn_marker_opacity; // editor overlay, kept subtle so it does not fight the model
         markers.push_back({spawn.guid, color, spawn.pos, ring_radius});
+      }
+
+      // Wander-distance visualization (creature editor): while the wander_distance field is focused,
+      // draw a ground ring of that radius (server yards == world units) around the edited spawn so
+      // the editor SEES how far movement_type-1 wandering reaches. Same projected-decal machinery
+      // as the selection circles; orange so it never reads as a selection/hostility ring.
+      if (_world->wander_viz && _world->wander_viz->radius > 0.01f)
+      {
+        markers.push_back({0u,
+                           glm::vec4(1.0f, 0.55f, 0.1f, 0.9f),
+                           _world->wander_viz->center,
+                           _world->wander_viz->radius});
       }
 
       if (capture_debug_enabled())
@@ -5799,6 +7132,7 @@ void WorldRender::draw (glm::mat4x4 const& model_view
           glm::mat4x4 const inv_mvp_rel = glm::inverse(mvp_rel);
 
           std::vector<glm::vec3> points;
+          std::vector<glm::vec3> waypoint_dots; // every authored waypoint of every drawn route
 
           for (auto const& spawn : _world->creatureSpawns())
           {
@@ -5834,6 +7168,25 @@ void WorldRender::draw (glm::mat4x4 const& model_view
             _path_decal_render.draw(mvp_rel, inv_mvp_rel, inv_vp, _decal_depth_tex, _world_depth_tex, points,
                                     camera_pos, view_axis, color,
                                     path_world_width, path_min_pixels, path_max_pixels, px_scale);
+
+            // The AUTHORED waypoints only (not the live spawn position): these are the coordinates
+            // the creature actually walks between, i.e. what a path editor needs to see.
+            waypoint_dots.insert(waypoint_dots.end(), it->second.begin(), it->second.end());
+          }
+
+          // Waypoint nodes: one near-black dot per authored coordinate, drawn AFTER every route so
+          // the nodes sit on top of their lines. Black contrasts against every palette entry (all
+          // bright/saturated, incl. white) and against terrain; sized a bit wider than the ribbon
+          // with its own pixel clamps so the nodes read as beads at any distance.
+          if (!waypoint_dots.empty())
+          {
+            constexpr float dot_world_diameter = 0.85f;         // ~2x the ribbon width
+            constexpr float dot_min_pixels = 5.0f;
+            constexpr float dot_max_pixels = 26.0f;
+            glm::vec4 const dot_color(0.03f, 0.03f, 0.03f, 0.92f);
+            _path_decal_render.draw_dots(mvp_rel, inv_mvp_rel, inv_vp, _decal_depth_tex, _world_depth_tex,
+                                         waypoint_dots, camera_pos, view_axis, dot_color,
+                                         dot_world_diameter, dot_min_pixels, dot_max_pixels, px_scale);
           }
         }
 
@@ -5930,6 +7283,11 @@ void WorldRender::draw (glm::mat4x4 const& model_view
 
     ZoneScopedN("World::draw() : Draw water");
     noggit::perf::Scoped _prof_water(noggit::perf::Phase::Water);
+
+    // [A2C leak fix 2026-08-18] The env shadow-caster pass above re-enables GL_SAMPLE_ALPHA_TO_COVERAGE after
+    // the frame's last defensive disable (it draws the grass detail-doodads into the depth FBO), so water --
+    // which writes fractional per-depth alpha -- inherits it and shows the same coverage dither. Force it off.
+    gl.disable(GL_SAMPLE_ALPHA_TO_COVERAGE);
 
     // draw the water on both sides
     OpenGL::Scoped::bool_setter<GL_CULL_FACE, GL_FALSE> const cull;
@@ -6032,6 +7390,17 @@ void WorldRender::draw (glm::mat4x4 const& model_view
     _deferred_wmo_liquid.clear();
   }
 
+  // Weather precipitation (rain streaks / snow flakes) around the camera -- the visible half of the
+  // editor weather; the light/fog half is the STORM-param blend in Sky::colorFor. Drawn after the
+  // water so drops overlay it like everything else.
+  if (_world->weather_type != 0 && _world->weather_intensity > 0.0f)
+  {
+    glm::vec3 const precip_light = _skies->color_set[LIGHT_GLOBAL_AMBIENT] * 0.75f
+                                 + _skies->color_set[LIGHT_GLOBAL_DIFFUSE] * 0.45f;
+    _weather_effect.draw(mvp, camera_pos, _world->weather_type, _world->weather_intensity,
+                         _world->animtime, precip_light, _world->_context);
+  }
+
   // Deferred pure-additive light effects (god rays / lighthouse beams), drawn AFTER the water so
   // the opaque deep water no longer paints over them. prepareDraw applies each pass's additive
   // blend + no-depth-write, so they brighten the water surface instead of being occluded by it.
@@ -6083,6 +7452,10 @@ void WorldRender::draw (glm::mat4x4 const& model_view
     gl.enable(GL_CULL_FACE);
     gl.depthMask(GL_TRUE);
   }
+
+  // GEOMETRY-MODEL particle collector (checklist 12.2): path -> world transforms, one per live
+  // particle, filled inside each placement's live-state swap below and drawn after the phase.
+  std::unordered_map<std::string, std::vector<glm::mat4x4>> geometry_particle_draws;
 
   // model particles (drawn after water so additive glows appear on top of the water surface).
   // Drawn even when animations are off -> particles freeze in place (not advanced) instead of vanishing.
@@ -6180,15 +7553,21 @@ void WorldRender::draw (glm::mat4x4 const& model_view
       }
       else
       {
-        std::vector<std::thread> pool;
+        // [threading 2026-08-18] persistent pool instead of per-frame std::thread spawns; each of the
+        // `workers` contiguous ranges is one work item.
         std::size_t const per = (n + workers - 1) / workers;
-        for (std::size_t w = 0; w < workers; ++w)
+        if (auto* tp = noggit::render_pool())
         {
-          std::size_t const b = w * per, e = std::min(n, b + per);
-          if (b >= e) { break; }
-          pool.emplace_back(sim_range, b, e);
+          tp->parallel_for(workers, [&](std::size_t w)
+          {
+            std::size_t const b = w * per, e = std::min(n, b + per);
+            if (b < e) { sim_range(b, e); }
+          });
         }
-        for (auto& t : pool) { t.join(); }
+        else
+        {
+          sim_range(0, n);
+        }
       }
     }
 
@@ -6237,6 +7616,10 @@ void WorldRender::draw (glm::mat4x4 const& model_view
             pmodel->updateParticleSystems(adt);
           }
           pmodel->renderer()->drawParticlesForInstance(glm::transpose(model_view), particles_shader, transform);
+          if (pmodel->hasGeometryParticles())
+          {
+            pmodel->appendGeometryParticleTransforms(transform, geometry_particle_draws);
+          }
           pmodel->swapInstanceEmitterState(key);
         }
       }
@@ -6263,6 +7646,10 @@ void WorldRender::draw (glm::mat4x4 const& model_view
       }
       pmodel->renderer()->drawParticlesForInstance(
           glm::transpose(model_view), particles_shader, instance->transformMatrix(), instance->model_alpha);
+      if (pmodel->hasGeometryParticles())
+      {
+        pmodel->appendGeometryParticleTransforms(instance->transformMatrix(), geometry_particle_draws);
+      }
       if (use_instance_state)
       {
         pmodel->swapInstanceEmitterState(draw_item.guid);
@@ -6297,6 +7684,46 @@ void WorldRender::draw (glm::mat4x4 const& model_view
             amodel->swapInstanceEmitterState(attachment_key);
           }
         }
+      }
+    }
+
+    // Individually-drawn GAMEOBJECTS (mid-fade + cylindrical-billboard models like the mage portals):
+    // their transforms are no longer in models_to_draw, so the bucket placement loop above never sees
+    // them -- without this loop the portals' swirl emitters vanished the moment they were rerouted to
+    // the per-instance path. Same swap-by-key pattern as WMO doodads (GOs are static placements).
+    for (auto const& go_item : go_fading_individual)
+    {
+      ModelInstance* go_instance = go_item.first;
+      if (!go_instance || !go_instance->model.get() || !go_instance->model->finishedLoading()
+          || go_instance->model->loading_failed()
+          || (!draw_hidden_models && go_instance->model->is_hidden())
+          || go_instance->model->_particles.empty())
+      {
+        continue;
+      }
+      glm::vec3 const go_pos(go_instance->transformMatrix()[3]);
+      if (particle_too_far(go_pos)) { continue; }
+      Model* pmodel = go_instance->model.get();
+      // Unlike creatures (whose body pass advances their per-guid particle state), the individual GO
+      // body draw does NOT advance emitters -- advance this placement's own state here before submitting,
+      // the same dt-stepping the bucket placement loop uses.
+      std::uint64_t const key = wmo_doodad_placement_key(go_pos);
+      if (draw_model_animations)
+      {
+        pmodel->swapInstanceEmitterState(key);
+        float pdt = _world->models_emitter_dt();
+        while (pdt > 0.1f)
+        {
+          pmodel->updateParticleSystems(0.1f);
+          pdt -= 0.1f;
+        }
+        pmodel->updateParticleSystems(pdt);
+      }
+      pmodel->renderer()->drawParticlesForInstance(
+          glm::transpose(model_view), particles_shader, go_instance->transformMatrix());
+      if (draw_model_animations)
+      {
+        pmodel->swapInstanceEmitterState(key);
       }
     }
 
@@ -6377,6 +7804,64 @@ void WorldRender::draw (glm::mat4x4 const& model_view
     }
     gl.colorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
     gl.blendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+  }
+
+  // GEOMETRY-MODEL PARTICLES (checklist 12.2): draw the collected mesh instances -- one transform
+  // per live particle -- through the instanced M2 path (the deferred-additive pattern). Falling
+  // embers / Dark Iron node rocks (Burning Steppes), SandVortex cyclone, cone-of-cold shards.
+  if (!geometry_particle_draws.empty())
+  {
+    OpenGL::Scoped::use_program m2_shader {*_m2_instanced_program.get()};
+
+    OpenGL::M2RenderState model_render_state;
+    model_render_state.tex_arrays = {0, 0};
+    model_render_state.tex_indices = {0, 0};
+    model_render_state.tex_unit_lookups = {0, 0};
+    gl.blendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    gl.disable(GL_BLEND);
+    gl.depthMask(GL_TRUE);
+    gl.enable(GL_CULL_FACE);
+    m2_shader.uniform("blend_mode", 0);
+    m2_shader.uniform("unfogged", static_cast<int>(model_render_state.unfogged));
+    m2_shader.uniform("unlit", static_cast<int>(model_render_state.unlit));
+    m2_shader.uniform("tex_unit_lookup_1", 0);
+    m2_shader.uniform("tex_unit_lookup_2", 0);
+    m2_shader.uniform("pixel_shader", 0);
+    m2_shader.uniform("model_origin", glm::vec3(0.0f));
+
+    std::unordered_map<Model*, std::size_t> unused_boxes;
+
+    for (auto& entry : geometry_particle_draws)
+    {
+      auto ref = _geometry_particle_models.find(entry.first);
+      if (ref == _geometry_particle_models.end())
+      {
+        ref = _geometry_particle_models.emplace(
+            entry.first,
+            scoped_model_reference(BlizzardArchive::Listfile::FileKey(entry.first), _world->_context)).first;
+      }
+      Model* geometry_model = ref->second.get();
+      if (!geometry_model || !geometry_model->finishedLoading() || geometry_model->loading_failed())
+      {
+        continue;
+      }
+      geometry_model->renderer()->draw(model_view
+          , entry.second
+          , m2_shader
+          , model_render_state
+          , frustum
+          , _cull_distance
+          , camera_pos
+          , _world->model_animtime
+          , false
+          , unused_boxes
+          , display
+      );
+    }
+
+    gl.disable(GL_BLEND);
+    gl.enable(GL_CULL_FACE);
+    gl.depthMask(GL_TRUE);
   }
 
   // RE-STAMP creature bloom masks AFTER the particle + ribbon passes. Those passes multiply the FBO
@@ -6866,6 +8351,54 @@ void WorldRender::renderBloomAndComposite(GLuint target_fbo, int w, int h, glm::
   gl.enable(GL_DEPTH_TEST);
 }
 
+void WorldRender::ensureShadowTarget(int size)
+{
+  // 3.3.5a-style dynamic shadow map (RE doc 35): the client renders D24X8 DEPTH TEXTURES and samples
+  // them with hardware PCF (`hwPCF`; Ascension trace: 1024x1024 at extShadowQuality 3). GL mirror:
+  // a DEPTH_COMPONENT24 texture with COMPARE_REF_TO_TEXTURE -> sampler2DShadow PCF in the receivers.
+  if (!_shadow_initialized)
+  {
+    gl.genFramebuffers(1, &_shadow_fbo);
+    gl.genTextures(1, &_shadow_tex);
+    gl.genFramebuffers(1, &_shadow_env_fbo);
+    gl.genTextures(1, &_shadow_env_tex);
+    _shadow_initialized = true;
+    _shadow_size = 0;
+  }
+  if (_shadow_size == size)
+  {
+    return;
+  }
+  _shadow_size = size;
+
+  // MUST restore the caller's framebuffer: this runs MID-FRAME while the scene renders into the
+  // bloom/MSAA FBO -- leaving binding 0 here made the caller save-and-"restore" the DEFAULT
+  // framebuffer, breaking the whole frame on every realloc (the black-world bug).
+  GLint prev_fbo_binding = 0;
+  gl.getIntegerv(GL_FRAMEBUFFER_BINDING, &prev_fbo_binding);
+
+  gl.activeTexture(GL_TEXTURE0);
+  auto const alloc = [size](GLuint fbo, GLuint tex)
+  {
+    gl.bindTexture(GL_TEXTURE_2D, tex);
+    gl.texImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT24, size, size, 0, GL_DEPTH_COMPONENT, GL_UNSIGNED_INT, nullptr);
+    gl.texParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR); // LINEAR + compare = 2x2 hw PCF per tap
+    gl.texParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    gl.texParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    gl.texParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    gl.texParameteri(GL_TEXTURE_2D, GL_TEXTURE_COMPARE_MODE, GL_COMPARE_REF_TO_TEXTURE);
+    gl.texParameteri(GL_TEXTURE_2D, GL_TEXTURE_COMPARE_FUNC, GL_LEQUAL);
+    gl.bindFramebuffer(GL_FRAMEBUFFER, fbo);
+    gl.framebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, tex, 0);
+    gl.drawBuffer(GL_NONE);
+    gl.readBuffer(GL_NONE);
+  };
+  alloc(_shadow_fbo, _shadow_tex);
+  alloc(_shadow_env_fbo, _shadow_env_tex);
+  gl.bindFramebuffer(GL_FRAMEBUFFER, static_cast<GLuint>(prev_fbo_binding));
+  gl.bindTexture(GL_TEXTURE_2D, 0);
+}
+
 void WorldRender::upload()
 {
   ZoneScoped;
@@ -7005,6 +8538,9 @@ void WorldRender::upload()
     gl.bufferData(GL_UNIFORM_BUFFER, sizeof(OpenGL::LightingUniformBlock), NULL, GL_DYNAMIC_DRAW);
     gl.bindBufferRange(GL_UNIFORM_BUFFER, OpenGL::ubo_targets::LIGHTING, _lighting_ubo, 0, sizeof(OpenGL::LightingUniformBlock));
     gl.bindBuffer(GL_UNIFORM_BUFFER, 0);
+    // 3.3.5a dynamic shadow map: unit 16 (units 1-15 belong to the texture arrays; desktop GL exposes 32)
+    m2_shader.uniform("shadow_map", 16);
+    m2_shader.uniform("shadow_map_env", 17);
   }
 
   {
@@ -7015,6 +8551,8 @@ void WorldRender::upload()
     wmo_program.uniform("texture_samplers", samplers);
     wmo_program.bind_uniform_block("matrices", 0);
     wmo_program.bind_uniform_block("lighting", 1);
+    wmo_program.uniform("shadow_map", 16);
+    wmo_program.uniform("shadow_map_env", 17);
   }
 
   {
@@ -7042,6 +8580,8 @@ void WorldRender::upload()
 
     std::vector<int> samplers {5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
     mcnk_shader.uniform("textures", samplers);
+    mcnk_shader.uniform("shadow_map", 16);
+    mcnk_shader.uniform("shadow_map_env", 17);
 
   }
 
@@ -7052,6 +8592,8 @@ void WorldRender::upload()
     m2_shader_instanced.uniform("bone_matrices", 0);
     m2_shader_instanced.uniform("tex1", 1);
     m2_shader_instanced.uniform("tex2", 2);
+    m2_shader_instanced.uniform("shadow_map", 16);
+    m2_shader_instanced.uniform("shadow_map_env", 17);
   }
 
   {
@@ -7062,6 +8604,8 @@ void WorldRender::upload()
     m2_shader_batched.uniform("bone_matrices", 0);
     m2_shader_batched.uniform("tex1", 1);
     m2_shader_batched.uniform("tex2", 2);
+    m2_shader_batched.uniform("shadow_map", 16);
+    m2_shader_batched.uniform("shadow_map_env", 17);
   }
 
   {
@@ -7210,6 +8754,9 @@ void WorldRender::updateLightingUniformBlock(bool draw_fog, glm::vec3 const& cam
     underwater = false;
   }
   _skies->setCurrentParam(underwater ? CLEAR_WATER : CLEAR);
+  // Weather: every band (fog/diffuse/ambient/sky/water) blends toward the STORM param set by the
+  // editor weather intensity (Sky::colorFor / floatParamFor read it).
+  Skies::set_weather_intensity(_world->weather_type != 0 ? _world->weather_intensity : 0.0f);
   _skies->update_sky_colors(camera_pos, daytime);
   _outdoor_light_stats = _outdoor_lighting->getLightStats(static_cast<int>(_world->time));
 
@@ -7249,7 +8796,41 @@ void WorldRender::updateLightingUniformBlock(bool draw_fog, glm::vec3 const& cam
   // Editor fog-distance scale (Settings, default 2.0). Pick the INTERIOR (WMO) multiplier when the camera
   // is inside a WMO, else the OUTDOOR (zone) one; store it so WMORender's per-group fog (fogDistanceScale())
   // uses the SAME band. fog_start is a fraction of fog_end, so scaling the end stretches the whole band.
-  _active_fog_distance_scale = _camera_inside_wmo ? _fog_distance_scale_interior : _fog_distance_scale;
+  // [fog transition 2026-08-18] Blend the OUTDOOR->INDOOR fog-distance band CONTINUOUSLY by the camera's
+  // depth into the room (client-spatial, RE note above) instead of snapping on the binary _camera_inside_wmo.
+  // factor 0 at the entrance = outdoor band, 1 deep inside = interior band. collect_camera_fog below reads
+  // this same _active_fog_distance_scale, so the WMO sphere fog eases with it too.
+  static bool const s_no_fog_transition = std::getenv("NOGGIT_NO_FOG_TRANSITION") != nullptr;
+  float const fog_scale_target = _camera_inside_wmo ? _fog_distance_scale_interior : _fog_distance_scale;
+  if (s_no_fog_transition)
+  {
+    _active_fog_distance_scale = fog_scale_target; // original binary flip
+  }
+  else
+  {
+    // Ease the fog-distance SCALE toward its target so crossing the WMO boundary FADES the band instead of
+    // snapping (the fog COLOUR is unchanged across the boundary -- only the band scales, e.g. Stormwind 4x->1x).
+    // _camera_inside_wmo follows the CHARACTER (see _fog_probe_pos), so the target moves only on the
+    // character's own crossing -- camera orbit never does. A map whose scale never flips (Timbermaw: fog from
+    // MFOG spheres) holds a CONSTANT target here -> the ease is an exact no-op, its sphere blend untouched.
+    static float const s_fog_scale_tau = []
+    {
+      char const* const e = std::getenv("NOGGIT_FOG_FADE_SECONDS");
+      float const v = e ? static_cast<float>(std::atof(e)) : 0.5f;
+      return v > 0.02f ? v : 0.5f;
+    }();
+    float const sdt = _world->models_emitter_dt();
+    if (!_fog_scale_eased_valid || sdt <= 0.0f || sdt > 1.0f)
+    {
+      _fog_scale_eased = fog_scale_target; // first frame / paused / hitch -> snap (never fade from a stale value)
+      _fog_scale_eased_valid = true;
+    }
+    else
+    {
+      _fog_scale_eased += (fog_scale_target - _fog_scale_eased) * (1.0f - std::exp(-sdt / s_fog_scale_tau));
+    }
+    _active_fog_distance_scale = _fog_scale_eased;
+  }
   fog_end *= _active_fog_distance_scale;
 
   // NOTE (trace: wow_cap_kara_cull_fog, per-draw fog attribution): the client does NOT override the
@@ -7279,7 +8860,9 @@ void WorldRender::updateLightingUniformBlock(bool draw_fog, glm::vec3 const& cam
       glm::vec3 cam_color = fog_color;
       float cam_end = fog_end;
       float cam_start_abs = fog_start * fog_end;
-      _world->collect_camera_fog(camera_pos, _active_fog_distance_scale, cam_color, cam_end, cam_start_abs);
+      // SELECT the fog from the character's placement (see _fog_probe_pos), not the camera -- orbiting the
+      // 3rd-person camera into/out of a fog sphere must not change the scene fog.
+      _world->collect_camera_fog(_fog_probe_pos, _active_fog_distance_scale, cam_color, cam_end, cam_start_abs);
       fog_color = cam_color;
       fog_end = std::min(cam_end, _view_distance);
       fog_start = (fog_end > 0.001f) ? (cam_start_abs / fog_end) : fog_start;
@@ -7302,9 +8885,10 @@ void WorldRender::updateLightingUniformBlock(bool draw_fog, glm::vec3 const& cam
     float best_vol = std::numeric_limits<float>::max();
     for (auto const& v : _env_fog_volumes)
     {
-      if (camera_pos.x < v.min.x || camera_pos.x > v.max.x
-       || camera_pos.y < v.min.y || camera_pos.y > v.max.y
-       || camera_pos.z < v.min.z || camera_pos.z > v.max.z)
+      // Which interior group the fog is taken from follows the CHARACTER's placement, not the camera.
+      if (_fog_probe_pos.x < v.min.x || _fog_probe_pos.x > v.max.x
+       || _fog_probe_pos.y < v.min.y || _fog_probe_pos.y > v.max.y
+       || _fog_probe_pos.z < v.min.z || _fog_probe_pos.z > v.max.z)
       {
         continue;
       }
@@ -7324,7 +8908,7 @@ void WorldRender::updateLightingUniformBlock(bool draw_fog, glm::vec3 const& cam
     float mf_end = 0.0f, mf_start = 0.0f;
     if (cam_int_group
         && cam_int_group->wmo->evaluate_camera_fog(*cam_int_group->group, cam_int_group->transform,
-                                                   camera_pos, /*camera_inside_wmo=*/ true,
+                                                   _fog_probe_pos, /*camera_inside_wmo=*/ true,
                                                    &mf_color, &mf_end, &mf_start))
     {
       fog_color = mf_color;
@@ -7355,6 +8939,10 @@ void WorldRender::updateLightingUniformBlock(bool draw_fog, glm::vec3 const& cam
       _int_fog_valid = false;
     }
   }
+
+  // (The scene fog COLOUR is unchanged across a WMO boundary; the only thing that flips is the distance
+  // scale, which is eased above -- so no whole-fog temporal ease is needed here, and none is applied so maps
+  // whose fog comes from spatial MFOG spheres never get temporal lag.)
 
   // TRACE (NOGGIT_LIGHT_DEBUG): the FINAL zone-fog state fed to the render, logged so overblown-fog spots
   // can be diagnosed straight from log.txt. Pairs with the Sky.cpp ZONEFOG line (weighted-light list).
@@ -7551,21 +9139,26 @@ void WorldRender::updateLightingUniformBlock(bool draw_fog, glm::vec3 const& cam
       return glm::dot(dd, dd) > _light_cull_d2;
     };
 
-    _world->_model_instance_storage.for_each_m2_instance([&] (ModelInstance& inst)
+    // CANON LIGHTING ONLY: do NOT synthesize warm point lights for "hot" props (lightray shafts,
+    // braziers, fires, candles, lava, etc.). Previous code fabricated a warm light from an
+    // emissive-material flag + a filename-keyword guess, which flooded prop-dense rooms (Zul'Farrak
+    // troll camps) with up to 16 fake orange lights = the orange wash. A prop with no AUTHORED M2 light
+    // does not illuminate its surroundings in the real client; only its own emissive material/particles
+    // are visible. We keep ONLY authored lights below (standalone M2 type-1, WMO MOLT, WMO-doodad M2).
+    //
+    // [20.4 PERF 2026-08-22] Registry-driven collection: light carriers are a tiny fraction of the
+    // instance flood (0.6% of M2 models have lights), so the per-rebuild walk visits ONLY the uids in
+    // _point_light_registry instead of every instance. The registry re-derives (a full scan, identical
+    // coverage to the old walk) whenever storage.light_epoch() changes -- bumped by every instance
+    // add/move/remove/doodad-set change and tile load/unload. The per-instance collection math below is
+    // UNCHANGED, so the collected set is identical; only which instances get VISITED differs.
+    int lightray_lights = 0;
+    int wmo_molt_lights = 0;
+
+    auto const collect_m2_lights = [&] (ModelInstance& inst)
     {
       Model* m = inst.model.get();
-      if (!m || !m->finishedLoading())
-      {
-        return;
-      }
-
-      // CANON LIGHTING ONLY: do NOT synthesize warm point lights for "hot" props (lightray shafts,
-      // braziers, fires, candles, lava, etc.). Previous code fabricated a warm light from an
-      // emissive-material flag + a filename-keyword guess, which flooded prop-dense rooms (Zul'Farrak
-      // troll camps) with up to 16 fake orange lights = the orange wash. A prop with no AUTHORED M2 light
-      // does not illuminate its surroundings in the real client; only its own emissive material/particles
-      // are visible. We keep ONLY authored lights below (standalone M2 type-1, WMO MOLT, WMO-doodad M2).
-      if (m->lights().empty())
+      if (!m || !m->finishedLoading() || m->lights().empty())
       {
         return;
       }
@@ -7598,26 +9191,34 @@ void WorldRender::updateLightingUniformBlock(bool draw_fog, glm::vec3 const& cam
         glm::vec3 const d = world - camera_pos;
         collected.push_back({world, col, radius, glm::dot(d, d)});
       }
-    });
+    };
 
-    // Lightray shafts are usually WMO doodads (e.g. timbermaw_instance.wmo's dusty light set), which
-    // the standalone-M2 loop above never sees -- collect their synthetic light here too.
-    int lightray_lights = 0;
-    int wmo_molt_lights = 0;
-    _world->_model_instance_storage.for_each_wmo_instance([&] (WMOInstance& wmo)
+    // Collects the WMO's MOLT + doodad lights AND classifies it for the registry: has_lights = any
+    // authored light found; fully_classified = it could be fully inspected (near enough, WMO and all
+    // its doodad models finished loading). A has_lights WMO is re-walked every rebuild, so doodad
+    // models that finish loading later still join in; !fully_classified stays pending.
+    auto const collect_wmo_lights = [&] (WMOInstance& wmo, bool& has_lights, bool& fully_classified)
     {
+      has_lights = false;
+      fully_classified = true;
       {
         auto const& _e = wmo.getExtents();
         if (!s_no_light_cull && _too_far_for_light(_e[0], _e[1]))
         {
-          return; // WMO's MOLT + doodad lights (<=60yd) can't reach a visible surface -- skip get_doodads
+          fully_classified = false; // too far to inspect -- its lights can't reach anyway
+          return;                   // WMO's MOLT + doodad lights (<=60yd) can't reach a visible surface -- skip get_doodads
         }
+      }
+      if (!wmo.wmo.get() || !wmo.wmo->finishedLoading())
+      {
+        fully_classified = false;
       }
       // Authored WMO lights (MOLT) -- e.g. Ironforge's 209 forge/torch lights, dungeon braziers. These
       // are parsed but were never fed to a renderer; wire them into the same point-light set the
       // terrain/WMO/M2 shaders already consume, so interiors are lit by their real authored lights.
       if (wmo.wmo.get() && wmo.wmo->finishedLoading() && !wmo.wmo->lights.empty())
       {
+        has_lights = true;
         glm::mat4x4 const wmo_transform = wmo.transformMatrix();
         for (auto const& wl : wmo.wmo->lights)
         {
@@ -7640,19 +9241,21 @@ void WorldRender::updateLightingUniformBlock(bool draw_fog, glm::vec3 const& cam
         for (auto& doodad : pair.second)
         {
           Model* dm = doodad.model.get();
-          if (!dm || !dm->finishedLoading())
+          if (!dm)
           {
             continue;
           }
+          if (!dm->finishedLoading())
+          {
+            fully_classified = false;
+            continue;
+          }
 
-          // (No synthesized lightray/hot light here either -- canon authored lights only.)
-
-          // Real authored M2 lights on the WMO doodad (candles, lamps, braziers placed inside a WMO).
-          // These were previously dropped -- only the synthesize-when-empty path below ran -- so interior
-          // props with their own light contributed nothing. Collect them like the standalone-M2 loop,
+          // Real authored M2 lights on the WMO doodad (candles, lamps, braziers placed inside a WMO),
           // with the animated (flickering) colour sampled on the global clock.
           if (!dm->lights().empty())
           {
+            has_lights = true;
             glm::mat4x4 const transform = doodad.transformMatrix();
             float const inst_scale = glm::length(glm::vec3(transform[0]));
             int const lt = static_cast<int>(_world->animtime);
@@ -7670,11 +9273,107 @@ void WorldRender::updateLightingUniformBlock(bool draw_fog, glm::vec3 const& cam
               collected.push_back({world, col, radius, glm::dot(d, d)});
             }
           }
-
-          // (No synthesized "hot prop" light for WMO doodads -- canon authored lights only.)
         }
       }
-    });
+    };
+
+    auto& light_storage = _world->_model_instance_storage;
+    auto& reg = _point_light_registry;
+    std::uint64_t const light_epoch = light_storage.light_epoch();
+    if (reg.epoch != light_epoch)
+    {
+      // FULL scan: same coverage as the pre-registry walk, deriving the registry as it goes.
+      reg.m2_uids.clear();
+      reg.pending_m2.clear();
+      reg.wmo_uids.clear();
+      reg.pending_wmo.clear();
+      light_storage.for_each_m2_instance([&] (ModelInstance& inst)
+      {
+        Model* m = inst.model.get();
+        if (!m)
+        {
+          return; // an instance never gains a model -- final
+        }
+        if (!m->finishedLoading())
+        {
+          reg.pending_m2.push_back(inst.uid);
+          return;
+        }
+        if (m->lights().empty())
+        {
+          return; // final: a finished model's light list never changes
+        }
+        reg.m2_uids.push_back(inst.uid);
+        collect_m2_lights(inst);
+      });
+      light_storage.for_each_wmo_instance([&] (WMOInstance& wmo)
+      {
+        bool has_lights = false, fully_classified = true;
+        collect_wmo_lights(wmo, has_lights, fully_classified);
+        if (has_lights)
+        {
+          reg.wmo_uids.push_back(wmo.uid);
+        }
+        else if (!fully_classified)
+        {
+          reg.pending_wmo.push_back(wmo.uid);
+        }
+      });
+      reg.epoch = light_epoch;
+    }
+    else
+    {
+      light_storage.visit_m2_uids(reg.m2_uids, collect_m2_lights);
+      if (!reg.pending_m2.empty())
+      {
+        std::vector<std::uint32_t> still_pending;
+        still_pending.reserve(reg.pending_m2.size());
+        light_storage.visit_m2_uids(reg.pending_m2, [&] (ModelInstance& inst)
+        {
+          Model* m = inst.model.get();
+          if (!m)
+          {
+            return;
+          }
+          if (!m->finishedLoading())
+          {
+            still_pending.push_back(inst.uid);
+            return;
+          }
+          if (m->lights().empty())
+          {
+            return;
+          }
+          reg.m2_uids.push_back(inst.uid);
+          collect_m2_lights(inst);
+        });
+        reg.pending_m2.swap(still_pending);
+      }
+      light_storage.visit_wmo_uids(reg.wmo_uids, [&] (WMOInstance& wmo)
+      {
+        bool has_lights = false, fully_classified = true;
+        collect_wmo_lights(wmo, has_lights, fully_classified);
+      });
+      if (!reg.pending_wmo.empty())
+      {
+        std::vector<std::uint32_t> still_pending;
+        still_pending.reserve(reg.pending_wmo.size());
+        light_storage.visit_wmo_uids(reg.pending_wmo, [&] (WMOInstance& wmo)
+        {
+          bool has_lights = false, fully_classified = true;
+          collect_wmo_lights(wmo, has_lights, fully_classified);
+          if (has_lights)
+          {
+            reg.wmo_uids.push_back(wmo.uid);
+          }
+          else if (!fully_classified)
+          {
+            still_pending.push_back(wmo.uid);
+          }
+        });
+        reg.pending_wmo.swap(still_pending);
+      }
+    }
 
     // (No synthesized lava-liquid point lights -- canon authored lights only. Lava still self-illuminates
     // as an emissive SURFACE via the liquid/WMO-unlit shader path; terrain near lava is warmed by its
@@ -7727,6 +9426,20 @@ void WorldRender::updateLightingUniformBlock(bool draw_fog, glm::vec3 const& cam
     }
     } // end if (rebuild_point_lights) -- else frames reuse last-built cached point-light UBO set
   }
+
+  // 3.3.5a dynamic shadow map: the matrix of the LAST rendered map (end-of-frame pass) + params.
+  // x = effective level (0 disables sampling entirely -- also while no map has been rendered yet),
+  // y = shadowed-light floor (residual sun in shadow; the client's Mod pass leaves ~35%),
+  // z = 1/map size for the PCF taps.
+  _lighting_ubo_data.ShadowMatrix = _shadow_matrix;
+  _lighting_ubo_data.ShadowParams = glm::vec4(
+      (_shadow_map_valid && _shadow_quality >= 1) ? static_cast<float>(_shadow_quality) : 0.0f,
+      0.35f,
+      _shadow_size > 0 ? 1.0f / static_cast<float>(_shadow_size) : 0.0f,
+      (_shadow_env_valid && _shadow_quality >= 3) ? 1.0f : 0.0f);
+  _lighting_ubo_data.ShadowCenterRange = _shadow_center_range;
+  _lighting_ubo_data.ShadowMatrixEnv = _shadow_env_matrix;
+  _lighting_ubo_data.ShadowEnvCenterRange = _shadow_env_center_range;
 
   gl.bindBuffer(GL_UNIFORM_BUFFER, _lighting_ubo);
   gl.bufferSubData(GL_UNIFORM_BUFFER, 0, sizeof(OpenGL::LightingUniformBlock), &_lighting_ubo_data);
@@ -7832,6 +9545,8 @@ void WorldRender::updateLightingUniformBlockMinimap(MinimapRenderSettings* setti
   _lighting_ubo_data.RiverColorLight = settings->river_color_light;
   _lighting_ubo_data.RiverColorDark = settings->river_color_dark;
   _lighting_ubo_data.PointLightParams = glm::vec4(0.f); // no emitter point lights on the minimap
+  _lighting_ubo_data.ShadowParams = glm::vec4(0.f);     // no dynamic shadows on the minimap
+  _lighting_ubo_data.ShadowCenterRange = glm::vec4(0.f);
 
   gl.bindBuffer(GL_UNIFORM_BUFFER, _lighting_ubo);
   gl.bufferSubData(GL_UNIFORM_BUFFER, 0, sizeof(OpenGL::LightingUniformBlock), &_lighting_ubo_data);

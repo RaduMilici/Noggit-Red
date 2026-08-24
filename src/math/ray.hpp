@@ -27,6 +27,11 @@ namespace math
       return _origin + _direction * distance;
     }
 
+    glm::vec3 const& origin() const
+    {
+      return _origin;
+    }
+
   private:
      glm::vec3 _origin;
      glm::vec3 _direction;

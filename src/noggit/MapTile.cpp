@@ -707,7 +707,7 @@ void MapTile::convert_alphamap(bool to_big_alpha)
 }
 
 
-bool MapTile::intersect (math::ray const& ray, selection_result* results) const
+bool MapTile::intersect (math::ray const& ray, selection_result* results, float max_dist) const
 {
   if (!finished)
   {
@@ -723,6 +723,17 @@ bool MapTile::intersect (math::ray const& ray, selection_result* results) const
   {
     for (size_t i (0); i < 16; ++i)
     {
+      // short physics probes (game mode): skip chunks farther than max_dist from the probe origin
+      // so a 1-yd wall ray doesn't triangle-walk every chunk along its infinite line
+      if (max_dist > 0.0f)
+      {
+        MapChunk* const chunk = mChunks[j][i].get();
+        glm::vec3 const closest(glm::clamp(ray.origin(), chunk->vmin, chunk->vmax));
+        if (glm::distance(closest, ray.origin()) > max_dist)
+        {
+          continue;
+        }
+      }
       mChunks[j][i]->intersect (ray, results);
     }
   }

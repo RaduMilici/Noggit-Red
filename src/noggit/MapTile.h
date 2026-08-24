@@ -108,7 +108,7 @@ public:
   std::atomic<bool> rendered_recently{false};
 
 
-  bool intersect (math::ray const&, selection_result*) const;
+  bool intersect (math::ray const&, selection_result*, float max_dist = 0.0f) const;
 
 
   bool GetVertex(float x, float z, glm::vec3 *V);

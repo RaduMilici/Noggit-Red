@@ -134,7 +134,19 @@ public:
             , Noggit::Rendering::WorldRender* world_renderer = nullptr // per-room (MOLR) light scoping
             );
 
-  void intersect (math::ray const&, selection_result*, bool do_exterior = true);
+  void intersect (math::ray const&, selection_result*, bool do_exterior = true, float max_dist = 0.0f);
+  // [game mode] ray-test this WMO's OWN doodads (fences, crates, rocks placed by the WMO) --
+  // per-triangle via ModelInstance::intersect. Separate from intersect() so editor selection
+  // behaviour (WMO doodads are not selectable) stays unchanged.
+  void intersect_doodads (glm::mat4x4 const& model_view, math::ray const&, selection_result*, int animtime, float max_dist = 0.0f);
+  // [perf 2026-08-19] Append this WMO's COLLIDING doodads (those with a collision mesh) whose world position is
+  // within `radius` of `center` to `out`, updating their transforms. Lets the game-mode probe cache pre-filter
+  // the near-collidable set ONCE per rebuild so a collision ray no longer walks every doodad in a city WMO.
+  void collect_colliding_doodads_near (glm::vec3 const& center, float radius,
+                                       std::vector<wmo_doodad_instance*>& out);
+  // [game mode] world-space liquid surface height at world_pos from this WMO's group liquids
+  // (BRD lava, city pools); nullopt when none covers it.
+  std::optional<float> liquidHeightAt (glm::vec3 const& world_pos);
 
   // GAMEOBJECT-owned instances aren't registered with map tiles; skip the tile-visibility gate in
   // draw() (they are frustum-culled by their gather loop instead).

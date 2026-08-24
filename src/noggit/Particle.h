@@ -78,12 +78,37 @@ struct TexCoordSet {
 
 class ParticleSystem 
 {
+public:
+  int16_t particleColorIndex() const { return _particle_color_index; }
+  void setColorOverride(std::array<glm::vec4, 3> const& rgb); // rgb only; authored alpha kept
+  void clearColorOverride();
+
+  // GEOMETRY-MODEL particles (checklist 12.2): emitters authoring geometry_model_filename draw a
+  // mesh instance of that model per live particle instead of a billboard quad (falling embers,
+  // Dark Iron node rocks, SandVortex cyclone, cone-of-cold shards). The particle pass skips the
+  // quad fill for these; WorldRender collects one world transform per particle and draws the model
+  // through the instanced M2 path after the particle phase.
+  bool hasGeometryModel() const { return !_geometry_model_path.empty(); }
+  std::string const& geometryModelPath() const { return _geometry_model_path; }
+  void appendGeometryParticleTransforms(glm::mat4x4 const& host_transform,
+                                        std::vector<glm::mat4x4>& out) const;
+
+private:
   Model *model;
   int emitter_type;
   std::unique_ptr<ParticleEmitter> emitter;
   Animation::M2Value<float> speed, variation, spread, lat, gravity, lifespan, rate, areal, areaw, deacceleration;
   Animation::M2Value<uint8_t> enabled;
   std::array<glm::vec4, 3> colors;
+  // ParticleColor.dbc recolor (WotLK, 12.10): emitters authored with particleColorIndex 11/12/13
+  // take colour-set 1/2/3 of the CreatureDisplayInfo.particleColorID row while a recolored spawn's
+  // state is swapped in. _authored_colors restores the shared state on swap-out; the DBC carries no
+  // alpha, so overrides keep the authored alpha ramp.
+  int16_t _particle_color_index = -1;
+  std::array<glm::vec4, 3> _authored_colors {};
+  std::string _geometry_model_path;
+  void read_geometry_model_filename(BlizzardArchive::ClientFile const& f,
+                                    std::uint32_t n, std::uint32_t ofs);
   std::array<float,3> sizes;
   float mid, slowdown;
   float _spin = 0.f; // emitter spin (revolutions/sec): for a spline emitter this is how fast the

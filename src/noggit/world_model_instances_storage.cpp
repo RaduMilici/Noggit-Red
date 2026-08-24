@@ -267,6 +267,7 @@ namespace Noggit
       _instance_count_per_uid.erase(uid);
       _m2s.erase(uid);
       _wmos.erase(uid);
+      bump_light_epoch(); // tile-unload erase bypasses updateTiles* -- invalidate the light registry
     }
   }
 
@@ -277,6 +278,7 @@ namespace Noggit
     _instance_count_per_uid.clear();
     _m2s.clear();
     _wmos.clear();
+    bump_light_epoch(); // map teardown bypasses updateTiles* -- invalidate the light registry here
   }
 
   std::optional<ModelInstance*> world_model_instances_storage::get_model_instance(std::uint32_t uid)

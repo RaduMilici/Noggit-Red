@@ -538,6 +538,152 @@ namespace
 
 namespace mysql
 {
+  namespace
+  {
+    // Split a .sql script into individual statements. Understands '...'/"..."/`...` quoting with
+    // backslash escapes, -- and # line comments, and /* */ block comments, so semicolons inside
+    // strings or comments never split a statement. DELIMITER directives (procedure dumps) are NOT
+    // supported -- spawn exports and world-table dumps don't use them.
+    std::vector<std::string> splitSqlStatements(std::string const& script)
+    {
+      std::vector<std::string> statements;
+      std::string current;
+      char quote = 0;             // active quote char (' " `) or 0
+      bool line_comment = false;  // -- or # until end of line
+      bool block_comment = false; // /* ... */
+
+      for (std::size_t i = 0; i < script.size(); ++i)
+      {
+        char const c = script[i];
+        char const next = (i + 1 < script.size()) ? script[i + 1] : 0;
+
+        if (line_comment)
+        {
+          if (c == '\n')
+          {
+            line_comment = false;
+            current += c;
+          }
+          continue;
+        }
+        if (block_comment)
+        {
+          if (c == '*' && next == '/')
+          {
+            block_comment = false;
+            ++i;
+          }
+          continue;
+        }
+        if (quote)
+        {
+          current += c;
+          if (c == '\\' && quote != '`' && next) // backticks have no backslash escapes
+          {
+            current += next;
+            ++i;
+          }
+          else if (c == quote)
+          {
+            quote = 0;
+          }
+          continue;
+        }
+
+        if (c == '\'' || c == '"' || c == '`')
+        {
+          quote = c;
+          current += c;
+          continue;
+        }
+        if (c == '-' && next == '-' && (i + 2 >= script.size() || script[i + 2] == ' ' || script[i + 2] == '\n' || script[i + 2] == '\r' || script[i + 2] == '\t'))
+        {
+          line_comment = true;
+          ++i;
+          continue;
+        }
+        if (c == '#')
+        {
+          line_comment = true;
+          continue;
+        }
+        if (c == '/' && next == '*')
+        {
+          block_comment = true;
+          ++i;
+          continue;
+        }
+        if (c == ';')
+        {
+          auto const start = current.find_first_not_of(" \t\r\n");
+          if (start != std::string::npos)
+          {
+            statements.push_back(current.substr(start));
+          }
+          current.clear();
+          continue;
+        }
+        current += c;
+      }
+
+      auto const start = current.find_first_not_of(" \t\r\n");
+      if (start != std::string::npos)
+      {
+        statements.push_back(current.substr(start));
+      }
+      return statements;
+    }
+  }
+
+  SqlScriptResult executeSqlScript(std::string const& script)
+  {
+    SqlScriptResult result;
+
+    auto connection = connect(&result.error);
+    if (!connection)
+    {
+      return result;
+    }
+
+    auto const statements = splitSqlStatements(script);
+    if (statements.empty())
+    {
+      result.error = "The script contains no SQL statements.";
+      return result;
+    }
+
+    if (!executeStatement(connection.get(), "START TRANSACTION", &result.error))
+    {
+      return result;
+    }
+
+    for (auto const& statement : statements)
+    {
+      if (!executeStatement(connection.get(), statement, &result.error))
+      {
+        result.failed_statement = statement.substr(0, 300);
+        executeStatement(connection.get(), "ROLLBACK");
+        return result;
+      }
+      ++result.statements_executed;
+    }
+
+    if (!executeStatement(connection.get(), "COMMIT", &result.error))
+    {
+      executeStatement(connection.get(), "ROLLBACK");
+      return result;
+    }
+
+    result.ok = true;
+    return result;
+  }
+
+  std::string connectionDescription()
+  {
+    auto const details = loadConnectionDetails();
+    return details.user + "@" + details.host + ":" + std::to_string(details.port) + "/" + details.schema;
+  }
+
   bool testConnection(bool report_only_err)
   {
 		std::string error;
@@ -648,7 +794,8 @@ namespace mysql
 	  mysql_query(connection.get(), statement.str().c_str());
 	}
 
-	std::vector<CreatureSpawnRecord> getCreatureSpawns(std::size_t mapID, std::string* error)
+	std::vector<CreatureSpawnRecord> getCreatureSpawns(std::size_t mapID, std::string* error,
+	                                                   CreatureSpawnTableColumns* columns_out)
 	{
 		auto connection = connect(error);
 		if (!connection)
@@ -740,9 +887,60 @@ namespace mysql
 			? "LEFT JOIN (SELECT guid, MIN(" + event_col + ") AS gevent FROM game_event_creature GROUP BY guid) gec ON gec.guid = c.guid "
 			: "";
 
+		// Extended spawn columns (Edit/New Creature panel). Detect per schema: tortoise-wow names
+		// first, then the mangos-style equivalents; a missing column selects a constant so the row
+		// layout stays fixed. The resolved REAL column names go to columns_out for the SQL exporter.
+		CreatureSpawnTableColumns cols;
+		cols.entry_col = creature_entry_col.substr(2); // strip the "c." prefix
+		auto col_or = [&](char const* a, char const* b) -> std::string
+		{
+			if (tableHasColumn(connection.get(), "creature", a)) return a;
+			if (b && tableHasColumn(connection.get(), "creature", b)) return b;
+			return {};
+		};
+		cols.id2_col = col_or("id2", nullptr);
+		cols.id3_col = col_or("id3", nullptr);
+		cols.id4_col = col_or("id4", nullptr);
+		cols.respawn_min_col = col_or("spawntimesecsmin", "spawntimesecs");
+		cols.respawn_max_col = col_or("spawntimesecsmax", "spawntimesecs");
+		cols.wander_col = col_or("wander_distance", "spawndist");
+		// Turtle: health_percent/mana_percent (spawn at % of max). AzerothCore: curhealth/curmana
+		// (ABSOLUTE, 0 = full) -- same editor fields, absolute semantics flagged for the UI.
+		cols.health_percent_col = col_or("health_percent", "curhealth");
+		cols.mana_percent_col = col_or("mana_percent", "curmana");
+		cols.health_mana_absolute = cols.health_percent_col == "curhealth" || cols.mana_percent_col == "curmana";
+		cols.movement_col = col_or("movement_type", "MovementType");
+		cols.spawn_flags_col = col_or("spawn_flags", nullptr);
+		cols.visibility_col = col_or("visibility_mod", nullptr);
+		cols.spawn_mask_col = col_or("spawnMask", nullptr);
+		cols.phase_mask_col = col_or("phaseMask", nullptr);
+		// cmangos alternative to id2..id4: creature_spawn_entry (guid, entry). creature.id = 0 +
+		// rows there = random entry per spawn -- those guids' template join would otherwise FAIL
+		// (id 0) and the spawns silently vanish from the editor, so the join below also resolves the
+		// effective entry through the table.
+		cols.spawn_entry_table = cols.id2_col.empty() && tableExists(connection.get(), "creature_spawn_entry");
+		if (columns_out)
+		{
+			*columns_out = cols;
+		}
+		auto ext_sel = [](std::string const& col, char const* fallback) -> std::string
+		{
+			return col.empty() ? std::string(fallback) : ("c.`" + col + "`");
+		};
+		std::string const spawn_entry_join = cols.spawn_entry_table
+			? "LEFT JOIN (SELECT guid, MIN(entry) AS first_entry, GROUP_CONCAT(entry ORDER BY entry SEPARATOR ',') AS entries "
+			  "FROM creature_spawn_entry GROUP BY guid) cse ON cse.guid = c.guid "
+			: "";
+		std::string const effective_entry_expr = cols.spawn_entry_table
+			? ("COALESCE(NULLIF(" + creature_entry_col + ", 0), cse.first_entry, 0)")
+			: creature_entry_col;
+		std::string const spawn_entries_sel = cols.spawn_entry_table
+			? "COALESCE(cse.entries, '') AS spawn_entries "
+			: "'' AS spawn_entries ";
+
 		std::stringstream statement;
 		statement
-			<< "SELECT c.guid, " << creature_entry_col << ", c.map, c.position_x, c.position_y, c.position_z, c.orientation, ct.name, "
+			<< "SELECT c.guid, " << effective_entry_expr << ", c.map, c.position_x, c.position_y, c.position_z, c.orientation, ct.name, "
 			<< template_scale_expr << ", "
 			<< display_expr << ", "
 			<< mount_expr << ", "
@@ -751,9 +949,24 @@ namespace mysql
 			<< "COALESCE(" << spawn_faction_expr << ", 0) AS spawn_faction, "
 			<< event_select << ", "
 			<< standstate_expr << ", "
-			<< emotestate_expr << " "
+			<< emotestate_expr << ", "
+			<< ext_sel(cols.id2_col, "0") << " AS ext_id2, "
+			<< ext_sel(cols.id3_col, "0") << " AS ext_id3, "
+			<< ext_sel(cols.id4_col, "0") << " AS ext_id4, "
+			<< ext_sel(cols.respawn_min_col, "0") << " AS ext_respawn_min, "
+			<< ext_sel(cols.respawn_max_col, "0") << " AS ext_respawn_max, "
+			<< ext_sel(cols.wander_col, "0") << " AS ext_wander, "
+			<< ext_sel(cols.health_percent_col, "100") << " AS ext_health_pct, "
+			<< ext_sel(cols.mana_percent_col, "100") << " AS ext_mana_pct, "
+			<< ext_sel(cols.movement_col, "0") << " AS ext_movement, "
+			<< ext_sel(cols.spawn_flags_col, "0") << " AS ext_spawn_flags, "
+			<< ext_sel(cols.visibility_col, "0") << " AS ext_visibility, "
+			<< ext_sel(cols.spawn_mask_col, "1") << " AS ext_spawn_mask, "
+			<< ext_sel(cols.phase_mask_col, "1") << " AS ext_phase_mask, "
+			<< spawn_entries_sel
 			<< "FROM creature c "
-			<< "INNER JOIN creature_template ct ON ct.entry = " << creature_entry_col << " "
+			<< spawn_entry_join
+			<< "INNER JOIN creature_template ct ON ct.entry = " << effective_entry_expr << " "
 			<< (needs_ctm_join ? "LEFT JOIN creature_template_model ctm ON ctm.CreatureID = ct.entry AND ctm.Idx = 0 " : "")
 			<< (needs_creature_addon_join ? "LEFT JOIN creature_addon ca ON ca.guid = c.guid " : "")
 			<< (has_template_addon_auras ? "LEFT JOIN creature_template_addon cta ON cta.entry = ct.entry " : "")
@@ -809,6 +1022,52 @@ namespace mysql
 			record.event = parseSigned(row[19]);
 			record.stand_state = static_cast<std::uint8_t>(parseUnsigned(row[20]));
 			record.emote_state = parseUnsigned(row[21]);
+			record.id2 = parseUnsigned(row[22]);
+			record.id3 = parseUnsigned(row[23]);
+			record.id4 = parseUnsigned(row[24]);
+			record.spawntimesecs_min = parseUnsigned(row[25]);
+			record.spawntimesecs_max = parseUnsigned(row[26]);
+			record.wander_distance = parseFloat(row[27]);
+			record.health_percent = parseUnsigned(row[28]);
+			record.mana_percent = parseUnsigned(row[29]);
+			record.movement_type = parseUnsigned(row[30]);
+			record.spawn_flags = parseUnsigned(row[31]);
+			record.visibility_mod = parseFloat(row[32]);
+			record.spawn_mask = parseUnsigned(row[33]);
+			record.phase_mask = parseUnsigned(row[34]);
+			// cmangos spawn-entry mode: the alt entries come from creature_spawn_entry (comma list);
+			// map the ones beyond the effective/primary entry onto the id2..id4 slots.
+			if (cols.spawn_entry_table && row[35] && row[35][0])
+			{
+				std::string const list(row[35]);
+				// NB: not named "slots" -- that's a Qt keyword-macro and expands to nothing here.
+				std::uint32_t* alt_slots[3] = { &record.id2, &record.id3, &record.id4 };
+				int slot_index = 0;
+				bool skipped_primary = false;
+				std::size_t start = 0;
+				while (start <= list.size() && slot_index < 3)
+				{
+					std::size_t const comma = list.find(',', start);
+					std::string const tok = list.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
+					if (!tok.empty())
+					{
+						auto const e = static_cast<std::uint32_t>(std::strtoul(tok.c_str(), nullptr, 10));
+						if (e == record.entry && !skipped_primary)
+						{
+							skipped_primary = true; // the primary entry occupies the Entry field
+						}
+						else if (e != 0)
+						{
+							*alt_slots[slot_index++] = e;
+						}
+					}
+					if (comma == std::string::npos)
+					{
+						break;
+					}
+					start = comma + 1;
+				}
+			}
 			records.push_back(record);
 		}
 
@@ -1381,23 +1640,57 @@ namespace mysql
 			return {};
 		}
 
-		// Per-guid waypoints (vmangos/mangos-style `creature_movement`, keyed by creature.guid). Absent
-		// table -> no patrol data, not an error.
-		if (!tableExists(connection.get(), "creature_movement")
-		    || !tableHasColumn(connection.get(), "creature_movement", "id")
-		    || !tableHasColumn(connection.get(), "creature_movement", "point")
-		    || !tableHasColumn(connection.get(), "creature_movement", "position_x"))
+		// Per-guid waypoints, one of THREE schema shapes:
+		//  - Turtle/vmangos:  creature_movement (id, point, position_x, ...) keyed by creature.guid
+		//  - CMaNGOS-wotlk:   creature_movement (Id, Point, PositionX, ...) -- same table, CamelCase
+		//    columns (genuinely different names, not just case) keyed by creature.guid
+		//  - AzerothCore:     waypoint_data (id, point, position_x, ...) keyed by PATH id, linked to
+		//    the spawn through creature_addon.path_id
+		// Absent tables -> no patrol data, not an error.
+		std::stringstream statement;
+		if (tableExists(connection.get(), "creature_movement")
+		    && tableHasColumn(connection.get(), "creature_movement", "id")
+		    && tableHasColumn(connection.get(), "creature_movement", "point")
+		    && tableHasColumn(connection.get(), "creature_movement", "position_x"))
+		{
+			statement
+				<< "SELECT cm.id, cm.point, cm.position_x, cm.position_y, cm.position_z "
+				<< "FROM creature_movement cm "
+				<< "INNER JOIN creature c ON c.guid = cm.id "
+				<< "WHERE c.map = " << mapID << " "
+				<< "ORDER BY cm.id, cm.point";
+		}
+		else if (tableExists(connection.get(), "creature_movement")
+		         && tableHasColumn(connection.get(), "creature_movement", "Id")
+		         && tableHasColumn(connection.get(), "creature_movement", "Point")
+		         && tableHasColumn(connection.get(), "creature_movement", "PositionX"))
+		{
+			statement
+				<< "SELECT cm.Id, cm.Point, cm.PositionX, cm.PositionY, cm.PositionZ "
+				<< "FROM creature_movement cm "
+				<< "INNER JOIN creature c ON c.guid = cm.Id "
+				<< "WHERE c.map = " << mapID << " "
+				<< "ORDER BY cm.Id, cm.Point";
+		}
+		else if (tableExists(connection.get(), "waypoint_data")
+		         && tableHasColumn(connection.get(), "waypoint_data", "id")
+		         && tableHasColumn(connection.get(), "waypoint_data", "point")
+		         && tableHasColumn(connection.get(), "waypoint_data", "position_x")
+		         && tableExists(connection.get(), "creature_addon")
+		         && tableHasColumn(connection.get(), "creature_addon", "path_id"))
+		{
+			statement
+				<< "SELECT ca.guid, wd.point, wd.position_x, wd.position_y, wd.position_z "
+				<< "FROM waypoint_data wd "
+				<< "INNER JOIN creature_addon ca ON ca.path_id = wd.id AND ca.path_id > 0 "
+				<< "INNER JOIN creature c ON c.guid = ca.guid "
+				<< "WHERE c.map = " << mapID << " "
+				<< "ORDER BY ca.guid, wd.point";
+		}
+		else
 		{
 			return {};
 		}
-
-		std::stringstream statement;
-		statement
-			<< "SELECT cm.id, cm.point, cm.position_x, cm.position_y, cm.position_z "
-			<< "FROM creature_movement cm "
-			<< "INNER JOIN creature c ON c.guid = cm.id "
-			<< "WHERE c.map = " << mapID << " "
-			<< "ORDER BY cm.id, cm.point";
 
 		if (mysql_query(connection.get(), statement.str().c_str()) != 0)
 		{
@@ -1464,19 +1757,34 @@ namespace mysql
 			? "COALESCE(ct.scale, 0) AS template_scale"
 			: "0 AS template_scale";
 
+		// Entry column per schema (mangos/Turtle `id`, AzerothCore `id1`); cmangos id-0 spawns
+		// resolve their effective entry through creature_spawn_entry like the main loader.
+		std::string const search_entry_col =
+			  tableHasColumn(connection.get(), "creature", "id")  ? "c.id"
+			: tableHasColumn(connection.get(), "creature", "id1") ? "c.id1"
+			: "c.id";
+		bool const search_spawn_entry = tableExists(connection.get(), "creature_spawn_entry")
+		                             && !tableHasColumn(connection.get(), "creature", "id2");
+		std::string const search_entry_expr = search_spawn_entry
+			? ("COALESCE(NULLIF(" + search_entry_col + ", 0), cse.first_entry, 0)")
+			: search_entry_col;
+
 		auto escaped_search = escapeString(connection.get(), searchTerm);
 		std::stringstream statement;
 		statement
-			<< "SELECT c.guid, c.id, c.map, c.position_x, c.position_y, c.position_z, c.orientation, ct.name, "
+			<< "SELECT c.guid, " << search_entry_expr << ", c.map, c.position_x, c.position_y, c.position_z, c.orientation, ct.name, "
 			<< template_scale_expr << ", "
 			<< display_expr << ", "
 			<< mount_expr << ", "
 			<< creatureEquipmentSelectExpr(equipment_schema) << " "
 			<< "FROM creature c "
-			<< "INNER JOIN creature_template ct ON ct.entry = c.id "
+			<< (search_spawn_entry
+			      ? "LEFT JOIN (SELECT guid, MIN(entry) AS first_entry FROM creature_spawn_entry GROUP BY guid) cse ON cse.guid = c.guid "
+			      : "")
+			<< "INNER JOIN creature_template ct ON ct.entry = " << search_entry_expr << " "
 			<< (needs_creature_addon_join ? "LEFT JOIN creature_addon ca ON ca.guid = c.guid " : "")
 			<< creatureEquipmentJoinExpr(equipment_schema)
-			<< "WHERE ct.name LIKE '%" << escaped_search << "%' OR CAST(c.id AS CHAR) = '" << escaped_search << "' "
+			<< "WHERE ct.name LIKE '%" << escaped_search << "%' OR CAST(" << search_entry_expr << " AS CHAR) = '" << escaped_search << "' "
 			<< "ORDER BY ct.name, c.map, c.guid "
 			<< "LIMIT " << limit;
 

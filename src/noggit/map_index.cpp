@@ -77,12 +77,12 @@ MapIndex::MapIndex (const std::string &pBasename, int map_id, World* world,
 
   BlizzardArchive::ClientFile theFile(filename.str(), Noggit::Application::NoggitApplication::instance()->clientData());
 
-  uint32_t fourcc;
-  uint32_t size;
+  uint32_t fourcc = 0;
+  uint32_t size = 0;
 
   // - MVER ----------------------------------------------
 
-  uint32_t version;
+  uint32_t version = 0;
 
   theFile.read(&fourcc, 4);
   theFile.read(&size, 4);

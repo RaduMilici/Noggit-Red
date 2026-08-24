@@ -155,7 +155,7 @@ void WMOInstance::draw ( OpenGL::Scoped::use_program& wmo_shader
   }
 }
 
-void WMOInstance::intersect (math::ray const& ray, selection_result* results, bool do_exterior)
+void WMOInstance::intersect (math::ray const& ray, selection_result* results, bool do_exterior, float max_dist)
 {
   if (!ray.intersect_bounds (extents[0], extents[1]))
   {
@@ -164,9 +164,114 @@ void WMOInstance::intersect (math::ray const& ray, selection_result* results, bo
 
   math::ray subray(_transform_mat_inverted, ray);
 
-  for (auto&& result : wmo->intersect(subray, do_exterior))
+  // WMO instances are unscaled (3.3.5), so local-space distances equal world distances and
+  // max_dist passes through unchanged for the per-group reach cull.
+  for (auto&& result : wmo->intersect(subray, do_exterior, max_dist))
   {
     results->emplace_back (result, this);
+  }
+}
+
+std::optional<float> WMOInstance::liquidHeightAt (glm::vec3 const& world_pos)
+{
+  if (!wmo->finishedLoading() || wmo->loading_failed())
+  {
+    return std::nullopt;
+  }
+  if (world_pos.x < extents[0].x || world_pos.x > extents[1].x
+      || world_pos.z < extents[0].z || world_pos.z > extents[1].z)
+  {
+    return std::nullopt;
+  }
+  glm::vec3 const local(_transform_mat_inverted * glm::vec4(world_pos, 1.0f));
+  std::optional<float> best;
+  for (auto const& group : wmo->groups)
+  {
+    if (auto const h = group.liquidHeightAtLocal(local))
+    {
+      glm::vec3 const world_surface(_transform_mat * glm::vec4(local.x, *h, local.z, 1.0f));
+      if (!best || world_surface.y > *best)
+      {
+        best = world_surface.y;
+      }
+    }
+  }
+  return best;
+}
+
+void WMOInstance::intersect_doodads (glm::mat4x4 const& model_view, math::ray const& ray, selection_result* results, int animtime, float max_dist)
+{
+  if (!ray.intersect_bounds (extents[0], extents[1]))
+  {
+    return;
+  }
+
+  for (auto& [group_index, doodads] : _doodads_per_group)
+  {
+    for (auto& doodad : doodads)
+    {
+      if (!doodad.model->finishedLoading() || doodad.model->loading_failed())
+      {
+        continue;
+      }
+      // [perf 2026-08-17] Physics probes (game-mode collision) collide ONLY with a doodad's dedicated M2
+      // collision mesh; a doodad that ships none (decorations, furniture, clutter -- the large majority in
+      // a city WMO) is walk-through, so skip it BEFORE the transform + sphere-reject + intersect work. This
+      // is behaviour-identical (those doodads already contributed no collision) and removes the per-ray cost
+      // of a WMO's hundreds of non-colliding doodads (measured ~3.6ms/frame). Editor picking (max_dist==0)
+      // still walks every doodad's render geometry so they stay clickable.
+      if (max_dist > 0.0f && doodad.model->_collision_indices.empty())
+      {
+        continue;
+      }
+      if (doodad.need_matrix_update())
+      {
+        doodad.update_transform_matrix_wmo(this);
+      }
+      // short physics probes: sphere-reject doodads farther than max_dist from the probe origin --
+      // a city WMO always contains the player, so without this every probe ray walks EVERY doodad
+      // in it (the game-mode framerate hit). 0 = unlimited (editor picking).
+      if (max_dist > 0.0f)
+      {
+        glm::vec3 const world_pos(doodad.transformMatrix()[3]);
+        if (glm::distance(world_pos, ray.origin()) - doodad.model->rad * doodad.scale > max_dist)
+        {
+          continue;
+        }
+      }
+      // per-doodad bbox reject + per-triangle test happen inside (instance-local subray).
+      // max_dist > 0 marks a PHYSICS probe -> collision-mesh only (plants pass through);
+      // unlimited (editor picking) keeps the render geometry.
+      doodad.intersect(model_view, ray, results, animtime, max_dist > 0.0f);
+    }
+  }
+}
+
+void WMOInstance::collect_colliding_doodads_near (glm::vec3 const& center, float radius,
+                                                  std::vector<wmo_doodad_instance*>& out)
+{
+  for (auto& [group_index, doodads] : _doodads_per_group)
+  {
+    for (auto& doodad : doodads)
+    {
+      // Same eligibility as intersect_doodads's PHYSICS path (max_dist > 0): loaded, with a dedicated
+      // collision mesh (decorations/furniture ship none and are walk-through), within reach of the centre.
+      if (!doodad.model->finishedLoading() || doodad.model->loading_failed()
+          || doodad.model->_collision_indices.empty())
+      {
+        continue;
+      }
+      if (doodad.need_matrix_update())
+      {
+        doodad.update_transform_matrix_wmo(this);
+      }
+      glm::vec3 const world_pos(doodad.transformMatrix()[3]);
+      if (glm::distance(world_pos, center) - doodad.model->rad * doodad.scale > radius)
+      {
+        continue;
+      }
+      out.push_back(&doodad);
+    }
   }
 }
 

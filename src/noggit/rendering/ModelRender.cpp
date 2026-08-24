@@ -382,6 +382,8 @@ void ModelRender::draw(glm::mat4x4 const& model_view
     // before this instance's animate() -- creatures re-animate per draw, so it applies to this spawn only.
     _model->_hand_overlay_active_main = instance.closeHandMain();
     _model->_hand_overlay_active_off = instance.closeHandOff();
+    _model->_lower_body_twist = instance.lower_body_twist;
+    _model->_anim_time_scale = instance.anim_time_scale;
     // Identify which spawn is animating so the idle-variation scheduler keeps a per-instance timeline
     // (each spawn leans on its own schedule instead of all in unison). uid is the spawn guid for creatures.
     _model->_active_idle_key = static_cast<std::uint64_t>(instance.uid);
@@ -598,13 +600,19 @@ void ModelRender::draw(glm::mat4x4 const& model_view
         });
     }
 
-    for (std::size_t idx : draw_order)
     {
-      ModelRenderPass& p = _render_passes[idx];
-      if (p.prepareDraw(m2_shader, _model, &instance, model_render_state, dist_fade))
+      // [CRE-PROFILE 2026-08-18 TEMP] split the single-instance creature/doodad pass work (prepareDraw =
+      // per-pass uniform sets + bindTexture; drawElements) into the idle M2Submit phase, to confirm whether
+      // the individual creature path's cost is the per-pass CPU state churn (-> batching collapses it).
+      noggit::perf::Scoped _prof_cre_pass(noggit::perf::Phase::M2Submit);
+      for (std::size_t idx : draw_order)
       {
-        gl.drawElements(GL_TRIANGLES, p.index_count, GL_UNSIGNED_SHORT, reinterpret_cast<void*>(p.index_start * sizeof(GLushort)));
-        p.afterDraw();
+        ModelRenderPass& p = _render_passes[idx];
+        if (p.prepareDraw(m2_shader, _model, &instance, model_render_state, dist_fade))
+        {
+          gl.drawElements(GL_TRIANGLES, p.index_count, GL_UNSIGNED_SHORT, reinterpret_cast<void*>(p.index_start * sizeof(GLushort)));
+          p.afterDraw();
+        }
       }
     }
   }
@@ -644,8 +652,14 @@ void ModelRender::draw(glm::mat4x4 const& model_view
   gl.disable(GL_BLEND);
   gl.enable(GL_CULL_FACE);
   gl.depthMask(GL_TRUE);
+  // [A2C source fix 2026-08-20] If the LAST pass drawn in this scope was a ground-clutter detail doodad,
+  // prepareDraw left GL_SAMPLE_ALPHA_TO_COVERAGE enabled -- and every draw path that does NOT run
+  // prepareDraw (the MDI-batched doodads = most world models) then rendered with screen-door DITHER at
+  // its alpha edges ("most models dither, some worse"). Clear it at the source, like the blend reset,
+  // and desync the cache so the next clutter pass re-applies it.
+  gl.disable(GL_SAMPLE_ALPHA_TO_COVERAGE);
 
-  // These three GL resets change state that prepareDraw caches in model_render_state, which is SHARED
+  // These GL resets change state that prepareDraw caches in model_render_state, which is SHARED
   // across every model in the batch. Sync the cache to what we just forced, so the next model's first
   // pass doesn't skip re-applying a state we changed out from under it (e.g. an additive-first effect
   // model rendering with blend left disabled). blend = 0xFFFF is an invalid sentinel that forces the
@@ -653,6 +667,7 @@ void ModelRender::draw(glm::mat4x4 const& model_view
   model_render_state.blend = 0xFFFF;
   model_render_state.backface_cull = true;
   model_render_state.z_buffered = false;
+  model_render_state.detail_doodad = -1;
 }
 
 void ModelRender::draw(glm::mat4x4 const& model_view
@@ -820,7 +835,9 @@ void ModelRender::draw(glm::mat4x4 const& model_view
       // bufferData+draw(+depth-prepass) calls per model, the dominant SubmitInst cost. 1/8 collapses the ring
       // to ~8 alpha steps (imperceptible on distant fogged clutter) and ~5x fewer draws. The opaque bulk
       // (fade==1, most instances) is one draw either way.
-      float fade = std::round(std::clamp(fade_raw, 0.0f, 1.0f) * 8.0f) / 8.0f;
+      // 1/16 steps (was 1/8): finer alpha quantization so the widened grass fade band reads as a
+      // smooth ease-in rather than visible 12.5% steps. Still collapses the fade ring to few draws.
+      float fade = std::round(std::clamp(fade_raw, 0.0f, 1.0f) * 16.0f) / 16.0f;
       if (fade <= 0.0f)
       {
         // hold the faintest visible step until the raw alpha is truly imperceptible, so the final
@@ -997,9 +1014,13 @@ void ModelRender::draw(glm::mat4x4 const& model_view
     gl.disable(GL_BLEND);
     gl.enable(GL_CULL_FACE);
     gl.depthMask(GL_TRUE);
+    // [A2C source fix 2026-08-20] see the single-instance overload: a trailing ground-clutter pass left
+    // GL_SAMPLE_ALPHA_TO_COVERAGE on for every prepareDraw-less path after it (MDI doodads) = global dither.
+    gl.disable(GL_SAMPLE_ALPHA_TO_COVERAGE);
     model_render_state.blend = 0xFFFF;
     model_render_state.backface_cull = true;
     model_render_state.z_buffered = false;
+    model_render_state.detail_doodad = -1;
 
     // Leave the FULL instance set in the transform buffer for the particle/ribbon draws that follow
     // (they instance-count off it). Interior partitioning only affects the mesh passes above.
@@ -1141,7 +1162,7 @@ void ModelRender::drawPersistent(glm::mat4x4 const& model_view
 
   // One instanced draw per pass over the whole bucket. extra_alpha < 1 (distance fade) promotes the opaque/
   // alpha-key passes to alpha blend via prepareDraw's translucent path -> the whole tile-bucket fades out
-  // SMOOTHLY and stays fully lit (authored_translucent keys off model_alpha, not extra_alpha), and additive
+  // SMOOTHLY and keeps its authored lighting (translucency never changes lit/unlit), and additive
   // glow passes dim with it (mesh_color.w *= inst_alpha). No dither/shimmer. representative=nullptr.
   for (ModelRenderPass& p : _render_passes)
   {
@@ -1159,9 +1180,12 @@ void ModelRender::drawPersistent(glm::mat4x4 const& model_view
   gl.disable(GL_BLEND);
   gl.enable(GL_CULL_FACE);
   gl.depthMask(GL_TRUE);
+  // [A2C source fix 2026-08-20] clutter A2C must never outlive its own pass (see single-instance overload).
+  gl.disable(GL_SAMPLE_ALPHA_TO_COVERAGE);
   model_render_state.blend = 0xFFFF;
   model_render_state.backface_cull = true;
   model_render_state.z_buffered = false;
+  model_render_state.detail_doodad = -1;
 }
 
 void ModelRender::drawParticles(glm::mat4x4 const& model_view
@@ -1424,20 +1448,47 @@ void ModelRender::fixShaderIDLayer()
   if (non_layered_count < _render_passes.size())
   {
     std::vector<ModelRenderPass> passes;
+    // [2026-08-20 Varian face-shine fix] first_pass must point into THIS surviving vector: the loop
+    // pushes COPIES into `passes`, and the merge branches below then write through first_pass
+    // (shader_id 0x8001/0x8002/0xE, texture_count, textures[1]). When first_pass pointed at the
+    // SOURCE _render_passes element, every one of those writes landed on a copy that was thrown
+    // away at `_render_passes = passes` -- the merged EnvMetal pass kept its UNMASKED
+    // Combiners_Opaque_Mod2x shader while its alpha cover layer was dropped as "merged", so
+    // reflective models (KingVarianWrynn etc.) shone x2 across skin the texture alpha masks out
+    // in the client. reserve() guarantees the pointers stay valid (no reallocation).
+    passes.reserve(_render_passes.size());
 
     ModelRenderPass* first_pass = nullptr;
     bool need_reducing = false;
     uint16_t previous_render_flag = -1, some_flags = 0;
+    uint16_t previous_submesh = 0xFFFF;
 
     for (auto& pass : _render_passes)
     {
-      if (pass.renderflag_index == previous_render_flag)
+      // [2026-08-20 Jaina.m2 missing forearms, SIMULATED before shipping] This reduction block only runs
+      // for models with material_layer > 0 batches -- character models have NONE (verified: humanmale/
+      // humanfemale/dwarfmale/bloodelffemale all layered=0, reduction skipped), so nothing here can
+      // affect character NPCs. (The 2026-08-20 NPC gear/eye chaos attributed to an earlier version of
+      // this fix was actually the unsatisfiable-selection fallback + sleeve stacking, both fixed
+      // elsewhere.) The dedupe may only collapse duplicate layers of the SAME skin section: a shared
+      // renderflag_index across DIFFERENT submeshes is ordinary material reuse, not layering -- Jaina.m2
+      // shares material 0 across the base passes of submeshes 0/1/3/4 (material 1 across their alpha
+      // layers), and the unguarded dedupe deleted her gloves/forearms, earrings and necklace (12 built
+      // passes -> 5 drawn). And the merge state machine must reset at a submesh boundary, so a merge
+      // group can never pair passes of different body parts.
+      if (pass.submesh != previous_submesh)
+      {
+        some_flags = 0;
+        first_pass = nullptr;
+      }
+      if (pass.renderflag_index == previous_render_flag && pass.submesh == previous_submesh)
       {
         need_reducing = true;
         continue;
       }
 
       previous_render_flag = pass.renderflag_index;
+      previous_submesh = pass.submesh;
 
       uint8_t lower_bits = pass.shader_id & 0x7;
 
@@ -1561,22 +1612,31 @@ void ModelRender::fixShaderIDLayer()
       pass.uv_animations[1] = pass.texture_count > 1 ? pass.animation_combo_index + 1 : 0;
 
       passes.push_back(pass);
+      // Later merge iterations write through first_pass -- retarget it at the SURVIVING copy
+      // (see the reserve() note above; without this the writes go to the discarded source vector).
+      if (first_pass == &pass)
+      {
+        first_pass = &passes.back();
+      }
     }
 
     if (need_reducing)
     {
+      // [2026-08-20] Operate on the SURVIVING `passes` vector -- this block used to read/write
+      // _render_passes (the pre-removal source, with mismatched indices) and every write was then
+      // discarded by the assignment below.
       previous_render_flag = -1;
-      for (int i = 0; i < passes.size(); ++i)
+      for (std::size_t i = 0; i < passes.size(); ++i)
       {
-        auto& pass = _render_passes[i];
+        auto& pass = passes[i];
         uint16_t renderflag_index = pass.renderflag_index;
 
-        if (renderflag_index == previous_render_flag)
+        if (renderflag_index == previous_render_flag && i > 0)
         {
-          pass.shader_id = _render_passes[i - 1].shader_id;
-          pass.texture_count = _render_passes[i - 1].texture_count;
-          pass.texture_combo_index = _render_passes[i - 1].texture_combo_index;
-          pass.texture_coord_combo_index = _render_passes[i - 1].texture_coord_combo_index;
+          pass.shader_id = passes[i - 1].shader_id;
+          pass.texture_count = passes[i - 1].texture_count;
+          pass.texture_combo_index = passes[i - 1].texture_combo_index;
+          pass.texture_coord_combo_index = passes[i - 1].texture_coord_combo_index;
         }
         else
         {
@@ -1913,6 +1973,9 @@ void ModelRender::updateBoneMatrices()
   // here -- skip it until the buffers exist (the real per-instance/creature uploads run after upload()).
   if (_bone_matrices_buf_tex != 0 && _bone_matrices_buffer != 0)
   {
+    // [CRE-PROFILE 2026-08-18 TEMP] per-model bone-TBO re-upload (bufferData STREAM_DRAW + texBuffer
+    // re-association), run once per individual creature/attachment draw. Suspected bulk of M2Creatures.
+    noggit::perf::Scoped _prof_boneup(noggit::perf::Phase::TileStream);
     OpenGL::Scoped::buffer_binder<GL_TEXTURE_BUFFER> const binder (_bone_matrices_buffer);
     // Orphan-on-upload (perf 2026-07-20). The per-instance doodad/creature path re-uploads this SHARED
     // per-model bone buffer once per instance and immediately draws from it. A plain bufferSubData then
@@ -1949,6 +2012,30 @@ ModelRenderPass::ModelRenderPass(ModelTexUnit const& tex_unit, Model* m)
 {
 }
 
+// [2026-08-20 CLIENT-EXACT] Controlled-geoset hide test: a controlled family draws its SELECTED geoset
+// and nothing else -- INCLUDING when the selected variant doesn't exist in the model, where the client
+// renders NOTHING for that family (eyeglow default 1701 absent -> no glow; tabard 1201 absent -> no
+// tabard). Two earlier special rules were removed after causing NPC-wide artifacts: "unsatisfiable ->
+// show lowest existing variant" (painted DK-glow eyes and phantom tabards/gear) and "never hide the
+// family-8 arm-skin variant" (stacked sleeve bands under gauntlets). The bare-arm case both were invented
+// for is solved at the SELECTION level instead: family-8 defaults to variant 1 (802 bare arm, which every
+// character model has) and a real glove geoset suppresses the sleeve family (World.cpp).
+// External linkage: shared by the individual (prepareDraw), MDI-batch (resolveStaticBatch) and
+// creature-batch (WorldRender) hide sites so they can never diverge. Returns true = hide this geoset.
+bool noggit_geoset_hidden_by_controlled_family(Model* m,
+    std::vector<std::uint16_t> const& controlled_families,
+    std::vector<std::uint16_t> const& visible_ids,
+    std::uint16_t geoset_id)
+{
+  (void)m;
+  std::uint16_t const family = static_cast<std::uint16_t>(geoset_id / 100);
+  if (std::find(controlled_families.begin(), controlled_families.end(), family) == controlled_families.end())
+  {
+    return false; // family not controlled by the instance's selection -> this rule never hides it
+  }
+  return std::find(visible_ids.begin(), visible_ids.end(), geoset_id) == visible_ids.end();
+}
+
 bool ModelRenderPass::prepareDraw(OpenGL::Scoped::use_program& m2_shader, Model *m, ModelInstance const* instance, OpenGL::M2RenderState& model_render_state, float extra_alpha)
 {
   auto const* visible_geosets = &m->showGeosets;
@@ -1969,15 +2056,12 @@ bool ModelRenderPass::prepareDraw(OpenGL::Scoped::use_program& m2_shader, Model 
     return false;
   }
 
-  if (instance && !instance->controlledGeosetFamilies().empty())
+  if (instance && !instance->controlledGeosetFamilies().empty()
+      && noggit_geoset_hidden_by_controlled_family(m, instance->controlledGeosetFamilies(),
+                                                   instance->visibleGeosetIds(), geoset_id))
   {
-    auto const geoset_family = static_cast<std::uint16_t>(geoset_id / 100);
-    if (instance->isGeosetFamilyControlled(geoset_family)
-        && !instance->isGeosetIdVisible(geoset_id))
-    {
-      log_classic_character_controlled_geoset_decision(m, instance, geoset_id, "hidden");
-      return false;
-    }
+    log_classic_character_controlled_geoset_decision(m, instance, geoset_id, "hidden");
+    return false;
   }
 
   log_classic_character_controlled_geoset_decision(m, instance, geoset_id, "draw");
@@ -2085,8 +2169,9 @@ bool ModelRenderPass::prepareDraw(OpenGL::Scoped::use_program& m2_shader, Model 
   //     on, ZWRITEENABLE=FALSE, CULL=NONE -- glowing on top.
   // (An earlier read of a previous capture concluded "solid body" -- that was PASS A, whose color
   // writes are off; the blended PASS B right after it is what makes the creature see-through.)
-  // Implemented via the depth prepass in ModelRender::draw + promote_to_alpha_blend below. Creatures
-  // are also forced fullbright (spawns get no scene light; a lit material would render black).
+  // Implemented via the depth prepass in ModelRender::draw + promote_to_alpha_blend below. Lighting
+  // is NOT changed by translucency -- authored lit/unlit per material, like the client (see the
+  // effective_unlit note below).
   // extra_alpha = distance fade for instanced draws; folds into the same channel as
   // CreatureModelAlpha so opaque passes promote to alpha-blend and everything dims consistently.
   float const inst_alpha = (instance ? instance->model_alpha : 1.0f) * extra_alpha;
@@ -2227,7 +2312,13 @@ bool ModelRenderPass::prepareDraw(OpenGL::Scoped::use_program& m2_shader, Model 
   }
 
   bool const classic_alpha_pass = m->_uses_classic_layout && effective_blend != static_cast<uint16_t>(M2Blend::Opaque);
-  bool const backface_cull = !renderflag.flags.two_sided && !classic_alpha_pass;
+  // ADDITIVE passes (No_Add_Alpha / Add) are two-sided in the client: additive blending is order-independent
+  // so both faces add the same, and many effect models -- notably the mage portals (world/generic/activedoodads/
+  // spellportals/*, v256 additive discs) -- ship WITHOUT the two_sided flag yet the client draws both faces.
+  // Honouring only the flag rendered them one-sided (vanished from the back). Match the client for additive.
+  bool const additive_two_sided = effective_blend == static_cast<uint16_t>(M2Blend::Add)
+                               || effective_blend == static_cast<uint16_t>(M2Blend::No_Add_Alpha);
+  bool const backface_cull = !renderflag.flags.two_sided && !classic_alpha_pass && !additive_two_sided;
   if (model_render_state.backface_cull != backface_cull)
   {
     if (!backface_cull)
@@ -2255,15 +2346,16 @@ bool ModelRenderPass::prepareDraw(OpenGL::Scoped::use_program& m2_shader, Model 
     model_render_state.unfogged = renderflag.flags.unfogged;
   }
 
-  // A translucent creature is self-illuminated energy: render every pass FULLBRIGHT. Creature spawns don't
-  // get scene lighting, so a LIT material would render BLACK (e.g. Anomalus submesh 2 = the MANAMISTBASE
-  // aura on mat1, which is LIT unlike the UNLIT body). The body (unlit) is already fullbright; force the
-  // others to match so the whole creature reads as bright energy.
-  // AUTHORED translucency ONLY (CreatureModelAlpha) -- NOT the distance/cull fade: a normal lit
-  // creature must keep its exact lit shading while fading, or its lighting visibly flips to
-  // fullbright the moment the fade starts and back when it completes.
-  bool const authored_translucent = (instance ? instance->model_alpha : 1.0f) < 0.999f;
-  bool const effective_unlit = renderflag.flags.unlit || authored_translucent;
+  // CLIENT-EXACT (2026-08-22, Stratholme ghost-citizen hunt): CreatureModelAlpha does NOT change
+  // lighting -- the trace rule above (RE_notes/20) is that it multiplies the ALPHA of every pass and
+  // nothing else. Translucent creatures keep their AUTHORED lit/unlit materials: the Spectral/Ghostly
+  // Citizens are ordinary LIT humans (warm-brown baked skins, display alpha 128, aura 16331 has NO
+  // spell visual) that the client dims with scene light like any other NPC. The old forcing
+  // (unlit ||= model_alpha < 1) painted their raw warm textures fullbright over the dark scene =
+  // the reported wrong ghost hue. Its "spawns get no scene light -> lit renders black" premise
+  // predates the client-exact M2 sun/interior lighting; Anomalus-style energy bodies are AUTHORED
+  // unlit and keep their look without it.
+  bool const effective_unlit = renderflag.flags.unlit;
   if (model_render_state.unlit != effective_unlit)
   {
     m2_shader.uniform("unlit", (int)effective_unlit);
@@ -2661,7 +2753,11 @@ bool ModelRenderPass::bindTexture(size_t index, Model* m, ModelInstance const* i
   return true;
 }
 
-bool ModelRenderPass::resolveStaticBatch(Model* m, StaticBatchKey& out, bool for_pib) const
+// [CRE-BODY-DIAG 2026-08-19] the last rej() code, read by WorldRender::drawCreatureBodiesBatched to attribute
+// creature-group batch failures to a specific gate (the shared s_rej histogram mixes doodads + creatures).
+thread_local int g_last_static_batch_reject = 0;
+
+bool ModelRenderPass::resolveStaticBatch(Model* m, StaticBatchKey& out, bool for_pib, ModelInstance const* rep) const
 {
   // [perf 2026-08-05] Conservative batchability gate. Everything rejected here falls back to the classic
   // per-model persistent draw, so it is always safe to reject; coverage is widened later (3b). The batched
@@ -2689,6 +2785,7 @@ bool ModelRenderPass::resolveStaticBatch(Model* m, StaticBatchKey& out, bool for
     && m->file_key().filepath().find("lavafalls") != std::string::npos;
   auto rej = [&](int code) -> bool
   {
+    g_last_static_batch_reject = code;
     ++s_rej[code];
     if (falls_dbg)
     {
@@ -2708,8 +2805,20 @@ bool ModelRenderPass::resolveStaticBatch(Model* m, StaticBatchKey& out, bool for
   // [black-cone fix 2026-08-08] mirror prepareDraw's visible_geosets gate: submeshes hidden at load
   // (emitter placeholder cards, elementalearth shells, centroid cores) must never enter an MDI batch.
   // Rejecting drops the model to the individual path, which skips the hidden submesh.
-  if (submesh < m->showGeosets.size() && !m->showGeosets[submesh])
-    return rej(4);
+  // [creature MDI 2026-08-18] filter passes by geoset VISIBILITY exactly like prepareDraw: a creature batch
+  // uses the representative instance's per-display visibility (rep->geosetVisibility() + controlled families),
+  // a doodad batch uses the model default m->showGeosets. Using the model default for a creature would show
+  // equipment/hidden geosets or hide body geosets.
+  {
+    std::vector<bool> const& visible_geosets =
+      (rep && !rep->geosetVisibility().empty()) ? rep->geosetVisibility() : m->showGeosets;
+    if (submesh < visible_geosets.size() && !visible_geosets[submesh])
+      return rej(4);
+    if (rep && !rep->controlledGeosetFamilies().empty()
+        && noggit_geoset_hidden_by_controlled_family(m, rep->controlledGeosetFamilies(),
+                                                     rep->visibleGeosetIds(), geoset_id))
+      return rej(4);
+  }
   auto const& renderflag = m->_render_flags[renderflag_index];
 
   // effective pixel shader (mirror prepareDraw: classic layout derives a default from the blend)
@@ -2742,8 +2851,36 @@ bool ModelRenderPass::resolveStaticBatch(Model* m, StaticBatchKey& out, bool for
   // exactly as prepareDraw does and batch only when it is ~1 -- the common case is a CONSTANT-1 track (opaque
   // prop), which IS batchable; only genuine fades (alpha < 1) fall back to the uniform path. Blanket-rejecting
   // any transparency track killed ~96% of coverage (nearly every doodad has one). [MDI-DIAG 2026-08-06]
+  // A CONSTANT-white M2Color track is extremely common on CREATURES (most bodies carry one with no visual
+  // effect) -- it evaluates to opaque white and IS batchable; only a genuinely coloured/animated track must
+  // fall back. [2026-08-19] For CREATURE batches (rep != null, which rebuild the batch EVERY frame) evaluate
+  // the track exactly like prepareDraw (~2020-2053) and accept an opaque-white frame -- the pib shader's
+  // constant mesh_color=(1,1,1,1) is then byte-identical (emissive_color is dead, so white = no-op). DOODAD
+  // batches (rep == null) are CACHED across frames, where a per-frame eval could lock an animated colour, so
+  // keep the blanket reject for them. This was the ENTIRE creature-body-MDI failure: 100% of rejects = rej5.
   if (color_index != -1)
-    return rej(5);
+  {
+    bool white_frame = false;
+    if (rep && static_cast<std::size_t>(color_index) < m->_colors.size())
+    {
+      auto& ctrack = m->_colors[color_index].color;
+      auto& otrack = m->_colors[color_index].opacity;
+      ::glm::vec3 c(1.0f, 1.0f, 1.0f);
+      if (ctrack.uses(m->_current_anim_seq))
+        c = ctrack.getValue(m->_current_anim_seq, m->_anim_time, m->_global_animtime);
+      else if (ctrack.uses(0))
+        c = ctrack.getValue(0, m->_anim_time, m->_global_animtime);
+      float o = 1.0f;
+      if (otrack.uses(m->_current_anim_seq))
+        o = otrack.getValue(m->_current_anim_seq, m->_anim_time, m->_global_animtime);
+      else if (otrack.uses(0))
+        o = otrack.getValue(0, m->_anim_time, m->_global_animtime);
+      white_frame = c.x >= 0.999f && c.x <= 1.001f && c.y >= 0.999f && c.y <= 1.001f
+                 && c.z >= 0.999f && c.z <= 1.001f && o >= 0.999f;
+    }
+    if (!white_frame)
+      return rej(5);
+  }
   float alpha = m->trans;
   if (transparency_combo_index != 0xFFFF && transparency_combo_index < m->_transparency_lookup.size())
   {
@@ -2761,7 +2898,10 @@ bool ModelRenderPass::resolveStaticBatch(Model* m, StaticBatchKey& out, bool for
     return rej(7); // genuine fade -> real alpha needed, keep uniform path
 
   // classes handled by other paths / not representable in the static batch
-  if (is_classic_creature_or_character_model(m))
+  // [creature MDI 2026-08-18] a creature BATCH (rep != null) admits creature/character models -- they fold
+  // into the pib-style per-instance-bone MDI. The doodad batch (rep == null) still routes them to the
+  // individual path.
+  if (!rep && is_classic_creature_or_character_model(m))
     return rej(8);
   if (is_masked_lightray_model(m))
     return rej(9);
@@ -2787,8 +2927,26 @@ bool ModelRenderPass::resolveStaticBatch(Model* m, StaticBatchKey& out, bool for
     if (textures[index] >= m->_texture_lookup.size()) return -1;
     uint16_t const tex = m->_texture_lookup[textures[index]];
     if (tex >= m->_specialTextures.size() || tex >= m->_textures.size()) return -1;
-    if (m->_specialTextures[tex] != -1) return -1; // special/replaceable -> per-instance, not batchable
-    auto& t = m->_textures[tex];
+    scoped_blp_texture_reference const* sel = nullptr;
+    if (m->_specialTextures[tex] != -1)
+    {
+      // [creature MDI 2026-08-18] special/replaceable texture. A doodad batch can't represent it -> reject.
+      // A creature batch (rep) resolves the display's skin from the representative instance's replaceTextures
+      // (then the model default), mirroring ModelRenderPass::bindTexture. Since the group is keyed by
+      // display_id, all instances share this (array,layer) -> it rides inst_tex.x/y like a doodad's layer.
+      if (!rep) return -1;
+      auto const special = static_cast<std::size_t>(m->_specialTextures[tex]);
+      auto const& repl = rep->replaceTextures();
+      auto it = repl.find(special);
+      if (it != repl.end()) { sel = &it->second; }
+      if (!sel)
+      {
+        auto mr = m->_replaceTextures.find(special);
+        if (mr != m->_replaceTextures.end()) { sel = &mr->second; }
+      }
+      if (!sel) return -1; // unresolved special skin this frame -> fall back (retried next frame)
+    }
+    scoped_blp_texture_reference const& t = sel ? *sel : m->_textures[tex];
     if (t->loading_failed() || !t->finishedLoading()) return -1; // defer until loaded (retried next frame)
     t->upload();
     if (!t->is_uploaded()) return -1;
@@ -2825,7 +2983,10 @@ bool ModelRenderPass::resolveStaticBatch(Model* m, StaticBatchKey& out, bool for
   out.unfogged = for_pib && renderflag.flags.unfogged; // tile batch always resolves these false (gated above)
   out.unlit = for_pib && renderflag.flags.unlit;
   bool const classic_alpha_pass = m->_uses_classic_layout && blend != static_cast<uint16_t>(M2Blend::Opaque);
-  out.backface_cull = !renderflag.flags.two_sided && !classic_alpha_pass;
+  // Additive passes are two-sided (see prepareDraw) -- keep the batched draw consistent for additive effects.
+  bool const additive_two_sided = blend == static_cast<uint16_t>(M2Blend::Add)
+                               || blend == static_cast<uint16_t>(M2Blend::No_Add_Alpha);
+  out.backface_cull = !renderflag.flags.two_sided && !classic_alpha_pass && !additive_two_sided;
   ++s_ok;
   if (falls_dbg)
   {

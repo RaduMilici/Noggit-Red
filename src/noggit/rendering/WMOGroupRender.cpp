@@ -349,7 +349,18 @@ void WMOGroupRender::upload()
       , GL_STATIC_DRAW
   );
 
+  // dedicated two-layer blend-alpha stream (see WMO.h _blend_alphas)
+  _has_blend_alphas = !_wmo_group->_blend_alphas.empty();
+  if (_has_blend_alphas)
+  {
+    gl.bufferData<GL_ARRAY_BUFFER>( _blend_alphas_buffer
+        , _wmo_group->_blend_alphas.size() * sizeof(float)
+        , _wmo_group->_blend_alphas.data()
+        , GL_STATIC_DRAW);
+  }
+
   // free unused data
+  _wmo_group->_blend_alphas.clear();
   _wmo_group->_normals.clear();
   _wmo_group->_texcoords.clear();
   _wmo_group->_texcoords_2.clear();
@@ -391,6 +402,10 @@ void WMOGroupRender::setupVao(OpenGL::Scoped::use_program& wmo_shader)
     if (_wmo_group->header.flags.has_vertex_color || _wmo_group->header.flags.use_mocv2_for_texture_blending)
     {
       wmo_shader.attrib("vertex_color", _vertex_colors_buffer, 4, GL_FLOAT, GL_FALSE, 0, 0);
+    }
+    if (_has_blend_alphas)
+    {
+      wmo_shader.attrib("blend_alpha_attr", _blend_alphas_buffer, 1, GL_FLOAT, GL_FALSE, 0, 0);
     }
 
     indices.bind();
@@ -748,6 +763,12 @@ void WMOGroupRender::initRenderBatches()
     if (has_blend_mocv)
     {
       flags |= WMORenderBatchFlags::eWMOBatch_HasMOCVBlend;
+    }
+    // mocv2 group -> the blend factor lives in its own stream, not in .w (which now carries the
+    // portal-openness doorway fade for these groups too)
+    if (_wmo_group->header.flags.use_mocv2_for_texture_blending)
+    {
+      flags |= WMORenderBatchFlags::eWMOBatch_BlendStream;
     }
     if (_wmo_group->_has_portal_openness)
     {

@@ -75,6 +75,13 @@ namespace Noggit::Rendering
       GLuint transform_vbo = 0;
       GLuint interior_vbo = 0;   // per-instance interior (all-zero for outdoor tile doodads; kept for WMO reuse)
       GLsizei count = 0;
+      // [game-view cull 2026-08-15] The client doodad size class (ModelInstance::_cull_class,
+      // FUN_007bdb10) for this per-(model,tile) bucket = the MAX class over its instances. The bucket is
+      // culled/dropped by TILE distance against the client's per-class cull table, and MAX is the
+      // conservative choice (keep the bucket while its LARGEST instance would still survive the client's
+      // cull -> never drops a bucket while any instance could still be visible). See
+      // twmoa-335a-client-doodad-cull.md.
+      int cull_class = 4;
       // [perf 2026-08-05] CPU copy of the same transforms (already computed during the rebuild) retained so the
       // MDI doodad batcher can concatenate a model's instances across tiles into one indirect-draw instance
       // buffer without a GPU readback or a per-frame transformMatrix() recompute. Unused when MDI is off.

@@ -54,6 +54,13 @@ namespace Noggit
 
       setWindowFlags(windowFlags() | Qt::Tool | Qt::WindowStaysOnTopHint);
 
+      // [settings window sizing 2026-08-16] The Performance tab has grown a lot of runtime toggles/sliders,
+      // so give the window a taller default and open it near the top-left of the screen (it used to open a
+      // bit low and to the right). Raise the minimum height so the tab content isn't clipped.
+      setMinimumSize(680, 720);
+      resize(780, 900);
+      move(40, 30);
+
       connect(ui->importPathField, &QLineEdit::textChanged, [&](QString value)
               {
                 _settings->setValue("project/import_file", value);
@@ -427,11 +434,43 @@ namespace Noggit
       {
         auto* portal_cb = new QCheckBox(tr("WMO portal culling (hide unseen interior rooms)"), this);
         portal_cb->setObjectName("_wmo_portal_culling_checkbox");
-        portal_cb->setChecked(_settings->value("render/wmo_portal_culling", false).toBool());
+        portal_cb->setChecked(_settings->value("render/wmo_portal_culling", true).toBool());
         _perf_layout->addWidget(portal_cb);
         connect(portal_cb, &QCheckBox::toggled, [this](bool checked)
                 {
                   _settings->setValue("render/wmo_portal_culling", checked);
+                  _settings->sync();
+                });
+      }
+
+      // Client doodad distance cull (live): ON = static doodads/trees/clutter are culled + faded by the
+      // CLIENT's exact per-size-class distance table (small clutter drops at ~30y, trees ~200y, tall
+      // landmarks ~750y), like the real 3.3.5a client. OFF = draw everything out to the object render
+      // distance (old editor behaviour). Byte-exact port of FUN_00791cb0; read live by WorldRender.
+      {
+        auto* doodad_cull_cb = new QCheckBox(tr("Client doodad distance cull (size-class)"), this);
+        doodad_cull_cb->setObjectName("_gv_doodad_cull_checkbox");
+        doodad_cull_cb->setChecked(_settings->value("render/gv_doodad_cull", true).toBool());
+        _perf_layout->addWidget(doodad_cull_cb);
+        connect(doodad_cull_cb, &QCheckBox::toggled, [this](bool checked)
+                {
+                  _settings->setValue("render/gv_doodad_cull", checked);
+                  _settings->sync();
+                });
+      }
+
+      // Client creature distance cull (live): ON = creatures/NPCs are culled + faded by the SAME client
+      // size-class table (a humanoid is class 1 -> ~100y, big creatures persist farther), exactly like the
+      // client. OFF = draw creatures out to the flat creature draw distance (500y). The player character is
+      // never culled. Byte-exact port of FUN_00791cb0 (units are scene nodes like doodads); read live.
+      {
+        auto* creature_cull_cb = new QCheckBox(tr("Client creature distance cull (size-class)"), this);
+        creature_cull_cb->setObjectName("_gv_creature_cull_checkbox");
+        creature_cull_cb->setChecked(_settings->value("render/gv_creature_cull", true).toBool());
+        _perf_layout->addWidget(creature_cull_cb);
+        connect(creature_cull_cb, &QCheckBox::toggled, [this](bool checked)
+                {
+                  _settings->setValue("render/gv_creature_cull", checked);
                   _settings->sync();
                 });
       }
@@ -583,6 +622,28 @@ namespace Noggit
         form->addRow(new QLabel("Anisotropic filtering"), af);
       }
 
+      // Shadow quality: the 3.3.5a client's own extShadowQuality ladder (0-5, labels from the exe --
+      // wow335a.exe @0xa4d47a..0xa4d5bc; RE doc 35). Level 0 IS the classic/1.12 look: baked terrain
+      // shadows + the blob unit decal (client rule FUN_007e49e0: blobs draw only at quality < 1).
+      // Applies LIVE -- WorldRender re-reads graphics/shadow_quality every frame.
+      {
+        auto* sq = new QComboBox();
+        sq->addItem("0 - Lowest (baked terrain + blob units, 1.12-style)", 0);
+        sq->addItem("1 - Low (dynamic PC/NPC shadows, low-res)", 1);
+        sq->addItem("2 - Medium (dynamic PC/NPC shadows, high-res)", 2);
+        sq->addItem("3 - Med-High (full environmental + PC/NPC, low-res, lg-dist)", 3);
+        sq->addItem("4 - High (full environmental + PC/NPC, hi-res, lg-dist)", 4);
+        sq->addItem("5 - Very High (cascaded shadow maps)", 5);
+        int const cur = _settings->value("graphics/shadow_quality", 3).toInt();
+        sq->setCurrentIndex(std::max(0, sq->findData(cur)));
+        connect(sq, QOverload<int>::of(&QComboBox::currentIndexChanged), [=](int idx)
+        {
+          _settings->setValue("graphics/shadow_quality", sq->itemData(idx).toInt());
+          _settings->sync();
+        });
+        form->addRow(new QLabel("Shadow quality (client extShadowQuality)"), sq);
+      }
+
       gLayout->addWidget(toggles);
       gLayout->addStretch(1);
 
@@ -651,7 +712,9 @@ namespace Noggit
 
 
 #ifdef USE_MYSQL_UID_STORAGE
-  ui->MySQL_box->setChecked(true);
+  // load the STORED per-project toggle -- this was hardcoded setChecked(true), so ANY settings
+  // visit that ended in save silently re-enabled MySQL no matter how often it was turned off
+  ui->MySQL_box->setChecked(Noggit::mysqlSetting("enabled", false).toBool());
 
       // Per-project MySQL settings (see MySqlSettings.hpp) so each project keeps its own connection.
       auto server_str = Noggit::mysqlSetting("server", "127.0.0.1").toString();

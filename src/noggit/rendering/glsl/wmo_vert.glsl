@@ -4,6 +4,7 @@
 in vec4 position;
 in vec3 normal;
 in vec4 vertex_color;
+in float blend_alpha_attr;
 in vec2 texcoord;
 in vec2 texcoord_2;
 in uint batch_mapping;
@@ -13,6 +14,7 @@ out vec3 f_normal;
 out vec2 f_texcoord;
 out vec2 f_texcoord_2;
 out vec4 f_vertex_color;
+out float f_blend_alpha;
 
 flat out uint flags;
 flat out uint shader;
@@ -50,6 +52,7 @@ void main()
     f_texcoord = vec2(0);
     f_texcoord_2 = vec2(0);
     f_vertex_color = vec4(0);
+    f_blend_alpha = 0.0;
 
     flags = 0;
     shader = 0;
@@ -109,5 +112,6 @@ void main()
     }
 
     f_vertex_color = vertex_color;
+    f_blend_alpha = blend_alpha_attr;
   }
 }

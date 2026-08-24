@@ -1,5 +1,4 @@
 // This file is part of Noggit3, licensed under GNU General Public License (version 3).
-
 #include "LiquidRender.hpp"
 #include <noggit/Log.h>
 #include <noggit/MapTile.h>
@@ -233,18 +232,42 @@ void LiquidRender::updateLayerData(LiquidTextureManager* tex_manager)
           MapChunk* terrain = _map_tile->getChunk(static_cast<unsigned>(x), static_cast<unsigned>(z));
           glm::vec3 const* heightmap = terrain ? terrain->getHeightmap() : nullptr;
 
+          // [2026-08-21 WPL "too bright" fix] The client's water color factor is the AUTHORED
+          // Water depth for the colour/alpha ramps = the MAX of the physical terrain thinness and the
+          // AUTHORED MCLQ/MH2O depth byte. [2026-08-23: RESTORED the authored term after a wrong detour.]
+          // The client bakes the water colour/alpha from the AUTHORED depth (the artist-painted 0..255
+          // shallow->deep gradient, verified: Azeroth_36_29 MCLQ carries a real 0..244 spread), NOT the
+          // physical terrain. Using terrain-only broke Caer Darrow (a STEEP crater lake): the terrain
+          // drops away everywhere so terrain-diff read uniformly DEEP -> the whole lake snapped to one
+          // dark colour with no coast gradient (user report). The authored byte preserves the real
+          // shallow-edge -> deep-centre gradient and is streaming-STABLE. authored_deep_units scales the
+          // normalized byte so 255 saturates this liquid type's colour ramp (river 0.05/u, ocean 0.012/u).
+          int const liquid_cat = layer.mclq_liquid_type(); // 0 water, 1 ocean, 2 magma, 3 slime
+          float const authored_deep_units = layer.hasAuthoredDepth()
+            ? ((liquid_cat == 1) ? (1.0f / 0.012f) : (1.0f / 0.05f))
+            : 0.0f;
+
           for (int z_v = 0; z_v < 9; ++z_v)
           {
             for (int x_v = 0; x_v < 9; ++x_v)
             {
               const unsigned v_index = z_v * 9 + x_v;
               glm::vec2& tex_coord = tex_coords[v_index];
-              // Fallback (no terrain): scale the normalized file depth into rough world units.
-              float render_depth = depth[v_index] * 100.f;
+              // Depth = MAX(physical terrain thinness, authored byte x ramp scale). [2026-08-23 final,
+              // after two wrong detours the same day:] the authored MCLQ byte is a LINEAR depth
+              // measure, not a full-ramp saturator — ordinary rivers author TINY bytes (Elwynn
+              // 31_49/32_49: max 6-55, mean 0-9) so authored-ONLY collapsed every river to the flat
+              // shallow colour (user: "one flat color, no coast gradient"); their gradient comes from
+              // TERRAIN. WPL's murk pools author high bytes (~255 -> saturate the ramp) so max() still
+              // gives them the deep murk colour over physically-shallow beds (the 08-21 intent). The
+              // earlier Caer Darrow "whole lake snaps dark" was the STREAMING FALLBACK (byte*100 while
+              // the terrain heightmap loads), not max() — keep that fallback on the same authored
+              // scale instead so un-streamed tiles look like their streamed selves.
+              float render_depth = depth[v_index] * (layer.hasAuthoredDepth() ? authored_deep_units : 8.f);
               if (heightmap)
               {
                 float const diff = vertices[v_index].y - heightmap[17 * z_v + x_v].y;
-                render_depth = std::max(0.f, diff);
+                render_depth = std::max(std::max(0.f, diff), depth[v_index] * authored_deep_units);
               }
               layer_params.vertex_data[n_chunks][v_index] = glm::vec4(vertices[v_index].y, render_depth, tex_coord.x, tex_coord.y);
             }

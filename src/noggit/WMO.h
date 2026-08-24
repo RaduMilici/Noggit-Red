@@ -173,6 +173,11 @@ public:
 
   void load();
 
+  // [VK overnight] CPU-side geometry for the Vulkan clay pass (these arrays are retained for ray-picking).
+  std::vector<::glm::vec3> const& vk_vertices() const { return _vertices; }
+  std::vector<::glm::vec3> const& vk_normals() const { return _normals; }
+  std::vector<uint16_t> const& vk_indices() const { return _indices; }
+
   void drawLiquid ( glm::mat4x4 const& transform
                   , OpenGL::Scoped::use_program& water_shader
                   , Noggit::Rendering::LiquidTextureManager& texture_manager
@@ -185,7 +190,11 @@ public:
 
   void setupFog (bool draw_fog, std::function<void (bool)> setup_fog);
 
-  void intersect (math::ray const&, std::vector<float>* results) const;
+  void intersect (math::ray const&, std::vector<float>* results, float max_dist = 0.0f) const;
+
+  // [game mode] local-space liquid surface height at p when THIS group's room contains p and has
+  // liquid covering that spot (upper-floor pools must not read as covering someone below them).
+  std::optional<float> liquidHeightAtLocal(glm::vec3 const& p) const;
 
   // todo: portal culling
   [[nodiscard]]
@@ -213,6 +222,11 @@ public:
 
   [[nodiscard]]
   bool has_skybox() const { return header.flags.skybox; }
+
+  // MOGP 0x10000. The client draws these unconditionally, outside the interior portal flood (e.g. Stormwind's
+  // cathedral banners / stained glass, gid 18970+: unreachable via portals but always shown).
+  [[nodiscard]]
+  bool always_draw() const { return header.flags.always_draw; }
 
   [[nodiscard]]
   bool is_indoor() const { return header.flags.indoor; }
@@ -292,6 +306,28 @@ private:
 
   std::vector <wmo_triangle_material_info> _material_infos;
   std::vector<wmo_batch> _batches;
+  // Per-batch AABBs in the converted vertex space, computed lazily on the first reach-limited
+  // intersect (game-mode physics probes). City groups are huge; without these every short probe
+  // ray triangle-walks the whole group. Mutable: filled inside the const intersect().
+  mutable std::vector<std::pair<glm::vec3, glm::vec3>> _batch_bounds;
+  mutable bool _batch_bounds_computed = false;
+
+  // [perf 2026-08-17] Lazy 2D (XZ) uniform grid over this group's COLLIDABLE triangles, built on the
+  // first reach-limited physics probe. Game-mode collision fires ~260 short rays/frame; each used to
+  // triangle-walk every near batch of a city building (measured 15ms/frame -- the game-view bottleneck).
+  // With the grid a ray only tests the triangles in the few cells its short XZ span crosses. CONSERVATIVE
+  // (a triangle sits in every cell its XZ AABB overlaps; the query gathers the ray-span AABB + a 1-cell
+  // margin) so it can never miss a triangle the brute walk would hit -> identical collision, just faster.
+  // Only used for max_dist>0 (physics); editor picking (max_dist==0) keeps the full batch walk.
+  mutable std::vector<std::vector<uint32_t>> _collision_grid; // cell (cz*nx+cx) -> triangle-start indices (i in _indices, step 3)
+  mutable std::vector<uint32_t> _collision_grid_visit;        // per-triangle last-query stamp (dedup across cells)
+  mutable std::uint32_t _collision_grid_query = 0;
+  mutable glm::vec2 _collision_grid_origin = glm::vec2(0.0f);
+  mutable float _collision_grid_cell = 0.0f;                  // 0 => grid unavailable, fall back to batch walk
+  mutable int _collision_grid_nx = 0;
+  mutable int _collision_grid_nz = 0;
+  mutable bool _collision_grid_built = false;
+  void buildCollisionGrid() const;
 
   // (Legacy, always false now: the portal-spill experiment is superseded by the byte-matched 1.12
   // AttenTransVerts + tex*MOCV*(1+4a) pipeline, RE_notes/19.)
@@ -303,6 +339,11 @@ private:
   std::vector<glm::vec2> _texcoords;
   std::vector<glm::vec2> _texcoords_2;
   std::vector<glm::vec4> _vertex_colors;
+  // Two-layer texture-blend factor per vertex, its OWN stream (the client keeps a second colour
+  // attribute for exactly this). Only groups shipping the dedicated mocv2 chunk fill it. It used
+  // to be written into _vertex_colors.w, which is why compute_portal_openness had to SKIP those
+  // groups -- and that skip is what left the Ascension doorways with no blend (hard seam).
+  std::vector<float> _blend_alphas;
   std::vector<uint16_t> _indices;
   // Compact MOCV rgb copy (post atten_trans_verts), INDOOR groups only: the renderer clears
   // _vertex_colors on GPU upload, but sample_ground_color() needs the baked floor colours on the CPU.
@@ -403,7 +444,7 @@ public:
   explicit WMO(BlizzardArchive::Listfile::FileKey const& file_key, Noggit::NoggitRenderContext context );
 
   [[nodiscard]]
-  std::vector<float> intersect (math::ray const&, bool do_exterior = true) const;
+  std::vector<float> intersect (math::ray const&, bool do_exterior = true, float max_dist = 0.0f) const;
 
   void finishLoading() override;
 

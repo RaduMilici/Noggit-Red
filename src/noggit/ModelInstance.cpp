@@ -201,8 +201,9 @@ std::vector<std::tuple<int, int, int>> ModelInstance::intersect (glm::mat4x4 con
                               , math::ray const& ray
                               , selection_result* results
                               , int animtime
+                              , bool use_collision_mesh
                               )
-{  
+{
   std::vector<std::tuple<int, int, int>> triangle_indices;
   math::ray subray (_transform_mat_inverted, ray);
 
@@ -211,6 +212,26 @@ std::vector<std::tuple<int, int, int>> ModelInstance::intersect (glm::mat4x4 con
                                 )
      )
   {
+    return triangle_indices;
+  }
+
+  // [game mode] PHYSICS path: the client collides only with the M2's dedicated COLLISION MESH
+  // (boundingTriangles). Models without one -- grass, ground clutter, most foliage -- are
+  // walk-through, exactly like the game. Static bind-pose mesh: no animate needed either.
+  if (use_collision_mesh)
+  {
+    if (model->finishedLoading() && !model->_collision_indices.empty())
+    {
+      auto const& cv = model->_collision_vertices;
+      auto const& ci = model->_collision_indices;
+      for (std::size_t i = 0; i + 2 < ci.size(); i += 3)
+      {
+        if (auto distance = subray.intersect_triangle(cv[ci[i]], cv[ci[i + 1]], cv[ci[i + 2]]))
+        {
+          results->emplace_back (*distance * scale, this);
+        }
+      }
+    }
     return triangle_indices;
   }
 
@@ -332,13 +353,89 @@ void ModelInstance::recalcExtents()
   {
     extents[0] = extents[1] = pos;
     size_cat = 0.f;
+    _cull_class = 4; // fuckported/degenerate box -> classify as largest (keep visible; noggit guard)
     _need_recalc_extents = false;
     return;
   }
 
   size_cat = glm::distance(bounding_of_rotated_points.max, bounding_of_rotated_points.min);
 
+  // [game-view cull 2026-08-15] Cache the client doodad size class (wow335a.exe FUN_007bdb10). The
+  // client builds the batch WORLD AABB from the model RENDER bounding box (header.bounding_box -- the
+  // geometry bounds, NOT the collision box) x placement transform (scale+rotation included), then
+  // classifies by its LARGEST axis extent E vs sizeThresh {1,4,15,100} @DAT_00adf378:
+  //   E<=1 ->0, 1..4 ->1, 4..15 ->2, 15..100 ->3, >100 ->4. Byte-exact; see
+  //   twmoa-335a-client-doodad-cull.md. Same corner pipeline as the extents above (transform_model_box
+  //   -> _transform_mat), but the render box alone so collision-box union can't bump the class.
+  {
+    math::aabb const render_box (model->header.bounding_box_min, model->header.bounding_box_max);
+    std::vector<glm::vec3> rb_corners;
+    for (auto const& corner : render_box.all_corners())
+    {
+      rb_corners.emplace_back (_transform_mat * glm::vec4 (transform (corner), 1.f));
+    }
+    math::aabb const rb (rb_corners);
+    float const E = std::max ({rb.max.x - rb.min.x, rb.max.y - rb.min.y, rb.max.z - rb.min.z});
+    static constexpr float sizeThresh[4] = {1.f, 4.f, 15.f, 100.f}; // @DAT_00adf378
+    int cls = 0;
+    while (cls < 4 && E > sizeThresh[cls]) ++cls;
+    _cull_class = cls;
+  }
+
   _need_recalc_extents = false;
+}
+
+// [game-view cull 2026-08-15] Client placed-doodad (MDDF/M2) distance cull + fade, ported byte-exact
+// from wow335a.exe build 12340 (cull reader FUN_00791cb0, class writer FUN_007bdb10). Returns a fade
+// alpha in [0,1]; 0.0 == hard-culled. Per-class tables, verbatim:
+//   cullFar  @DAT_00adf364 = {30,100,200,750,1250}   (hard cull beyond)
+//   fadeBand @DAT_00adf38c = { 5, 10, 15, 20,  50}   (linear fade width)
+//   fadeStart = cullFar - fadeBand = {25,90,185,730,1200}
+// environmentDetail s = clamp(v,0.5,1.5) (default 1.0 @0x009e1340) scales ONLY classes 1,2,3 (0 and 4
+// are unscaled). Cull test uses distSq vs cullFarSq off the world-AABB centre (client batch centre
+// +0x38). Fade: alpha = 1 - (dist - fadeStart)/fadeBand, with the min-alpha cull floor 0.01
+// (_DAT_009f1968). See twmoa-335a-client-doodad-cull.md.
+void ModelInstance::doodadCullParams(int cull_class, float environment_detail,
+                                     float& cull_far, float& fade_band)
+{
+  static constexpr float cullFar[5]  = {30.f, 100.f, 200.f, 750.f, 1250.f};
+  static constexpr float fadeBand[5] = { 5.f,  10.f,  15.f,  20.f,   50.f};
+
+  int cls = cull_class;
+  if (cls < 0) cls = 0;
+  else if (cls > 4) cls = 4;
+
+  float s = environment_detail;
+  if (s < 0.5f) s = 0.5f;
+  else if (s > 1.5f) s = 1.5f;
+
+  cull_far = cullFar[cls];
+  if (cls >= 1 && cls <= 3)
+    cull_far *= s;
+  fade_band = fadeBand[cls];
+}
+
+float ModelInstance::doodadCullFade(glm::vec3 const& camera, float environment_detail)
+{
+  ensureExtents(); // guarantees extents + _cull_class are current
+
+  float cull_far, band;
+  doodadCullParams(_cull_class, environment_detail, cull_far, band);
+  float const fade_start = cull_far - band;
+
+  glm::vec3 const center ((extents[0] + extents[1]) * 0.5f);
+  glm::vec3 const d (camera - center);
+  float const distSq = glm::dot (d, d);
+
+  if (distSq > cull_far * cull_far)
+    return 0.0f; // FUN_00791cb0: distSq > cullFarSq -> hard cull
+
+  float const dist = std::sqrt (distSq);
+  if (dist <= fade_start)
+    return 1.0f;
+
+  float const alpha = 1.0f - (dist - fade_start) / band;
+  return alpha < 0.01f ? 0.0f : alpha; // min-alpha cull floor
 }
 
 void ModelInstance::ensureExtents()

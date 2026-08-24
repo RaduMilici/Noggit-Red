@@ -41,6 +41,55 @@ namespace mysql
     float position_y = 0.0f;
     float position_z = 0.0f;
     float orientation = 0.0f;
+    // Extended spawn columns (tortoise-wow schema; adaptively mapped on mangos-style schemas, 0/default
+    // when a column has no equivalent). Semantics RE'd from the live server source (Object.h /
+    // Creature.h / RandomMovementGenerator / ObjectMgr::LoadCreatures):
+    //  - id2..id4: alternate creature_template entries; one non-zero id is picked at RANDOM each spawn.
+    //  - spawntimesecs min/max: respawn delay range, seconds (server rolls urand(min, max)).
+    //  - wander_distance: YARDS -- radius around the spawn for movement_type 1 (Random) wandering.
+    //  - health/mana percent: spawn at this % of maximum (Turtle-only columns).
+    //  - movement_type: 0 Idle, 1 Random (wander), 2 Waypoint (path from creature_movement).
+    //  - spawn_flags: bitmask, see SPAWN_FLAG_* (0x01 ACTIVE .. 0x100 NO_DYNAMIC_RESPAWN).
+    //  - visibility_mod: YARDS -- creature is visible within max(normal visibility, this); 0 = normal.
+    std::uint32_t id2 = 0;
+    std::uint32_t id3 = 0;
+    std::uint32_t id4 = 0;
+    std::uint32_t spawntimesecs_min = 0;
+    std::uint32_t spawntimesecs_max = 0;
+    float         wander_distance = 0.0f;
+    std::uint32_t health_percent = 100;
+    std::uint32_t mana_percent = 100;
+    std::uint32_t movement_type = 0;
+    std::uint32_t spawn_flags = 0;
+    float         visibility_mod = 0.0f;
+    // cmangos-only columns: spawnMask = map-difficulty bitmask (bit k = spawned in Difficulty k;
+    // open world = 1), phaseMask = WotLK phasing bitmask (default 1; 0 is invalid).
+    std::uint32_t spawn_mask = 1;
+    std::uint32_t phase_mask = 1;
+  };
+
+  // Which extended `creature` columns THIS database actually has, with their real column names
+  // (Turtle: spawntimesecsmin/wander_distance/movement_type...; mangos-style: spawntimesecs/
+  // spawndist/MovementType). Empty string = the schema has no equivalent -> the editor field is
+  // disabled and the exporter omits the column.
+  struct CreatureSpawnTableColumns
+  {
+    std::string entry_col = "id";  // "id" (mangos/Turtle) or "id1" (AzerothCore)
+    std::string id2_col, id3_col, id4_col;
+    std::string respawn_min_col, respawn_max_col;   // same column when the schema has one spawntimesecs
+    std::string wander_col;
+    std::string health_percent_col, mana_percent_col;
+    // AzerothCore keeps ABSOLUTE curhealth/curmana (0 = spawn at full) instead of percents; when
+    // those columns matched, this flags the editor to switch the fields to absolute semantics.
+    bool health_mana_absolute = false;
+    std::string movement_col;
+    std::string spawn_flags_col;
+    std::string visibility_col;
+    std::string spawn_mask_col, phase_mask_col; // cmangos + AzerothCore (spawnMask / phaseMask)
+    // cmangos-style alternative to id2..id4: the creature_spawn_entry (guid, entry) table --
+    // creature.id = 0 + rows there = random entry pick per spawn (mangos-wotlk ObjectMgr).
+    // Only set when the schema has no id2 column but DOES have this table.
+    bool spawn_entry_table = false;
   };
 
   struct CreatureTemplateRecord
@@ -164,12 +213,31 @@ namespace mysql
   // exact radius the client uses for the ground selection circle.
   std::map<std::uint32_t, float> getCreatureBoundingRadii(std::string* error = nullptr);
 
+  // Result of running a multi-statement SQL script against the connected world DB.
+  struct SqlScriptResult
+  {
+    bool ok = false;
+    std::size_t statements_executed = 0;
+    std::string error;            // driver error text on failure
+    std::string failed_statement; // first ~300 chars of the statement that failed
+  };
+
+  // Execute a .sql script (multiple ;-terminated statements; --/#/C-style comments and quoted
+  // strings are handled) against the project's connected database, inside one transaction:
+  // any failure rolls the whole script back (DDL statements self-commit per MySQL rules, but
+  // spawn exports are pure DML so the all-or-nothing guarantee holds for them).
+  SqlScriptResult executeSqlScript(std::string const& script);
+
+  // "user@host:port/schema" of the project connection, for confirmation dialogs.
+  std::string connectionDescription();
+
   bool testConnection(bool report_only_err = false);
   bool hasMaxUIDStoredDB(std::size_t mapID);
   std::uint32_t getGUIDFromDB(std::size_t mapID);
   void insertUIDinDB(std::size_t mapID, std::uint32_t NewUID);
   void updateUIDinDB (std::size_t mapID, std::uint32_t NewUID);
-  std::vector<CreatureSpawnRecord> getCreatureSpawns(std::size_t mapID, std::string* error = nullptr);
+  std::vector<CreatureSpawnRecord> getCreatureSpawns(std::size_t mapID, std::string* error = nullptr,
+                                                     CreatureSpawnTableColumns* columns_out = nullptr);
   std::vector<GameObjectSpawnRecord> getGameObjectSpawns(std::size_t mapID, std::string* error = nullptr);
   std::vector<GameEventRecord> getGameEvents(std::string* error = nullptr);
   std::vector<CreaturePatrolPoint> getCreaturePatrolPaths(std::size_t mapID, std::string* error = nullptr);

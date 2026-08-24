@@ -189,8 +189,13 @@ void PreviewRenderer::resetCamera(float x, float y, float z, float roll, float y
 
 void PreviewRenderer::draw()
 {
-  auto trace = [this](char const* step) {
-    if (_preview_trace) { LogError << "PREVIEW draw step: " << step << " '" << _filename << "'" << std::endl; gl.finish(); }
+  // Trace only frames that contain a WMO: M2-only previews repaint continuously and the per-step
+  // gl.finish() would tank the whole session. The outstanding NVIDIA __fastfail repro (the GO
+  // picker's playerhousing WMO -- WER: nvoglv64 0xc0000409, same offset twice) only needs the WMO
+  // frames; the LAST trace line in log.txt before the crash names the failing draw stage.
+  bool const trace_frame = _preview_trace && !_wmo_instances.empty();
+  auto trace = [this, trace_frame](char const* step) {
+    if (trace_frame) { LogError << "PREVIEW draw step: " << step << " '" << _filename << "'" << std::endl; gl.finish(); }
   };
   trace("enter");
 
@@ -257,13 +262,20 @@ void PreviewRenderer::draw()
         wmo_instance.wmo->wait_until_loaded();
         wmo_instance.wmo->waitForChildrenLoaded();
         wmo_instance.ensureExtents();
+        if (trace_frame)
+        {
+          LogError << "PREVIEW draw wmo groups: '" << wmo_instance.wmo->file_key().filepath() << "'" << std::endl;
+          gl.finish();
+        }
         wmo_instance.draw(
             wmo_program, nullptr, nullptr, model_view(), projection(), frustum, culldistance,
-            _camera.position, _draw_boxes.get(), _draw_models.get() 
+            _camera.position, _draw_boxes.get(), _draw_models.get()
             , false, std::vector<selection_type>(), 0, false, display_mode::in_3D, true
         );
+        trace("wmo groups done");
 
         auto doodads = wmo_instance.get_doodads(true);
+        trace("wmo doodads gathered");
 
         if (doodads)
         {
@@ -275,6 +287,7 @@ void PreviewRenderer::draw()
         }
 
      }
+     trace("wmo end");
 
     }
 
@@ -319,7 +332,7 @@ void PreviewRenderer::draw()
       {
         model_instance.model->wait_until_loaded();
         model_instance.model->waitForChildrenLoaded();
-        if (_preview_trace && model_instance.model->file_key().hasFilepath())
+        if (trace_frame && model_instance.model->file_key().hasFilepath())
         { LogError << "PREVIEW draw m2: '" << model_instance.model->file_key().filepath() << "'" << std::endl; gl.finish(); }
 
         model_instance.model->renderer()->draw(
@@ -355,7 +368,7 @@ void PreviewRenderer::draw()
       {
         for (auto* instance : it.second)
         {
-          if (_preview_trace && instance->model->file_key().hasFilepath())
+          if (trace_frame && instance->model->file_key().hasFilepath())
           { LogError << "PREVIEW draw wmo-doodad: '" << instance->model->file_key().filepath() << "'" << std::endl; gl.finish(); }
           instance->model->renderer()->draw(
             mv
@@ -460,7 +473,9 @@ glm::mat4x4 PreviewRenderer::model_view() const
 glm::mat4x4 PreviewRenderer::projection() const
 {
   float far_z = _settings->value("farZ", 900).toFloat();
-  return glm::perspective(_camera.fov()._, aspect_ratio(), 1.f, far_z);
+  // Tiny near plane: preview scenes are a few yards deep, and near=1.0 made models clip into the
+  // camera while zooming long before the camera touched them.
+  return glm::perspective(_camera.fov()._, aspect_ratio(), 0.05f, far_z);
 }
 
 float PreviewRenderer::aspect_ratio() const
@@ -708,6 +723,10 @@ void PreviewRenderer::upload()
     gl.bufferData(GL_UNIFORM_BUFFER, sizeof(OpenGL::LightingUniformBlock), NULL, GL_DYNAMIC_DRAW);
     gl.bindBufferRange(GL_UNIFORM_BUFFER, OpenGL::ubo_targets::LIGHTING, _lighting_ubo, 0, sizeof(OpenGL::LightingUniformBlock));
     gl.bindBuffer(GL_UNIFORM_BUFFER, 0);
+    // shadow_map must NOT share unit 0 with bone_matrices (mixed sampler types on one unit =
+    // draw-time INVALID_OPERATION). Unit 16 like WorldRender; never sampled here (ShadowParams.x=0).
+    m2_shader.uniform("shadow_map", 16);
+    m2_shader.uniform("shadow_map_env", 17);
   }
 
   // m2 instaced
@@ -726,6 +745,8 @@ void PreviewRenderer::upload()
     m2_shader_instanced.uniform("bone_matrices", 0);
     m2_shader_instanced.uniform("tex1", 1);
     m2_shader_instanced.uniform("tex2", 2);
+    m2_shader_instanced.uniform("shadow_map", 16);
+    m2_shader_instanced.uniform("shadow_map_env", 17);
   }
  
   // m2 box
@@ -780,6 +801,8 @@ void PreviewRenderer::upload()
     wmo_program.uniform("texture_samplers", samplers);
     wmo_program.bind_uniform_block("matrices", 0);
     wmo_program.bind_uniform_block("lighting", 1);
+    wmo_program.uniform("shadow_map", 16);
+    wmo_program.uniform("shadow_map_env", 17);
   }
 
   // liquid
@@ -889,6 +912,10 @@ void Noggit::Ui::Tools::PreviewRenderer::updateLightingUniformBlock()
   _lighting_ubo_data.OceanColorDark = { 1.0f, 1.0f, 1.0f, 1.0f };
   _lighting_ubo_data.RiverColorLight = { 1.0f, 1.0f, 1.0f, 1.0f };
   _lighting_ubo_data.RiverColorDark = { 1.0f, 1.0f, 1.0f, 1.0f };
+  // no dynamic shadows in the asset preview; MUST be explicit 0 -- glm default ctors leave the
+  // struct member uninitialized and garbage here would enable shadow sampling with no map bound.
+  _lighting_ubo_data.ShadowParams = glm::vec4(0.f);
+  _lighting_ubo_data.ShadowCenterRange = glm::vec4(0.f);
 
   gl.bindBuffer(GL_UNIFORM_BUFFER, _lighting_ubo);
   gl.bufferSubData(GL_UNIFORM_BUFFER, 0, sizeof(OpenGL::LightingUniformBlock), &_lighting_ubo_data);

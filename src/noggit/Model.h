@@ -90,6 +90,10 @@ public:
   }
 
   bool calc;
+  // blend_anim >= 0 && blend_w < 1: cross-fade at the TRACK level, the client's anim-slot
+  // architecture -- sample BOTH sequences' raw translation/rotation/scale, mix them (lerp/slerp),
+  // and build ONE matrix. Blending finished matrices instead desynced bones from their pivots
+  // mid-fade (stretched fingers/limbs). blend_w = weight of the CURRENT (anim,time) pose.
   void calcMatrix(glm::mat4x4 const& model_view
                  , Bone* allbones
                  , std::string const& model_name
@@ -97,6 +101,9 @@ public:
                  , int anim
                  , int time
                  , int animtime
+                 , int blend_anim = -1
+                 , int blend_time = 0
+                 , float blend_w = 1.0f
                  );
 
   // Weapon-grip finger overlay: recompute THIS bone's matrix from a DIFFERENT sequence (HandsClosed),
@@ -391,7 +398,8 @@ private:
   // updateBoneMatrices TBO upload). This lets the CPU bone math run on a worker thread; the caller uploads
   // on the main thread afterwards. Default true preserves every single-threaded caller unchanged.
   void animate(glm::mat4x4 const& model_view, int anim_id, int anim_time, bool upload_bones = true);
-  void calcBones(glm::mat4x4 const& model_view, int anim, int time, int animation_time);
+  void calcBones(glm::mat4x4 const& model_view, int anim, int time, int animation_time,
+                 int blend_anim = -1, int blend_time = 0, float blend_w = 1.0f);
 
   void lightsOn(OpenGL::light lbase);
   void lightsOff(OpenGL::light lbase);
@@ -421,9 +429,11 @@ private:
   std::vector<uint8_t> _hand_overlay_bone_is_off; // parallel to _hand_overlay_bones: 1 = left/offhand
   void applyHandGripOverlay(int time, int animtime);
 
-  // Scratch pose (final bone matrices of the blend-FROM sequence) used by animate()'s cross-fade on
-  // animation transitions. Transient per-draw, like the bone pose itself.
+  // Scratch poses used by animate()'s cross-fade on animation transitions: the blend-FROM pose and
+  // a copy of the blend-TO pose (needed because the hierarchical blend overwrites bones[].mat while
+  // children still read their parent's ORIGINAL to-pose). Transient per-draw.
   std::vector<glm::mat4x4> _blend_scratch;
+  std::vector<glm::mat4x4> _blend_scratch_to;
 
   // Idle-variation scheduling (client-accurate). Per animID, the playable variations with the authored
   // M2Sequence fields the 1.12 client uses to schedule them: a frequency-weighted roulette picks a
@@ -458,6 +468,108 @@ private:
   };
   std::unordered_map<std::uint64_t, IdleSchedule> _idle_schedules;
   std::uint64_t _active_idle_key = 0;
+
+  // [game mode 2026-08-10] Cross-ANIM-ID transition blend, client-style: when an INSTANCE's animation
+  // id changes (Stand->Run, Run->Jump...), cross-fade from the old sequence's last sampled pose into
+  // the new one over the client-typical M2 sequence blendTime, using the same rigid TRS blend as the
+  // intra-id variation fades. Keyed like the idle scheduler (instance uid via _active_idle_key).
+  struct AnimSwitchState
+  {
+    int last_anim_id = -1;
+    int last_seq = 0;
+    int last_seq_time = 0;
+    long long switch_time = -1; // global anim ms when the current cross-fade started (-1 = none)
+    long long anim_start = -1;  // global anim ms when the CURRENT anim id started: the client plays
+                                // every sequence from ITS OWN time 0 on switch (a global-clock modulo
+                                // lands mid-phase -- JumpEnd began half-played)
+    int from_seq = 0;
+    int from_time = 0;
+    int blend_ms = 150;
+    // ONE-SHOT VARIATION ROLL (client CM2Model::SetAnimation, RE'd 12340 FUN_00826e60): a
+    // one-shot anim id (Death/JumpStart/JumpEnd/JumpLandRun) rolls its variation ONCE at entry
+    // -- rand() in [0,0x7FFF] walked down the chain's frequency bands, falling off the end keeps
+    // variation 0 -- then plays that sequence on the sequence-local clock, holding its last
+    // frame. Stored here by rollForcedAnimVariation (called on the forced-anim transition), read
+    // by animate() (selection + hold length) and forcedAnimVariationLengthMs (MapView timers).
+    int oneshot_anim_id = -1;
+    int oneshot_seq = -1;
+    int oneshot_len = 0;
+    uint32_t oneshot_rng = 0; // xorshift32 state, entropy-seeded on first roll (client: CRT rand)
+  };
+  std::unordered_map<std::uint64_t, AnimSwitchState> _anim_switch_states;
+
+public:
+  // Client-exact variation roll for a one-shot anim id entering play on instance `key` (see
+  // AnimSwitchState.oneshot_*). No-ops (clears the stored roll) for non-one-shot ids or when the
+  // id has no variation data.
+  void rollForcedAnimVariation(std::uint64_t key, int anim_id);
+  // Length (ms) the active/rolled sequence of this anim id will play for on instance `key`:
+  // the rolled variation's length when a roll is stored, else the FIRST variation's length.
+  // (Model::animationLength sums ALL variations -- wrong for one-shot hold windows.)
+  [[nodiscard]] int forcedAnimVariationLengthMs(std::uint64_t key, int anim_id);
+private:
+
+public:
+  // [game mode] LOWER-BODY TWIST (client strafe look): rotate the posed skeleton about the model
+  // up axis by this angle, then counter-rotate the upper body (SpineLow keybone subtree) back --
+  // legs and hips face the strafe direction while the torso keeps facing forward. Set per instance
+  // before animate() (like the hand-grip overlay); 0 = off.
+  float _lower_body_twist = 0.0f;
+  // [game mode] playback-rate scale for the ACTIVE instance's sequence-local clock: the client has
+  // no sprint animation -- fast movement plays Run scaled by unit_speed / sequence.moveSpeed.
+  float _anim_time_scale = 1.0f;
+
+  // [game mode] M2 COLLISION MESH (boundingVertices/Triangles, both eras): the client's walking
+  // and camera collision test ONLY this dedicated mesh -- grass/clutter models ship none and are
+  // walk-through. Physics probes use it; editor picking keeps the render geometry.
+  std::vector<glm::vec3> _collision_vertices;
+  std::vector<uint16_t> _collision_indices;
+
+  // Authored moveSpeed (yd/s) of an animation id's first sequence; 0 if absent.
+  [[nodiscard]] float animationMoveSpeed(int anim_id)
+  {
+    auto const it = _animations_seq_per_id.find(static_cast<uint16_t>(anim_id));
+    if (it == _animations_seq_per_id.end() || it->second.empty())
+    {
+      return 0.0f;
+    }
+    return it->second.begin()->second.moveSpeed;
+  }
+
+  // Authored cross-fade duration (ms) for switching INTO this animation, version-gated by asset
+  // era. WotLK (v264) sequences carry blendTime at +0x1C -- the field ModelHeaders misnames
+  // "playSpeed" (client 12340 SetAnimation reads it as blend ms; "0 for some models" is simply
+  // no-blend sequences). Classic-era conversions carry it in the parsed variation table instead.
+  // 150 ms = client-typical fallback when neither has it.
+  [[nodiscard]] int animationBlendTimeMs(int anim_id)
+  {
+    if (!_uses_classic_layout)
+    {
+      auto const it = _animations_seq_per_id.find(static_cast<uint16_t>(anim_id));
+      if (it != _animations_seq_per_id.end() && !it->second.empty())
+      {
+        uint32_t const bt = it->second.begin()->second.playSpeed; // = wotlk blendTime (see above)
+        if (bt > 0 && bt < 5000)
+        {
+          return static_cast<int>(bt);
+        }
+      }
+    }
+    else
+    {
+      auto const it = _anim_variations.find(static_cast<uint16_t>(anim_id));
+      if (it != _anim_variations.end() && !it->second.empty() && it->second.front().blend_time > 0)
+      {
+        return static_cast<int>(std::min<uint32_t>(it->second.front().blend_time, 5000));
+      }
+    }
+    return 150;
+  }
+private:
+  int _twist_anchor_bone = -1;            // first bone with KeyBoneID 4 (SpineLow)
+  std::vector<uint8_t> _twist_upper_bone; // per bone: 1 = SpineLow or its descendant (counter-rotated)
+  int _twist_head_bone = -1;              // first bone with KeyBoneID 6 (Head)
+  std::vector<uint8_t> _twist_head_subtree; // per bone: 1 = Head or its descendant
   // Advances the active instance's idle schedule to anim_time and fills the current/blend selection.
   // Returns false if this animID has no variation data (caller uses the legacy path). do_blend/out params
   // mirror animate()'s cross-fade inputs.
@@ -473,6 +585,28 @@ private:
   // Per-spawn live particle state (see swapInstanceEmitterState). Keyed by creature spawn guid; each
   // entry holds one ParticleSystemLiveState per _particles emitter. Default states pre-warm on first update.
   std::unordered_map<std::uint64_t, std::vector<ParticleSystemLiveState>> _instance_emitter_states;
+
+  // ParticleColor.dbc recolor sets (WotLK, checklist 12.10): CreatureDisplayInfo.particleColorID
+  // resolves to 3 colour-sets of 3 ramp colours; emitters authored with particleColorIndex 11/12/13
+  // take set [0/1/2] while that spawn's emitter state is swapped in (see swapInstanceEmitterState).
+  std::unordered_map<std::uint64_t, std::array<std::array<glm::vec4, 3>, 3>> _instance_particle_color_sets;
+  std::uint64_t _live_emitter_state_key = 0; // whose per-spawn state is currently swapped in (0 = shared)
+
+public:
+  void setInstanceParticleColorSets(std::uint64_t key, std::array<std::array<glm::vec4, 3>, 3> const& sets)
+  {
+    _instance_particle_color_sets[key] = sets;
+  }
+
+  // GEOMETRY-MODEL particles (checklist 12.2): true when any emitter authors a geometry model.
+  // WorldRender collects per-particle world transforms (inside the placement's live-state swap) and
+  // draws that model through the instanced M2 path after the particle phase. Out-of-line: Model.h
+  // can be parsed with ParticleSystem still incomplete (the Model<->Particle circular include).
+  bool hasGeometryParticles() const;
+  void appendGeometryParticleTransforms(glm::mat4x4 const& host_transform,
+                                        std::unordered_map<std::string, std::vector<glm::mat4x4>>& out) const;
+
+private:
 
   std::vector<int> _global_sequences;
   std::vector<TextureAnim> _texture_animations;

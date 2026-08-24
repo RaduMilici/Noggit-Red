@@ -43,6 +43,7 @@
 #include <limits>
 #include <array>
 #include <cstdint>
+#include <optional>
 #include <cmath>
 
 #include <glm/gtc/quaternion.hpp>
@@ -51,7 +52,8 @@
 #ifdef USE_MYSQL_UID_STORAGE
 namespace mysql
 {
-  std::vector<CreatureSpawnRecord> getCreatureSpawns(std::size_t mapID, std::string* error);
+  std::vector<CreatureSpawnRecord> getCreatureSpawns(std::size_t mapID, std::string* error,
+                                                     CreatureSpawnTableColumns* columns_out);
   std::vector<GameObjectSpawnRecord> getGameObjectSpawns(std::size_t mapID, std::string* error);
 }
 #endif
@@ -959,6 +961,12 @@ namespace
     assign_geoset_selection(selection, CharacterGeosetFamily::Boots, 0);
     assign_geoset_selection(selection, CharacterGeosetFamily::Tail, 0);
     assign_geoset_selection(selection, CharacterGeosetFamily::Ears, 2, false);
+    // [2026-08-21 CORRECTED vs the 2026-08-19 note] The bare forearm surface is NOT in 802: it lives in
+    // geoset 401 together with the hand (the Gloves family default, shown above), which is why the base
+    // body can be carved there. 802/803 are sleeve-cuff ADD-ONS, and BOTH clients' default tables
+    // (wow112_stock.exe ctors @0x476810, wow335a.exe @0x4dfda0) select 801 for family 8 -- absent from
+    // every character model, i.e. the family renders NOTHING by default. The old variant-1 default put
+    // phantom rolled cuffs on every NPC.
     assign_geoset_selection(selection, CharacterGeosetFamily::Wristbands, 0);
     assign_geoset_selection(selection, CharacterGeosetFamily::Kneepads, 0);
     assign_geoset_selection(selection, CharacterGeosetFamily::Chest, 0);
@@ -1558,102 +1566,171 @@ namespace
           }
         });
 
-      apply_item("shirt", display_extra.getUInt(CreatureDisplayInfoExtraDB::ShirtDisplayID),
-        [&](DBCFile::Record const& item_display)
-        {
-          auto const wrist_flags = item_display.getUInt(ItemDisplayInfoDB::GeosetGroup1());
-          auto const robe_flags = item_display.getUInt(ItemDisplayInfoDB::GeosetGroup3());
-          assign_geoset_selection(selection, CharacterGeosetFamily::Wristbands, wrist_flags);
-          debug << " shirtWristApplied=" << wrist_flags;
-          if (robe_flags != 0)
-          {
-            assign_geoset_selection(selection, CharacterGeosetFamily::Trousers, robe_flags);
-            has_robe_bottom = has_robe_bottom || robe_flags == 1;
-            debug << " shirtRobeApplied=" << robe_flags;
-          }
-        });
-
-      apply_item("chest", display_extra.getUInt(CreatureDisplayInfoExtraDB::ChestDisplayID),
-        [&](DBCFile::Record const& item_display)
-        {
-          auto const wrist_flags = item_display.getUInt(ItemDisplayInfoDB::GeosetGroup1());
-          auto const robe_flags = item_display.getUInt(ItemDisplayInfoDB::GeosetGroup3());
-          assign_geoset_selection(selection, CharacterGeosetFamily::Wristbands, wrist_flags);
-          debug << " chestWristApplied=" << wrist_flags;
-          if (robe_flags != 0)
-          {
-            assign_geoset_selection(selection, CharacterGeosetFamily::Trousers, robe_flags);
-            has_robe_bottom = has_robe_bottom || robe_flags == 1;
-            debug << " chestRobeApplied=" << robe_flags;
-          }
-        });
-
-      apply_item("legs", display_extra.getUInt(CreatureDisplayInfoExtraDB::LegsDisplayID),
-        [&](DBCFile::Record const& item_display)
-        {
-          auto const kneepad_flags = item_display.getUInt(ItemDisplayInfoDB::GeosetGroup2());
-          auto const robe_flags = item_display.getUInt(ItemDisplayInfoDB::GeosetGroup3());
-          assign_geoset_selection(selection, CharacterGeosetFamily::Kneepads, kneepad_flags);
-          assign_geoset_selection(selection, CharacterGeosetFamily::Trousers, robe_flags);
-          has_robe_bottom = has_robe_bottom || robe_flags == 1;
-          debug << " legsKneepadApplied=" << kneepad_flags
-                << " legsTrousersApplied=" << robe_flags;
-        });
-
-      apply_item("gloves", gloves_display_id,
-        [&](DBCFile::Record const& item_display)
-        {
-          auto const glove_flags = item_display.getUInt(ItemDisplayInfoDB::GeosetGroup1());
-          assign_geoset_selection(selection, CharacterGeosetFamily::Gloves, glove_flags);
-          debug << " glovesApplied=" << glove_flags;
-        });
-
-      apply_item("boots", display_extra.getUInt(CreatureDisplayInfoExtraDB::BootsDisplayID),
-        [&](DBCFile::Record const& item_display)
-        {
-          if (!has_robe_bottom)
-          {
-            auto const boot_flags = item_display.getUInt(ItemDisplayInfoDB::GeosetGroup1());
-            assign_geoset_selection(selection, CharacterGeosetFamily::Boots, boot_flags);
-            debug << " bootsApplied=" << boot_flags;
-          }
-        });
-
-      apply_item("bracers", display_extra.getUInt(CreatureDisplayInfoExtraDB::BracersDisplayID),
-        [&](DBCFile::Record const&){});
-      apply_item("shoulders", display_extra.getUInt(CreatureDisplayInfoExtraDB::ShouldersDisplayID),
-        [&](DBCFile::Record const&){});
-      apply_item("belt", display_extra.getUInt(CreatureDisplayInfoExtraDB::BeltDisplayID),
-        [&](DBCFile::Record const&){});
-      // Cape. WotLK-only slot (see DBC.h) -- apply_character_default_geosets force-hides the cape
-      // family, so without this every cloaked NPC on 3.3.5a data renders capeless. Guarded on the
-      // accessor rather than the project version so Classic, which has no such column, skips it.
-      if (std::size_t const cape_slot = CreatureDisplayInfoExtraDB::CapeDisplayID())
+      // [2026-08-21 CLIENT-EXACT NPC ITEM DRESSING -- RE'd from BOTH game binaries]
+      // CCharacterComponent::UpdateGeosets: wow112_stock.exe @0x477520, wow335a.exe @0x4ed900. Same
+      // algorithm in both; CGUnit_C::UpdateDisplayInfo dresses CDIExtra NPCs through the same component
+      // as players, and UpdateGeosets is the ONLY item-geoset authority:
+      //   sleeves:  gloves.g1 ? gloves geoset 401+v (replaces the hand+forearm geoset)
+      //             : chest.g1 ? sleeve 801+v
+      //             : shirt.g1 shown ONLY when no chest/wrist/gloves item bakes an ArmLower texture
+      //               (the ArmLower compositing layers 1-6; the shirt itself is layer 0. 1.12 checks the
+      //               layer heads, 3.3.5a the layer bitmask at component+0x244 -- same meaning.)
+      //   robe:     chest.g3 else legs.g3 -> 1301+v, hides the Boots and Pants families, kneepads default
+      //   boots:    (no robe) boots.g1 -> 501+v and kneepads default; else legs.g2 -> kneepads 901+v
+      //   tabard:   (no robe) tabard.g1 -> 1201+v
+      //   tail:     (no chest robe, no tabard geoset) shirt.g2 -> 1001+v
+      //   pants:    legs.g1 -> 1.12: 1102+v (no chest robe/tabard geoset); 3.3.5a: 1101+v, v>=3 also
+      //             REPLACES the robe lower (hides trousers family), v<3 skipped when a tabard geoset shows
+      //   belt:     3.3.5a only: belt.g1 -> buckle 1801+v.  cape: cape.g1 -> 1501+v (slot exists WotLK+)
+      //   wrist/shoulder: textures and attachments only, never geosets. Shirt NEVER drives robes.
+      // Family-8 default = variant 0 in BOTH clients (801 is absent from every model = renders nothing):
+      // the bare forearm+hand surface is geoset 401. Full RE: full_data/RE_notes/15_112_npc_dressing.md.
+      bool const classic_dressing = CreatureDisplayInfoExtraDB::CapeDisplayID() == 0;
       {
-        apply_item("cape", display_extra.getUInt(cape_slot),
-          [&](DBCFile::Record const& item_display)
-          {
-            auto const cape_flags = item_display.getUInt(ItemDisplayInfoDB::GeosetGroup1());
-            assign_geoset_selection(selection, CharacterGeosetFamily::Cape, cape_flags);
-            debug << " capeApplied=" << cape_flags;
-          });
-      }
-
-      apply_item("tabard", display_extra.getUInt(CreatureDisplayInfoExtraDB::TabardDisplayID),
-        [&](DBCFile::Record const&)
+        std::optional<DBCFile::Record> shirt_rec, chest_rec, legs_rec, boots_rec, wrist_rec, gloves_rec, tabard_rec, belt_rec, cape_rec;
+        apply_item("shirt", display_extra.getUInt(CreatureDisplayInfoExtraDB::ShirtDisplayID),
+          [&](DBCFile::Record const& item_display) { shirt_rec.emplace(item_display); });
+        apply_item("chest", display_extra.getUInt(CreatureDisplayInfoExtraDB::ChestDisplayID),
+          [&](DBCFile::Record const& item_display) { chest_rec.emplace(item_display); });
+        apply_item("legs", display_extra.getUInt(CreatureDisplayInfoExtraDB::LegsDisplayID),
+          [&](DBCFile::Record const& item_display) { legs_rec.emplace(item_display); });
+        apply_item("gloves", gloves_display_id,
+          [&](DBCFile::Record const& item_display) { gloves_rec.emplace(item_display); });
+        apply_item("boots", display_extra.getUInt(CreatureDisplayInfoExtraDB::BootsDisplayID),
+          [&](DBCFile::Record const& item_display) { boots_rec.emplace(item_display); });
+        apply_item("bracers", display_extra.getUInt(CreatureDisplayInfoExtraDB::BracersDisplayID),
+          [&](DBCFile::Record const& item_display) { wrist_rec.emplace(item_display); });
+        apply_item("shoulders", display_extra.getUInt(CreatureDisplayInfoExtraDB::ShouldersDisplayID),
+          [&](DBCFile::Record const&){});
+        apply_item("belt", display_extra.getUInt(CreatureDisplayInfoExtraDB::BeltDisplayID),
+          [&](DBCFile::Record const& item_display) { belt_rec.emplace(item_display); });
+        apply_item("tabard", display_extra.getUInt(CreatureDisplayInfoExtraDB::TabardDisplayID),
+          [&](DBCFile::Record const& item_display) { tabard_rec.emplace(item_display); });
+        if (std::size_t const cape_slot = CreatureDisplayInfoExtraDB::CapeDisplayID())
         {
-          if (!has_robe_bottom)
+          apply_item("cape", display_extra.getUInt(cape_slot),
+            [&](DBCFile::Record const& item_display) { cape_rec.emplace(item_display); });
+        }
+
+        auto const group = [](std::optional<DBCFile::Record> const& rec, std::size_t field) -> std::uint32_t
+        {
+          return rec ? rec->getUInt(field) : 0u;
+        };
+
+        std::uint32_t const gloves_geoset = group(gloves_rec, ItemDisplayInfoDB::GeosetGroup1());
+        std::uint32_t const chest_sleeve = group(chest_rec, ItemDisplayInfoDB::GeosetGroup1());
+        std::uint32_t const shirt_sleeve = group(shirt_rec, ItemDisplayInfoDB::GeosetGroup1());
+        if (gloves_geoset != 0)
+        {
+          assign_geoset_selection(selection, CharacterGeosetFamily::Gloves, gloves_geoset);
+          debug << " glovesApplied=" << gloves_geoset;
+        }
+        else if (chest_sleeve != 0)
+        {
+          assign_geoset_selection(selection, CharacterGeosetFamily::Wristbands, chest_sleeve);
+          debug << " chestWristApplied=" << chest_sleeve;
+        }
+        else if (shirt_sleeve != 0)
+        {
+          auto const arm_lower_covered = [](std::optional<DBCFile::Record> const& rec)
           {
-            assign_geoset_selection(selection, CharacterGeosetFamily::Tabard, 1);
-            debug << " tabardShown=1";
+            return rec && rec->getString(ItemDisplayInfoDB::TextureLowerArm())[0] != '\0';
+          };
+          if (!arm_lower_covered(chest_rec) && !arm_lower_covered(wrist_rec) && !arm_lower_covered(gloves_rec))
+          {
+            assign_geoset_selection(selection, CharacterGeosetFamily::Wristbands, shirt_sleeve);
+            debug << " shirtWristApplied=" << shirt_sleeve;
           }
           else
           {
-            hide_geoset_family(selection, CharacterGeosetFamily::Tabard);
-            debug << " tabardSuppressedByRobe=1";
+            debug << " shirtWristSuppressedByArmTexture=1";
           }
-        });
+        }
 
+        std::uint32_t const chest_robe = group(chest_rec, ItemDisplayInfoDB::GeosetGroup3());
+        std::uint32_t const legs_robe = group(legs_rec, ItemDisplayInfoDB::GeosetGroup3());
+        std::uint32_t const robe = chest_robe ? chest_robe : legs_robe;
+        std::uint32_t const boots_geoset = group(boots_rec, ItemDisplayInfoDB::GeosetGroup1());
+        if (robe != 0)
+        {
+          assign_geoset_selection(selection, CharacterGeosetFamily::Trousers, robe);
+          hide_geoset_family(selection, CharacterGeosetFamily::Boots);
+          hide_geoset_family(selection, CharacterGeosetFamily::Pants);
+          assign_geoset_selection(selection, CharacterGeosetFamily::Kneepads, 0);
+          has_robe_bottom = true;
+          debug << " robeApplied=" << robe << (chest_robe ? " robeFrom=chest" : " robeFrom=legs");
+        }
+        else if (boots_geoset != 0)
+        {
+          assign_geoset_selection(selection, CharacterGeosetFamily::Boots, boots_geoset);
+          assign_geoset_selection(selection, CharacterGeosetFamily::Kneepads, 0);
+          debug << " bootsApplied=" << boots_geoset;
+        }
+        else if (std::uint32_t const kneepads = group(legs_rec, ItemDisplayInfoDB::GeosetGroup2()))
+        {
+          assign_geoset_selection(selection, CharacterGeosetFamily::Kneepads, kneepads);
+          debug << " legsKneepadApplied=" << kneepads;
+        }
+
+        std::uint32_t const tabard_geoset = group(tabard_rec, ItemDisplayInfoDB::GeosetGroup1());
+        if (robe == 0 && tabard_geoset != 0)
+        {
+          assign_geoset_selection(selection, CharacterGeosetFamily::Tabard, tabard_geoset);
+          debug << " tabardApplied=" << tabard_geoset;
+        }
+
+        if (chest_robe == 0 && tabard_geoset == 0)
+        {
+          if (std::uint32_t const shirt_tail = group(shirt_rec, ItemDisplayInfoDB::GeosetGroup2()))
+          {
+            assign_geoset_selection(selection, CharacterGeosetFamily::Chest, shirt_tail);
+            debug << " shirtTailApplied=" << shirt_tail;
+          }
+        }
+
+        if (chest_robe == 0)
+        {
+          if (std::uint32_t const pants = group(legs_rec, ItemDisplayInfoDB::GeosetGroup1()))
+          {
+            if (classic_dressing)
+            {
+              // 1.12: 1102+v, skipped when a tabard geoset shows
+              if (tabard_geoset == 0)
+              {
+                assign_geoset_selection(selection, CharacterGeosetFamily::Pants, pants + 1);
+                debug << " legsPantsApplied=" << pants;
+              }
+            }
+            else if (pants >= 3)
+            {
+              // 3.3.5a: a long-pants variant >= 3 REPLACES the robe lower entirely
+              hide_geoset_family(selection, CharacterGeosetFamily::Trousers);
+              assign_geoset_selection(selection, CharacterGeosetFamily::Pants, pants);
+              debug << " legsPantsApplied=" << pants << " pantsReplaceRobe=1";
+            }
+            else if (tabard_geoset == 0)
+            {
+              assign_geoset_selection(selection, CharacterGeosetFamily::Pants, pants);
+              debug << " legsPantsApplied=" << pants;
+            }
+          }
+        }
+
+        if (!classic_dressing)
+        {
+          if (std::uint32_t const buckle = group(belt_rec, ItemDisplayInfoDB::GeosetGroup1()))
+          {
+            assign_geoset_selection(selection, CharacterGeosetFamily::Belt, buckle);
+            debug << " beltBuckleApplied=" << buckle;
+          }
+        }
+
+        if (std::uint32_t const cape_geoset = group(cape_rec, ItemDisplayInfoDB::GeosetGroup1()))
+        {
+          assign_geoset_selection(selection, CharacterGeosetFamily::Cape, cape_geoset);
+          debug << " capeApplied=" << cape_geoset;
+        }
+      }
       if (classic_probe_hide_trousers_enabled())
       {
         hide_geoset_family(selection, CharacterGeosetFamily::Trousers);
@@ -2891,6 +2968,31 @@ World::World(const std::string& name, int map_id, Noggit::NoggitRenderContext co
 {
   LogDebug << "Loading world \"" << name << "\"." << std::endl;
   append_creature_geoset_trace("world", std::string("name='") + name + "' mapId=" + std::to_string(map_id));
+
+  // Map.dbc TimeOfDayOverride (client-canon, see MapDB::TimeOfDayOverride): the client renders such
+  // maps at a FIXED clock, always. Match it by INITIALISING noggit's time there (in half-minutes) --
+  // the editor's time slider stays usable afterwards, but the map opens looking like the client.
+  try
+  {
+    if (gMapDB.getRecordCount() > 0)
+    {
+      MapDB::Record rec = gMapDB.getByID(map_id);
+      if (gMapDB.getFieldCount() > MapDB::TimeOfDayOverride)
+      {
+        int const tod_minutes = rec.getInt(MapDB::TimeOfDayOverride);
+        if (tod_minutes >= 0 && tod_minutes < 1440)
+        {
+          time = static_cast<float>(tod_minutes * 2); // minutes -> half-minute day units
+          LogDebug << "Map " << map_id << " has a Map.dbc TimeOfDayOverride = " << tod_minutes
+                   << " min; initial time of day set to match the client." << std::endl;
+        }
+      }
+    }
+  }
+  catch (MapDB::NotFound const&)
+  {
+    // no Map.dbc row (custom/unlisted map) -> keep the default time
+  }
   _loaded_tiles_buffer[0] = std::make_pair<std::pair<int, int>, MapTile*>(std::make_pair(0, 0), nullptr);
   _creature_spawn_status = "Creature spawns inactive";
 }
@@ -2918,12 +3020,31 @@ bool World::reloadCreatureSpawns()
 
 #ifdef USE_MYSQL_UID_STORAGE
   std::string error;
-  auto rows = mysql::getCreatureSpawns(mapIndex._map_id, &error);
+  mysql::CreatureSpawnTableColumns db_columns;
+  auto rows = mysql::getCreatureSpawns(mapIndex._map_id, &error, &db_columns);
   if (!error.empty())
   {
     _creature_spawn_status = "Creature spawn load failed: " + error;
     return false;
   }
+  // Copy the resolved extended-column names for the editor UI + SQL exporter (mirror struct so
+  // World.h stays free of the mysql headers).
+  _creature_spawn_columns.entry_col = db_columns.entry_col;
+  _creature_spawn_columns.id2_col = db_columns.id2_col;
+  _creature_spawn_columns.id3_col = db_columns.id3_col;
+  _creature_spawn_columns.id4_col = db_columns.id4_col;
+  _creature_spawn_columns.respawn_min_col = db_columns.respawn_min_col;
+  _creature_spawn_columns.respawn_max_col = db_columns.respawn_max_col;
+  _creature_spawn_columns.wander_col = db_columns.wander_col;
+  _creature_spawn_columns.health_percent_col = db_columns.health_percent_col;
+  _creature_spawn_columns.mana_percent_col = db_columns.mana_percent_col;
+  _creature_spawn_columns.health_mana_absolute = db_columns.health_mana_absolute;
+  _creature_spawn_columns.movement_col = db_columns.movement_col;
+  _creature_spawn_columns.spawn_flags_col = db_columns.spawn_flags_col;
+  _creature_spawn_columns.visibility_col = db_columns.visibility_col;
+  _creature_spawn_columns.spawn_mask_col = db_columns.spawn_mask_col;
+  _creature_spawn_columns.phase_mask_col = db_columns.phase_mask_col;
+  _creature_spawn_columns.spawn_entry_table = db_columns.spawn_entry_table;
 
   LogDebug << "Creature spawn DBC stats: CreatureDisplayInfo records=" << gCreatureDisplayInfoDB.getRecordCount()
            << ", CreatureModelData records=" << gCreatureModelDataDB.getRecordCount() << std::endl;
@@ -2969,6 +3090,20 @@ bool World::reloadCreatureSpawns()
     spawn.offhand_inventory_type = row.offhand_inventory_type;
     spawn.ranged_inventory_type = row.ranged_inventory_type;
     spawn.auras = row.auras;
+    spawn.ext.id2 = row.id2;
+    spawn.ext.id3 = row.id3;
+    spawn.ext.id4 = row.id4;
+    spawn.ext.spawntimesecs_min = row.spawntimesecs_min;
+    spawn.ext.spawntimesecs_max = row.spawntimesecs_max;
+    spawn.ext.wander_distance = row.wander_distance;
+    spawn.ext.health_percent = row.health_percent;
+    spawn.ext.mana_percent = row.mana_percent;
+    spawn.ext.movement_type = row.movement_type;
+    spawn.ext.spawn_flags = row.spawn_flags;
+    spawn.ext.visibility_mod = row.visibility_mod;
+    spawn.ext.spawn_mask = row.spawn_mask;
+    spawn.ext.phase_mask = row.phase_mask;
+    spawn.original_ext = spawn.ext;
     if (auto const radius_it = bounding_radii.find(spawn.display_id); radius_it != bounding_radii.end())
     {
       // The client's ring radius = bounding_radius x the RAW template scale (1.0 when unset) --
@@ -3244,6 +3379,140 @@ namespace
   }
 }
 
+bool World::setGameCharacterDisplayId(std::uint32_t display_id)
+{
+  if (_game_character.display_id == display_id
+      && (_game_character.model_instance.has_value() || _game_character.model_create_failed))
+  {
+    return _game_character.model_instance.has_value();
+  }
+
+  _game_character = CreatureSpawnOverlay();
+  _game_character.guid = 0xFFFFFFFEu; // stable fake guid: idle-variation scheduler key, never a real spawn
+  _game_character.display_id = display_id;
+  if (!display_id)
+  {
+    return false;
+  }
+
+  auto const model_result = resolve_creature_model_path(display_id);
+  if (model_result.status != CreatureModelPathStatus::Success)
+  {
+    _game_character.model_create_failed = true;
+    LogError << "[game mode] character display " << display_id
+             << " did not resolve to a model (status " << static_cast<int>(model_result.status)
+             << ") -- pick another display id in the Game Mode panel" << std::endl;
+    return false;
+  }
+  _game_character.model_path = model_result.path;
+  _game_character.model_scale = resolve_creature_model_scale(display_id);
+  _game_character.template_scale = resolve_creature_display_scale(display_id);
+  _game_character.is_character_model = _game_character.model_path.rfind("character/", 0) == 0;
+  bool const ok = ensureCreatureSpawnModel(_game_character);
+  Log << "[game mode] character display " << display_id << " -> '" << _game_character.model_path
+      << "'" << (_game_character.is_character_model ? " (character skeleton)" : "")
+      << (ok ? " OK" : " FAILED") << std::endl;
+  return ok;
+}
+
+int World::gameCharacterAnimLengthMs(int anim_id)
+{
+  if (!_game_character.model_instance.has_value())
+  {
+    return 0;
+  }
+  Model* const m = _game_character.model_instance->model.get();
+  if (!m || !m->finishedLoading() || m->loading_failed())
+  {
+    return 0;
+  }
+  // roll-aware: the ROLLED one-shot variation's length when one is stored (else the first
+  // variation's). Model::animationLength sums ALL variations of the id -- on a two-variation
+  // JumpStart (night elf / blood elf alternate jump) that held the anim for both lengths.
+  return m->forcedAnimVariationLengthMs(
+    static_cast<std::uint64_t>(_game_character.model_instance->uid), anim_id);
+}
+
+void World::setGameCharacterBubbles(bool on)
+{
+  if (on == _game_character_bubbles || !_game_character.model_instance.has_value())
+  {
+    return;
+  }
+  _game_character_bubbles = on;
+  int constexpr breath_attachment = 17; // M2 attachment "Breath" -- where the client hangs it
+  auto& attachments = _game_character.attachment_models;
+  if (!on)
+  {
+    attachments.erase(std::remove_if(attachments.begin(), attachments.end(),
+                                     [&](CreatureSpawnOverlay::AttachmentModel const& a)
+                                     { return a.attachment_id == breath_attachment; }),
+                      attachments.end());
+    return;
+  }
+  try
+  {
+    // client-exact effect: SpellVisualEffectName 108 "HARDCODED Breath Underwater"
+    CreatureSpawnOverlay::AttachmentModel bubbles;
+    bubbles.attachment_id = breath_attachment;
+    bubbles.model_instance.emplace(BlizzardArchive::Listfile::FileKey("particles/bubbles.m2"), _context);
+    bubbles.model_instance->pos = _game_character.pos;
+    bubbles.model_instance->dir = _game_character.model_instance->dir;
+    bubbles.model_instance->scale = _game_character.model_instance->scale;
+    bubbles.model_instance->updateTransformMatrix();
+    attachments.push_back(std::move(bubbles));
+  }
+  catch (std::exception const&)
+  {
+    // model missing in this project's data: no bubbles, no harm
+  }
+}
+
+float World::gameCharacterAnimMoveSpeed(int anim_id)
+{
+  if (!_game_character.model_instance.has_value())
+  {
+    return 0.0f;
+  }
+  Model* const m = _game_character.model_instance->model.get();
+  if (!m || !m->finishedLoading() || m->loading_failed())
+  {
+    return 0.0f;
+  }
+  return m->animationMoveSpeed(anim_id);
+}
+
+void World::updateGameCharacter(glm::vec3 const& pos, float orientation_deg, int anim_id,
+                                float lower_body_twist_rad, float anim_time_scale,
+                                float body_pitch_deg)
+{
+  _game_character.pos = pos;
+  _game_character.orientation = orientation_deg;
+  if (_game_character.model_instance.has_value())
+  {
+    auto& mi = *_game_character.model_instance;
+    if (anim_id != mi.forcedAnimationId() && mi.model->finishedLoading())
+    {
+      // entering a one-shot (JumpStart/JumpEnd/JumpLandRun/Death): roll its variation NOW,
+      // client SetAnimation-style, so this tick's length queries and the next draw's animate()
+      // both see the rolled sequence (night elf / blood elf alternate jump odds)
+      mi.model->rollForcedAnimVariation(static_cast<std::uint64_t>(mi.uid), anim_id);
+    }
+    mi.pos = pos;
+    // dir.x drives the eulerAngleYZX Z-slot: RZ(+) tilts model-forward (+X) toward model-up, so
+    // nose-up-positive pitch maps to dir.x = -pitch. Yaw as before.
+    mi.dir = glm::vec3(-body_pitch_deg, orientation_deg, 0.0f);
+    mi.lower_body_twist = lower_body_twist_rad;
+    mi.anim_time_scale = anim_time_scale;
+    mi.setForcedAnimationId(anim_id);
+    mi.updateTransformMatrix();
+    if (mi.model->finishedLoading())
+    {
+      mi.recalcExtents(); // isInFrustum in the render gather reads these
+    }
+  }
+}
+
 bool World::ensureCreatureSpawnModel(CreatureSpawnOverlay& spawn)
 {
   if (spawn.model_instance.has_value())
@@ -3282,6 +3551,39 @@ bool World::ensureCreatureSpawnModel(CreatureSpawnOverlay& spawn)
       if (pose_anim >= 0)
       {
         spawn.model_instance->setForcedAnimationId(pose_anim);
+      }
+    }
+
+    // WotLK ParticleColor.dbc recolor (checklist 12.10): CreatureDisplayInfo.particleColorID picks a
+    // 3-set colour table; emitters authored with particleColorIndex 11/12/13 take set 1/2/3 while
+    // this spawn's per-instance emitter state is live. Stored on the Model keyed by guid -- applied
+    // in swapInstanceEmitterState, so it works even while the model is still async-loading.
+    if (std::size_t const particle_color_col = CreatureDisplayInfoDB::ParticleColorID())
+    {
+      try
+      {
+        auto display = gCreatureDisplayInfoDB.getByID(spawn.display_id);
+        if (auto const particle_color_id = display.getUInt(particle_color_col))
+        {
+          auto row = gParticleColorDB.getByID(particle_color_id);
+          std::array<std::array<glm::vec4, 3>, 3> sets;
+          for (int set = 0; set < 3; ++set)
+          {
+            for (int key = 0; key < 3; ++key)
+            {
+              auto const packed = row.getUInt(ParticleColorDB::Start1 + set * 3 + key);
+              // 0xRRGGBB like the light bands; flip here if recolored variants read channel-swapped.
+              sets[set][key] = glm::vec4(((packed >> 16) & 0xFF) / 255.0f,
+                                         ((packed >> 8) & 0xFF) / 255.0f,
+                                         (packed & 0xFF) / 255.0f,
+                                         1.0f);
+            }
+          }
+          spawn.model_instance->model->setInstanceParticleColorSets(spawn.guid, sets);
+        }
+      }
+      catch (DBCFile::NotFound const&)
+      {
       }
     }
 
@@ -3568,6 +3870,33 @@ bool World::ensureGameObjectSpawnModel(GameObjectSpawnOverlay& spawn)
   }
 
   return false;
+}
+
+std::vector<World::CreaturePreviewAttachment> World::resolveCreaturePreviewAttachments(CreatureSpawnOverlay const& spawn)
+{
+  std::vector<CreatureAttachmentModelSpec> specs;
+  // CDIExtra helm/shoulder attachments only exist for character-skeleton NPCs; equipment weapons
+  // attach to any skeleton with hand points (same selection ensureCreatureSpawnModel makes).
+  if (spawn.is_character_model)
+  {
+    specs = resolve_creature_attachment_models(spawn.display_id);
+  }
+  auto equipment_specs = resolve_creature_equipment_attachment_models(spawn.display_id,
+                                                                      spawn.mainhand_display_id,
+                                                                      spawn.offhand_display_id,
+                                                                      spawn.ranged_display_id,
+                                                                      spawn.offhand_inventory_type);
+  specs.insert(specs.end(),
+               std::make_move_iterator(equipment_specs.begin()),
+               std::make_move_iterator(equipment_specs.end()));
+
+  std::vector<CreaturePreviewAttachment> out;
+  out.reserve(specs.size());
+  for (auto& spec : specs)
+  {
+    out.push_back({spec.attachment_id, std::move(spec.model_path), std::move(spec.texture_overrides)});
+  }
+  return out;
 }
 
 std::vector<std::pair<std::size_t, std::string>> World::applyCreatureSpawnModelAppearance(CreatureSpawnOverlay const& spawn,
@@ -4780,6 +5109,210 @@ bool World::isInIndoorWmoGroup(std::array<glm::vec3, 2> obj_bounds, glm::mat4x4 
     return is_indoor;
 }
 
+std::vector<std::uint32_t> const& World::creatureDisplayIds()
+{
+  if (_creature_display_ids.empty())
+  {
+    try
+    {
+      for (auto it = gCreatureDisplayInfoDB.begin(); it != gCreatureDisplayInfoDB.end(); ++it)
+      {
+        _creature_display_ids.push_back(it->getUInt(CreatureDisplayInfoDB::ID));
+      }
+      std::sort(_creature_display_ids.begin(), _creature_display_ids.end());
+    }
+    catch (...)
+    {
+      _creature_display_ids.clear();
+    }
+  }
+  return _creature_display_ids;
+}
+
+std::optional<float> World::getLiquidHeightAt(glm::vec3 const& pos)
+{
+  auto const result = for_maybe_chunk_at(pos, [&](MapChunk* chunk) -> std::optional<float>
+  {
+    ChunkWater* const cw = chunk->liquid_chunk();
+    if (!cw)
+    {
+      return std::optional<float>{};
+    }
+    std::optional<float> best;
+    for (auto& layer : *cw->getLayers())
+    {
+      if (layer.empty())
+      {
+        continue;
+      }
+      auto const& verts = layer.getVertices();
+      float const fx = (pos.x - verts[0].x) / UNITSIZE;
+      float const fz = (pos.z - verts[0].z) / UNITSIZE;
+      if (fx < 0.0f || fz < 0.0f || fx > 8.0f || fz > 8.0f)
+      {
+        continue;
+      }
+      int const cx = std::min(7, static_cast<int>(fx));
+      int const cz = std::min(7, static_cast<int>(fz));
+      if (!layer.hasSubchunk(cx, cz))
+      {
+        continue;
+      }
+      float const tx = fx - static_cast<float>(cx);
+      float const tz = fz - static_cast<float>(cz);
+      float const h =
+        glm::mix(glm::mix(verts[cz * 9 + cx].y,       verts[cz * 9 + cx + 1].y,       tx),
+                 glm::mix(verts[(cz + 1) * 9 + cx].y, verts[(cz + 1) * 9 + cx + 1].y, tx), tz);
+      if (!best || h > *best)
+      {
+        best = h;
+      }
+    }
+    return best;
+  });
+  std::optional<float> best = result ? *result : std::optional<float>{};
+
+  // WMO group liquids (BRD lava, city pools) via the probe cache -- valid in game mode, where
+  // this runs right after ensureProbeCache. Lava/slime swim exactly like water in the client.
+  if (_probe_cache_valid)
+  {
+    for (auto* wmo_instance : _probe_cache_wmos)
+    {
+      if (auto const h = wmo_instance->liquidHeightAt(pos))
+      {
+        if (!best || *h > *best)
+        {
+          best = *h;
+        }
+      }
+    }
+  }
+  return best;
+}
+
+void World::ensureProbeCache(glm::vec3 const& center)
+{
+  float constexpr cache_radius = k_probe_cache_radius;  // covers the 25yd camera boom + corners + margin
+  float constexpr rebuild_move = 10.0f;  // radius - move threshold >> longest probe reach
+  ++_probe_cache_age;
+  if (_probe_cache_valid
+      && glm::distance(center, _probe_cache_center) < rebuild_move
+      && _probe_cache_age < 240) // periodic refresh bounds staleness vs editor changes
+  {
+    return;
+  }
+  _probe_cache_wmos.clear();
+  _probe_cache_m2s.clear();
+  auto const near_sphere = [&](glm::vec3 const& mn, glm::vec3 const& mx)
+  {
+    glm::vec3 const c(glm::clamp(center, mn, mx));
+    return glm::distance(c, center) <= cache_radius;
+  };
+  _model_instance_storage.for_each_wmo_instance([&](WMOInstance& wmo_instance)
+  {
+    if (near_sphere(wmo_instance.extents[0], wmo_instance.extents[1]))
+    {
+      _probe_cache_wmos.push_back(&wmo_instance);
+    }
+  });
+  _model_instance_storage.for_each_m2_instance([&](ModelInstance& model_instance)
+  {
+    if (near_sphere(model_instance.extents[0], model_instance.extents[1]))
+    {
+      _probe_cache_m2s.push_back(&model_instance);
+    }
+  });
+  // [perf 2026-08-19] Flatten the near colliding doodads of the near WMOs ONCE here, so the ~220 short physics
+  // rays/frame test this small set (intersectProbe) instead of each walking every doodad of a city WMO. Same
+  // near+colliding filter intersect_doodads applies per ray; rebuilt on the same cadence as the WMO/M2 caches.
+  _probe_cache_wmo_doodads.clear();
+  for (auto* wmo_instance : _probe_cache_wmos)
+  {
+    if (wmo_instance->wmo->is_hidden()) { continue; } // mirror the per-ray is_hidden() gate below
+    wmo_instance->collect_colliding_doodads_near(center, cache_radius, _probe_cache_wmo_doodads);
+  }
+  _probe_cache_center = center;
+  _probe_cache_valid = true;
+  _probe_cache_age = 0;
+}
+
+selection_result World::intersectProbe(glm::mat4x4 const& model_view, math::ray const& ray, float max_dist)
+{
+  ZoneScopedN("World::intersectProbe()");
+  // [perf diag 2026-08-16] TEMP: all game-mode collision ray-casts (movement + camera boom) funnel here.
+  // Time them into the otherwise-idle Selection bucket so the FRAME-PROFILE log shows exactly how much of
+  // the frame is collision probing vs. everything else in tick(). Remove once the cost is confirmed.
+  noggit::perf::Scoped _prof_probe(noggit::perf::Phase::Selection);
+  selection_result results;
+
+  auto const out_of_reach = [&](glm::vec3 const& aabb_min, glm::vec3 const& aabb_max)
+  {
+    glm::vec3 const closest(glm::clamp(ray.origin(), aabb_min, aabb_max));
+    return glm::distance(closest, ray.origin()) > max_dist;
+  };
+
+  for (auto& pair : _loaded_tiles_buffer)
+  {
+    MapTile* tile = pair.second;
+    if (!tile)
+      break;
+    TileIndex index{ static_cast<std::size_t>(pair.first.first)
+                   , static_cast<std::size_t>(pair.first.second) };
+    if (!mapIndex.tileLoaded(index) || mapIndex.tileAwaitingLoading(index))
+      continue;
+    if (!tile->finishedLoading() || tile->loading_failed())
+      continue;
+    if (tile->intersect(ray, &results, max_dist))
+      break;
+  }
+
+  // [perf 2026-08-19] Doodad fast path: when the ray (origin + reach) lies wholly inside the probe-cache
+  // sphere, its colliding doodads are all in _probe_cache_wmo_doodads, so test that small pre-filtered set
+  // ONCE instead of walking every doodad of each near WMO PER RAY (the ~220-ray/frame camera-boom cost). The
+  // guard makes it byte-identical: any ray reaching outside the cache (a far zoomed-out boom, or editor picks
+  // with max_dist==0) falls back to the exact per-WMO walk below.
+  bool const doodads_from_cache = max_dist > 0.0f && _probe_cache_valid
+    && (glm::distance(ray.origin(), _probe_cache_center) + max_dist <= k_probe_cache_radius);
+
+  for (auto* wmo_instance : _probe_cache_wmos)
+  {
+    if (wmo_instance->wmo->is_hidden() || out_of_reach(wmo_instance->extents[0], wmo_instance->extents[1]))
+    {
+      continue;
+    }
+    wmo_instance->intersect(ray, &results, true, max_dist);
+    if (!doodads_from_cache)
+    {
+      wmo_instance->intersect_doodads(model_view, ray, &results, animtime, max_dist);
+    }
+  }
+  if (doodads_from_cache)
+  {
+    // Same per-ray reject intersect_doodads applies (collision-mesh-only, distance vs the ray origin), just
+    // over the pre-filtered near set. Transforms were refreshed when the cache was built.
+    for (auto* doodad : _probe_cache_wmo_doodads)
+    {
+      glm::vec3 const world_pos(doodad->transformMatrix()[3]);
+      if (glm::distance(world_pos, ray.origin()) - doodad->model->rad * doodad->scale > max_dist)
+      {
+        continue;
+      }
+      doodad->intersect(model_view, ray, &results, animtime, true);
+    }
+  }
+  for (auto* model_instance : _probe_cache_m2s)
+  {
+    if (model_instance->model->is_hidden() || out_of_reach(model_instance->extents[0], model_instance->extents[1]))
+    {
+      continue;
+    }
+    // collision-mesh-only: grass/clutter (no collision mesh) is walk-through like the client
+    model_instance->intersect(model_view, ray, &results, animtime, true);
+  }
+
+  return std::move(results);
+}
+
 selection_result World::intersect (glm::mat4x4 const& model_view
                                   , math::ray const& ray
                                   , bool pOnlyMap
@@ -4789,10 +5322,25 @@ selection_result World::intersect (glm::mat4x4 const& model_view
                                   , bool draw_models
                                   , bool draw_hidden_models
                                   , bool draw_wmo_exterior
+                                  , bool draw_wmo_doodads
+                                  , float max_dist
                                   )
 {
   ZoneScopedN("World::intersect()");
   selection_result results;
+
+  // Short physics probes (game mode runs a dozen per frame) only care about geometry within a yard
+  // or two -- skip whole instances whose AABB is farther than max_dist from the probe origin instead
+  // of ray-walking every loaded object. 0 (the default) keeps the old unlimited behaviour.
+  auto const out_of_reach = [&](glm::vec3 const& aabb_min, glm::vec3 const& aabb_max) -> bool
+  {
+    if (max_dist <= 0.0f)
+    {
+      return false;
+    }
+    glm::vec3 const closest(glm::clamp(ray.origin(), aabb_min, aabb_max));
+    return glm::distance(closest, ray.origin()) > max_dist;
+  };
 
   if (draw_terrain)
   {
@@ -4815,7 +5363,7 @@ selection_result World::intersect (glm::mat4x4 const& model_view
       if (!tile->finishedLoading() || tile->loading_failed())
         continue;
 
-      if (tile->intersect(ray, &results))
+      if (tile->intersect(ray, &results, max_dist))
         break;
     }
   }
@@ -4829,6 +5377,10 @@ selection_result World::intersect (glm::mat4x4 const& model_view
       {
         if (draw_hidden_models || !model_instance.model->is_hidden())
         {
+          if (out_of_reach(model_instance.extents[0], model_instance.extents[1]))
+          {
+            return;
+          }
           model_instance.intersect(model_view, ray, &results, animtime);
         }
       });
@@ -4841,7 +5393,15 @@ selection_result World::intersect (glm::mat4x4 const& model_view
       {
         if (draw_hidden_models || !wmo_instance.wmo->is_hidden())
         {
-          wmo_instance.intersect(ray, &results, draw_wmo_exterior);
+          if (out_of_reach(wmo_instance.extents[0], wmo_instance.extents[1]))
+          {
+            return;
+          }
+          wmo_instance.intersect(ray, &results, draw_wmo_exterior, max_dist);
+          if (draw_wmo_doodads) // [game mode] fences/crates/rocks the WMO itself places
+          {
+            wmo_instance.intersect_doodads(model_view, ray, &results, animtime, max_dist);
+          }
         }
       });
     }
@@ -5306,7 +5866,7 @@ unsigned int World::getWMOZoneMusic(glm::vec3 const& pos, size_t wmo_field)
   return music;
 }
 
-bool World::camera_is_inside_wmo(glm::vec3 const& pos)
+bool World::camera_is_inside_wmo(glm::vec3 const& pos, float* out_h_depth)
 {
   auto contains = [](std::pair<glm::vec3, glm::vec3> const& extents, glm::vec3 const& point)
   {
@@ -5314,8 +5874,17 @@ bool World::camera_is_inside_wmo(glm::vec3 const& pos)
         && point.y >= extents.first.y && point.y <= extents.second.y
         && point.z >= extents.first.z && point.z <= extents.second.z;
   };
+  // Horizontal (x/z) distance from the camera to the nearest wall of the room box = how far PAST the
+  // entrance it has moved. Floor/ceiling (y) is excluded -- a standing camera always sits near the floor
+  // face, which would otherwise pin the depth to ~0. Drives the fog interior blend factor (client-spatial).
+  auto h_depth = [](std::pair<glm::vec3, glm::vec3> const& e, glm::vec3 const& p) -> float
+  {
+    return std::min(std::min(p.x - e.first.x, e.second.x - p.x),
+                    std::min(p.z - e.first.z, e.second.z - p.z));
+  };
 
   bool inside = false;
+  float depth = 0.0f;
   _model_instance_storage.for_each_wmo_instance([&](WMOInstance& wmo_instance)
   {
     if (inside || !wmo_instance.finishedLoading() || wmo_instance.wmo->loading_failed())
@@ -5356,6 +5925,7 @@ bool World::camera_is_inside_wmo(glm::vec3 const& pos)
             && contains(cit->second, pos))
         {
           inside = true;
+          depth = std::max(0.0f, h_depth(cit->second, pos));
           return;
         }
       }
@@ -5377,6 +5947,7 @@ bool World::camera_is_inside_wmo(glm::vec3 const& pos)
         wmo_instance._last_containing_group = group_index; // remember for next frame's fast path
         wmo_instance._no_room_cache_valid = false;
         inside = true;
+        depth = std::max(0.0f, h_depth(group_bounds, pos));
         return;
       }
     }
@@ -5385,6 +5956,7 @@ bool World::camera_is_inside_wmo(glm::vec3 const& pos)
     wmo_instance._no_room_cache_valid = true;
   }, [&]() { return inside; });
 
+  if (out_h_depth) { *out_h_depth = inside ? depth : 0.0f; }
   return inside;
 }
 
@@ -6506,12 +7078,16 @@ void World::updateTilesEntry(SceneObject* entry, model_update type)
 void World::updateTilesWMO(WMOInstance* wmo, model_update type, bool mark_changed)
 {
   ZoneScoped;
+  // Every instance mutation (add/move/remove/doodad-set change) funnels through here --
+  // the single choke point that invalidates the renderer's point-light registry (20.4).
+  _model_instance_storage.bump_light_epoch();
   _tile_update_queue.queue_update(wmo, type, mark_changed);
 }
 
 void World::updateTilesModel(ModelInstance* m2, model_update type, bool mark_changed)
 {
   ZoneScoped;
+  _model_instance_storage.bump_light_epoch();
   _tile_update_queue.queue_update(m2, type, mark_changed);
 }
 

@@ -4,6 +4,7 @@
 #include <noggit/MapTile.h>
 #include <noggit/MapChunk.h>
 #include <noggit/Model.h>
+#include <noggit/ModelInstance.h>   // ModelInstance::_cull_class for the per-bucket doodad cull class
 #include <noggit/SceneObject.hpp>
 #include <noggit/ui/TexturingGUI.h>
 #include <noggit/frame_profiler.hpp>
@@ -168,9 +169,17 @@ void TileRender::rebuildDoodadInstanceBuffers()
 
     std::vector<glm::mat4x4> transforms;
     transforms.reserve(pair.second.size());
+    // [game-view cull 2026-08-15] Bucket's client doodad cull class = MAX class over its instances
+    // (conservative -- keep the whole bucket while its largest instance would still survive the client
+    // cull). ensureExtents() guarantees each instance's _cull_class is computed (model is finished
+    // loading here, checked above). See twmoa-335a-client-doodad-cull.md.
+    int bucket_cull_class = 0;
     for (auto* instance : pair.second)
     {
       transforms.push_back(instance->transformMatrix());
+      auto* const mi = static_cast<ModelInstance*>(instance);
+      mi->ensureExtents();
+      bucket_cull_class = std::max(bucket_cull_class, mi->_cull_class);
     }
     if (transforms.empty())
     {
@@ -183,6 +192,7 @@ void TileRender::rebuildDoodadInstanceBuffers()
 
     DoodadInstanceBuffer buf;
     buf.count = static_cast<GLsizei>(transforms.size());
+    buf.cull_class = bucket_cull_class;
 
     gl.genBuffers(1, &buf.transform_vbo);
     gl.bindBuffer(GL_ARRAY_BUFFER, buf.transform_vbo);

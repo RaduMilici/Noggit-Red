@@ -205,6 +205,23 @@ namespace Noggit::Rendering::Primitives
              , float px_scale                     // world units per pixel, per unit of view depth
              );
 
+    // Filled disc decal at each point (degenerate zero-length segments -> the shader's round end
+    // caps make dots). Used for the waypoint nodes on patrol routes.
+    void draw_dots(glm::mat4x4 const& mvp_rel
+                  , glm::mat4x4 const& inv_mvp_rel
+                  , glm::vec2 const& inv_viewport
+                  , GLuint scene_depth_tex
+                  , GLuint world_depth_tex
+                  , std::vector<glm::vec3> const& points // world space, at least 1
+                  , glm::vec3 const& camera
+                  , glm::vec3 const& view_axis
+                  , glm::vec4 const& color
+                  , float world_width               // dot DIAMETER, world units
+                  , float min_pixels
+                  , float max_pixels
+                  , float px_scale
+                  );
+
     void unload();
 
   private:
@@ -217,6 +234,53 @@ namespace Noggit::Rendering::Primitives
     OpenGL::Scoped::deferred_upload_buffers<1> _buffers;
     GLuint const& _segments_vbo = _buffers[0];
     std::unique_ptr<OpenGL::program> _program;
+  };
+
+  // Precipitation pass — the visible half of the client's weather (MapWeather.cpp, RE'd in
+  // docs/client_re/36): a camera-centered volume of falling rain streaks or snow flakes drawn with
+  // the client's own textures (textures\Weather\RainDrop01.blp / SnowFlake01.blp; volume box
+  // 44x44x25 around the camera per the client's weather init FUN_00674620/FUN_00677420). The
+  // light/fog half (the zone light blending to its STORM param) lives in Sky::colorFor.
+  class WeatherEffect
+  {
+  public:
+    WeatherEffect();
+    ~WeatherEffect(); // out-of-line: unique_ptr<blp_texture> members with forward-declared type
+
+    void draw(glm::mat4x4 const& mvp
+             , glm::vec3 const& camera_pos
+             , int type                    // 0 none, 1 rain, 2 snow
+             , float intensity             // 0..1
+             , float animtime_ms
+             , glm::vec3 const& light_color
+             , Noggit::NoggitRenderContext context
+             );
+
+    void unload();
+
+  private:
+    struct Drop
+    {
+      glm::vec3 pos;
+      float speed;
+      float seed;
+    };
+
+    void setup(Noggit::NoggitRenderContext context);
+
+    std::vector<Drop> _drops;
+    std::vector<float> _vertex_data; // scratch: 6 verts x (pos3 + uv2) per drop
+    int _active_type = 0;
+    float _last_time = -1.0f;
+
+    bool _buffers_are_setup = false;
+    OpenGL::Scoped::deferred_upload_vertex_arrays<1> _vao;
+    OpenGL::Scoped::deferred_upload_buffers<1> _buffers;
+    GLuint const& _vbo = _buffers[0];
+    std::unique_ptr<OpenGL::program> _program;
+    std::unique_ptr<blp_texture> _rain_texture;
+    std::unique_ptr<blp_texture> _snow_texture;
+    bool _texture_failed = false;
   };
 
   // Flat thick ring drawn in the XZ plane.

@@ -35,6 +35,11 @@ layout(location = 5) in uvec4 bones_indices;
   // whole ivec4 stays live because .xy is read. The batched program is compiled with `instanced` ALSO defined.
   layout(location = 11) in ivec4 inst_tex;   // x = tex1 layer, y = tex2 layer, z = pixel_shader (reserved), w = blend_mode (reserved)
   flat out ivec4 v_inst_tex;
+  // [size-class draw distance 2026-08-17] per-instance size class 0-4 (client FUN_007bdb10). The batched
+  // MDI path draws EVERY loaded doodad with ONE flat slice_dist; this lets the fragment shader cull each
+  // instance at ITS class's distance instead (small clutter close, trees far -- matching the client).
+  layout(location = 12) in float inst_cull_class;
+  flat out float v_cull_class;
 #endif
 
 // Interior light for this draw: rgb = WMO room ambient; a in [0.5,1.0] indoors (carries GAP B doorway
@@ -59,6 +64,15 @@ out float camera_dist;
 out vec3 norm;
 out vec3 m2_world_pos;
 flat out vec4 v_interior;        // rgb = interior room ambient; a in [0.5,1.0] indoors (carries GAP B doorway spill), 0 outdoors
+
+// CLIENT ground-clutter distance fade (wow.exe 3.3.5a DetailDoodad.bls vs_2_0 + FUN_007b15d0, RE
+// 2026-08-20): the client VS computes per-vertex alpha = clamp(viewZ*c9.x + c9.y, 0, 1) with
+// c9 = (-1/(0.15*groundEffectDist), 1/0.15) -- a linear view-DEPTH ramp from 85% to 100% of the
+// clutter distance (fade start fraction 0.85 @ .rdata 0x9f23d0, scale -1.0 @ 0x9e2ef4). There is
+// NO chunk-level fade logic in the client at all. detail_dist = groundEffectDist for the clutter
+// draw; <= 0 (every other draw / previews) = no fade. Only the detail_doodad frag path reads this.
+uniform float detail_dist;
+out float v_detail_fade;
 
 layout (std140) uniform matrices
 {
@@ -198,10 +212,25 @@ void main()
   mat3 cameraNormMatrix = mat3(view_rot) * normMatrix;
 
   vec3 local_pos = (boneTransformMat * pos).xyz;                                  // animated, model-local (small)
-  vec3 anchor_rel = mat3(transform) * local_pos + transform[3].xyz;               // vertex relative to model_origin (small)
-  vec3 world_rel = anchor_rel + (model_origin - camera_pos.xyz);                  // + Sterbenz-exact origin-minus-camera
+  vec3 rot_pos = mat3(transform) * local_pos;                                     // animated, rotated/scaled (small)
+  // [2026-08-20 instanced-path dither fix] The INSTANCED paths pass transform[3] = FULL world position
+  // (model_origin = 0), and the old order (rot_pos + transform[3], THEN - camera) formed the ~9000-unit
+  // world position in float FIRST -- quantizing the small animated component onto the ~1mm grid: every
+  // batched model shimmered/"dithered", worse the more it animates (the release exe predates instancing
+  // and never showed it). Group the BIG terms first: (transform[3] + (model_origin - camera)) is
+  // Sterbenz-exact near the camera for both paths (individual: small + exact-small; instanced:
+  // big - big cancels), and the small animated part is added LAST at full precision.
+  vec3 inst_rel = transform[3].xyz + (model_origin - camera_pos.xyz);             // instance-minus-camera (small, exact)
+  vec3 world_rel = rot_pos + inst_rel;
   vec4 vertex = view_rot * vec4(world_rel, 1.0);
-  m2_world_pos = anchor_rel + model_origin;                                       // full world (for point lights)
+  m2_world_pos = rot_pos + transform[3].xyz + model_origin;                       // full world (for point lights)
+
+  // Client clutter fade (see detail_dist above). View-space forward is -z in GL; the client's viewZ
+  // is the equivalent positive depth. fade = (dist - viewZ) / (0.15 * dist), clamped -- 1.0 inside
+  // 85% of the clutter distance, 0.0 at it.
+  v_detail_fade = (detail_dist > 0.0)
+    ? clamp((detail_dist - (-vertex.z)) / (0.15 * detail_dist), 0.0, 1.0)
+    : 1.0;
 
   // important to normalize because of the scaling !!
   norm = normalize(normMatrix * normal);
@@ -223,6 +252,7 @@ void main()
 #endif
 #ifdef batched
   v_inst_tex = inst_tex;             // per-instance texture layers to the fragment shader
+  v_cull_class = inst_cull_class;    // per-instance size class -> per-class draw distance in the frag shader
 #endif
   gl_Position = projection * vertex;
 }

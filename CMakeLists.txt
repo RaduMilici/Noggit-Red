@@ -417,6 +417,10 @@ IF(WIN32)
     COMMAND "${CMAKE_SOURCE_DIR}/src/external/glslang-bin/glslang.exe" -V "${CMAKE_SOURCE_DIR}/src/noggit/rendering/vulkan/shaders/test.frag" -o "$<TARGET_FILE_DIR:noggit>/vk_shaders/test.frag.spv"
     COMMAND "${CMAKE_SOURCE_DIR}/src/external/glslang-bin/glslang.exe" -V "${CMAKE_SOURCE_DIR}/src/noggit/rendering/vulkan/shaders/terrain.vert" -o "$<TARGET_FILE_DIR:noggit>/vk_shaders/terrain.vert.spv"
     COMMAND "${CMAKE_SOURCE_DIR}/src/external/glslang-bin/glslang.exe" -V "${CMAKE_SOURCE_DIR}/src/noggit/rendering/vulkan/shaders/terrain.frag" -o "$<TARGET_FILE_DIR:noggit>/vk_shaders/terrain.frag.spv"
+    COMMAND "${CMAKE_SOURCE_DIR}/src/external/glslang-bin/glslang.exe" -V "${CMAKE_SOURCE_DIR}/src/noggit/rendering/vulkan/shaders/sky.frag" -o "$<TARGET_FILE_DIR:noggit>/vk_shaders/sky.frag.spv"
+    COMMAND "${CMAKE_SOURCE_DIR}/src/external/glslang-bin/glslang.exe" -V "${CMAKE_SOURCE_DIR}/src/noggit/rendering/vulkan/shaders/water.frag" -o "$<TARGET_FILE_DIR:noggit>/vk_shaders/water.frag.spv"
+    COMMAND "${CMAKE_SOURCE_DIR}/src/external/glslang-bin/glslang.exe" -V "${CMAKE_SOURCE_DIR}/src/noggit/rendering/vulkan/shaders/doodad.vert" -o "$<TARGET_FILE_DIR:noggit>/vk_shaders/doodad.vert.spv"
+    COMMAND "${CMAKE_SOURCE_DIR}/src/external/glslang-bin/glslang.exe" -V "${CMAKE_SOURCE_DIR}/src/noggit/rendering/vulkan/shaders/doodad.frag" -o "$<TARGET_FILE_DIR:noggit>/vk_shaders/doodad.frag.spv"
     COMMENT "Compiling Vulkan shaders (glslang -> SPIR-V)")
 ENDIF()
 

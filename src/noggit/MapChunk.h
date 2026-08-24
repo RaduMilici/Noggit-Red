@@ -78,6 +78,12 @@ public:
   {
     std::string model_path;
     glm::mat4x4 transform;
+    // Per-blade baked ground light (client FUN_006bfc10 / decomp_sky7.c bakes this into the grass
+    // VERTEX COLOURS): vertColor = Ambient + Directional * SHADE, where shade is a per-texel byte
+    // mapped into [0.25 .. 0.75] -- an UNSHADOWED blade only ever gets 0.75 of the directional light
+    // (there is NO N.L term for grass), an MCSH-shadowed one drops to 0.25. rgb here = the ground's
+    // MCCV vertex colour (neutral 1.0, wotlk terrain tint the blade grows from), w = the shade factor.
+    glm::vec4 tint = glm::vec4(1.0f, 1.0f, 1.0f, 0.75f);
     // Resolved once by the clutter draw (WorldRender) and cached here so the per-frame collection skips
     // the std::string hash-map lookup for every doodad. Safe: _detail_doodad_models is never cleared, and
     // this doodad is destroyed together with its chunk. mutable so it can be filled through a const ref.

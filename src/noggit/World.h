@@ -131,6 +131,43 @@ public:
     std::uint8_t  stand_state = 0;
     std::uint32_t emote_state = 0;
 
+    // Extended `creature` columns (tortoise-wow schema; see mysql::CreatureSpawnRecord for the
+    // server-RE'd semantics). `ext` is the editable state, `original_ext` the DB state -- any
+    // difference marks the spawn dirty and the exporter writes the changed columns.
+    struct ExtFields
+    {
+      std::uint32_t id2 = 0, id3 = 0, id4 = 0;      // alternate entries, random pick per spawn
+      std::uint32_t spawntimesecs_min = 0;           // respawn delay range (seconds)
+      std::uint32_t spawntimesecs_max = 0;
+      float         wander_distance = 0.0f;          // yards; movement_type 1 wander radius
+      std::uint32_t health_percent = 100;
+      std::uint32_t mana_percent = 100;
+      std::uint32_t movement_type = 0;               // 0 Idle, 1 Random, 2 Waypoint
+      std::uint32_t spawn_flags = 0;                 // SPAWN_FLAG_* bitmask
+      float         visibility_mod = 0.0f;           // yards; 0 = normal visibility distance
+      std::uint32_t spawn_mask = 1;                  // cmangos: map-difficulty bitmask (bit k = diff k)
+      std::uint32_t phase_mask = 1;                  // cmangos: phasing bitmask (default 1)
+
+      bool operator==(ExtFields const& o) const
+      {
+        return id2 == o.id2 && id3 == o.id3 && id4 == o.id4
+            && spawntimesecs_min == o.spawntimesecs_min
+            && spawntimesecs_max == o.spawntimesecs_max
+            && wander_distance == o.wander_distance
+            && health_percent == o.health_percent
+            && mana_percent == o.mana_percent
+            && movement_type == o.movement_type
+            && spawn_flags == o.spawn_flags
+            && visibility_mod == o.visibility_mod
+            && spawn_mask == o.spawn_mask
+            && phase_mask == o.phase_mask;
+      }
+      bool operator!=(ExtFields const& o) const { return !(*this == o); }
+    };
+    ExtFields ext;
+    ExtFields original_ext;
+    [[nodiscard]] bool extDirty() const { return !(ext == original_ext); }
+
     // World radius of the ground selection circle, EXACTLY like the live client (see
     // bounding_radius above; the scale is already applied). Falls back to the model footprint
     // estimate when the DB has no bounding radius for this display.
@@ -215,6 +252,11 @@ public:
 
   // Time of the day.
   float animtime;
+
+  // Editor weather preview (client mechanism: blends the zone light toward its STORM param set and
+  // drives the precipitation pass). 0 = none, 1 = rain, 2 = snow; intensity 0..1. Runtime-only.
+  int weather_type = 0;
+  float weather_intensity = 1.0f;
   // Like animtime but only advances while model animations are enabled, so toggling animations off
   // freezes (pauses) model/particle animation in place while liquid/terrain keep churning on animtime.
   float model_animtime = 0.0f;
@@ -268,7 +310,11 @@ public:
   // True if pos falls inside a loaded WMO's group AABB (i.e. the camera is standing inside a building/
   // dungeon interior, not merely inside its loose outer AABB). Used to drop the client's outdoor
   // FFXGlow floor when indoors (see renderBloomAndComposite).
-  bool camera_is_inside_wmo(glm::vec3 const& pos);
+  // out_h_depth (optional): how far HORIZONTALLY (x/z) the camera is past the nearest wall of the room it
+  // is inside -- 0 at the boundary/entrance, growing with depth into the room. Feeds the fog's continuous
+  // interior factor so the indoor/outdoor fog blends by position (the client's spatial model) instead of
+  // snapping on the binary containment flip. 0 when the camera is not inside any interior group.
+  bool camera_is_inside_wmo(glm::vec3 const& pos, float* out_h_depth = nullptr);
   // Blend the map's authored WMO fog spheres (MOFG) the camera is inside over the given ZONE fog, so the
   // one camera fog can be written to the MAIN UBO for terrain, doodads AND WMO geometry alike. color +
   // absolute end/start in/out (start = the pre-multiplied absolute distance); scale = fog-distance scale.
@@ -307,6 +353,9 @@ public:
                              , bool draw_models
                              , bool draw_hidden_models
                              , bool draw_wmo_exterior
+                             , bool draw_wmo_doodads = false // [game mode] collide with WMO-owned doodads
+                             , float max_dist = 0.0f // > 0: skip objects farther than this from the ray
+                                                     // origin (short physics probes; 0 = unlimited)
                              );
 
   MapChunk* getChunkAt(glm::vec3 const& pos);
@@ -642,6 +691,76 @@ public:
   CreatureSpawnOverlay* findCreatureSpawn(std::uint32_t guid);
   CreatureSpawnOverlay const* findCreatureSpawn(std::uint32_t guid) const;
 
+  // Which extended `creature` columns the connected DB has (resolved REAL column names; empty =
+  // the schema has no equivalent -> editor field disabled, exporter omits it). Mirrors
+  // mysql::CreatureSpawnTableColumns (kept separate so World.h stays free of the mysql headers).
+  struct CreatureSpawnColumns
+  {
+    std::string entry_col = "id";
+    std::string id2_col, id3_col, id4_col;
+    std::string respawn_min_col, respawn_max_col;
+    std::string wander_col;
+    std::string health_percent_col, mana_percent_col;
+    bool health_mana_absolute = false; // AzerothCore curhealth/curmana (absolute, 0 = full) vs Turtle percents
+    std::string movement_col;
+    std::string spawn_flags_col;
+    std::string visibility_col;
+    std::string spawn_mask_col, phase_mask_col; // cmangos + AzerothCore
+    // cmangos alternative to id2..id4: creature_spawn_entry (guid, entry) rows + creature.id = 0
+    // = random entry per spawn. The alt-id editor slots map onto that table on such schemas.
+    bool spawn_entry_table = false;
+  };
+  CreatureSpawnColumns const& creatureSpawnColumns() const { return _creature_spawn_columns; }
+
+  // Attachment models (helm / shoulders / weapons) for one spawn, resolved for the picker's 3D
+  // PREVIEW: it draws these as extra instances at the body's bind-pose attachment points. (The
+  // world path renders them via CreatureSpawnOverlay::attachment_models instead.) Without them a
+  // helmeted NPC previews BALD -- the helmet rule hides the hair geoset and nothing draws the helm.
+  struct CreaturePreviewAttachment
+  {
+    int attachment_id = -1;
+    std::string model_path;
+    std::vector<std::pair<std::size_t, std::string>> texture_overrides;
+  };
+  std::vector<CreaturePreviewAttachment> resolveCreaturePreviewAttachments(CreatureSpawnOverlay const& spawn);
+
+  // Wander-distance visualization (creature editor): while the wander_distance field is focused,
+  // WorldRender draws a ground ring of this radius (yards) at this center. nullopt = off.
+  struct WanderViz { glm::vec3 center; float radius; };
+  std::optional<WanderViz> wander_viz;
+
+  // [game mode] the Game View player character: a creature-display-driven model walked around in
+  // 3rd person. Rides the whole creature-spawn model pipeline (display id -> model + skin +
+  // attachments + anims) but lives outside _creature_spawns so it never touches save/export and
+  // draws independently of the creature-spawns overlay toggle.
+  bool setGameCharacterDisplayId(std::uint32_t display_id);
+  void updateGameCharacter(glm::vec3 const& pos, float orientation_deg, int anim_id,
+                           float lower_body_twist_rad = 0.0f, float anim_time_scale = 1.0f,
+                           float body_pitch_deg = 0.0f);
+  // Authored moveSpeed (yd/s) of one of the character's animations; 0 when unavailable.
+  float gameCharacterAnimMoveSpeed(int anim_id);
+  // Underwater breath bubbles (client: HARDCODED "Breath Underwater" -> Particles\Bubbles.m2 at
+  // the Breath attachment 17), toggled while the character's head is below the water surface.
+  void setGameCharacterBubbles(bool on);
+
+  // [game mode] sorted list of REAL CreatureDisplayInfo row ids (lazy, cached) -- the Game Mode
+  // panel's display-id spinner steps through these instead of every integer.
+  std::vector<std::uint32_t> const& creatureDisplayIds();
+
+  // [game mode] ADT liquid surface height covering pos (top-most layer); nullopt when dry.
+  // Bilinear over the layer's 9x9 vertex grid, subchunk-coverage aware.
+  std::optional<float> getLiquidHeightAt(glm::vec3 const& pos);
+
+  // [game mode] PROBE CACHE: physics/camera rays fire ~15x per frame, and walking the whole
+  // instance storage per ray was the game-mode frame lag. The cache holds the collidables near
+  // the player (refreshed on movement / periodically); intersectProbe tests only those.
+  void ensureProbeCache(glm::vec3 const& center);
+  selection_result intersectProbe(glm::mat4x4 const& model_view, math::ray const&, float max_dist);
+  void setGameCharacterVisible(bool visible) { _game_character_visible = visible; }
+  // Authored length (ms) of one of the character's animations; 0 when the model isn't ready or
+  // lacks the id. Used to play JumpStart to its real end before switching to the Jump loop.
+  int gameCharacterAnimLengthMs(int anim_id);
+
   // Spell details for the spawned creatures' permanent auras (fetched once per spawn reload from the
   // server's spell_template). Keyed by spell id; used for aura state-kit visuals and the creature-info
   // UI (name/description/icon).
@@ -708,6 +827,24 @@ protected:
   bool _creature_spawns_load_attempted = false;
   std::string _creature_spawn_status;
   std::vector<CreatureSpawnOverlay> _creature_spawns;
+  CreatureSpawnColumns _creature_spawn_columns;
+  // [game mode] see setGameCharacterDisplayId; drawn by WorldRender when visible.
+  CreatureSpawnOverlay _game_character;
+  bool _game_character_visible = false;
+  bool _game_character_bubbles = false;
+  std::vector<std::uint32_t> _creature_display_ids; // see creatureDisplayIds()
+  // [game mode] probe cache state (see ensureProbeCache / intersectProbe)
+  static constexpr float k_probe_cache_radius = 45.0f; // covers the 25yd camera boom + corners + margin
+  glm::vec3 _probe_cache_center = glm::vec3(0.0f);
+  bool _probe_cache_valid = false;
+  int _probe_cache_age = 0;
+  std::vector<WMOInstance*> _probe_cache_wmos;
+  std::vector<ModelInstance*> _probe_cache_m2s;
+  // [perf 2026-08-19] Flattened near-and-COLLIDING WMO doodads (a city WMO holds thousands; only those with a
+  // collision mesh within the cache radius are kept). intersectProbe fires ~220 short rays/frame (camera boom
+  // clearance) and each one used to walk EVERY doodad of the containing WMO to distance-reject it. Testing this
+  // pre-filtered near-set instead is behaviour-identical for physics probes (max_dist << cache radius).
+  std::vector<wmo_doodad_instance*> _probe_cache_wmo_doodads;
   std::vector<GameObjectSpawnOverlay> _gameobject_spawns;
   std::map<std::uint32_t, SpellInfo> _spell_infos;
   // Seasonal event filter state (see the accessors above).

@@ -177,9 +177,12 @@ void AsyncLoader::process()
         // LogError (not LogDebug) so it survives to log.txt -- for a HANG, the last "begin" with no
         // matching "done" names the object whose finishLoading() is stuck (e.g. a malformed WMO/M2 chunk
         // that allocs/loops forever). cerr is unit-buffered so it reaches disk even before a force-close.
-        LogError << "ASYNCLOAD begin type=" << object->async_object_type_name()
-                 << " key='" << async_object_key(object)
-                 << "' ptr=" << object << std::endl;
+        // [2026-08-20] Preformat into ONE string insertion: 10 loader threads streaming multi-part '<<'
+        // chains interleaved mid-line and corrupted most keys, making the begin/done diff useless.
+        std::ostringstream line;
+        line << "ASYNCLOAD begin type=" << object->async_object_type_name()
+             << " key='" << async_object_key(object) << "' ptr=" << object;
+        LogError << line.str() << std::endl;
       }
 
       if (additional_log)
@@ -193,9 +196,10 @@ void AsyncLoader::process()
 
       if (async_loader_trace_enabled())
       {
-        LogError << "ASYNCLOAD done  type=" << object->async_object_type_name()
-                 << " key='" << async_object_key(object)
-                 << "' ptr=" << object << std::endl;
+        std::ostringstream line;
+        line << "ASYNCLOAD done  type=" << object->async_object_type_name()
+             << " key='" << async_object_key(object) << "' ptr=" << object;
+        LogError << line.str() << std::endl;
       }
 
       if (additional_log)

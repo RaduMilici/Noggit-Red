@@ -297,6 +297,14 @@ namespace Noggit::Ui
       sep->setFrameShadow(QFrame::Sunken);
       lay->addWidget(sep);
       lay->addWidget(_mapView->makeSeasonalEventsToolButton(_popup), 0, Qt::AlignVCenter);
+
+      // Weather section (none/rain/snow + intensity), same host pattern as the calendar button.
+      // Weather belongs with time-of-day: both drive the zone light (STORM param blend + precipitation).
+      auto wsep = new QFrame(_popup);
+      wsep->setFrameShape(QFrame::VLine);
+      wsep->setFrameShadow(QFrame::Sunken);
+      lay->addWidget(wsep);
+      lay->addWidget(_mapView->makeWeatherWidget(_popup), 0, Qt::AlignVCenter);
     }
 
     auto fmt = [](int m) { return QString("%1:%2").arg(m / 60, 2, 10, QChar('0')).arg(m % 60, 2, 10, QChar('0')); };

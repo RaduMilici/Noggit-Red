@@ -12,8 +12,10 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
+#include <glm/gtc/matrix_transform.hpp>
 #include <cstdlib>
 #include <cstring>
 #include <functional>
@@ -560,6 +562,9 @@ ParticleSystem::ParticleSystem(Model* model_
     initTile(tc.tc, i);
     tiles.push_back(tc);
   }
+  _particle_color_index = mta.ParticleColor;
+  _authored_colors = colors;
+  read_geometry_model_filename(f, mta.nModelFileName, mta.ofsModelFileName);
 }
 
 ParticleSystem::ParticleSystem(Model* model_
@@ -721,6 +726,9 @@ ParticleSystem::ParticleSystem(Model* model_
     initTile(tc.tc, i);
     tiles.push_back(tc);
   }
+  // classic defs carry no ParticleColor index (wotlk-only field); keep -1 = no recolor
+  _authored_colors = colors;
+  read_geometry_model_filename(f, mta.nModelFileName, mta.ofsModelFileName);
 }
 
 ParticleSystem::ParticleSystem(ParticleSystem const& other)
@@ -742,6 +750,9 @@ ParticleSystem::ParticleSystem(ParticleSystem const& other)
   , deacceleration(other.deacceleration)
   , enabled(other.enabled)
   , colors(other.colors)
+  , _particle_color_index(other._particle_color_index)
+  , _authored_colors(other._authored_colors)
+  , _geometry_model_path(other._geometry_model_path)
   , sizes(other.sizes)
   , mid(other.mid)
   , slowdown(other.slowdown)
@@ -1300,6 +1311,10 @@ void ParticleSystem::draw( glm::mat4x4 const& model_view
   if (particles.empty())
   {
     return;
+  }
+  if (!_geometry_model_path.empty())
+  {
+    return; // geometry-model particles draw as mesh instances (WorldRender pass), never as quads
   }
 
   if (!_uploaded)
@@ -2524,4 +2539,67 @@ void RibbonEmitter::unload()
   _vertex_array.unload();
   _buffers.unload();
   _uploaded = false;
+}
+
+void ParticleSystem::setColorOverride(std::array<glm::vec4, 3> const& rgb)
+{
+  for (std::size_t i = 0; i < colors.size(); ++i)
+  {
+    colors[i] = glm::vec4(rgb[i].r, rgb[i].g, rgb[i].b, _authored_colors[i].a);
+  }
+}
+
+void ParticleSystem::clearColorOverride()
+{
+  colors = _authored_colors;
+}
+
+void ParticleSystem::read_geometry_model_filename(BlizzardArchive::ClientFile const& f,
+                                                  std::uint32_t n, std::uint32_t ofs)
+{
+  _geometry_model_path.clear();
+  if (n <= 1 || ofs == 0 || static_cast<std::size_t>(ofs) + n > f.getSize())
+  {
+    return;
+  }
+  std::string path(f.getBuffer() + ofs, n);
+  path = path.c_str(); // trim at the embedded NUL
+  if (path.empty())
+  {
+    return;
+  }
+  std::replace(path.begin(), path.end(), '\\', '/');
+  std::transform(path.begin(), path.end(), path.begin(),
+                 [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  if (path.size() >= 4)
+  {
+    auto const ext = path.substr(path.size() - 4);
+    if (ext == ".mdx" || ext == ".mdl")
+    {
+      path.replace(path.size() - 4, 4, ".m2");
+    }
+  }
+  _geometry_model_path = std::move(path);
+}
+
+void ParticleSystem::appendGeometryParticleTransforms(glm::mat4x4 const& host_transform,
+                                                      std::vector<glm::mat4x4>& out) const
+{
+  for (auto const& p : particles)
+  {
+    glm::mat4x4 t = glm::translate(host_transform, p.pos);
+    // Sprite-spin reused as a yaw for the mesh (revolutions -> radians over the particle's age);
+    // alternate the sign by slot parity like the billboard path when the emitter authors it.
+    if (_spin != 0.0f)
+    {
+      float angle = _spin * p.life * glm::two_pi<float>();
+      if (_spin_alternate && (p.slot & 1u))
+      {
+        angle = -angle;
+      }
+      t = glm::rotate(t, angle, glm::vec3(0.0f, 1.0f, 0.0f));
+    }
+    t = glm::scale(t, glm::vec3(std::max(p.size, 0.001f)));
+    out.push_back(t);
+  }
 }

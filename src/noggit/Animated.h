@@ -263,7 +263,25 @@ namespace Animation
 
           case Animation::Interpolation::Type::HERMITE:
           {
-            result = math::interpolation::hermite(percentage, dataVector[pos], dataVector[pos + 1], inVector[pos], outVector[pos]);
+            if constexpr (std::is_same_v<AnimatedType, glm::quat>)
+            {
+              // QUATERNION hermite keys need the hemisphere fix the LINEAR path gets from
+              // glm::slerp: componentwise hermite between opposite-hemisphere neighbours takes the
+              // LONG way around (a backward limb spin) and denormalizes the quat. Native wotlk
+              // assets hermite-key their bone rotations constantly; 1.12-converted models never
+              // showed it because the converter normalizes hemispheres into the data.
+              glm::quat b = dataVector[pos + 1];
+              if (glm::dot(dataVector[pos], b) < 0.0f)
+              {
+                b = -b;
+              }
+              result = glm::normalize(
+                math::interpolation::hermite(percentage, dataVector[pos], b, inVector[pos], outVector[pos]));
+            }
+            else
+            {
+              result = math::interpolation::hermite(percentage, dataVector[pos], dataVector[pos + 1], inVector[pos], outVector[pos]);
+            }
           }
             break;
           }

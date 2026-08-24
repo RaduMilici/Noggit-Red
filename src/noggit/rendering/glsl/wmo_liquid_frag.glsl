@@ -133,7 +133,7 @@ void main()
     out_color = vec4(clamp(water_rgb, 0.0, 1.0), water_alpha);
   }
 
-  if (FogColor_FogOn.w != 0 && liquid_type != 2) // reference applies no fog to lava
+  if (FogColor_FogOn.w != 0) // fog applies to lava too (see liquid_frag.glsl -- client behaviour)
   {
     // WMO liquid sits inside the WMO: fog with the camera's fog context (Env slots) when active.
     bool use_env = EnvFogColor_On.w > 0.5;

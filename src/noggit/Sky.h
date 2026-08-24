@@ -123,6 +123,15 @@ public:
   glm::vec3 colorFor(int r, int t) const;
   float floatParamFor(int r, int t) const;
 
+private:
+  // Evaluate a band on an EXPLICIT param set (nullptr falls back like an unauthored band). colorFor/
+  // floatParamFor blend the current (clear) set toward the STORM set by the global weather intensity —
+  // the client's rainy-weather light change (Light.dbc authors clear/storm/... param ids per light).
+  glm::vec3 colorFromParam(SkyParam const* param, int r, int t) const;
+  float floatFromParam(SkyParam const* param, int r, int t) const;
+
+public:
+
   float weight;
   bool global;
 
@@ -249,6 +258,12 @@ public:
   Sky* findClosestSkyByDistance(glm::vec3 pos);
 
   void setCurrentParam(int param_id);
+
+  // Weather intensity (0 = clear .. 1 = full storm): blends every Light.dbc band toward the zone
+  // light's STORM param set (the client's rainy-weather light change). Set per-frame by the renderer
+  // from the editor's weather control.
+  static void set_weather_intensity(float w);
+  static float weather_intensity();
   void setAreaLightId(int light_id);
   void update_sky_colors(glm::vec3 pos, int time);
 

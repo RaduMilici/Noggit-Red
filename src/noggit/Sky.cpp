@@ -643,9 +643,42 @@ Sky::Sky(int id, glm::vec3 const& position, float inner_radius, float outer_radi
   }
 }
 
+namespace
+{
+  // Editor weather intensity (0 = clear .. 1 = full storm), set per-frame by the renderer from the
+  // weather control. File-scope: Sky::colorFor/floatParamFor are per-sky const calls with no Skies
+  // backpointer.
+  float g_weather_intensity = 0.0f;
+}
+
+void Skies::set_weather_intensity(float w)
+{
+  g_weather_intensity = std::clamp(w, 0.0f, 1.0f);
+}
+
+float Skies::weather_intensity()
+{
+  return g_weather_intensity;
+}
+
 float Sky::floatParamFor(int r, int t) const
 {
-  auto sky_param = active_sky_param(*this);
+  float const base = floatFromParam(active_sky_param(*this), r, t);
+  if (g_weather_intensity > 0.0f)
+  {
+    // The client's rainy weather runs the zone light's STORM param set; blend by intensity.
+    int const storm_idx = (curr_sky_param == CLEAR_WATER) ? STORM_WATER : STORM;
+    SkyParam const* storm = skyParams[storm_idx];
+    if (storm)
+    {
+      return base + (floatFromParam(storm, r, t) - base) * g_weather_intensity;
+    }
+  }
+  return base;
+}
+
+float Sky::floatFromParam(SkyParam const* sky_param, int r, int t) const
+{
   if (!sky_param || r < 0 || r >= NUM_SkyFloatParamsNames || sky_param->mmin_float[r] < 0 || sky_param->floatParams[r].empty())
   {
     return default_sky_float_param(r);
@@ -693,9 +726,35 @@ float Sky::floatParamFor(int r, int t) const
 
 glm::vec3 Sky::colorFor(int r, int t) const
 {
-  auto sky_param = active_sky_param(*this);
+  glm::vec3 const base = colorFromParam(active_sky_param(*this), r, t);
+  if (g_weather_intensity > 0.0f)
+  {
+    // Rainy weather: blend every band toward the zone light's STORM param set (client mechanism —
+    // e.g. WPL storm param 473 turns the orange clear fog 133,98,37 into the beige 127,102,56).
+    int const storm_idx = (curr_sky_param == CLEAR_WATER) ? STORM_WATER : STORM;
+    SkyParam const* storm = skyParams[storm_idx];
+    if (storm)
+    {
+      return glm::mix(base, colorFromParam(storm, r, t), g_weather_intensity);
+    }
+  }
+  return base;
+}
+
+glm::vec3 Sky::colorFromParam(SkyParam const* sky_param, int r, int t) const
+{
   if (!sky_param || r < 0 || r >= NUM_SkyColorNames || sky_param->mmin[r] < 0 || sky_param->colorRows[r].empty())
   {
+    // [2026-08-22 WPL "water still blue"] WATER bands the zone left UNAUTHORED are ZERO in the
+    // client (its band table defaults to black; e.g. the WPL murk lights 31/35 author their ocean
+    // bands empty -> the client's bay water is near-black under the orange fog). The editor-palette
+    // fallback below painted those bands a hardcoded blue (0.22,0.45,0.55) instead -- the "blue
+    // lake" mismatch. Keep the palette for SKY bands (editor ergonomics on unauthored maps); the
+    // four water bands follow the client.
+    if (r == OCEAN_COLOR_LIGHT || r == OCEAN_COLOR_DARK || r == RIVER_COLOR_LIGHT || r == RIVER_COLOR_DARK)
+    {
+      return glm::vec3(0.0f);
+    }
     return default_sky_color(r);
   }
   glm::vec3 c1, c2;

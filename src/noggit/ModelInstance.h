@@ -59,6 +59,13 @@ public:
   // longest side of an AABB transformed model's bounding box from the M2 header
   float size_cat;
 
+  // [game-view cull 2026-08-15] Client placed-doodad (MDDF/M2) size class, ported byte-exact from
+  // wow335a.exe build 12340 FUN_007bdb10: class 0..4 by the LARGEST world-AABB axis extent E of the
+  // model RENDER bounding box (header.bounding_box, transformed by this instance's placement -- scale
+  // and rotation included) vs sizeThresh {1,4,15,100} @DAT_00adf378. Cached in recalcExtents(); drives
+  // doodadCullFade(). See twmoa-335a-client-doodad-cull.md.
+  int _cull_class = 4;
+
   explicit ModelInstance(BlizzardArchive::Listfile::FileKey const& file_key
                          , Noggit::NoggitRenderContext context);
 
@@ -129,10 +136,27 @@ public:
       , math::ray const&
       , selection_result*
       , int animtime
+      , bool use_collision_mesh = false // [game mode] physics: M2 collision mesh only (grass = none)
   );
 
   bool isInFrustum(math::frustum const& frustum);
   bool isInRenderDist(const float& cull_distance, const glm::vec3& camera, display_mode display);
+
+  // [game-view cull 2026-08-15] Client placed-doodad distance cull+fade (wow335a.exe FUN_00791cb0),
+  // byte-exact. Returns a fade alpha in [0,1]; 0.0 == hard-culled (skip the draw entirely). Uses the
+  // cached _cull_class, the world-AABB centre, and the per-class {cullFar,fadeBand} tables.
+  // environment_detail = client environmentDetail CVar (default 1.0, @0x009e1340), scales classes 1..3.
+  // See twmoa-335a-client-doodad-cull.md.
+  float doodadCullFade(glm::vec3 const& camera, float environment_detail);
+
+  // [game-view cull 2026-08-15] Single source of truth for the client per-class doodad cull tables
+  // (FUN_007bdb10/FUN_00791cb0). Given a class 0..4 and the environmentDetail CVar, yields the hard
+  // cull distance and the fade band width (fadeStart = cull_far - fade_band). Used by doodadCullFade()
+  // (individual path) AND WorldRender's persistent per-tile bucket cull. cullFar @DAT_00adf364 =
+  // {30,100,200,750,1250}; fadeBand @DAT_00adf38c = {5,10,15,20,50}; envDetail clamp(0.5,1.5) scales
+  // classes 1,2,3 only. See twmoa-335a-client-doodad-cull.md.
+  static void doodadCullParams(int cull_class, float environment_detail,
+                               float& cull_far, float& fade_band);
 
   [[nodiscard]]
   virtual glm::vec3 const& get_pos() const { return pos; }
@@ -195,6 +219,22 @@ public:
   // Weapon grip: overlay the HandsClosed pose onto the finger bones only (fist closes around a held weapon)
   // while the body keeps its normal idle. PER-HAND (2026-07-25): main = right/mainhand, off = left/offhand,
   // so an empty hand stays open. See Model::applyHandGripOverlay.
+  // [game mode] lower-body twist (radians): legs+hips rotated toward the strafe direction, torso
+  // counter-rotated to keep facing forward. Copied onto the shared Model just before this
+  // instance's animate(), like the hand-grip overlay. 0 for everything but the player character.
+  float lower_body_twist = 0.0f;
+  // [game mode] playback-rate scale for this instance's forced animation (see Model::_anim_time_scale)
+  float anim_time_scale = 1.0f;
+
+  // CLIENT-PARITY per-instance bone palette (2026-08-14). The WoW client stores each CM2Model's bone
+  // matrices ON the instance, computed once per frame, and BOTH the color pass and the shadow depth
+  // pass read that same palette (it never separately animates shadows). noggit historically shared ONE
+  // bone buffer per Model across all instances, so a unit's shadow / attachment placement picked up the
+  // LAST-drawn instance's pose. This palette makes each unit own its bones: the per-frame creature
+  // animate fills it, and the color pass, the shadow pass, and attachment (helmet/shoulder/weapon)
+  // placement all restore from it. Empty = not animated / not yet computed (fallback: animate in-draw).
+  std::vector<glm::mat4x4> _animation_bones;
+
   void setCloseHandMain(bool v) { _close_hand_main = v; }
   void setCloseHandOff(bool v) { _close_hand_off = v; }
   [[nodiscard]] bool closeHandMain() const { return _close_hand_main; }

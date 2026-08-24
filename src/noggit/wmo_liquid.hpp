@@ -5,6 +5,8 @@
 #include <opengl/scoped.hpp>
 
 #include <memory>
+#include <optional>
+#include <algorithm>
 #include <string>
 
 namespace BlizzardArchive
@@ -115,6 +117,30 @@ public:
              bool interior_material_color = false,
              glm::vec3 const& material_color = glm::vec3(0.0f));
   wmo_liquid(wmo_liquid const& other);
+
+  // [game mode] local-space surface height when local_pos lies within this liquid's XZ extent
+  // (WMO pools are flat-ish: the max vertex height). nullopt outside.
+  std::optional<float> heightAtLocal(glm::vec3 const& local_pos) const
+  {
+    if (vertices.empty())
+    {
+      return std::nullopt;
+    }
+    float minx = vertices[0].x, maxx = minx;
+    float minz = vertices[0].z, maxz = minz;
+    float maxh = vertices[0].y;
+    for (auto const& v : vertices)
+    {
+      minx = std::min(minx, v.x); maxx = std::max(maxx, v.x);
+      minz = std::min(minz, v.z); maxz = std::max(maxz, v.z);
+      maxh = std::max(maxh, v.y);
+    }
+    if (local_pos.x < minx || local_pos.x > maxx || local_pos.z < minz || local_pos.z > maxz)
+    {
+      return std::nullopt;
+    }
+    return maxh;
+  }
 
   void upload(OpenGL::Scoped::use_program& water_shader);
   void draw(glm::mat4x4 const& transform,

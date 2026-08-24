@@ -62,6 +62,14 @@ namespace OpenGL
     [[nodiscard]] bool hasMultiDrawIndirect() const { return _4_3_core_func != nullptr; }
     NOGGIT_FORCEINLINE void multiDrawElementsIndirect (GLenum mode, GLenum type, const void* indirect, GLsizei drawcount, GLsizei stride);
 
+    // [GPU-driven 2026-08-17] Compute-shader entry points (GL 4.3 core, via _4_3_core_func -- same gate as
+    // MDI: null on a < 4.3 context). Foundation for GPU skeleton animation. dispatchCompute launches the
+    // work groups; memoryBarrier orders compute SSBO writes before the draw that reads them (pass
+    // GL_SHADER_STORAGE_BARRIER_BIT = 0x2000 / GL_TEXTURE_FETCH_BARRIER_BIT = 0x8 as needed).
+    [[nodiscard]] bool hasComputeShaders() const { return _4_3_core_func != nullptr; }
+    NOGGIT_FORCEINLINE void dispatchCompute (GLuint num_groups_x, GLuint num_groups_y, GLuint num_groups_z);
+    NOGGIT_FORCEINLINE void memoryBarrier (GLbitfield barriers);
+
     NOGGIT_FORCEINLINE void enable (GLenum);
     NOGGIT_FORCEINLINE void disable (GLenum);
     NOGGIT_FORCEINLINE GLboolean isEnabled (GLenum);
@@ -85,6 +93,7 @@ namespace OpenGL
     NOGGIT_FORCEINLINE void clearColor (GLfloat, GLfloat, GLfloat, GLfloat);
 
     NOGGIT_FORCEINLINE void readBuffer (GLenum);
+    NOGGIT_FORCEINLINE void drawBuffer (GLenum);
     NOGGIT_FORCEINLINE void readPixels (GLint x, GLint y, GLsizei width, GLsizei height, GLenum format, GLenum type, GLvoid* data);
 
     NOGGIT_FORCEINLINE void lineWidth (GLfloat);

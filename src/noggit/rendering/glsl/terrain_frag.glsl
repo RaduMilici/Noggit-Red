@@ -14,7 +14,55 @@ layout (std140) uniform lighting
   vec4 PointLightParams;     // .x = active point-light count
   vec4 PointLightPos[16];    // xyz = world pos, w = radius
   vec4 PointLightColor[16];  // xyz = colour * intensity
+  vec4 EnvFogColor_On;       // (unused here; keeps the std140 prefix aligned with the C++ block)
+  vec4 EnvFogDist;
+  mat4 ShadowMatrix;         // world -> shadow map UV+depth (last rendered map)
+  vec4 ShadowParams;         // x = quality level (0 = off), y = shadowed-light floor, z = 1/map size
+  vec4 ShadowCenterRange;    // xyz = map world center, w = half-range (client-style distance fade)
+  mat4 ShadowMatrixEnv;      // ENVIRONMENTAL map (client-split second multiply pass)
+  vec4 ShadowEnvCenterRange; // ShadowParams.w = 1 when the env map is valid
 };
+
+// 3.3.5a-style dynamic shadow map (extShadowQuality): 1 = fully lit, ShadowParams.y = in shadow.
+// 3x3 PCF like the client's hwPCF depth-texture path. Outside the map = lit.
+uniform sampler2DShadow shadow_map;
+uniform sampler2DShadow shadow_map_env;
+float dyn_shadow_sample(sampler2DShadow smap, mat4 smatrix, vec4 center_range, vec3 world_pos)
+{
+  vec4 sc = smatrix * vec4(world_pos, 1.0);
+  if (sc.w <= 0.0) { return 1.0; }
+  sc.xyz /= sc.w;
+  if (any(lessThan(sc.xy, vec2(0.001))) || any(greaterThan(sc.xy, vec2(0.999))) || sc.z >= 1.0 || sc.z <= 0.0)
+  {
+    return 1.0;
+  }
+  float t = ShadowParams.z;
+  float s = 0.0;
+  for (int i = -1; i <= 1; ++i)
+  {
+    for (int j = -1; j <= 1; ++j)
+    {
+      s += texture(smap, vec3(sc.xy + vec2(float(i), float(j)) * t, sc.z));
+    }
+  }
+  // CLIENT-style distance fade (ShadowMap.bls caster PS writes distance-faded shadow values --
+  // farther casters shade lighter). Receiver-side: fade to fully lit over the outer 35% of the map.
+  float fade_r = distance(world_pos, center_range.xyz) / max(center_range.w, 1.0);
+  float fade = clamp((fade_r - 0.65) / 0.35, 0.0, 1.0);
+  return mix(mix(ShadowParams.y, 1.0, s / 9.0), 1.0, fade);
+}
+float dyn_shadow_factor(vec3 world_pos)
+{
+  if (ShadowParams.x < 0.5) { return 1.0; }
+  // client-split maps MULTIPLY (each projected as its own Mod pass): a unit's shadow darkens ON TOP
+  // of a building's environmental shadow.
+  float f = dyn_shadow_sample(shadow_map, ShadowMatrix, ShadowCenterRange, world_pos);
+  if (ShadowParams.w > 0.5)
+  {
+    f *= dyn_shadow_sample(shadow_map_env, ShadowMatrixEnv, ShadowEnvCenterRange, world_pos);
+  }
+  return f;
+}
 
 // Accumulated diffuse contribution of the emitter point lights (campfires etc.) at a world point.
 vec3 point_lights(vec3 world_pos, vec3 n)
@@ -286,7 +334,9 @@ void main()
   // sky / *0.7 ground mix (keyed on nDotL) was a noggit invention -- it tinted slopes brighter/darker
   // than the client. See RE_notes/lighting/00_lighting_pipeline_RE.md 7.2.
   currColor = AmbientColor_FogEnd.xyz;
-  lDiffuse = DiffuseColor_FogStart.xyz * nDotL;
+  // Dynamic shadow (extShadowQuality-style): occludes the DIRECTIONAL sun term only, like the
+  // client's shadow-map darkening pass; ambient is unaffected.
+  lDiffuse = DiffuseColor_FogStart.xyz * nDotL * dyn_shadow_factor(vary_position);
 
   // TERRAIN SPECULAR, CLIENT-EXACT (Westfall trace, 25.6k terrain draws + the terrain PS disasm):
   // the client's FF vertex pipeline (SPECULARENABLE=1, LOCALVIEWER=1) computes Blinn specular with
@@ -362,7 +412,10 @@ void main()
   // NOT texture-modulated and NOT darkened by the 0.7 shadow term; the lit factor gates it instead).
   if (draw_terrain_specular != 0)
   {
-    out_color.rgb = clamp(out_color.rgb + sun_spec_color * (spec_scalar * lit_factor * blended_layer_alpha), 0.0, 1.0);
+    // dyn_shadow_factor: a dynamically-shadowed texel gets no sun gloss either (client: the shadow
+    // map's lit factor gates the specular).
+    out_color.rgb = clamp(out_color.rgb + sun_spec_color * (spec_scalar * lit_factor * blended_layer_alpha
+                                                            * dyn_shadow_factor(vary_position)), 0.0, 1.0);
   }
 
   if (draw_terrain_height_contour != 0)

@@ -16,6 +16,9 @@
 #define eWMOBatch_HasMOCVBlend 0x400u
 // Env/EnvMetal material that ships NO environment map (empty MOTX second entry).
 #define eWMOBatch_NoEnvTexture 0x800u
+// group ships the dedicated mocv2 blend chunk -> two-layer blend reads f_blend_alpha (its own
+// stream) instead of f_vertex_color.a, which now carries the portal-openness doorway fade.
+#define eWMOBatch_BlendStream 0x1000u
 
 layout (std140) uniform lighting
 {
@@ -30,7 +33,55 @@ layout (std140) uniform lighting
   vec4 PointLightParams;     // .x = active point-light count
   vec4 PointLightPos[16];    // xyz = world pos, w = radius
   vec4 PointLightColor[16];  // xyz = colour * intensity
+  vec4 EnvFogColor_On;       // (unused here; keeps the std140 prefix aligned with the C++ block)
+  vec4 EnvFogDist;
+  mat4 ShadowMatrix;         // world -> shadow map UV+depth (last rendered map)
+  vec4 ShadowParams;         // x = quality level (0 = off), y = shadowed-light floor, z = 1/map size
+  vec4 ShadowCenterRange;    // xyz = map world center, w = half-range (client-style distance fade)
+  mat4 ShadowMatrixEnv;      // ENVIRONMENTAL map (client-split second multiply pass)
+  vec4 ShadowEnvCenterRange; // ShadowParams.w = 1 when the env map is valid
 };
+
+// 3.3.5a-style dynamic shadow map (extShadowQuality): 1 = fully lit, ShadowParams.y = in shadow.
+// 3x3 PCF like the client's hwPCF depth-texture path. Outside the map = lit.
+uniform sampler2DShadow shadow_map;
+uniform sampler2DShadow shadow_map_env;
+float dyn_shadow_sample(sampler2DShadow smap, mat4 smatrix, vec4 center_range, vec3 world_pos)
+{
+  vec4 sc = smatrix * vec4(world_pos, 1.0);
+  if (sc.w <= 0.0) { return 1.0; }
+  sc.xyz /= sc.w;
+  if (any(lessThan(sc.xy, vec2(0.001))) || any(greaterThan(sc.xy, vec2(0.999))) || sc.z >= 1.0 || sc.z <= 0.0)
+  {
+    return 1.0;
+  }
+  float t = ShadowParams.z;
+  float s = 0.0;
+  for (int i = -1; i <= 1; ++i)
+  {
+    for (int j = -1; j <= 1; ++j)
+    {
+      s += texture(smap, vec3(sc.xy + vec2(float(i), float(j)) * t, sc.z));
+    }
+  }
+  // CLIENT-style distance fade (ShadowMap.bls caster PS writes distance-faded shadow values --
+  // farther casters shade lighter). Receiver-side: fade to fully lit over the outer 35% of the map.
+  float fade_r = distance(world_pos, center_range.xyz) / max(center_range.w, 1.0);
+  float fade = clamp((fade_r - 0.65) / 0.35, 0.0, 1.0);
+  return mix(mix(ShadowParams.y, 1.0, s / 9.0), 1.0, fade);
+}
+float dyn_shadow_factor(vec3 world_pos)
+{
+  if (ShadowParams.x < 0.5) { return 1.0; }
+  // client-split maps MULTIPLY (each projected as its own Mod pass): a unit's shadow darkens ON TOP
+  // of a building's environmental shadow.
+  float f = dyn_shadow_sample(shadow_map, ShadowMatrix, ShadowCenterRange, world_pos);
+  if (ShadowParams.w > 0.5)
+  {
+    f *= dyn_shadow_sample(shadow_map_env, ShadowMatrixEnv, ShadowEnvCenterRange, world_pos);
+  }
+  return f;
+}
 
 vec3 point_lights(vec3 world_pos, vec3 n)
 {
@@ -86,6 +137,11 @@ uniform int debug_mocv;
 // 3.3.5a WMO interior material shader is mod2x (tex*MOCV*2); 1.12 is x1. Set for non-CLASSIC projects when
 // the NOGGIT_335A_WMO_MOD2X toggle is on; pairs with the load-time WotLK FixColorVertexAlpha. 0 = x1 (1.12).
 uniform int wmo_interior_mod2x;
+// 1 = this WMO sets MOHD flag 0x2 (use_unified_render_path) -- RE-PROVEN the client hard-branches on
+// it (both WMO draw fns) to the additive MapObjU model: interior light = MOHD ambient + baked MOCV.
+// Set PER WMO from the file's own flag, so every stock WMO (flags 0x0) leaves wmo_unified == 0 and the
+// interior branch below byte-identical. Only Ascension's retail ports + stock Stormwind carry 0x2.
+uniform int wmo_unified;
 // 3.3.5a interior tone knobs (applied to the FINAL interior light when wmo_interior_mod2x is set):
 //   wmo_interior_floor = shadow minimum -- no interior face darker than this (kills pure-black voids).
 //   wmo_interior_gain  = overall interior brightness multiplier (1.0 = neutral).
@@ -98,6 +154,7 @@ in vec3 f_normal;
 in vec2 f_texcoord;
 in vec2 f_texcoord_2;
 in vec4 f_vertex_color;
+in float f_blend_alpha;
 
 flat in uint flags;
 flat in uint shader;
@@ -263,8 +320,29 @@ vec3 apply_lighting(vec3 material)
     // sun, tex * saturate(ambient + diffuse*N.L), exactly like terrain -- NO baked-colour add. (noggit's
     // old `+ vertex_color` stacked the buildings' baked colour ON TOP of the sun, which is why Stormwind
     // read too bright and warm vs in-game.)
+    // Dynamic shadow (extShadowQuality-style): occludes the directional sun term only.
+    nDotL *= dyn_shadow_factor(f_position);
     light_color = clamp(lit_diffuse * nDotL, 0.0, 1.0)
                 + lit_ambient;
+    // UNIFIED PATH (MOHD 0x2) EXTERIOR: the MapObjU shaders ADD the baked MOCV on exterior batches
+    // too. RE'd byte-level from wow335a.exe FUN_007a8940 (2026-08-12): c28 = packed 0xFF7F7F7F =
+    // (0.498,0.498,0.498) constant and c29 = saturate(matColor + DAT_00d1befc[default 0]) >> 1 --
+    // both PRE-HALVED against the universal MapObj pixel x2. So the client's exterior unified pixel
+    // = tex*2*(clamp(amb + diff*NdL,0..1)*0.498 + MOCV_raw + c29) ~= tex*(sun + 2*MOCV). The
+    // retail-era city bakes (half-range, do_not_fix -> bytes loaded verbatim) carry the alley/eave/
+    // building shading; without this add the unified city renders PURE sun -- flat walls, no baked
+    // shadowing (the reported "city light/shadows differ from the client at matched time"; the
+    // sun DIRECTION itself is wire-verified identical, SetLight dir (-0.662,-0.662,-0.352) =
+    // azimuth 225 deg / phi 110-127 deg -- the same scene law noggit implements).
+    // Gated on the WMO's own flag + the batch's lighting MOCV (0x4): stock 0x0 WMOs and blend-only
+    // mocv2 groups (rgb 0, e.g. cathedral g0) are unchanged by construction. The x2 here is the
+    // U-path's own pixel x2, NOT the wmo_interior_mod2x A/B. NOTE the [0,1] clamp before the
+    // texture modulate still caps sun+bright-bake at 1.0 where the client can reach 2.0 overbright;
+    // deliberate first cut -- the visible delta is the DARK bake regions, far below the cap.
+    if (wmo_unified != 0 && bool(flags & eWMOBatch_HasMOCV))
+    {
+      light_color = clamp(lit_diffuse * nDotL + lit_ambient, 0.0, 1.0) + vertex_color * 2.0;
+    }
   }
   else
   {
@@ -298,7 +376,8 @@ vec3 apply_lighting(vec3 material)
     {
       float nDotL_ext = clamp(dot(normalize(f_normal),
                                   -normalize(vec3(LightDir_FogRate.x, LightDir_FogRate.z, -LightDir_FogRate.y))),
-                              0.0, 1.0);
+                              0.0, 1.0)
+                      * dyn_shadow_factor(f_position);
       vec3 exterior_light = clamp(DiffuseColor_FogStart.xyz * nDotL_ext, 0.0, 1.0) + AmbientColor_FogEnd.xyz;
       mocv_light = mix(mocv_light, exterior_light, clamp(f_vertex_color.a, 0.0, 1.0));
     }
@@ -308,7 +387,33 @@ vec3 apply_lighting(vec3 material)
     // the FINISHED light). Both flat + brighten-friendly, applied LAST so nothing upstream can leave black.
     if (wmo_interior_mod2x != 0)
     {
-      light_color = max(light_color * wmo_interior_gain, vec3(wmo_interior_floor));
+      // HUE-PRESERVING shadow floor. The old per-channel max(light, floor) lifted each channel
+      // INDEPENDENTLY, so a dark vertex (0.15,0.05,0.02) became (0.15,0.10,0.10) -- the two dim
+      // channels clamped up while the bright one stayed = a HUE SHIFT. On bakes that dip to zero
+      // in patches (the retail-era ports: MOCV min 0) that is the "rainbow blotches in the
+      // shadows". Scaling the whole colour until its BRIGHTEST channel reaches the floor gives the
+      // same anti-black lift without inventing hue.
+      // BYTE-IDENTICAL FOR STOCK: when max(channel) >= floor the scale is 1.0 (pure identity), and
+      // stock bakes never go below it (their MOCV min == the MOHD ambient -> 0.043*2*1.3 = 0.112 >
+      // 0.10). Only content whose bake actually reaches near-black takes the new branch.
+      vec3 lc = light_color * wmo_interior_gain;
+      float mx = max(max(lc.r, lc.g), lc.b);
+      light_color = (mx >= wmo_interior_floor) ? lc
+                  : ((mx > 1e-5) ? lc * (wmo_interior_floor / mx)  // lift, keep hue
+                                 : vec3(wmo_interior_floor));      // truly black -> neutral grey
+    }
+    // UNIFIED PATH (MOHD 0x2), client-exact and the FINAL word for these WMOs -- overrides the
+    // multiplicative interior result above. RE'd from the client (see noggit-wmo-unified-render-path):
+    // the MapObjU interior shader is ADDITIVE -- light + baked MOCV, with the interior light = the
+    // MOHD ambient (light mode 3). This is THE fix for the retail-era ports: their bakes are
+    // half-range with NO ambient baked in (cathedral MOCV min 0 / max 127, vs stock whose min ==
+    // the ambient), so noggit's multiply drove shadows to black ("dark interior") and amplified the
+    // near-zero colour quantisation into saturated speckle ("rainbow blotches"). Adding the authored
+    // ambient floors the blacks and swamps the hue noise, exactly like the client. mocv_light already
+    // carries the mod2x x2. GATED ON THE WMO'S OWN FLAG -> 0x0 stock WMOs never reach this.
+    if (wmo_unified != 0)
+    {
+      light_color = ambient_color + (bool(flags & eWMOBatch_HasMOCV) ? mocv_light : vec3(0.0));
     }
   }
 
@@ -403,7 +508,10 @@ void main()
   // vertex-colour chunk was uploaded -- including modern WMOs that carry ONLY a texture-blend mocv2 (RGB=0)
   // and are therefore NOT flagged HasMOCV for lighting. Gate the blend on its own flag so those groups
   // still blend their two layers instead of collapsing to layer 1; default 1.0 = pure layer 1.
-  float blend_alpha = bool(flags & eWMOBatch_HasMOCVBlend) ? f_vertex_color.a : 1.0;
+  // mocv2 groups read the separate stream; stock groups keep the LEGACY .a source (identical).
+  float blend_alpha = bool(flags & eWMOBatch_HasMOCVBlend)
+                    ? (bool(flags & eWMOBatch_BlendStream) ? f_blend_alpha : f_vertex_color.a)
+                    : 1.0;
 
   // see: https://github.com/Deamon87/WebWowViewerCpp/blob/master/wowViewerLib/src/glsl/wmoShader.glsl
   if(shader == 3) // Env

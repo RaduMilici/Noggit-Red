@@ -55,6 +55,13 @@ namespace Noggit
   inline QVariant mysqlSetting(QString const& suffix, QVariant const& def)
   {
     QSettings settings;
+    // "enabled" NEVER seeds from the legacy global key: a stale global enabled=true would silently
+    // turn MySQL ON for every project that hasn't saved its own toggle yet. Connection params
+    // (server/user/pwd/db/port) still migrate; the on/off switch stays per-project, default OFF.
+    if (suffix == QStringLiteral("enabled"))
+    {
+      return settings.value(mysqlSettingKey(suffix), def);
+    }
     return settings.value(mysqlSettingKey(suffix),
                           settings.value(QStringLiteral("project/mysql/") + suffix, def));
   }

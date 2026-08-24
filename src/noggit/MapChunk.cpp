@@ -2259,9 +2259,12 @@ void MapChunk::computeDetailDoodads()
         }
 
         std::string filename;
+        unsigned doodad_flags = 0;
         try
         {
-          filename = gGroundEffectDoodadDB.getByID(doodad_id).getString(GroundEffectDoodadDB::Filename());
+          DBCFile::Record dd_rec = gGroundEffectDoodadDB.getByID(doodad_id);
+          filename = dd_rec.getString(GroundEffectDoodadDB::Filename());
+          doodad_flags = dd_rec.getUInt(GroundEffectDoodadDB::Flags());
         }
         catch (...)
         {
@@ -2284,7 +2287,50 @@ void MapChunk::computeDetailDoodads()
 
         float const u = next01();
         float const v = next01();
-        glm::vec3 const world_pos = cell_pos(sx, sy, u, v);
+        glm::vec3 world_pos = cell_pos(sx, sy, u, v);
+
+        // CLIENT terrain triangulation (FUN_007d3390): a subcell is FOUR triangles around its CENTER
+        // vertex; the blade's HEIGHT comes from that triangle's plane (the old bilinear height
+        // ignored the center vertex).
+        {
+          glm::vec3 const tl = mVertices[sy * 17 + sx];
+          glm::vec3 const tr = mVertices[sy * 17 + sx + 1];
+          glm::vec3 const bl = mVertices[(sy + 1) * 17 + sx];
+          glm::vec3 const br = mVertices[(sy + 1) * 17 + sx + 1];
+          glm::vec3 const cen = mVertices[sy * 17 + 9 + sx];
+          glm::vec3 p0, p1;
+          if (v <= u && v <= 1.0f - u)      { p0 = tl; p1 = tr; } // north tri
+          else if (v >= u && v >= 1.0f - u) { p0 = bl; p1 = br; } // south tri
+          else if (u <= v)                  { p0 = tl; p1 = bl; } // west tri
+          else                              { p0 = tr; p1 = br; } // east tri
+          glm::vec3 n = glm::cross(p1 - p0, cen - p0);
+          float const nl = glm::length(n);
+          if (nl > 1e-6f && std::abs(n.y) > 1e-6f)
+          {
+            n /= nl;
+            world_pos.y = p0.y - (n.x * (world_pos.x - p0.x) + n.z * (world_pos.z - p0.z)) / n.y;
+          }
+        }
+        // Lighting normal: the SAME data the terrain shader lights -- interpolated mNormals (the
+        // MCNR array that feeds the terrain vertex buffer). Deriving a normal from cross products
+        // of noggit WORLD-space positions put it in a different component frame than the terrain's
+        // normal attribute, so the grass N.L azimuth was mirrored vs the ground ("where the ground
+        // is bright the grass is dark"). Using terrain's own normals makes the grass response match
+        // the terrain pixel beneath it by construction (client: the subcell plane normal, same frame
+        // as ITS terrain normals).
+        glm::vec3 ground_n(0.0f, 1.0f, 0.0f);
+        {
+          glm::vec3 const n_tl = mNormals[sy * 17 + sx];
+          glm::vec3 const n_tr = mNormals[sy * 17 + sx + 1];
+          glm::vec3 const n_bl = mNormals[(sy + 1) * 17 + sx];
+          glm::vec3 const n_br = mNormals[(sy + 1) * 17 + sx + 1];
+          glm::vec3 n = glm::mix(glm::mix(n_tl, n_tr, u), glm::mix(n_bl, n_br, u), v);
+          float const nl = glm::length(n);
+          if (nl > 1e-6f)
+          {
+            ground_n = n / nl;
+          }
+        }
 
         float const yaw = next01() * glm::two_pi<float>();
         float const scale = 0.9f + next01() * 0.2f; // client: rand[-1,1] * 0.1 + 1.0 = [0.9, 1.1]
@@ -2294,7 +2340,39 @@ void MapChunk::computeDetailDoodads()
         transform = glm::rotate(transform, yaw, glm::vec3(0.0f, 1.0f, 0.0f));
         transform = glm::scale(transform, glm::vec3(scale));
 
-        _detail_doodads.push_back({std::move(path), transform});
+        // Per-blade packed attribute -- CLIENT-EXACT bake (placement FUN_007d3390 + DetailDoodad.bls
+        // vs_2_0/ps_2_0 extracted from patch.MPQ, RE 2026-08-20):
+        //   vertColor.rgb = the RAW interpolated MCCV bytes (neutral painted MCCV 0x7F ~= HALF
+        //   brightness -- the grass shader multiplies the vertex colour ONCE, it does NOT double
+        //   MCCV like the terrain shader), WHITE 255 only when the chunk has no MCCV or the
+        //   GroundEffectDoodad row has flag 2. vertColor.a = the MCSH shadow BIT (0 = shadowed;
+        //   the pixel shader's a*0.3+0.7 factor makes that x0.70, never darker).
+        // Packed float-exact into the ONE per-instance vec4 the instanced M2 path already carries:
+        //   x = r*256 + g   (<= 65535, exact in float)
+        //   y = b*2 + shadowBit + 1024   (the +1024 marks "packed"; other paths send 0 -> neutral)
+        //   z,w = ground normal x,z (terrain frame; the shader recovers y = sqrt(1 - x^2 - z^2))
+        float cr = 255.0f, cg = 255.0f, cb = 255.0f;
+        if (hasMCCV && (doodad_flags & 2) == 0)
+        {
+          glm::vec3 const c_tl = mccv[sy * 17 + sx];
+          glm::vec3 const c_tr = mccv[sy * 17 + sx + 1];
+          glm::vec3 const c_bl = mccv[(sy + 1) * 17 + sx];
+          glm::vec3 const c_br = mccv[(sy + 1) * 17 + sx + 1];
+          glm::vec3 const ground = glm::mix(glm::mix(c_tl, c_tr, u), glm::mix(c_bl, c_br, u), v);
+          // noggit stores MCCV as byte/127 (neutral 1.0); the client bakes the RAW byte -> x127.
+          cr = std::floor(std::clamp(ground.x * 127.0f, 0.0f, 255.0f));
+          cg = std::floor(std::clamp(ground.y * 127.0f, 0.0f, 255.0f));
+          cb = std::floor(std::clamp(ground.z * 127.0f, 0.0f, 255.0f));
+        }
+        int const tx = std::clamp(static_cast<int>((static_cast<float>(sx) + u) * 8.0f), 0, 63);
+        int const tz = std::clamp(static_cast<int>((static_cast<float>(sy) + v) * 8.0f), 0, 63);
+        float const shadow_bit = _shadow_map[tz * 64 + tx] ? 0.0f : 1.0f;
+        glm::vec4 const tint(cr * 256.0f + cg,
+                             cb * 2.0f + shadow_bit + 1024.0f,
+                             ground_n.x,
+                             ground_n.z);
+
+        _detail_doodads.push_back({std::move(path), transform, tint});
       }
     }
   }

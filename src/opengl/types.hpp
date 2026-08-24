@@ -56,6 +56,22 @@ namespace OpenGL
     // (else the shaders fall back to the zone slots). EnvFogDist = (start FRACTION, end, 0, 0).
     glm::vec4 EnvFogColor_On;
     glm::vec4 EnvFogDist;
+    // 3.3.5a-style dynamic shadow map (extShadowQuality). ShadowMatrix = world -> shadow-map UV+depth
+    // ([0,1]^3, bias folded in) for the LAST RENDERED map (the pass runs at end-of-frame, sampled next
+    // frame). ShadowParams = (quality level 0..5, shadow strength 0..1, 1/texture size, 0). Level 0
+    // (or minimap) = disabled: receivers skip the sample entirely.
+    glm::mat4 ShadowMatrix;
+    glm::vec4 ShadowParams;
+    // xyz = the shadow map's world-space center, w = its half-range. Drives the client-style
+    // distance fade (the 335a caster PS writes shadow values that FADE with distance from the map
+    // reference -- ShadowMap.bls arbfp1: result = tex*c13.z + dist*c13.x + ...; farther casters =
+    // lighter shadows). noggit evaluates the fade receiver-side over the outer band of the map.
+    glm::vec4 ShadowCenterRange;
+    // Second (ENVIRONMENTAL) shadow map, client-exact split (FUN_00875f80/FUN_00874fb0): the client
+    // projects the UNIT map and the environmental rings as SEPARATE multiply passes, so a unit's
+    // shadow darkens ON TOP of a building's shadow. ShadowParams.w = 1 when the env map is valid.
+    glm::mat4 ShadowMatrixEnv;
+    glm::vec4 ShadowEnvCenterRange;
   };
 
   struct TerrainParamsUniformBlock

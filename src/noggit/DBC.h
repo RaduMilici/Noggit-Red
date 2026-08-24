@@ -52,6 +52,11 @@ public:
   static const size_t Name = 5;        // loc
 
   static const size_t LoadingScreen = 57;    // uint [LoadingScreen]
+  // Minutes 0..1439, or -1 = none. CLIENT-CANON (wow335a.exe FUN_004f8410, ".\WorldFrame.cpp"):
+  // when != -1 the client FORCES the day-night clock to this minute on the whole map, every frame
+  // ("Invalid time of day override in Map ID %d. TOD = %d." when out of range). Stock uses it on
+  // OrgrimmarArena (720); Ascension also on Uldum(1080)/Azzarfaire(1260)/nerubianarena(240)/etc.
+  static const size_t TimeOfDayOverride = 62; // int, minutes, -1 = none
   static std::string getMapName(int pMapID);
   static int findMapName(const std::string& map_name);
 };
@@ -302,6 +307,9 @@ public:
     static const size_t ID = 0;
     static const size_t ModelID = 1;
     static const size_t ExtendedDisplayInfoID = 3;
+    // WotLK-only column (16-field layout): ParticleColor.dbc row id for recolored creature variants.
+    // Returns 0 on classic layouts (no such column) -- gate on the value like CapeDisplayID().
+    static size_t ParticleColorID();
     static const size_t CreatureModelScale = 4;
     static const size_t CreatureModelAlpha = 5;
     static const size_t TextureVariation1 = 6;
@@ -445,6 +453,29 @@ public:
     static const size_t Facial1Flags = 2;
     static const size_t Facial2Flags = 3;
     static const size_t Facial3Flags = 4;
+  };
+
+  // WotLK-only (absent from 1.12 data; open() no-ops there and the record count stays 0).
+  // Row = id + 3 colour-sets x {start, mid, end} packed 0xRRGGBB ints; an emitter authored with
+  // particleColorIndex 11/12/13 takes set 1/2/3, selected per creature by
+  // CreatureDisplayInfo.particleColorID (checklist 12.10).
+  class ParticleColorDB : public DBCFile
+  {
+  public:
+    ParticleColorDB() :
+      DBCFile("DBFilesClient\\ParticleColor.dbc")
+    { }
+
+    static const size_t ID = 0;
+    static const size_t Start1 = 1;
+    static const size_t Mid1 = 2;
+    static const size_t End1 = 3;
+    static const size_t Start2 = 4;
+    static const size_t Mid2 = 5;
+    static const size_t End2 = 6;
+    static const size_t Start3 = 7;
+    static const size_t Mid3 = 8;
+    static const size_t End3 = 9;
   };
 
   class CharacterSectionsDB : public DBCFile
@@ -758,6 +789,7 @@ extern CharacterFacialHairStylesDB gCharacterFacialHairStylesDB;
 extern CharacterHairGeosetsDB gCharacterHairGeosetsDB;
 extern CharacterSectionsDB gCharacterSectionsDB;
 extern HelmetGeosetVisDataDB gHelmetGeosetVisDataDB;
+extern ParticleColorDB gParticleColorDB;
 extern WMOAreaTableDB gWMOAreaTableDB;
 extern GameObjectDisplayInfoDB gGameObjectDisplayInfoDB;
 extern SpellVisualDB gSpellVisualDB;

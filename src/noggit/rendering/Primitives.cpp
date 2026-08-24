@@ -13,6 +13,9 @@
 #include <numbers>
 #include <array>
 #include <vector>
+#include <random>
+#include <cmath>
+#include <algorithm>
 #include <glm/gtx/quaternion.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 
@@ -409,6 +412,223 @@ void Square::setup_buffers()
 
   }
 
+  WeatherEffect::WeatherEffect() = default;
+  WeatherEffect::~WeatherEffect() = default;
+
+  void WeatherEffect::setup(Noggit::NoggitRenderContext context)
+  {
+    _vao.upload();
+    _buffers.upload();
+
+    // Inline shader: textured, colour-tinted, alpha-blended quads. Precipitation is small and
+    // per-frame dynamic; no qrc round-trip needed.
+    static char const* vs =
+      "#version 410 core\n"
+      "in vec3 pos;\n"
+      "in vec2 uv;\n"
+      "uniform mat4 mvp;\n"
+      "out vec2 f_uv;\n"
+      "void main() { f_uv = uv; gl_Position = mvp * vec4(pos, 1.0); }\n";
+    static char const* fs =
+      "#version 410 core\n"
+      "uniform sampler2DArray tex;\n"
+      "uniform float tex_index;\n"
+      "uniform vec4 color;\n"
+      "in vec2 f_uv;\n"
+      "out vec4 out_color;\n"
+      "void main()\n"
+      "{\n"
+      "  vec4 t = texture(tex, vec3(f_uv, tex_index));\n"
+      "  out_color = vec4(t.rgb * color.rgb, t.a * color.a);\n"
+      "  if (out_color.a < 0.01) discard;\n"
+      "}\n";
+    _program.reset(new OpenGL::program(
+      {{ GL_VERTEX_SHADER, std::string(vs) }
+      ,{ GL_FRAGMENT_SHADER, std::string(fs) }}));
+
+    OpenGL::Scoped::use_program sp (*_program.get());
+    {
+      OpenGL::Scoped::vao_binder const _ (_vao[0]);
+      OpenGL::Scoped::buffer_binder<GL_ARRAY_BUFFER> const vb (_vbo);
+      GLsizei const stride = static_cast<GLsizei>(sizeof(float) * 5);
+      sp.attrib("pos", 3, GL_FLOAT, GL_FALSE, stride, nullptr);
+      sp.attrib("uv", 2, GL_FLOAT, GL_FALSE, stride,
+                reinterpret_cast<GLvoid const*>(sizeof(float) * 3));
+    }
+
+    if (!_texture_failed)
+    {
+      try
+      {
+        _rain_texture = std::make_unique<blp_texture>(
+          BlizzardArchive::Listfile::FileKey("textures\\Weather\\RainDrop01.blp"), context);
+        _rain_texture->finishLoading();
+        _rain_texture->upload();
+        _snow_texture = std::make_unique<blp_texture>(
+          BlizzardArchive::Listfile::FileKey("textures\\Weather\\SnowFlake01.blp"), context);
+        _snow_texture->finishLoading();
+        _snow_texture->upload();
+      }
+      catch (std::exception const&)
+      {
+        _rain_texture.reset();
+        _snow_texture.reset();
+        _texture_failed = true;
+      }
+    }
+
+    _buffers_are_setup = true;
+  }
+
+  void WeatherEffect::draw(glm::mat4x4 const& mvp
+                          , glm::vec3 const& camera_pos
+                          , int type
+                          , float intensity
+                          , float animtime_ms
+                          , glm::vec3 const& light_color
+                          , Noggit::NoggitRenderContext context
+                          )
+  {
+    if (type == 0 || intensity <= 0.0f)
+    {
+      _active_type = 0;
+      _drops.clear();
+      _last_time = -1.0f;
+      return;
+    }
+
+    if (!_buffers_are_setup)
+    {
+      setup(context);
+    }
+
+    blp_texture* tex = (type == 2) ? _snow_texture.get() : _rain_texture.get();
+    if (!tex || !tex->is_uploaded())
+    {
+      return;
+    }
+
+    // Client weather volume (MapWeather init): a 44 x 44 horizontal, +-25 vertical box around the
+    // camera. Density: the client's flake pool caps at 0x1800 (6144); scaled down for the editor's
+    // CPU refill and by the intensity slider (the client's weatherDensity works the same way).
+    float const kBoxH = 44.0f;
+    float const kBoxV = 25.0f;
+    bool const snow = (type == 2);
+    int const target = static_cast<int>((snow ? 900 : 1500) * intensity);
+
+    float dt = (_last_time >= 0.0f) ? (animtime_ms - _last_time) / 1000.0f : 0.016f;
+    _last_time = animtime_ms;
+    dt = std::clamp(dt, 0.0f, 0.1f);
+
+    static std::mt19937 rng(20260823u);
+    auto frand = [&](float a, float b) {
+      return a + (b - a) * (static_cast<float>(rng()) / static_cast<float>(rng.max()));
+    };
+
+    if (_active_type != type)
+    {
+      _active_type = type;
+      _drops.clear();
+    }
+    while (static_cast<int>(_drops.size()) < target)
+    {
+      Drop d;
+      d.pos = glm::vec3(camera_pos.x + frand(-kBoxH, kBoxH),
+                        camera_pos.y + frand(-kBoxV, kBoxV),
+                        camera_pos.z + frand(-kBoxH, kBoxH));
+      d.speed = snow ? frand(4.0f, 7.0f) : frand(50.0f, 70.0f);
+      d.seed = frand(0.0f, 6.2831853f);
+      _drops.push_back(d);
+    }
+    if (static_cast<int>(_drops.size()) > target)
+    {
+      _drops.resize(target);
+    }
+
+    float const t_s = animtime_ms / 1000.0f;
+    for (Drop& d : _drops)
+    {
+      d.pos.y -= d.speed * dt;
+      if (snow)
+      {
+        d.pos.x += std::sin(t_s * 0.9f + d.seed) * 1.2f * dt;
+        d.pos.z += std::cos(t_s * 0.7f + d.seed) * 1.0f * dt;
+      }
+      // Keep the volume centered on the (moving) camera: wrap on every axis.
+      if (d.pos.y < camera_pos.y - kBoxV)
+      {
+        d.pos.y += 2.0f * kBoxV;
+        d.pos.x = camera_pos.x + frand(-kBoxH, kBoxH);
+        d.pos.z = camera_pos.z + frand(-kBoxH, kBoxH);
+      }
+      if (d.pos.x < camera_pos.x - kBoxH) d.pos.x += 2.0f * kBoxH;
+      if (d.pos.x > camera_pos.x + kBoxH) d.pos.x -= 2.0f * kBoxH;
+      if (d.pos.z < camera_pos.z - kBoxH) d.pos.z += 2.0f * kBoxH;
+      if (d.pos.z > camera_pos.z + kBoxH) d.pos.z -= 2.0f * kBoxH;
+    }
+
+    // Build camera-facing quads: rain = tall thin streak, snow = small flake.
+    float const half_w = snow ? 0.09f : 0.03f;
+    float const half_h = snow ? 0.09f : 0.9f;
+    _vertex_data.clear();
+    _vertex_data.reserve(_drops.size() * 6 * 5);
+    for (Drop const& d : _drops)
+    {
+      glm::vec3 const to_cam = camera_pos - d.pos;
+      glm::vec3 right = glm::cross(glm::vec3(0.0f, 1.0f, 0.0f), to_cam);
+      float const len2 = glm::dot(right, right);
+      right = (len2 > 1e-6f) ? right * (half_w / std::sqrt(len2)) : glm::vec3(half_w, 0.0f, 0.0f);
+      glm::vec3 const up(0.0f, half_h, 0.0f);
+
+      glm::vec3 const a = d.pos - right - up;
+      glm::vec3 const b = d.pos + right - up;
+      glm::vec3 const c = d.pos + right + up;
+      glm::vec3 const e = d.pos - right + up;
+      auto push = [&](glm::vec3 const& p, float u, float v) {
+        _vertex_data.push_back(p.x); _vertex_data.push_back(p.y); _vertex_data.push_back(p.z);
+        _vertex_data.push_back(u);   _vertex_data.push_back(v);
+      };
+      push(a, 0.f, 1.f); push(b, 1.f, 1.f); push(c, 1.f, 0.f);
+      push(a, 0.f, 1.f); push(c, 1.f, 0.f); push(e, 0.f, 0.f);
+    }
+    if (_vertex_data.empty())
+    {
+      return;
+    }
+
+    OpenGL::Scoped::use_program sp (*_program.get());
+    sp.uniform("mvp", mvp);
+    sp.uniform("color", glm::vec4(light_color, snow ? 0.85f : 0.55f));
+    gl.activeTexture(GL_TEXTURE0);
+    gl.bindTexture(GL_TEXTURE_2D_ARRAY, tex->texture_array());
+    sp.uniform("tex", 0);
+    sp.uniform("tex_index", static_cast<float>(tex->array_index()));
+
+    OpenGL::Scoped::vao_binder const _ (_vao[0]);
+    OpenGL::Scoped::buffer_binder<GL_ARRAY_BUFFER> const vb (_vbo);
+    gl.bufferData(GL_ARRAY_BUFFER,
+                  static_cast<GLsizeiptr>(_vertex_data.size() * sizeof(float)),
+                  _vertex_data.data(), GL_STREAM_DRAW);
+
+    OpenGL::Scoped::bool_setter<GL_BLEND, GL_TRUE> const blend;
+    gl.blendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    OpenGL::Scoped::depth_mask_setter<GL_FALSE> const no_depth_write;
+    // the GL wrapper exposes only the instanced form; instancecount=1 == plain drawArrays
+    gl.drawArraysInstanced(GL_TRIANGLES, 0, static_cast<GLsizei>(_vertex_data.size() / 5), 1);
+  }
+
+  void WeatherEffect::unload()
+  {
+    _vao.unload();
+    _buffers.unload();
+    _program.reset();
+    _rain_texture.reset();
+    _snow_texture.reset();
+    _buffers_are_setup = false;
+    _texture_failed = false;
+    _drops.clear();
+  }
+
   Circle::Circle() = default;
   Circle::~Circle() = default;
 
@@ -633,6 +853,68 @@ void Square::setup_buffers()
 
     OpenGL::Scoped::vao_binder const _ (_vao[0]);
     gl.drawArraysInstanced(GL_TRIANGLES, 0, 36, static_cast<GLsizei>(points.size() - 1));
+  }
+
+  void PathDecal::draw_dots(glm::mat4x4 const& mvp_rel
+                           , glm::mat4x4 const& inv_mvp_rel
+                           , glm::vec2 const& inv_viewport
+                           , GLuint scene_depth_tex
+                           , GLuint world_depth_tex
+                           , std::vector<glm::vec3> const& points
+                           , glm::vec3 const& camera
+                           , glm::vec3 const& view_axis
+                           , glm::vec4 const& color
+                           , float world_width
+                           , float min_pixels
+                           , float max_pixels
+                           , float px_scale)
+  {
+    if (points.empty() || !scene_depth_tex || !world_depth_tex)
+    {
+      return;
+    }
+
+    if (!_buffers_are_setup)
+    {
+      setup_buffers();
+    }
+
+    // One DEGENERATE segment per point (a == b): the fragment shader's clamped closest-point math
+    // collapses to plain distance-to-point, and its round end caps render a filled disc.
+    _segment_data.clear();
+    _segment_data.reserve(points.size() * 6);
+    for (auto const& point : points)
+    {
+      glm::vec3 const a(point - camera);
+      _segment_data.insert(_segment_data.end(), {a.x, a.y, a.z, a.x, a.y, a.z});
+    }
+
+    gl.bufferData<GL_ARRAY_BUFFER, float>(_segments_vbo, _segment_data, GL_STREAM_DRAW);
+
+    OpenGL::Scoped::use_program shader {*_program.get()};
+    OpenGL::Scoped::bool_setter<GL_DEPTH_TEST, GL_FALSE> const no_depth_test;
+    OpenGL::Scoped::bool_setter<GL_CULL_FACE, GL_FALSE> const no_cull;
+
+    shader.uniform("model_view_projection", mvp_rel);
+    shader.uniform("inv_view_projection", inv_mvp_rel);
+    shader.uniform("inv_viewport", inv_viewport);
+    shader.uniform("view_axis", view_axis);
+    shader.uniform("color", color);
+    shader.uniform("world_width", world_width);
+    shader.uniform("min_pixels", min_pixels);
+    shader.uniform("max_pixels", max_pixels);
+    shader.uniform("px_scale", px_scale);
+
+    gl.activeTexture(GL_TEXTURE1);
+    gl.bindTexture(GL_TEXTURE_2D, scene_depth_tex);
+    shader.uniform("scene_depth", 1);
+    gl.activeTexture(GL_TEXTURE2);
+    gl.bindTexture(GL_TEXTURE_2D, world_depth_tex);
+    shader.uniform("world_depth", 2);
+    gl.activeTexture(GL_TEXTURE0);
+
+    OpenGL::Scoped::vao_binder const _ (_vao[0]);
+    gl.drawArraysInstanced(GL_TRIANGLES, 0, 36, static_cast<GLsizei>(points.size()));
   }
 
   void PathDecal::setup_buffers()

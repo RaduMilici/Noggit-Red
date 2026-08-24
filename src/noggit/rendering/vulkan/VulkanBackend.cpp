@@ -214,6 +214,16 @@ namespace Noggit::Rendering::VK
     vkCmdBindIndexBuffer = reinterpret_cast<PFN_vkCmdBindIndexBuffer>(ld("vkCmdBindIndexBuffer"));
     vkCmdDrawIndexed = reinterpret_cast<PFN_vkCmdDrawIndexed>(ld("vkCmdDrawIndexed"));
     vkQueueWaitIdle = reinterpret_cast<PFN_vkQueueWaitIdle>(ld("vkQueueWaitIdle"));
+    vkCreateSampler = reinterpret_cast<PFN_vkCreateSampler>(ld("vkCreateSampler"));
+    vkDestroySampler = reinterpret_cast<PFN_vkDestroySampler>(ld("vkDestroySampler"));
+    vkCreateDescriptorSetLayout = reinterpret_cast<PFN_vkCreateDescriptorSetLayout>(ld("vkCreateDescriptorSetLayout"));
+    vkDestroyDescriptorSetLayout = reinterpret_cast<PFN_vkDestroyDescriptorSetLayout>(ld("vkDestroyDescriptorSetLayout"));
+    vkCreateDescriptorPool = reinterpret_cast<PFN_vkCreateDescriptorPool>(ld("vkCreateDescriptorPool"));
+    vkDestroyDescriptorPool = reinterpret_cast<PFN_vkDestroyDescriptorPool>(ld("vkDestroyDescriptorPool"));
+    vkAllocateDescriptorSets = reinterpret_cast<PFN_vkAllocateDescriptorSets>(ld("vkAllocateDescriptorSets"));
+    vkUpdateDescriptorSets = reinterpret_cast<PFN_vkUpdateDescriptorSets>(ld("vkUpdateDescriptorSets"));
+    vkCmdBindDescriptorSets = reinterpret_cast<PFN_vkCmdBindDescriptorSets>(ld("vkCmdBindDescriptorSets"));
+    vkCmdCopyBufferToImage = reinterpret_cast<PFN_vkCmdCopyBufferToImage>(ld("vkCmdCopyBufferToImage"));
 
     if (!_pfn_vkGetMemoryWin32HandleKHR || !_pfn_vkGetSemaphoreWin32HandleKHR)
     {
@@ -398,8 +408,15 @@ namespace Noggit::Rendering::VK
 
   bool VulkanBackend::createDepthTarget()
   {
+    // exportable like the colour image: the GL side imports it for the depth-compose route (VK scene as the
+    // base layer UNDER the normal editor, gated NOGGIT_VK_COMPOSE). SAMPLED so the compose quad can read it.
+    VkExternalMemoryImageCreateInfo ext{};
+    ext.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO;
+    ext.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
+
     VkImageCreateInfo ici{};
     ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    ici.pNext = &ext;
     ici.imageType = VK_IMAGE_TYPE_2D;
     ici.format = VK_FORMAT_D32_SFLOAT;
     ici.extent = { _width, _height, 1 };
@@ -407,13 +424,14 @@ namespace Noggit::Rendering::VK
     ici.arrayLayers = 1;
     ici.samples = VK_SAMPLE_COUNT_1_BIT;
     ici.tiling = VK_IMAGE_TILING_OPTIMAL;
-    ici.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+    ici.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
     ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     if (vkCreateImage(_device, &ici, nullptr, &_depth_image) != VK_SUCCESS)
       return false;
 
     VkMemoryRequirements req{};
     vkGetImageMemoryRequirements(_device, _depth_image, &req);
+    _depth_mem_size = req.size;
     VkPhysicalDeviceMemoryProperties mp{};
     vkGetPhysicalDeviceMemoryProperties(_phys, &mp);
     std::uint32_t type = UINT32_MAX;
@@ -422,13 +440,30 @@ namespace Noggit::Rendering::VK
       { type = i; break; }
     if (type == UINT32_MAX)
       return false;
+    VkExportMemoryAllocateInfo exp{};
+    exp.sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO;
+    exp.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
+    VkMemoryDedicatedAllocateInfo ded{};
+    ded.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO;
+    ded.pNext = &exp;
+    ded.image = _depth_image;
     VkMemoryAllocateInfo mai{};
     mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    mai.pNext = &ded;
     mai.allocationSize = req.size;
     mai.memoryTypeIndex = type;
     if (vkAllocateMemory(_device, &mai, nullptr, &_depth_mem) != VK_SUCCESS
         || vkBindImageMemory(_device, _depth_image, _depth_mem, 0) != VK_SUCCESS)
       return false;
+    {
+      VkMemoryGetWin32HandleInfoKHR gh{};
+      gh.sType = VK_STRUCTURE_TYPE_MEMORY_GET_WIN32_HANDLE_INFO_KHR;
+      gh.memory = _depth_mem;
+      gh.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
+      HANDLE h = nullptr;
+      if (reinterpret_cast<PFN_vkGetMemoryWin32HandleKHR>(_pfn_vkGetMemoryWin32HandleKHR)(_device, &gh, &h) == VK_SUCCESS)
+        _depth_mem_handle = h; // optional: compose route only
+    }
 
     VkImageViewCreateInfo vci{};
     vci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
@@ -605,13 +640,362 @@ namespace Noggit::Rendering::VK
     pci.layout = _pipe_layout;
     pci.renderPass = _render_pass;
     VkResult const r = vkCreateGraphicsPipelines(_device, VK_NULL_HANDLE, 1, &pci, nullptr, &_pipeline);
-    vkDestroyShaderModule(_device, vs, nullptr);
     vkDestroyShaderModule(_device, fs, nullptr);
     if (r != VK_SUCCESS)
     {
+      vkDestroyShaderModule(_device, vs, nullptr);
       LogError << "[VK] graphics pipeline create failed: " << vkres(r) << std::endl;
       return false;
     }
+
+    // [overnight stage 2] SKY pipeline: same fullscreen vert + layout, gradient fragment, no depth.
+    VkShaderModule sky_fs = loadShaderModule("sky.frag.spv");
+    if (sky_fs)
+    {
+      stages[1].module = sky_fs;
+      VkResult const rs2 = vkCreateGraphicsPipelines(_device, VK_NULL_HANDLE, 1, &pci, nullptr, &_sky_pipeline);
+      vkDestroyShaderModule(_device, sky_fs, nullptr);
+      if (rs2 != VK_SUCCESS)
+      {
+        LogError << "[VK] sky pipeline create failed: " << vkres(rs2) << " (terrain draws over flat clear)" << std::endl;
+        _sky_pipeline = VK_NULL_HANDLE; // soft: sky is optional
+      }
+    }
+    vkDestroyShaderModule(_device, vs, nullptr);
+    return true;
+  }
+
+  // [overnight stage 6] Descriptor infrastructure + a generated ground texture. Proves the full texturing
+  // path (sampler -> set layout -> pool/set -> staging upload -> OPTIMAL image -> sampled in terrain.frag);
+  // real BLP layers replace the generated image next session through this exact machinery.
+  bool VulkanBackend::createTextureInfra()
+  {
+    // sampler (repeat, linear, mips off for the generated texture)
+    VkSamplerCreateInfo sci{};
+    sci.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+    sci.magFilter = VK_FILTER_LINEAR;
+    sci.minFilter = VK_FILTER_LINEAR;
+    sci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+    sci.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    sci.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    sci.maxLod = 0.0f;
+    if (vkCreateSampler(_device, &sci, nullptr, &_sampler) != VK_SUCCESS)
+      return false;
+
+    VkDescriptorSetLayoutBinding b{};
+    b.binding = 0;
+    b.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    b.descriptorCount = 1;
+    b.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    VkDescriptorSetLayoutCreateInfo dlci{};
+    dlci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    dlci.bindingCount = 1;
+    dlci.pBindings = &b;
+    if (vkCreateDescriptorSetLayout(_device, &dlci, nullptr, &_dsl) != VK_SUCCESS)
+      return false;
+
+    VkDescriptorPoolSize ps{};
+    ps.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    ps.descriptorCount = 8;
+    VkDescriptorPoolCreateInfo dpci{};
+    dpci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    dpci.maxSets = 8;
+    dpci.poolSizeCount = 1;
+    dpci.pPoolSizes = &ps;
+    if (vkCreateDescriptorPool(_device, &dpci, nullptr, &_dpool) != VK_SUCCESS)
+      return false;
+
+    VkDescriptorSetAllocateInfo dsai{};
+    dsai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    dsai.descriptorPool = _dpool;
+    dsai.descriptorSetCount = 1;
+    dsai.pSetLayouts = &_dsl;
+    if (vkAllocateDescriptorSets(_device, &dsai, &_dset) != VK_SUCCESS)
+      return false;
+
+    // generated 256x256 grass/dirt value-noise texture (multi-octave hash noise, deliberately organic)
+    constexpr std::uint32_t TW = 256;
+    std::vector<std::uint32_t> pixels(TW * TW);
+    auto hash01 = [](std::uint32_t x, std::uint32_t y) -> float
+    {
+      std::uint32_t h = x * 374761393u + y * 668265263u;
+      h = (h ^ (h >> 13)) * 1274126177u;
+      return static_cast<float>((h ^ (h >> 16)) & 0xFFFFu) / 65535.0f;
+    };
+    auto smooth = [&](float x, float y) -> float
+    {
+      std::uint32_t const xi = static_cast<std::uint32_t>(x), yi = static_cast<std::uint32_t>(y);
+      float const fx = x - xi, fy = y - yi;
+      float const a = hash01(xi & 255u, yi & 255u), b2 = hash01((xi + 1u) & 255u, yi & 255u);
+      float const c = hash01(xi & 255u, (yi + 1u) & 255u), d = hash01((xi + 1u) & 255u, (yi + 1u) & 255u);
+      float const ux = fx * fx * (3.f - 2.f * fx), uy = fy * fy * (3.f - 2.f * fy);
+      return a + (b2 - a) * ux + (c - a) * uy + (a - b2 - c + d) * ux * uy;
+    };
+    for (std::uint32_t y = 0; y < TW; ++y)
+    {
+      for (std::uint32_t x = 0; x < TW; ++x)
+      {
+        float n = 0.55f * smooth(x * 0.06f, y * 0.06f)
+                + 0.30f * smooth(x * 0.19f, y * 0.19f)
+                + 0.15f * smooth(x * 0.47f, y * 0.47f);
+        float const g = 0.55f + 0.45f * n; // brightness variation
+        std::uint8_t const r = static_cast<std::uint8_t>(90.f * g + 25.f * n);
+        std::uint8_t const gg = static_cast<std::uint8_t>(120.f * g + 20.f * n);
+        std::uint8_t const bb = static_cast<std::uint8_t>(60.f * g);
+        pixels[y * TW + x] = 0xFF000000u | (static_cast<std::uint32_t>(bb) << 16)
+                           | (static_cast<std::uint32_t>(gg) << 8) | r;
+      }
+    }
+
+    // image (OPTIMAL) + staging upload through a one-time command buffer
+    VkImageCreateInfo ici{};
+    ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    ici.imageType = VK_IMAGE_TYPE_2D;
+    ici.format = VK_FORMAT_R8G8B8A8_UNORM;
+    ici.extent = { TW, TW, 1 };
+    ici.mipLevels = 1;
+    ici.arrayLayers = 1;
+    ici.samples = VK_SAMPLE_COUNT_1_BIT;
+    ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ici.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (vkCreateImage(_device, &ici, nullptr, &_ground_image) != VK_SUCCESS)
+      return false;
+    VkMemoryRequirements req{};
+    vkGetImageMemoryRequirements(_device, _ground_image, &req);
+    VkPhysicalDeviceMemoryProperties mp{};
+    vkGetPhysicalDeviceMemoryProperties(_phys, &mp);
+    std::uint32_t type = UINT32_MAX;
+    for (std::uint32_t i = 0; i < mp.memoryTypeCount; ++i)
+      if ((req.memoryTypeBits & (1u << i)) && (mp.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))
+      { type = i; break; }
+    if (type == UINT32_MAX)
+      return false;
+    VkMemoryAllocateInfo mai{};
+    mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    mai.allocationSize = req.size;
+    mai.memoryTypeIndex = type;
+    if (vkAllocateMemory(_device, &mai, nullptr, &_ground_mem) != VK_SUCCESS
+        || vkBindImageMemory(_device, _ground_image, _ground_mem, 0) != VK_SUCCESS)
+      return false;
+
+    VkBuffer staging = VK_NULL_HANDLE;
+    VkDeviceMemory staging_mem = VK_NULL_HANDLE;
+    if (!createHostBuffer(VK_BUFFER_USAGE_TRANSFER_SRC_BIT, pixels.size() * 4, staging, staging_mem, pixels.data()))
+      return false;
+
+    // one-time upload: fence starts SIGNALED -> wait+reset, record copy, submit, wait
+    vkWaitForFences(_device, 1, &_fence, VK_TRUE, UINT64_MAX);
+    vkResetFences(_device, 1, &_fence);
+    VkCommandBufferBeginInfo bi{};
+    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(_cmd, &bi);
+    VkImageMemoryBarrier ib{};
+    ib.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    ib.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    ib.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    ib.image = _ground_image;
+    ib.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    ib.subresourceRange.levelCount = 1;
+    ib.subresourceRange.layerCount = 1;
+    ib.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    ib.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    ib.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    vkCmdPipelineBarrier(_cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         0, 0, nullptr, 0, nullptr, 1, &ib);
+    VkBufferImageCopy region{};
+    region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    region.imageSubresource.layerCount = 1;
+    region.imageExtent = { TW, TW, 1 };
+    vkCmdCopyBufferToImage(_cmd, staging, _ground_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+    ib.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    ib.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    ib.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    ib.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    vkCmdPipelineBarrier(_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                         0, 0, nullptr, 0, nullptr, 1, &ib);
+    vkEndCommandBuffer(_cmd);
+    VkSubmitInfo si{};
+    si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &_cmd;
+    if (vkQueueSubmit(_queue, 1, &si, _fence) != VK_SUCCESS)
+      return false;
+    vkWaitForFences(_device, 1, &_fence, VK_TRUE, UINT64_MAX);
+    // leave the fence SIGNALED (renderFrame's wait/reset cycle expects it)
+    vkDestroyBuffer(_device, staging, nullptr);
+    vkFreeMemory(_device, staging_mem, nullptr);
+
+    VkImageViewCreateInfo vci{};
+    vci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    vci.image = _ground_image;
+    vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    vci.format = VK_FORMAT_R8G8B8A8_UNORM;
+    vci.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    vci.subresourceRange.levelCount = 1;
+    vci.subresourceRange.layerCount = 1;
+    if (vkCreateImageView(_device, &vci, nullptr, &_ground_view) != VK_SUCCESS)
+      return false;
+
+    VkDescriptorImageInfo dii{};
+    dii.sampler = _sampler;
+    dii.imageView = _ground_view;
+    dii.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    VkWriteDescriptorSet wr{};
+    wr.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    wr.dstSet = _dset;
+    wr.dstBinding = 0;
+    wr.descriptorCount = 1;
+    wr.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    wr.pImageInfo = &dii;
+    vkUpdateDescriptorSets(_device, 1, &wr, 0, nullptr);
+
+    LogError << "[VK] descriptor infra ready (sampler + set + 256x256 generated ground texture)" << std::endl;
+    return true;
+  }
+
+  // [overnight 04:11, DORMANT] swap the ground texture for caller pixels (decoded BLP later). Self-contained
+  // duplicate of the init upload sequence on purpose -- no refactor of the proven init path.
+  bool VulkanBackend::setGroundTexture(std::uint32_t const* rgba, std::uint32_t width, std::uint32_t height)
+  {
+    if (!_ready || !rgba || !width || !height || !_dset)
+      return false;
+
+    VkImage img = VK_NULL_HANDLE;
+    VkDeviceMemory mem = VK_NULL_HANDLE;
+    VkImageView view = VK_NULL_HANDLE;
+
+    VkImageCreateInfo ici{};
+    ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    ici.imageType = VK_IMAGE_TYPE_2D;
+    ici.format = VK_FORMAT_R8G8B8A8_UNORM;
+    ici.extent = { width, height, 1 };
+    ici.mipLevels = 1;
+    ici.arrayLayers = 1;
+    ici.samples = VK_SAMPLE_COUNT_1_BIT;
+    ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ici.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (vkCreateImage(_device, &ici, nullptr, &img) != VK_SUCCESS)
+      return false;
+
+    VkMemoryRequirements req{};
+    vkGetImageMemoryRequirements(_device, img, &req);
+    VkPhysicalDeviceMemoryProperties mp{};
+    vkGetPhysicalDeviceMemoryProperties(_phys, &mp);
+    std::uint32_t type = UINT32_MAX;
+    for (std::uint32_t i = 0; i < mp.memoryTypeCount; ++i)
+      if ((req.memoryTypeBits & (1u << i)) && (mp.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))
+      { type = i; break; }
+    VkMemoryAllocateInfo mai{};
+    mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    mai.allocationSize = req.size;
+    mai.memoryTypeIndex = type;
+    if (type == UINT32_MAX
+        || vkAllocateMemory(_device, &mai, nullptr, &mem) != VK_SUCCESS
+        || vkBindImageMemory(_device, img, mem, 0) != VK_SUCCESS)
+    {
+      if (mem) vkFreeMemory(_device, mem, nullptr);
+      vkDestroyImage(_device, img, nullptr);
+      return false;
+    }
+
+    VkBuffer staging = VK_NULL_HANDLE;
+    VkDeviceMemory staging_mem = VK_NULL_HANDLE;
+    if (!createHostBuffer(VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                          static_cast<std::size_t>(width) * height * 4, staging, staging_mem, rgba))
+    {
+      vkFreeMemory(_device, mem, nullptr);
+      vkDestroyImage(_device, img, nullptr);
+      return false;
+    }
+
+    vkWaitForFences(_device, 1, &_fence, VK_TRUE, UINT64_MAX);
+    vkResetFences(_device, 1, &_fence);
+    VkCommandBufferBeginInfo bi{};
+    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(_cmd, &bi);
+    VkImageMemoryBarrier ib{};
+    ib.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    ib.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    ib.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    ib.image = img;
+    ib.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    ib.subresourceRange.levelCount = 1;
+    ib.subresourceRange.layerCount = 1;
+    ib.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    ib.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    ib.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    vkCmdPipelineBarrier(_cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         0, 0, nullptr, 0, nullptr, 1, &ib);
+    VkBufferImageCopy region{};
+    region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    region.imageSubresource.layerCount = 1;
+    region.imageExtent = { width, height, 1 };
+    vkCmdCopyBufferToImage(_cmd, staging, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+    ib.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    ib.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    ib.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    ib.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    vkCmdPipelineBarrier(_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                         0, 0, nullptr, 0, nullptr, 1, &ib);
+    vkEndCommandBuffer(_cmd);
+    VkSubmitInfo si{};
+    si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &_cmd;
+    if (vkQueueSubmit(_queue, 1, &si, _fence) != VK_SUCCESS)
+    {
+      vkDestroyBuffer(_device, staging, nullptr);
+      vkFreeMemory(_device, staging_mem, nullptr);
+      vkFreeMemory(_device, mem, nullptr);
+      vkDestroyImage(_device, img, nullptr);
+      return false;
+    }
+    vkWaitForFences(_device, 1, &_fence, VK_TRUE, UINT64_MAX); // fence stays SIGNALED for renderFrame
+    vkDestroyBuffer(_device, staging, nullptr);
+    vkFreeMemory(_device, staging_mem, nullptr);
+
+    VkImageViewCreateInfo vci{};
+    vci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    vci.image = img;
+    vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    vci.format = VK_FORMAT_R8G8B8A8_UNORM;
+    vci.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    vci.subresourceRange.levelCount = 1;
+    vci.subresourceRange.layerCount = 1;
+    if (vkCreateImageView(_device, &vci, nullptr, &view) != VK_SUCCESS)
+    {
+      vkFreeMemory(_device, mem, nullptr);
+      vkDestroyImage(_device, img, nullptr);
+      return false;
+    }
+
+    VkDescriptorImageInfo dii{};
+    dii.sampler = _sampler;
+    dii.imageView = view;
+    dii.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    VkWriteDescriptorSet wr{};
+    wr.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    wr.dstSet = _dset;
+    wr.dstBinding = 0;
+    wr.descriptorCount = 1;
+    wr.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    wr.pImageInfo = &dii;
+    vkQueueWaitIdle(_queue); // no in-flight frame may still sample the old image / read the old descriptor
+    vkUpdateDescriptorSets(_device, 1, &wr, 0, nullptr);
+
+    // retire the old image
+    if (_ground_view) vkDestroyImageView(_device, _ground_view, nullptr);
+    if (_ground_image) vkDestroyImage(_device, _ground_image, nullptr);
+    if (_ground_mem) vkFreeMemory(_device, _ground_mem, nullptr);
+    _ground_image = img;
+    _ground_mem = mem;
+    _ground_view = view;
+    LogError << "[VK] ground texture replaced: " << width << "x" << height << std::endl;
     return true;
   }
 
@@ -639,18 +1023,18 @@ namespace Noggit::Rendering::VK
 
     VkVertexInputBindingDescription bind{};
     bind.binding = 0;
-    bind.stride = 12; // vec3 position
+    bind.stride = 36; // vec3 position + vec3 smooth normal + vec3 MCCV colour, interleaved
     bind.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
-    VkVertexInputAttributeDescription attr{};
-    attr.location = 0;
-    attr.binding = 0;
-    attr.format = VK_FORMAT_R32G32B32_SFLOAT;
+    VkVertexInputAttributeDescription attrs[3]{};
+    attrs[0] = { 0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0 };
+    attrs[1] = { 1, 0, VK_FORMAT_R32G32B32_SFLOAT, 12 };
+    attrs[2] = { 2, 0, VK_FORMAT_R32G32B32_SFLOAT, 24 };
     VkPipelineVertexInputStateCreateInfo vin{};
     vin.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
     vin.vertexBindingDescriptionCount = 1;
     vin.pVertexBindingDescriptions = &bind;
-    vin.vertexAttributeDescriptionCount = 1;
-    vin.pVertexAttributeDescriptions = &attr;
+    vin.vertexAttributeDescriptionCount = 3;
+    vin.pVertexAttributeDescriptions = attrs;
 
     VkPipelineInputAssemblyStateCreateInfo ia{};
     ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
@@ -702,6 +1086,8 @@ namespace Noggit::Rendering::VK
     lci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
     lci.pushConstantRangeCount = 1;
     lci.pPushConstantRanges = &push;
+    lci.setLayoutCount = _dsl ? 1 : 0; // stage 6: set 0 = ground sampler (createTextureInfra runs first)
+    lci.pSetLayouts = _dsl ? &_dsl : nullptr;
     if (vkCreatePipelineLayout(_device, &lci, nullptr, &_terrain_layout) != VK_SUCCESS)
     {
       vkDestroyShaderModule(_device, vs, nullptr);
@@ -723,13 +1109,211 @@ namespace Noggit::Rendering::VK
     pci.layout = _terrain_layout;
     pci.renderPass = _render_pass;
     VkResult const r = vkCreateGraphicsPipelines(_device, VK_NULL_HANDLE, 1, &pci, nullptr, &_terrain_pipeline);
+    vkDestroyShaderModule(_device, fs, nullptr);
+    if (r != VK_SUCCESS)
+    {
+      vkDestroyShaderModule(_device, vs, nullptr);
+      LogError << "[VK] terrain pipeline create failed: " << vkres(r) << std::endl;
+      return false;
+    }
+
+    // [overnight stage 3] WATER pipeline: same vertex layout/stages, alpha blending on, depth write OFF
+    // (test stays on so water sits correctly against the terrain). Soft-optional like the sky.
+    VkShaderModule water_fs = loadShaderModule("water.frag.spv");
+    if (water_fs)
+    {
+      stages[1].module = water_fs;
+      ds.depthWriteEnable = VK_FALSE;
+      cba.blendEnable = VK_TRUE;
+      cba.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+      cba.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+      cba.colorBlendOp = VK_BLEND_OP_ADD;
+      cba.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+      cba.dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+      cba.alphaBlendOp = VK_BLEND_OP_ADD;
+      VkResult const rw = vkCreateGraphicsPipelines(_device, VK_NULL_HANDLE, 1, &pci, nullptr, &_water_pipeline);
+      vkDestroyShaderModule(_device, water_fs, nullptr);
+      if (rw != VK_SUCCESS)
+      {
+        LogError << "[VK] water pipeline create failed: " << vkres(rw) << " (water skipped)" << std::endl;
+        _water_pipeline = VK_NULL_HANDLE;
+      }
+    }
+    vkDestroyShaderModule(_device, vs, nullptr);
+    return true;
+  }
+
+  // [overnight stage 4] instanced doodad pipeline: binding 0 = per-vertex pos+normal (24B), binding 1 =
+  // per-INSTANCE mat4 (64B, divisor 1, locations 2-5). Depth on, opaque. Same push layout as terrain.
+  bool VulkanBackend::createDoodadPipeline()
+  {
+    VkShaderModule vs = loadShaderModule("doodad.vert.spv");
+    VkShaderModule fs = loadShaderModule("doodad.frag.spv");
+    if (!vs || !fs)
+    {
+      if (vs) vkDestroyShaderModule(_device, vs, nullptr);
+      if (fs) vkDestroyShaderModule(_device, fs, nullptr);
+      LogError << "[VK] doodad shaders missing (doodads skipped)" << std::endl;
+      return true; // soft-optional
+    }
+
+    VkPipelineShaderStageCreateInfo stages[2]{};
+    stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+    stages[0].module = vs;
+    stages[0].pName = "main";
+    stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    stages[1].module = fs;
+    stages[1].pName = "main";
+
+    VkVertexInputBindingDescription binds[2]{};
+    binds[0].binding = 0;
+    binds[0].stride = 24;
+    binds[0].inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+    binds[1].binding = 1;
+    binds[1].stride = 64;
+    binds[1].inputRate = VK_VERTEX_INPUT_RATE_INSTANCE;
+    VkVertexInputAttributeDescription attrs[6]{};
+    attrs[0] = { 0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0 };
+    attrs[1] = { 1, 0, VK_FORMAT_R32G32B32_SFLOAT, 12 };
+    for (std::uint32_t i = 0; i < 4; ++i)
+      attrs[2 + i] = { 2 + i, 1, VK_FORMAT_R32G32B32A32_SFLOAT, i * 16 };
+    VkPipelineVertexInputStateCreateInfo vin{};
+    vin.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+    vin.vertexBindingDescriptionCount = 2;
+    vin.pVertexBindingDescriptions = binds;
+    vin.vertexAttributeDescriptionCount = 6;
+    vin.pVertexAttributeDescriptions = attrs;
+
+    VkPipelineInputAssemblyStateCreateInfo ia{};
+    ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+    VkViewport vp{};
+    vp.width = static_cast<float>(_width);
+    vp.height = static_cast<float>(_height);
+    vp.maxDepth = 1.0f;
+    VkRect2D sc{};
+    sc.extent = { _width, _height };
+    VkPipelineViewportStateCreateInfo vps{};
+    vps.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+    vps.viewportCount = 1;
+    vps.pViewports = &vp;
+    vps.scissorCount = 1;
+    vps.pScissors = &sc;
+
+    VkPipelineRasterizationStateCreateInfo rs{};
+    rs.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+    rs.polygonMode = VK_POLYGON_MODE_FILL;
+    rs.cullMode = VK_CULL_MODE_NONE;
+    rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    rs.lineWidth = 1.0f;
+
+    VkPipelineMultisampleStateCreateInfo ms{};
+    ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+    VkPipelineDepthStencilStateCreateInfo ds{};
+    ds.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+    ds.depthTestEnable = VK_TRUE;
+    ds.depthWriteEnable = VK_TRUE;
+    ds.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
+
+    VkPipelineColorBlendAttachmentState cba{};
+    cba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT
+                       | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    VkPipelineColorBlendStateCreateInfo cb{};
+    cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+    cb.attachmentCount = 1;
+    cb.pAttachments = &cba;
+
+    VkGraphicsPipelineCreateInfo pci{};
+    pci.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    pci.stageCount = 2;
+    pci.pStages = stages;
+    pci.pVertexInputState = &vin;
+    pci.pInputAssemblyState = &ia;
+    pci.pViewportState = &vps;
+    pci.pRasterizationState = &rs;
+    pci.pMultisampleState = &ms;
+    pci.pColorBlendState = &cb;
+    pci.pDepthStencilState = &ds;
+    pci.layout = _terrain_layout; // same push block
+    pci.renderPass = _render_pass;
+    VkResult const r = vkCreateGraphicsPipelines(_device, VK_NULL_HANDLE, 1, &pci, nullptr, &_doodad_pipeline);
     vkDestroyShaderModule(_device, vs, nullptr);
     vkDestroyShaderModule(_device, fs, nullptr);
     if (r != VK_SUCCESS)
     {
-      LogError << "[VK] terrain pipeline create failed: " << vkres(r) << std::endl;
+      LogError << "[VK] doodad pipeline create failed: " << vkres(r) << " (doodads skipped)" << std::endl;
+      _doodad_pipeline = VK_NULL_HANDLE;
+    }
+    return true;
+  }
+
+  bool VulkanBackend::setDoodads(float const* pn_verts, std::size_t vertex_count,
+                                 std::uint32_t const* indices, std::size_t index_count,
+                                 float const* instance_mat4s, std::size_t instance_count,
+                                 DoodadDraw const* draws, std::size_t draw_count)
+  {
+    if (!_ready)
+      return false;
+
+    vkQueueWaitIdle(_queue);
+    auto kill = [&](VkBuffer& b, VkDeviceMemory& m)
+    {
+      if (b) { vkDestroyBuffer(_device, b, nullptr); b = VK_NULL_HANDLE; }
+      if (m) { vkFreeMemory(_device, m, nullptr); m = VK_NULL_HANDLE; }
+    };
+    kill(_doodad_vbo, _doodad_vbo_mem);
+    kill(_doodad_ibo, _doodad_ibo_mem);
+    kill(_doodad_inst, _doodad_inst_mem);
+    _doodad_draws.clear();
+
+    if (!vertex_count || !index_count || !instance_count || !draw_count)
+      return true; // nothing to draw here
+
+    if (!createHostBuffer(VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, vertex_count * 24, _doodad_vbo, _doodad_vbo_mem, pn_verts)
+        || !createHostBuffer(VK_BUFFER_USAGE_INDEX_BUFFER_BIT, index_count * 4, _doodad_ibo, _doodad_ibo_mem, indices)
+        || !createHostBuffer(VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, instance_count * 64, _doodad_inst, _doodad_inst_mem, instance_mat4s))
+    {
+      LogError << "[VK] doodad upload failed" << std::endl;
+      kill(_doodad_vbo, _doodad_vbo_mem);
+      kill(_doodad_ibo, _doodad_ibo_mem);
+      kill(_doodad_inst, _doodad_inst_mem);
       return false;
     }
+    _doodad_draws.assign(draws, draws + draw_count);
+    LogError << "[VK] doodads: " << draw_count << " models / " << instance_count
+             << " instances / " << vertex_count << " verts" << std::endl;
+    return true;
+  }
+
+  bool VulkanBackend::setWaterMesh(float const* pos_normal_interleaved, std::size_t vertex_count,
+                                   std::uint32_t const* indices, std::size_t index_count)
+  {
+    if (!_ready)
+      return false;
+
+    vkQueueWaitIdle(_queue);
+    if (_water_vbo) { vkDestroyBuffer(_device, _water_vbo, nullptr); _water_vbo = VK_NULL_HANDLE; }
+    if (_water_vbo_mem) { vkFreeMemory(_device, _water_vbo_mem, nullptr); _water_vbo_mem = VK_NULL_HANDLE; }
+    if (_water_ibo) { vkDestroyBuffer(_device, _water_ibo, nullptr); _water_ibo = VK_NULL_HANDLE; }
+    if (_water_ibo_mem) { vkFreeMemory(_device, _water_ibo_mem, nullptr); _water_ibo_mem = VK_NULL_HANDLE; }
+    _water_index_count = 0;
+
+    if (!vertex_count || !index_count)
+      return true; // legitimately no water in this neighbourhood
+
+    if (!createHostBuffer(VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, vertex_count * 36, _water_vbo, _water_vbo_mem, pos_normal_interleaved)
+        || !createHostBuffer(VK_BUFFER_USAGE_INDEX_BUFFER_BIT, index_count * 4, _water_ibo, _water_ibo_mem, indices))
+    {
+      LogError << "[VK] water mesh upload failed" << std::endl;
+      return false;
+    }
+    _water_index_count = static_cast<std::uint32_t>(index_count);
+    LogError << "[VK] water mesh: " << vertex_count << " verts / " << index_count << " indices" << std::endl;
     return true;
   }
 
@@ -774,7 +1358,7 @@ namespace Noggit::Rendering::VK
     return true;
   }
 
-  bool VulkanBackend::setTerrainMesh(float const* xyz, std::size_t vertex_count,
+  bool VulkanBackend::setTerrainMesh(float const* pos_normal_interleaved, std::size_t vertex_count,
                                      std::uint32_t const* indices, std::size_t index_count)
   {
     if (!_ready || !vertex_count || !index_count)
@@ -788,7 +1372,7 @@ namespace Noggit::Rendering::VK
     if (_terrain_ibo_mem) { vkFreeMemory(_device, _terrain_ibo_mem, nullptr); _terrain_ibo_mem = VK_NULL_HANDLE; }
     _terrain_index_count = 0;
 
-    if (!createHostBuffer(VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, vertex_count * 12, _terrain_vbo, _terrain_vbo_mem, xyz)
+    if (!createHostBuffer(VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, vertex_count * 36, _terrain_vbo, _terrain_vbo_mem, pos_normal_interleaved)
         || !createHostBuffer(VK_BUFFER_USAGE_INDEX_BUFFER_BIT, index_count * 4, _terrain_ibo, _terrain_ibo_mem, indices))
     {
       LogError << "[VK] terrain mesh upload failed" << std::endl;
@@ -805,7 +1389,7 @@ namespace Noggit::Rendering::VK
     _height = height;
     if (!loadLoader() || !createInstance() || !pickDeviceAndQueue() || !createDevice()
         || !createSharedImage() || !createSemaphores() || !createRenderTarget() || !createPipeline()
-        || !createTerrainPipeline())
+        || !createTextureInfra() || !createTerrainPipeline() || !createDoodadPipeline())
     {
       LogError << "[VK] init failed -- staying on pure GL" << std::endl;
       return false;
@@ -850,7 +1434,19 @@ namespace Noggit::Rendering::VK
     vkCmdBeginRenderPass(_cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
     if (_terrain_index_count && mvp16)
     {
+      // sky gradient behind the terrain (no depth interaction; terrain depth-tests over it)
+      if (_sky_pipeline)
+      {
+        vkCmdBindPipeline(_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, _sky_pipeline);
+        float sky_push[4] = { t, 0.f, 0.f, 0.f };
+        vkCmdPushConstants(_cmd, _pipe_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(sky_push), sky_push);
+        vkCmdDraw(_cmd, 3, 1, 0, 0);
+      }
       vkCmdBindPipeline(_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, _terrain_pipeline);
+      if (_dset)
+      {
+        vkCmdBindDescriptorSets(_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, _terrain_layout, 0, 1, &_dset, 0, nullptr);
+      }
       float push[20]; // mat4 (16) + time + pad
       std::memcpy(push, mvp16, 16 * sizeof(float));
       push[16] = t;
@@ -861,6 +1457,29 @@ namespace Noggit::Rendering::VK
       vkCmdBindVertexBuffers(_cmd, 0, 1, &_terrain_vbo, &zero);
       vkCmdBindIndexBuffer(_cmd, _terrain_ibo, 0, VK_INDEX_TYPE_UINT32);
       vkCmdDrawIndexed(_cmd, _terrain_index_count, 1, 0, 0, 0);
+
+      // doodads (opaque, instanced) after the terrain
+      if (_doodad_pipeline && !_doodad_draws.empty())
+      {
+        vkCmdBindPipeline(_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, _doodad_pipeline);
+        VkBuffer vbs[2] = { _doodad_vbo, _doodad_inst };
+        VkDeviceSize offs[2] = { 0, 0 };
+        vkCmdBindVertexBuffers(_cmd, 0, 2, vbs, offs);
+        vkCmdBindIndexBuffer(_cmd, _doodad_ibo, 0, VK_INDEX_TYPE_UINT32);
+        for (DoodadDraw const& d : _doodad_draws)
+        {
+          vkCmdDrawIndexed(_cmd, d.index_count, d.instance_count, d.first_index, d.base_vertex, d.first_instance);
+        }
+      }
+
+      // water after the terrain (translucent; same layout so the push constants above still apply)
+      if (_water_pipeline && _water_index_count)
+      {
+        vkCmdBindPipeline(_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, _water_pipeline);
+        vkCmdBindVertexBuffers(_cmd, 0, 1, &_water_vbo, &zero);
+        vkCmdBindIndexBuffer(_cmd, _water_ibo, 0, VK_INDEX_TYPE_UINT32);
+        vkCmdDrawIndexed(_cmd, _water_index_count, 1, 0, 0, 0);
+      }
     }
     else
     {
@@ -871,6 +1490,19 @@ namespace Noggit::Rendering::VK
     }
     vkCmdEndRenderPass(_cmd);
     _image_initialized = true;
+
+    // [overnight 04:11] throttled content-stats line for morning diagnosis (every ~900 frames)
+    {
+      static unsigned s_stat_tick = 0;
+      if ((s_stat_tick++ % 900u) == 0)
+      {
+        LogError << "[VK] frame content: terrainIdx=" << _terrain_index_count
+                 << " waterIdx=" << _water_index_count
+                 << " doodadDraws=" << _doodad_draws.size()
+                 << " sky=" << (_sky_pipeline ? 1 : 0)
+                 << " tex=" << (_dset ? 1 : 0) << std::endl;
+      }
+    }
 
     vkEndCommandBuffer(_cmd);
 
@@ -903,6 +1535,24 @@ namespace Noggit::Rendering::VK
       vkDeviceWaitIdle(_device);
     if (_device)
     {
+      if (_ground_view) vkDestroyImageView(_device, _ground_view, nullptr);
+      if (_ground_image) vkDestroyImage(_device, _ground_image, nullptr);
+      if (_ground_mem) vkFreeMemory(_device, _ground_mem, nullptr);
+      if (_dpool) vkDestroyDescriptorPool(_device, _dpool, nullptr); // frees _dset with it
+      if (_dsl) vkDestroyDescriptorSetLayout(_device, _dsl, nullptr);
+      if (_sampler) vkDestroySampler(_device, _sampler, nullptr);
+      if (_doodad_pipeline) vkDestroyPipeline(_device, _doodad_pipeline, nullptr);
+      if (_doodad_vbo) vkDestroyBuffer(_device, _doodad_vbo, nullptr);
+      if (_doodad_vbo_mem) vkFreeMemory(_device, _doodad_vbo_mem, nullptr);
+      if (_doodad_ibo) vkDestroyBuffer(_device, _doodad_ibo, nullptr);
+      if (_doodad_ibo_mem) vkFreeMemory(_device, _doodad_ibo_mem, nullptr);
+      if (_doodad_inst) vkDestroyBuffer(_device, _doodad_inst, nullptr);
+      if (_doodad_inst_mem) vkFreeMemory(_device, _doodad_inst_mem, nullptr);
+      if (_water_pipeline) vkDestroyPipeline(_device, _water_pipeline, nullptr);
+      if (_water_vbo) vkDestroyBuffer(_device, _water_vbo, nullptr);
+      if (_water_vbo_mem) vkFreeMemory(_device, _water_vbo_mem, nullptr);
+      if (_water_ibo) vkDestroyBuffer(_device, _water_ibo, nullptr);
+      if (_water_ibo_mem) vkFreeMemory(_device, _water_ibo_mem, nullptr);
       if (_terrain_vbo) vkDestroyBuffer(_device, _terrain_vbo, nullptr);
       if (_terrain_vbo_mem) vkFreeMemory(_device, _terrain_vbo_mem, nullptr);
       if (_terrain_ibo) vkDestroyBuffer(_device, _terrain_ibo, nullptr);
@@ -912,6 +1562,7 @@ namespace Noggit::Rendering::VK
       if (_depth_view) vkDestroyImageView(_device, _depth_view, nullptr);
       if (_depth_image) vkDestroyImage(_device, _depth_image, nullptr);
       if (_depth_mem) vkFreeMemory(_device, _depth_mem, nullptr);
+      if (_sky_pipeline) vkDestroyPipeline(_device, _sky_pipeline, nullptr);
       if (_pipeline) vkDestroyPipeline(_device, _pipeline, nullptr);
       if (_pipe_layout) vkDestroyPipelineLayout(_device, _pipe_layout, nullptr);
       if (_framebuffer) vkDestroyFramebuffer(_device, _framebuffer, nullptr);
