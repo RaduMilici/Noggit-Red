@@ -249,11 +249,13 @@ namespace Noggit::Rendering::Primitives
 
     void draw(glm::mat4x4 const& mvp
              , glm::vec3 const& camera_pos
-             , int type                    // 0 none, 1 rain, 2 snow
+             , int type                    // 0 none, 1 rain, 2 snow, 3 underwater particulates
              , float intensity             // 0..1
              , float animtime_ms
              , glm::vec3 const& light_color
              , Noggit::NoggitRenderContext context
+             , int liquid_family = 0       // motes only: 0/1 water/ocean, 2 magma, 3 slime -> the
+                                           // client's per-family sheet-cell row (DAT_0086a0a0)
              );
 
     void unload();
@@ -264,6 +266,8 @@ namespace Noggit::Rendering::Primitives
       glm::vec3 pos;
       float speed;
       float seed;
+      float size = 0.05f; // motes: per-particle half-size (client rand[0.5,1.5] x 1/36)
+      int frame = 0;      // motes: sprite cell 0-7 in the 4x4 WaterPoop02 sheet
     };
 
     void setup(Noggit::NoggitRenderContext context);
@@ -272,6 +276,18 @@ namespace Noggit::Rendering::Primitives
     std::vector<float> _vertex_data; // scratch: 6 verts x (pos3 + uv2) per drop
     int _active_type = 0;
     float _last_time = -1.0f;
+    // Motes: ONE shared slow current per emitter (client FUN_0068e1c0/FUN_0068e930) -- no
+    // per-particle velocity; visible motion is mostly camera parallax.
+    glm::vec3 _mote_dir = glm::vec3(0.0f, 1.0f, 0.0f);
+    float _mote_speed = 0.02f; // legacy, unused since the exact oscillation law below
+    // Client mote drift epoch (FUN_0068e1c0/e4f0, constants dumped 2026-08-26): shared direction
+    // oscillation sin(2pi x phase x freq) x amp, re-rolled every half period.
+    float _mote_freq = 0.0125f;
+    float _mote_amp = 0.005f;
+    float _mote_phase = 0.0f;
+    // Current liquid family of the mote pool (client obj+0xfa24 = type & 3). A family change
+    // re-seeds the pool like the client's FUN_0068e720.
+    int _mote_family = 0;
 
     bool _buffers_are_setup = false;
     OpenGL::Scoped::deferred_upload_vertex_arrays<1> _vao;
@@ -280,6 +296,51 @@ namespace Noggit::Rendering::Primitives
     std::unique_ptr<OpenGL::program> _program;
     std::unique_ptr<blp_texture> _rain_texture;
     std::unique_ptr<blp_texture> _snow_texture;
+    std::unique_ptr<blp_texture> _particulate_texture; // Textures\WaterPoop02.blp (underwater motes)
+    bool _texture_failed = false;
+  };
+
+  // Client 1.12 Water0Ripple port (RE doc 36, FUN_0068f8b0 chain): flat additive quads on the
+  // liquid surface -- wake rings while swimming (XTextures\splash\wake.blp), a splash burst on
+  // water entry (splash.blp). Client laws: linear size growth over the lifetime, alpha
+  // ATTACK/DECAY peaking at 40% of life (measured, both kinds), per-entry rotation, white x
+  // alpha. (The client also clips each quad to the liquid surface triangles; this draws plain
+  // surface-height quads -- documented simplification.)
+  class WaterRipples
+  {
+  public:
+    WaterRipples();
+    ~WaterRipples(); // out-of-line: unique_ptr<blp_texture> members with forward-declared type
+
+    // kind: 0 = wake ring, 1 = splash burst
+    void spawn(glm::vec3 const& surface_pos, float rotation_rad, float size0, float growth,
+               float lifetime_s, float alpha_peak, int kind);
+
+    void draw(glm::mat4x4 const& mvp, float animtime_ms, Noggit::NoggitRenderContext context);
+    void unload();
+
+  private:
+    struct RippleEntry
+    {
+      glm::vec3 pos;
+      float rot;
+      float size0, growth;
+      float birth_ms, lifetime_ms;
+      float alpha_peak;
+      int kind;
+    };
+
+    void setup(Noggit::NoggitRenderContext context);
+
+    std::vector<RippleEntry> _entries;
+    std::vector<float> _vertex_data;
+    bool _buffers_are_setup = false;
+    OpenGL::Scoped::deferred_upload_vertex_arrays<1> _vao;
+    OpenGL::Scoped::deferred_upload_buffers<1> _buffers;
+    GLuint const& _vbo = _buffers[0];
+    std::unique_ptr<OpenGL::program> _program;
+    std::unique_ptr<blp_texture> _wake_texture;
+    std::unique_ptr<blp_texture> _splash_texture;
     bool _texture_failed = false;
   };
 

@@ -116,6 +116,12 @@ namespace Noggit::Project
     std::string ProjectPath;
     std::string ProjectName;
     std::string ClientPath;
+    // Archive basenames this project must NOT mount (json "IgnoredArchives"). For clients that
+    // gate content archives at runtime (Ascension HD models in patch-CHA.MPQ: mounted by the game
+    // only with the HD toggle on) -- noggit otherwise mounts everything and renders models the
+    // player's client never uses (doc 40 sec 14). Applied via NOGGIT_EXCLUDE_ARCHIVES before
+    // ClientData construction in loadProject.
+    std::vector<std::string> IgnoredArchives;
     ProjectVersion projectVersion;
     std::vector<NoggitProjectPinnedMap> PinnedMaps;
     std::vector<NoggitProjectBookmarkMap> Bookmarks;
@@ -295,6 +301,23 @@ namespace Noggit::Project
       }
 
       project->ClientDatabase = std::make_shared<BlizzardDatabaseLib::BlizzardDatabase>(dbd_file_directory, client_build);
+
+      // Project-level archive exclusion (json "IgnoredArchives") -> handed to ClientData through
+      // NOGGIT_EXCLUDE_ARCHIVES (its single mount choke point reads it; doc 40 sec 14). ALWAYS
+      // (re)written per load -- empty when the project lists nothing -- so a previous project's
+      // exclusion never leaks into the next one opened in the same session. A user-set env var is
+      // overridden while a project is open (project setting wins), which is the intended precedence.
+      {
+        std::string joined;
+        for (auto const& name : project->IgnoredArchives)
+        {
+          if (!joined.empty()) joined += ';';
+          joined += name;
+        }
+        qputenv("NOGGIT_EXCLUDE_ARCHIVES", QByteArray::fromStdString(joined));
+        if (!joined.empty())
+          LogDebug << "Project ignores archives: " << joined << std::endl;
+      }
 
       try
       {

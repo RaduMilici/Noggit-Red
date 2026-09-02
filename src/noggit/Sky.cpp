@@ -661,6 +661,46 @@ float Skies::weather_intensity()
   return g_weather_intensity;
 }
 
+namespace
+{
+  // The WATER param's river-deep band, weighted across the active lights (computed each frame in
+  // update_sky_colors) -- the flat colour for exterior WMO liquid (canal dark blue). File-scope
+  // static for the same reason as the weather intensity.
+  glm::vec3 g_water_river_dark(0.05f, 0.15f, 0.25f);
+}
+
+void Skies::set_water_river_dark(glm::vec3 const& c)
+{
+  g_water_river_dark = c;
+}
+
+glm::vec3 Skies::water_river_dark()
+{
+  return g_water_river_dark;
+}
+
+float Sky::floatParamForAirVariant(int r, int t) const
+{
+  // The AIR twin of the current param: submersion swaps CLEAR->CLEAR_WATER (and storm blending
+  // uses STORM_WATER), but some bands must not follow -- clouds exist above the surface no matter
+  // where the camera is (user 2026-08-26: the underwater param's empty CLOUD_DENSITY zeroed the
+  // coverage; surfacing re-grew the cloud texture rows-per-frame = the "helmet closing" banding).
+  int const air_idx = (curr_sky_param == CLEAR_WATER) ? CLEAR
+                    : (curr_sky_param == STORM_WATER) ? STORM
+                    : curr_sky_param;
+  SkyParam const* p = skyParams[air_idx];
+  float const base = p ? floatFromParam(p, r, t) : floatParamFor(r, t);
+  if (p && g_weather_intensity > 0.0f)
+  {
+    SkyParam const* storm = skyParams[STORM];
+    if (storm)
+    {
+      return base + (floatFromParam(storm, r, t) - base) * g_weather_intensity;
+    }
+  }
+  return base;
+}
+
 float Sky::floatParamFor(int r, int t) const
 {
   float const base = floatFromParam(active_sky_param(*this), r, t);
@@ -1162,7 +1202,7 @@ void Skies::update_sky_colors(glm::vec3 pos, int time)
 
     _fog_distance = default_sky->floatParamFor(0, time);
     _fog_multiplier = default_sky->floatParamFor(1, time);
-    _cloud_coverage = default_sky->floatParamFor(CLOUD_DENSITY, time);
+    _cloud_coverage = default_sky->floatParamForAirVariant(CLOUD_DENSITY, time); // never the underwater band
     _celestial_flow = default_sky->floatParamFor(CELESTIAL_FLOW, time); // dusk twilight weight (was unread)
 
     auto default_sky_param = active_sky_param(*default_sky);
@@ -1219,7 +1259,7 @@ void Skies::update_sky_colors(glm::vec3 pos, int time)
 
       _fog_distance = (_fog_distance * (1.0f - sky.weight)) + (sky.floatParamFor(0, time) * sky.weight);
       _fog_multiplier = (_fog_multiplier * (1.0f - sky.weight)) + (sky.floatParamFor(1, time) * sky.weight);
-      _cloud_coverage = (_cloud_coverage * (1.0f - sky.weight)) + (sky.floatParamFor(CLOUD_DENSITY, time) * sky.weight);
+      _cloud_coverage = (_cloud_coverage * (1.0f - sky.weight)) + (sky.floatParamForAirVariant(CLOUD_DENSITY, time) * sky.weight);
       _celestial_flow = (_celestial_flow * (1.0f - sky.weight)) + (sky.floatParamFor(CELESTIAL_FLOW, time) * sky.weight);
       // sky.skyParams[sky.curr_sky_param]->river_shallow_alpha(); // new
       // sky.skyParams[sky.curr_sky_param].river_shallow_alpha(); // old
@@ -1235,6 +1275,37 @@ void Skies::update_sky_colors(glm::vec3 pos, int time)
       }
     }
 
+  }
+
+  // Exterior WMO water flat colour = the WATER param's RIVER_COLOR_DARK band, weighted like every
+  // other band (default light then positional mixes). Falls back to a light's active param when it
+  // authors no CLEAR_WATER set. Published via the Skies static for wmo_liquid::draw.
+  {
+    glm::vec3 water_river_dark(0.0f);
+    if (default_sky)
+    {
+      SkyParam const* p = default_sky->skyParams[CLEAR_WATER]
+                        ? default_sky->skyParams[CLEAR_WATER]
+                        : active_sky_param(*default_sky);
+      if (p)
+      {
+        water_river_dark = default_sky->colorFromParam(p, RIVER_COLOR_DARK, time);
+      }
+    }
+    for (Sky const& sky : skies)
+    {
+      if (sky.weight > 0)
+      {
+        SkyParam const* p = sky.skyParams[CLEAR_WATER] ? sky.skyParams[CLEAR_WATER]
+                                                       : active_sky_param(sky);
+        if (p)
+        {
+          water_river_dark = glm::mix(water_river_dark,
+                                      sky.colorFromParam(p, RIVER_COLOR_DARK, time), sky.weight);
+        }
+      }
+    }
+    Skies::set_water_river_dark(water_river_dark);
   }
 
   // NORTHREND SKY DOME (map 571) = dark & gloomy, not the DBC default light's bright cyan. The 3.3.5a
@@ -1498,6 +1569,7 @@ void Skies::tick_clouds(float dt_sec)
   }
 
   gl.bindTexture(GL_TEXTURE_2D, c.texture);
+  ++_vk_cloud_tex_serial;   // [VULKAN] the deck texture changed -> VK re-uploads its bindless slot
   gl.texSubImage2D(GL_TEXTURE_2D, 0, 0, row0, S, CloudGen::ROWS_PER_TICK,
                    GL_RGBA, GL_UNSIGNED_BYTE, &c.rgba[row0 * S * 4]);
 
@@ -1513,7 +1585,10 @@ void Skies::draw_clouds(glm::mat4x4 const& mvp, glm::vec3 const& camera_pos, int
 {
   QSettings cs;
   bool const on = cs.value("render/draw_clouds", true).toBool();
-  float const opacity = on ? cs.value("render/cloud_density", 0.9f).toFloat() : 0.0f;
+  // suppressed while the camera is underwater: draw nothing, but the tick below still runs on
+  // the AIR density -- the deck texture stays intact for the moment of surfacing.
+  float const opacity = (on && !_cloud_draw_suppressed)
+                      ? cs.value("render/cloud_density", 0.9f).toFloat() : 0.0f;
 
   if (!_clouds.initialized)
     init_cloud_gen();
@@ -1522,6 +1597,7 @@ void Skies::draw_clouds(glm::mat4x4 const& mvp, glm::vec3 const& camera_pos, int
   _last_cloud_animtime = animtime;
   if (on)
     tick_clouds(glm::clamp(dt, 0.f, 0.5f));
+  _vk_cloud_opacity = opacity;   // [VULKAN] the deck's live strength, pushed to the VK pipeline
   if (opacity <= 0.001f)
     return;
 
@@ -1618,6 +1694,11 @@ void main()
       gl.bindBuffer(GL_ELEMENT_ARRAY_BUFFER, _cloud_ibo);
       gl.bufferData(GL_ELEMENT_ARRAY_BUFFER, idx.size() * sizeof(std::uint16_t), idx.data(), GL_STATIC_DRAW);
       gl.bindVertexArray(0);
+
+      // [VULKAN] mirror the cap for the VK cloud pipeline (GL's copies live only in these locals).
+      _vk_cloud_verts = verts;
+      _vk_cloud_indices = idx;
+      _vk_cloud_mesh_dirty = true;
     }
   }
 
@@ -1635,9 +1716,12 @@ void main()
   gl.blendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ZERO, GL_ONE);
   OpenGL::Scoped::bool_setter<GL_CULL_FACE, GL_FALSE> const no_cull;
   OpenGL::Scoped::depth_mask_setter<GL_FALSE> const no_depth_write;
-  gl.bindVertexArray(_cloud_vao);
-  gl.drawElements(GL_TRIANGLES, _cloud_indices_count, GL_UNSIGNED_SHORT, nullptr);
-  gl.bindVertexArray(0);
+  if (!_vk_owns_clouds)
+  {
+    gl.bindVertexArray(_cloud_vao);
+    gl.drawElements(GL_TRIANGLES, _cloud_indices_count, GL_UNSIGNED_SHORT, nullptr);
+    gl.bindVertexArray(0);
+  }
   gl.blendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
   gl.disable(GL_BLEND);
 }
@@ -1652,6 +1736,10 @@ bool Skies::draw(glm::mat4x4 const& model_view
                 , OutdoorLightStats const& light_stats
                 )
 {
+  // Reset what this frame drew before the branches below refill it.
+  _vk_skybox_instance = nullptr;
+  _vk_stars_instance = nullptr;
+
   if (numSkies == 0)
   {
     if (!_uploaded)
@@ -1681,7 +1769,8 @@ bool Skies::draw(glm::mat4x4 const& model_view
     // makes the whole sky blend to fully transparent -> the cleared black shows through. Bloom hid this
     // because its composite disables blend as the last op. Force blend off for the opaque sky dome.
     gl.disable(GL_BLEND);
-    gl.drawElements(GL_TRIANGLES, _indices_count, GL_UNSIGNED_SHORT, nullptr);
+    if (!_vk_owns_dome)
+      gl.drawElements(GL_TRIANGLES, _indices_count, GL_UNSIGNED_SHORT, nullptr);
 
     draw_clouds(projection * model_view, camera_pos, animtime);
 
@@ -1716,7 +1805,8 @@ bool Skies::draw(glm::mat4x4 const& model_view
       // particle pass would make SRC_ALPHA=0 blend it fully transparent -> black sky (only visible with
       // bloom off, since bloom's composite disables blend last). Force blend off here.
       gl.disable(GL_BLEND);
-      gl.drawElements(GL_TRIANGLES, _indices_count, GL_UNSIGNED_SHORT, nullptr);
+      if (!_vk_owns_dome)
+        gl.drawElements(GL_TRIANGLES, _indices_count, GL_UNSIGNED_SHORT, nullptr);
     }
   }
 
@@ -1789,6 +1879,7 @@ bool Skies::draw(glm::mat4x4 const& model_view
       m2_shader.uniform("masked_additive", 0);
       m2_shader.uniform("pixel_shader", 0);
 
+      _vk_skybox_instance = &model;   // [VULKAN] fed to the VK M2 feed by WorldRender
       model.model->renderer()->draw(model_view, model, m2_shader, model_render_state, frustum, 1000000, camera_pos, skybox_animtime, display_mode::in_3D);
     }
   }
@@ -1818,6 +1909,7 @@ bool Skies::draw(glm::mat4x4 const& model_view
     m2_shader.uniform("masked_additive", 0);
     m2_shader.uniform("pixel_shader", 0);
 
+    _vk_stars_instance = &stars;   // [VULKAN] fed to the VK M2 feed by WorldRender
     stars.model->renderer()->draw(model_view, stars, m2_shader, model_render_state, frustum, 1000000, camera_pos, animtime, display_mode::in_3D);
   }
 
@@ -1985,6 +2077,11 @@ void main()
   gl.bufferData<GL_ARRAY_BUFFER, glm::vec3>(_vertices_vbo, vertices, GL_STATIC_DRAW);
   gl.bufferData<GL_ELEMENT_ARRAY_BUFFER, std::uint16_t>(_indices_vbo, indices, GL_STATIC_DRAW);
 
+  // [VULKAN] mirror the dome for the VK sky pipeline (GL's copies live only in these locals).
+  _vk_dome_verts = vertices;
+  _vk_dome_indices = indices;
+  _vk_sky_dirty = true;
+
   _indices_count = static_cast<int>(indices.size());
 
   _uploaded = true;
@@ -2089,6 +2186,10 @@ void Skies::update_color_buffer()
   }
 
   gl.bufferData<GL_ARRAY_BUFFER, glm::vec3>(_colors_vbo, colors, GL_STATIC_DRAW);
+
+  // [VULKAN] same colours feed the VK dome pipeline.
+  _vk_dome_colors = colors;
+  _vk_sky_dirty = true;
 
   _need_vao_update = true;
 }

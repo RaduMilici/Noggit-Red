@@ -23,6 +23,17 @@ namespace Noggit::Rendering
   class WMORender : public BaseRender
   {
   public:
+    // [VULKAN phase D] the fog context this WMO was last drawn with, captured where GL pushes it as
+    // uniforms so the VK feed sends the SAME values instead of falling back to global zone fog.
+    struct VkFogContext
+    {
+      bool use_wmo_fog = false;
+      glm::vec3 color = glm::vec3(0.f);
+      float start_frac = 0.25f;
+      float end = 0.f;
+    };
+    VkFogContext const& vkFogContext() const { return _vk_fog; }
+
     WMORender(WMO* wmo);
 
     void upload() override;
@@ -63,6 +74,7 @@ namespace Noggit::Rendering
     ) const;
 
   private:
+    VkFogContext _vk_fog;
     WMO* _wmo;
   };
 }

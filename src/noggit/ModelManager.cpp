@@ -27,7 +27,11 @@ namespace
   }
 }
 
-decltype (ModelManager::_) ModelManager::_ {};
+// [EXIT-CRASH FIX 2026-08-29] Intentionally LEAKED: the three object managers reference each other
+// from their element destructors (~WMO -> ModelManager::_, ~Model -> TextureManager::_), and their
+// cross-TU static destruction order is unspecified, so whichever died first left the others faulting
+// on a destroyed mutex/map during process exit. Never destroying them removes the hazard entirely.
+Noggit::AsyncObjectMultimap<Model>& ModelManager::_ = *new Noggit::AsyncObjectMultimap<Model>();
 
 void ModelManager::report()
 {

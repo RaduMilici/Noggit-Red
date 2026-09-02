@@ -3,8 +3,8 @@
 #include "WMOGroupRender.hpp"
 #include <atomic> // [TEXARRAYDBG] temporary
 #include <sstream> // [TEXARRAYDBG] temporary
-#include <vector> // [TEXBINDDBG] temporary
-#include <string> // [TEXBINDDBG] temporary
+#include <vector>
+#include <string>
 #include <noggit/WMO.h>
 
 #include <cstdlib>
@@ -98,6 +98,13 @@ void WMOGroupRender::upload()
 
     _render_batches[batch_counter].tex_array0 = tex_array0;
     _render_batches[batch_counter].tex_array1 = tex_array1;
+    // [VULKAN phase D] the same two textures, addressed by FILE so VK can bind them bindlessly
+    _render_batch_blps[batch_counter].first = tex1->file_key().stringRepr();
+    if (use_tex2)
+    {
+      _render_batch_blps[batch_counter].second =
+          _wmo_group->wmo->textures[mat.texture2]->file_key().stringRepr();
+    }
     _render_batches[batch_counter].tex0 = array_index0;
     _render_batches[batch_counter].tex1 = array_index1;
 
@@ -359,6 +366,43 @@ void WMOGroupRender::upload()
         , GL_STATIC_DRAW);
   }
 
+  // [VULKAN phase D] MIRROR for the VK WMO pass -- must happen BEFORE the frees below, because
+  // upload() is the last point at which normals / texcoords / vertex colours / render batches still
+  // exist on the CPU. Sized off the vertex array; every optional stream is bounds-checked so a group
+  // missing a second UV set or vertex colours still mirrors cleanly.
+  {
+    std::size_t const n = _wmo_group->_vertices.size();
+    _vk_verts.clear();
+    _vk_verts.resize(n);
+    for (std::size_t i = 0; i < n; ++i)
+    {
+      VkWmoVertex& v = _vk_verts[i];
+      v.pos = _wmo_group->_vertices[i];
+      v.normal = i < _wmo_group->_normals.size() ? _wmo_group->_normals[i] : glm::vec3(0.f, 1.f, 0.f);
+      v.uv0 = i < _wmo_group->_texcoords.size() ? _wmo_group->_texcoords[i] : glm::vec2(0.f);
+      v.uv1 = i < _wmo_group->_texcoords_2.size() ? _wmo_group->_texcoords_2[i] : glm::vec2(0.f);
+      v.color = i < _wmo_group->_vertex_colors.size() ? _wmo_group->_vertex_colors[i] : glm::vec4(1.f);
+      v.batch_id = i < _render_batch_mapping.size() ? _render_batch_mapping[i] : 0u;
+      v._pad = 0u;
+    }
+    _vk_indices = _wmo_group->_indices;
+    _vk_batches = _render_batches;
+    _vk_batch_mapping = _render_batch_mapping;
+    _vk_batch_blps = _render_batch_blps;
+    _vk_dirty = !_vk_verts.empty() && !_vk_indices.empty();
+    {
+      // [VK-DIFF] the mirror falls back to a CONSTANT normal when _normals is already empty, which
+      // makes the VK lighting flat. Count it: it must be 0 for every mirrored group.
+      static unsigned s_groups = 0, s_no_normals = 0, s_no_colors = 0;
+      ++s_groups;
+      if (_wmo_group->_normals.size() < n) ++s_no_normals;
+      if (_wmo_group->_vertex_colors.size() < n) ++s_no_colors;
+      if ((s_groups % 64u) == 0u)
+        LogError << "[VK] WMO mirror: groups=" << s_groups << " missingNormals=" << s_no_normals
+                 << " missingColors=" << s_no_colors << std::endl;
+    }
+  }
+
   // free unused data
   _wmo_group->_blend_alphas.clear();
   _wmo_group->_normals.clear();
@@ -414,6 +458,17 @@ void WMOGroupRender::setupVao(OpenGL::Scoped::use_program& wmo_shader)
   _vao_is_setup = true;
 }
 
+// [VK-DIFF phase D] draw calls GL issued for WMO groups this frame; WorldRender resets it.
+unsigned g_gl_wmo_draw_calls = 0;
+// Bumped once per frame by WorldRender::vkResetWmoFrame(); stamps each group's run capture so
+// the VK feed can tell "GL drew this group this frame" from "this record is stale".
+unsigned g_wmo_frame_stamp = 0;
+unsigned g_gl_draw_wmo_group = 0;
+// Set by WorldRender each frame: when Vulkan owns the WMO pass, this group draw still computes and
+// RECORDS its visible runs (the VK feed replays them) but does not issue the GL draw, because the
+// VK compose has already put those pixels in the framebuffer.
+bool g_vk_owns_wmo = false;
+
 void WMOGroupRender::draw(OpenGL::Scoped::use_program& wmo_shader
     , math::frustum const& frustum
     , glm::mat4x4 const& transform
@@ -423,6 +478,11 @@ void WMOGroupRender::draw(OpenGL::Scoped::use_program& wmo_shader
     , bool // world_has_skies
 )
 {
+
+  // [VULKAN phase D] record what GL emits this draw so the VK feed can replay it exactly
+  _vk_last_runs.clear();
+  _vk_last_run_frame = g_wmo_frame_stamp;
+
   if (!_uploaded)
   [[unlikely]]
   {
@@ -443,11 +503,17 @@ void WMOGroupRender::draw(OpenGL::Scoped::use_program& wmo_shader
 
   OpenGL::Scoped::vao_binder const _ (_vao);
 
-  gl.activeTexture(GL_TEXTURE0);
-  gl.bindTexture(GL_TEXTURE_BUFFER, _render_batch_tex);
+  // [finding 93] VK owns this pass: the GL state below exists only to serve draws that the gate
+  // at the bottom of emit() then skips. Record, do not set up.
+  bool const vk_records_only = g_vk_owns_wmo;
+  if (!vk_records_only)
+  {
+    gl.activeTexture(GL_TEXTURE0);
+    gl.bindTexture(GL_TEXTURE_BUFFER, _render_batch_tex);
+  }
 
   bool backface_cull = true;
-  gl.enable(GL_CULL_FACE);
+  if (!vk_records_only) { gl.enable(GL_CULL_FACE); }
 
   // Per-batch frustum cull (D4, client MOBA semantics): inside a merged draw call, test each member
   // batch's AABB (instance-transformed) and emit only the contiguous runs of visible batches. Runs
@@ -511,7 +577,7 @@ void WMOGroupRender::draw(OpenGL::Scoped::use_program& wmo_shader
       }
     }
 
-    if (backface_cull != draw_call.backface_cull)
+    if (!vk_records_only && backface_cull != draw_call.backface_cull)
     {
       if (draw_call.backface_cull)
       {
@@ -525,7 +591,9 @@ void WMOGroupRender::draw(OpenGL::Scoped::use_program& wmo_shader
       backface_cull = draw_call.backface_cull;
     }
 
-    for(std::size_t i = 0; i < draw_call.samplers.size(); ++i)
+    // the sampler binds are the hottest pair in the whole walk (461 bindTexture + 388
+    // activeTexture per frame); VK binds its own textures from the batch table
+    for(std::size_t i = 0; !vk_records_only && i < draw_call.samplers.size(); ++i)
     {
       if (draw_call.samplers[i] < 0)
         break;
@@ -534,91 +602,17 @@ void WMOGroupRender::draw(OpenGL::Scoped::use_program& wmo_shader
       gl.bindTexture(GL_TEXTURE_2D_ARRAY, draw_call.samplers[i]);
     }
 
-    // [TEXBINDDBG 2026-07-30] temporary: read back what is ACTUALLY bound to each texture unit right before
-    // the draw, and the sampler-array uniform values. The shader proves slot 0 samples correctly while slot 1
-    // returns garbage even at a fixed UV, so either unit 2 holds a different texture than the draw call
-    // recorded, or the sampler uniform doesn't map slot 1 -> unit 2.
-    {
-      static std::atomic<int> dbg{0};
-      bool const of_interest = _wmo_group->wmo->file_key().hasFilepath()
-        && _wmo_group->wmo->file_key().filepath().find("icebreaker") != std::string::npos;
-      if (of_interest && dbg.fetch_add(1) < 12)
-      {
-        std::ostringstream o;
-        o << "[TEXBINDDBG] drawcall n_used=" << draw_call.n_used_samplers << " expected=[";
-        for (std::size_t i = 0; i < draw_call.samplers.size() && draw_call.samplers[i] >= 0; ++i)
-        {
-          if (i) o << ",";
-          o << draw_call.samplers[i];
-        }
-        o << "] actually_bound=[";
-        for (int unit = 1; unit <= 6; ++unit)
-        {
-          GLint bound = 0;
-          gl.activeTexture(static_cast<GLenum>(GL_TEXTURE0 + unit));
-          gl.getIntegerv(GL_TEXTURE_BINDING_2D_ARRAY, &bound);
-          if (unit > 1) o << ",";
-          o << "u" << unit << ":" << bound;
-        }
-        o << "]";
-
-        // Read the ENV slot's texture straight off the GPU. Everything else checks out (right name bound,
-        // right file uploaded, no GL errors), yet sampling it at a fixed (0.5,0.5) returns green while
-        // wr_env's centre is (164,174,180). WIDTH==0 would mean the object has no storage at all.
-        if (auto* f = gl._4_1_core_func)
-        {
-          gl.activeTexture(GL_TEXTURE0 + 2);
-          GLint tw = 0, th = 0, td = 0, tfmt = 0;
-          f->glGetTexLevelParameteriv(GL_TEXTURE_2D_ARRAY, 0, GL_TEXTURE_WIDTH, &tw);
-          f->glGetTexLevelParameteriv(GL_TEXTURE_2D_ARRAY, 0, GL_TEXTURE_HEIGHT, &th);
-          f->glGetTexLevelParameteriv(GL_TEXTURE_2D_ARRAY, 0, GL_TEXTURE_DEPTH, &td);
-          f->glGetTexLevelParameteriv(GL_TEXTURE_2D_ARRAY, 0, GL_TEXTURE_INTERNAL_FORMAT, &tfmt);
-          o << " unit2_tex: " << tw << "x" << th << " layers=" << td << " fmt=" << tfmt;
-          if (tw > 0 && th > 0 && td > 0)
-          {
-            std::vector<unsigned char> px(static_cast<std::size_t>(tw) * th * td * 4, 0);
-            f->glGetTexImage(GL_TEXTURE_2D_ARRAY, 0, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
-            auto at = [&](int x, int y) -> std::string
-            {
-              std::size_t const i = (static_cast<std::size_t>(y) * tw + x) * 4;
-              std::ostringstream p;
-              p << "(" << int(px[i]) << "," << int(px[i+1]) << "," << int(px[i+2]) << ")";
-              return p.str();
-            };
-            o << " centre=" << at(tw/2, th/2) << " topleft=" << at(0, 0) << " q=" << at(tw/4, th/4);
-          }
-        }
-
-        // The texture at unit 2 reads back CORRECT (128x128, centre = wr_env's real centre), yet sampling
-        // slot 1 returns green while slot 0 is fine. So check the sampler-array uniform itself: element i
-        // MUST equal texture unit 1+i. Query each element BY NAME -- glUniform1iv on the array's base
-        // location silently does nothing if the driver doesn't lay the elements out contiguously.
-        if (auto* f = gl._4_1_core_func)
-        {
-          GLint prog = 0;
-          gl.getIntegerv(GL_CURRENT_PROGRAM, &prog);
-          o << " prog=" << prog << " texture_samplers=[";
-          for (int i = 0; i < 4; ++i)
-          {
-            std::string const nm = "texture_samplers[" + std::to_string(i) + "]";
-            GLint const l = f->glGetUniformLocation(static_cast<GLuint>(prog), nm.c_str());
-            GLint v = -999;
-            if (l >= 0)
-            {
-              f->glGetUniformiv(static_cast<GLuint>(prog), l, &v);
-            }
-            if (i) o << ",";
-            o << v << "@loc" << l;
-          }
-          o << "] (expect 1@..,2@..,3@..,4@..)";
-        }
-
-        LogError << o.str() << std::endl;
-      }
-    }
-
     for (auto const& run : visible_runs)
     {
+      ++g_gl_wmo_draw_calls;
+      _vk_last_runs.push_back(VkRun{run.first, run.second,
+                                    static_cast<std::int32_t>(draw_call.blend_mode),
+                                    draw_call.backface_cull ? 1 : 0});
+      if (g_vk_owns_wmo)
+      {
+        continue;   // recorded for the VK feed; VK draws it, so GL must not draw it again on top
+      }
+      { extern unsigned g_gl_draw_wmo_group; ++g_gl_draw_wmo_group; }   // AFTER the ownership gate
       gl.drawElements (GL_TRIANGLES, run.second, GL_UNSIGNED_SHORT, reinterpret_cast<void*>(sizeof(std::uint16_t)*run.first));
     }
   };
@@ -653,8 +647,7 @@ void WMOGroupRender::draw(OpenGL::Scoped::use_program& wmo_shader
 
   if (has_blended)
   {
-    gl.enable(GL_BLEND);
-    gl.depthMask(GL_FALSE);
+    if (!vk_records_only) { gl.enable(GL_BLEND); gl.depthMask(GL_FALSE); }
 
     for (auto& draw_call : _draw_calls)
     {
@@ -684,8 +677,7 @@ void WMOGroupRender::draw(OpenGL::Scoped::use_program& wmo_shader
       issue_draw_call(draw_call);
     }
 
-    gl.depthMask(GL_TRUE);
-    gl.disable(GL_BLEND);
+    if (!vk_records_only) { gl.depthMask(GL_TRUE); gl.disable(GL_BLEND); }
 
     if (fog_color_mode != 0)
     {
@@ -701,6 +693,8 @@ void WMOGroupRender::initRenderBatches()
   std::fill(_render_batch_mapping.begin(), _render_batch_mapping.end(), 0);
 
   _render_batches.resize(_wmo_group->_batches.size());
+  // [VULKAN phase D] BLP names per batch -- VK resolves textures by name, not by GL array handle
+  _render_batch_blps.assign(_wmo_group->_batches.size(), {});
 
   std::size_t batch_counter = 0;
   for (auto& batch : _wmo_group->_batches)

@@ -37,13 +37,17 @@ namespace Noggit::Rendering
     // Live-apply the render/anisotropic_filtering setting to the already-uploaded liquid arrays.
     void reapply_anisotropy();
 
-    tsl::robin_map<unsigned, std::tuple<GLuint, glm::vec2, int, unsigned>> const& getTextureFrames() { return _texture_frames_map; };
+    tsl::robin_map<unsigned, std::tuple<GLuint, glm::vec2, int, unsigned>> const& getTextureFrames() const { return _texture_frames_map; };
+    // [VULKAN] liquidTypeRecID -> (texture base name, frame count). VK addresses liquid textures by
+    // FILE (bindless), not by GL array handle, so it needs the names upload() already derived.
+    tsl::robin_map<unsigned, std::pair<std::string, unsigned>> const& vkTextureNames() const { return _vk_texture_names; }
 
   private:
     bool _uploaded = false;
 
     // liquidTypeRecID : (array, (animation_x, animation_y), liquid_type)
     tsl::robin_map<unsigned, std::tuple<GLuint, glm::vec2, int, unsigned>> _texture_frames_map;
+    tsl::robin_map<unsigned, std::pair<std::string, unsigned>> _vk_texture_names;
 
     Noggit::NoggitRenderContext _context;
   };

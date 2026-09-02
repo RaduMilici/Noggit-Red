@@ -60,6 +60,10 @@ namespace Noggit::Ui::Windows
                                     std::optional<glm::vec3> camera_position = std::nullopt,
                                     math::degrees camera_yaw = math::degrees(90.f),
                                     math::degrees camera_pitch = math::degrees(30.f));
+      // [VULKAN 2026-08-29] self-run parity loop: open map_id OFF-SCREEN (window never activates or
+      // appears on a monitor), force Graphics API = Vulkan + parity check, step the camera list, write
+      // vk_diff/<cam>_{gl,vk,diff}.png + the [VK-DIFF] lines, return when the harness reports done.
+      bool runVkParity(int map_id, QString const& cams_file, QString const& out_dir, int width, int height);
 
       QMenuBar* _menuBar;
 

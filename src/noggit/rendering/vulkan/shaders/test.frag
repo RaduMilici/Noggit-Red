@@ -4,6 +4,7 @@
 
 layout(location = 0) in vec2 v_uv;
 layout(location = 0) out vec4 out_color;
+layout(location = 1) out float out_z; // [phase A] depth-as-colour (R32F attachment GL imports)
 
 layout(push_constant) uniform Push
 {
@@ -20,4 +21,5 @@ void main()
   vec3 col = 0.5 + 0.5 * cos(pc.time + vec3(0.0, 2.1, 4.2) + rings * 3.0);
   col *= smoothstep(1.05, 0.85, r) * 0.9 + 0.1; // soft vignette
   out_color = vec4(col, 1.0);
+  out_z = 1.0;
 }

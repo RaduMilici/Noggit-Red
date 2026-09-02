@@ -1903,6 +1903,56 @@ void Model::initAnimated(const BlizzardArchive::ClientFile& f)
                          classic_anim.minimumRepetitions, classic_anim.maximumRepetitions,
                          classic_anim.blendTime });
       }
+
+      // ===== M2 ANIM EVENTS (doc 38): $FSD footsteps / $FD1-4 fidgets / $CSD sounds fire from
+      // these keyframes in the client (CGUnit_C::HandleAnimEvent). Classic layout: each event
+      // carries a classic TRACK BASE whose ranges are PER SEQUENCE INDEX into one global times
+      // array; anim-local time = t - times[range.start] (same law as every classic track). =====
+      if (header.nEvents > 0 && header.ofsEvents
+          && header.ofsEvents + header.nEvents * sizeof(ClassicModelEventDef) <= f.getSize())
+      {
+        auto const* event_defs =
+          reinterpret_cast<ClassicModelEventDef const*>(f.getBuffer() + header.ofsEvents);
+        _anim_events.clear();
+        _anim_events.reserve(header.nEvents);
+        for (std::uint32_t ev_i = 0; ev_i < header.nEvents; ++ev_i)
+        {
+          auto const& def = event_defs[ev_i];
+          ModelAnimEvent ev;
+          std::memcpy(&ev.fourcc, def.id, 4);
+          ev.data = def.data;
+          if (def.nTimes && def.ofsTimes
+              && def.ofsTimes + def.nTimes * sizeof(std::uint32_t) <= f.getSize()
+              && def.nRanges && def.ofsRanges
+              && def.ofsRanges + def.nRanges * 2u * sizeof(std::uint32_t) <= f.getSize())
+          {
+            auto const* ev_times =
+              reinterpret_cast<std::uint32_t const*>(f.getBuffer() + def.ofsTimes);
+            auto const* ev_ranges =
+              reinterpret_cast<std::uint32_t const*>(f.getBuffer() + def.ofsRanges);
+            std::uint32_t const n_ranges = std::min(def.nRanges, header.nAnimations);
+            for (std::uint32_t r = 0; r < n_ranges; ++r)
+            {
+              std::uint32_t const start = ev_ranges[r * 2];
+              std::uint32_t end = ev_ranges[r * 2 + 1];
+              if (start > end || start >= def.nTimes)
+              {
+                continue;
+              }
+              end = std::min(end, def.nTimes - 1);
+              std::uint32_t const base = ev_times[start];
+              auto& list =
+                ev.times_per_anim[static_cast<std::int16_t>(classic_animations[r].animID)];
+              for (std::uint32_t i = start; i <= end; ++i)
+              {
+                list.push_back(static_cast<int>(ev_times[i] >= base ? ev_times[i] - base
+                                                                    : ev_times[i]));
+              }
+            }
+          }
+          _anim_events.push_back(std::move(ev));
+        }
+      }
     }
     else
     {
@@ -2771,6 +2821,13 @@ void Model::rollForcedAnimVariation(std::uint64_t key, int anim_id)
   st.oneshot_anim_id = -1;
   st.oneshot_seq = -1;
   st.oneshot_len = 0;
+  // RE-ENTRY RESTART (user 2026-08-26, held-space dolphin hops): a roll marks a fresh one-shot
+  // ENTRY, so the playback clock must restart too -- anim_start only restamps on an ID CHANGE in
+  // animate() (st.last_anim_id test), and a re-launch of the SAME id (JumpStart while JumpStart)
+  // otherwise kept the old clock = frozen at the hold frame. Forcing last_anim_id invalid makes
+  // the next animate() restamp (with its normal short blend).
+  st.last_anim_id = -1;
+  st.anim_start = -1;
   auto const vit = _anim_variations.find(static_cast<uint16_t>(anim_id));
   if (vit == _anim_variations.end() || vit->second.empty())
   {
@@ -3936,6 +3993,25 @@ void Model::dropInstanceEmitterState(std::uint64_t instance_key)
   _instance_emitter_states.erase(instance_key);
 }
 
+std::vector<int> Model::animEventTimes(std::uint32_t fourcc, std::int16_t anim_id) const
+{
+  std::vector<int> out;
+  for (auto const& ev : _anim_events)
+  {
+    if (ev.fourcc != fourcc)
+    {
+      continue;
+    }
+    auto const it = ev.times_per_anim.find(anim_id);
+    if (it != ev.times_per_anim.end())
+    {
+      out.insert(out.end(), it->second.begin(), it->second.end());
+    }
+  }
+  std::sort(out.begin(), out.end());
+  return out;
+}
+
 bool Model::particlesRideParent() const
 {
   for (auto const& particle : _particles)
@@ -3946,6 +4022,25 @@ bool Model::particlesRideParent() const
     }
   }
   return false;
+}
+
+void Model::setWorldSpaceParticleEmission(glm::mat4x4 const& m, float kill_plane_y)
+{
+  for (auto& particle : _particles)
+  {
+    if (!(particle.emitterFlags() & 0x10)) // riding emitters stay local by definition
+    {
+      particle.setWorldSpaceEmission(m, kill_plane_y);
+    }
+  }
+}
+
+void Model::clearWorldSpaceParticleEmission()
+{
+  for (auto& particle : _particles)
+  {
+    particle.clearWorldSpaceEmission();
+  }
 }
 
 void Model::updateEmitters(float dt)

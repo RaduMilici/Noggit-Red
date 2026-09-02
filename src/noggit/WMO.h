@@ -192,9 +192,14 @@ public:
 
   void intersect (math::ray const&, std::vector<float>* results, float max_dist = 0.0f) const;
 
+  // [doc 38 footsteps] nearest COLLIDABLE hit of a (model-space) ray with its face's authored
+  // ground type: {distance, materials[MOPY tri material].ground_type} (0 for collision-only
+  // faces, which carry no material). nullopt = no hit within max_dist.
+  std::optional<std::pair<float, int>> groundHit(math::ray const&, float max_dist) const;
+
   // [game mode] local-space liquid surface height at p when THIS group's room contains p and has
   // liquid covering that spot (upper-floor pools must not read as covering someone below them).
-  std::optional<float> liquidHeightAtLocal(glm::vec3 const& p) const;
+  std::optional<float> liquidHeightAtLocal(glm::vec3 const& p, int* out_liquid_id = nullptr) const;
 
   // todo: portal culling
   [[nodiscard]]
@@ -256,6 +261,8 @@ public:
 
   [[nodiscard]]
   Noggit::Rendering::WMOGroupRender* renderer() { return &_renderer; };
+  // [VULKAN] the group's liquid, for the VK water feed (GL draws it in a deferred pass)
+  wmo_liquid const* vkLiquid() const { return lq.get(); }
   ::glm::vec3 center;
 
   // Root-side MOGI flags for this group, read at ROOT load (available for every group before any group
@@ -446,6 +453,11 @@ public:
   [[nodiscard]]
   std::vector<float> intersect (math::ray const&, bool do_exterior = true, float max_dist = 0.0f) const;
 
+  // [doc 38 footsteps] nearest ground hit over ALL groups (physics counts interior AND
+  // exterior faces) with the face material's ground_type. Model-space ray.
+  [[nodiscard]]
+  std::optional<std::pair<float, int>> groundHit(math::ray const&, float max_dist) const;
+
   void finishLoading() override;
 
   void waitForChildrenLoaded() override;
@@ -531,7 +543,7 @@ public:
   static std::size_t loaded_count() { return _.size(); } // [mem-diag]
 private:
   friend struct scoped_wmo_reference;
-  static Noggit::AsyncObjectMultimap<WMO> _;
+  static Noggit::AsyncObjectMultimap<WMO>& _;   // leaked on purpose, see WMO.cpp
 };
 
 struct scoped_wmo_reference

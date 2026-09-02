@@ -1,4 +1,5 @@
 #include <noggit/ui/windows/about/About.h>
+#include <cmath>
 #include <noggit/MySqlSettings.hpp>
 #include <noggit/AsyncLoader.h>
 #include <noggit/DBC.h>
@@ -8,6 +9,8 @@
 #include <noggit/ContextObject.hpp>
 #include <noggit/ui/windows/noggitWindow/NoggitWindow.hpp>
 #include <noggit/MapView.h>
+#include <noggit/ui/SfxPlayer.hpp>
+#include <noggit/ui/ZoneMusicPlayer.hpp>
 #include <noggit/ui/windows/settingsPanel/SettingsPanel.h>
 #include <noggit/ui/minimap_widget.hpp>
 #include <noggit/ui/UidFixWindow.hpp>
@@ -429,6 +432,256 @@ namespace Noggit::Ui::Windows
     }
 
     check_uid_then_enter_map(pos, camera_pitch, camera_yaw, from_bookmark);
+  }
+
+  // [VULKAN 2026-08-29] self-run parity loop. The window is created OFF-SCREEN and non-activating so it
+  // never appears on a monitor or steals focus; frames are pumped by calling the map view's paint path
+  // directly (no window update needed), the [VK-DIFF] harness steps its camera list, and we return once
+  // it has logged its SUMMARY (or after a hard frame cap).
+  bool NoggitWindow::runVkParity(int map_id, QString const& cams_file, QString const& out_dir, int width, int height)
+  {
+    // [phase I] NOGGIT_VK_BENCH=<frames>: time the SCENE instead of comparing it. Parity mode keeps
+    // GL drawing everything as the reference, so it can never show whether the VK ownership gates
+    // took work OFF the GL side -- which is exactly the regression that made VK slower than GL.
+    // Run it twice (render/graphics_api 1 vs 0) for the A/B.
+    int const bench_frames = []() -> int {
+      char const* v = std::getenv("NOGGIT_VK_BENCH");
+      return (v && *v) ? std::atoi(v) : 0;
+    }();
+    if (!bench_frames)
+      MapView::setVkParityForced(cams_file.toStdString());
+    _putenv_s("NOGGIT_VK_DIFF_DIR", out_dir.toStdString().c_str());
+    _putenv_s("NOGGIT_VK_DIFF_SETTLE", "150");
+    // AF-off diagnostic runs: py -3 vk_parity_run.py after setting NOGGIT_PARITY_NO_AF=1 in the env
+
+    setAnimated(false);
+    setDockOptions(AllowNestedDocks | AllowTabbedDocks | GroupedDragging);
+    setAttribute(Qt::WA_ShowWithoutActivating, true);
+    setWindowFlags(windowFlags() | Qt::WindowDoesNotAcceptFocus | Qt::Tool);
+    resize(width, height);
+    move(-20000, -20000); // far outside any monitor
+    show();
+    move(-20000, -20000);
+    qApp->processEvents();
+    loadMap(map_id);
+    if (!_world)
+    {
+      LogError << "vk-parity: failed to load mapId=" << map_id << std::endl;
+      return false;
+    }
+    // enter AT THE FIRST CAMERA so the warm-up streams the right neighbourhood (GL needs its tile
+    // uploads there before the first capture; VK reads the heightmaps as soon as the tiles exist)
+    glm::vec3 first_pos(0.f, 50.f, 0.f);
+    float first_yaw = 0.f, first_pitch = 25.f;
+    {
+      std::ifstream in(cams_file.toStdString());
+      std::string line;
+      while (std::getline(in, line))
+      {
+        if (line.empty() || line[0] == '#') continue;
+        std::istringstream ss(line);
+        std::string name;
+        if (ss >> name >> first_pos.x >> first_pos.y >> first_pos.z >> first_yaw >> first_pitch) break;
+      }
+    }
+    enterMapAt(first_pos, math::degrees(first_pitch), math::degrees(first_yaw), uid_fix_mode::none, true, true);
+    if (!_map_view)
+    {
+      LogError << "vk-parity: no map view" << std::endl;
+      return false;
+    }
+    move(-20000, -20000);
+    qApp->processEvents();
+    // terrain-vs-terrain: hide everything GL draws that VK does not yet own (objects, WMOs, water, clutter)
+    // NOGGIT_PARITY_DOODADS=1 keeps the M2 doodads visible so phase C can measure them; terrain-only
+    // runs (the default) hide every pass VK does not own yet.
+    bool const keep_doodads = std::getenv("NOGGIT_PARITY_DOODADS") != nullptr;
+    // [phase D] NOGGIT_PARITY_WMO=1 keeps WMOs visible so the WMO gap can be MEASURED before it is
+    // ported. Everything VK does not own yet stays hidden, so a passing run always means "VK draws
+    // everything on screen", never "the missing pass was switched off".
+    bool const keep_wmo = std::getenv("NOGGIT_PARITY_WMO") != nullptr;
+    _map_view->_draw_models.set(keep_doodads);
+    // Separate switch: WMO GEOMETRY and the doodads INSIDE WMOs are different feeds, and lumping them
+    // together hid which one a regression came from (an Elwynn camera with almost no WMOs still failed).
+    bool const keep_wmo_doodads = std::getenv("NOGGIT_PARITY_WMO_DOODADS") != nullptr;
+    _map_view->_draw_wmo.set(keep_wmo);
+    _map_view->_draw_wmo_doodads.set(keep_wmo_doodads);
+    // Each remaining pass gets its own switch so a regression names the feed it came from.
+    _map_view->_draw_water.set(std::getenv("NOGGIT_PARITY_WATER") != nullptr);
+    _map_view->_draw_ground_clutter.set(std::getenv("NOGGIT_PARITY_CLUTTER") != nullptr);
+    // NOGGIT_PARITY_SKY=1 hands the gradient dome to VK and stops the metric masking sky pixels
+    // out, so the dome is measured instead of silently excluded (MapView reads the same env).
+    _map_view->_draw_bloom.set(false);        // post-process glow: not a terrain property
+    // NOGGIT_PARITY_CLOUDS=1 keeps the cloud deck on so the VK cloud pipeline is MEASURED.
+    _map_view->_draw_clouds.set(std::getenv("NOGGIT_PARITY_CLOUDS") != nullptr);
+    // NOGGIT_PARITY_SUN / _MOON keep the celestial billboards on so the VK pipeline is MEASURED.
+    _map_view->_draw_sun.set(std::getenv("NOGGIT_PARITY_SUN") != nullptr);
+    _map_view->_draw_moon.set(std::getenv("NOGGIT_PARITY_MOON") != nullptr);
+    _map_view->_draw_creature_spawns.set(false);
+    _map_view->getWorld()->setDrawCreatureSpawns(false);
+    // SILENT: the run is invisible, it must be inaudible too (zone music/ambience + one-shot sfx)
+    _map_view->muteAudioForHarness();
+
+    if (bench_frames)
+    {
+      // Full scene, nothing hidden -- a benchmark that switches passes off measures nothing useful.
+      _map_view->_draw_models.set(true);
+      _map_view->_draw_wmo.set(true);
+      _map_view->_draw_wmo_doodads.set(true);
+      _map_view->_draw_water.set(true);
+      _map_view->_draw_ground_clutter.set(true);
+      _map_view->_draw_clouds.set(true);
+      _map_view->_draw_sun.set(true);
+      _map_view->_draw_moon.set(true);
+
+      if (char const* tv0 = std::getenv("NOGGIT_BENCH_TIME"))
+        _map_view->getWorld()->time = static_cast<float>(std::atof(tv0));
+      for (int i = 0; i < 240; ++i)   // warm up: stream tiles, build arenas, compile pipelines
+      {
+        if (char const* tv1 = std::getenv("NOGGIT_BENCH_TIME"))
+          _map_view->getWorld()->time = static_cast<float>(std::atof(tv1));
+        _map_view->getWorld()->animtime += 16.0f;
+        _map_view->renderFrameForHarness();
+        qApp->processEvents();
+      }
+      AsyncLoader::instance().wait_until_idle();
+      for (int i = 0; i < 120; ++i)
+      {
+        _map_view->getWorld()->animtime += 16.0f;
+        _map_view->renderFrameForHarness();
+        qApp->processEvents();
+      }
+
+      // [streaming stress] NOGGIT_VK_FLY=<yards/frame> moves the camera during the measured run, so
+      // tiles and textures STREAM while frames are being timed. Without this the bench warms up, waits
+      // for the async loader to go idle, and then measures a STATIC camera -- nothing loads, so the
+      // per-event GPU stalls (texture uploads, tile rebuilds) never fire and the run reports zero
+      // spikes. That is why a mean-over-600-frames benchmark looked healthy while flying hitched.
+      double fly_step = 0.0;
+      if (char const* fv = std::getenv("NOGGIT_VK_FLY"))
+        fly_step = std::atof(fv);
+      glm::vec3 const fly_origin = _map_view->getCamera()->position;
+
+      auto const t0 = std::chrono::steady_clock::now();
+      double worst = 0.0;
+      // [spike measurement] A MEAN hides hitching completely: one 100 ms frame in 600 moves a mean by
+      // 0.16 ms but is exactly what "60 fps drops to 10" feels like. Keep every frame time and report
+      // the distribution + how many frames blew past the median.
+      std::vector<double> frame_ms;
+      frame_ms.reserve(static_cast<std::size_t>(bench_frames));
+      auto prev = t0;
+      // [blind spots] NOGGIT_BENCH_TIME pins the world clock (0..2880 half-minutes; ~1450 = midday,
+      // ~0/2880 = midnight) so night lighting and the night sky can be compared at all. The parity
+      // suite only ever ran at whatever time the world loaded at, which is why a black sky survived
+      // in it indefinitely.
+      float bench_time = -1.0f;
+      if (char const* tv = std::getenv("NOGGIT_BENCH_TIME"))
+        bench_time = static_cast<float>(std::atof(tv));
+
+      for (int i = 0; i < bench_frames; ++i)
+      {
+        if (bench_time >= 0.0f)
+          _map_view->getWorld()->time = bench_time;
+        _map_view->getWorld()->animtime += 16.0f;
+        _map_view->getWorld()->update_models_emitters(0.016f);
+        if (fly_step != 0.0)
+        {
+          // CIRCLE, not a straight line. A straight line at 2.5 yd/frame covers ~3200 yards over a
+          // 900-frame run, which flies clean off the loaded map: both renderers then end the run
+          // staring at empty sky and the end-of-run screenshot is a flat clear colour. That makes the
+          // image check worthless exactly when it matters (it once read as "VK renders black" and cost
+          // a working change). A circle of radius 400 yd still crosses tile edges (533 yd) constantly,
+          // so tiles and textures stream all the way through the timed window, but the camera stays
+          // over real terrain and finishes where it started.
+          auto* cam = _map_view->getCamera();
+          double const fly_r = 400.0;
+          double const fly_a = fly_step * i / fly_r;   // arc length travelled = fly_step per frame
+          cam->position = fly_origin + glm::vec3(static_cast<float>(fly_r * std::sin(fly_a)), 0.f,
+                                                 static_cast<float>(fly_r * (1.0 - std::cos(fly_a))));
+        }
+        _map_view->renderFrameForHarness();
+        qApp->processEvents();
+        auto const now = std::chrono::steady_clock::now();
+        double const dt = std::chrono::duration<double, std::milli>(now - prev).count();
+        frame_ms.push_back(dt);
+        // [spike hunt] name the frames that actually stall, so they can be correlated with the
+        // rebuild/upload logs that print around the same point in the file.
+        if (dt > 40.0)
+          LogError << "[VK-BENCH] SPIKE frame " << i << " = " << dt << " ms" << std::endl;
+        worst = std::max(worst, dt);
+        prev = now;
+      }
+      double const total = std::chrono::duration<double, std::milli>(
+                             std::chrono::steady_clock::now() - t0).count();
+      // One frame of the REAL (gated) path, so VK mode can be diffed against GL mode outside parity.
+      {
+        char const* api = std::getenv("NOGGIT_BENCH_API");
+        std::string const tag = (api && *api == '1') ? "bench_vk.png" : "bench_gl.png";
+        _map_view->saveHarnessScreenshot(tag);
+      }
+      LogError << "[VK-BENCH] frames=" << bench_frames
+               << " mean=" << (total / bench_frames) << " ms"
+               << " fps=" << (1000.0 * bench_frames / total)
+               << " worst=" << worst << " ms" << std::endl;
+      if (!frame_ms.empty())
+      {
+        std::vector<double> sorted = frame_ms;
+        std::sort(sorted.begin(), sorted.end());
+        auto const pct = [&sorted](double q)
+        {
+          std::size_t i = static_cast<std::size_t>(q * (sorted.size() - 1) + 0.5);
+          return sorted[i];
+        };
+        double const median = pct(0.50);
+        std::size_t spikes2 = 0, spikes4 = 0;
+        double spike_ms = 0.0;
+        for (double v : frame_ms)
+        {
+          if (v > median * 2.0) { ++spikes2; spike_ms += v - median; }
+          if (v > median * 4.0) { ++spikes4; }
+        }
+        LogError << "[VK-BENCH] SPIKES p50=" << median
+                 << " p95=" << pct(0.95)
+                 << " p99=" << pct(0.99)
+                 << " p999=" << pct(0.999)
+                 << " max=" << sorted.back()
+                 << " | frames>2xp50=" << spikes2
+                 << " >4xp50=" << spikes4
+                 << " lost=" << spike_ms << " ms" << std::endl;
+      }
+      return true;
+    }
+    LogError << "[VK-DIFF] self-run start: map " << map_id << " cams " << cams_file.toStdString()
+             << " out " << out_dir.toStdString() << std::endl;
+    // WARM-UP before camera 1: let the tile neighbourhood + textures stream in (the first capture
+    // otherwise sees pure sky on the GL side); then the harness steps its cameras.
+    for (int i = 0; i < 90; ++i)
+    {
+      _map_view->renderFrameForHarness();
+      qApp->processEvents();
+    }
+    AsyncLoader::instance().wait_until_idle();
+    for (int i = 0; i < 30; ++i)
+    {
+      _map_view->renderFrameForHarness();
+      qApp->processEvents();
+    }
+    // pump: the harness advances one camera per settle window; give streaming time between frames
+    int const max_frames = 20000;
+    for (int i = 0; i < max_frames && !MapView::vkParityFinished(); ++i)
+    {
+      _map_view->getWorld()->animtime += 16.0f;
+      _map_view->getWorld()->update_models_emitters(0.016f);
+      _map_view->renderFrameForHarness();
+      qApp->processEvents();
+      if ((i % 600) == 599)
+      {
+        AsyncLoader::instance().wait_until_idle();
+      }
+    }
+    bool const done = MapView::vkParityFinished();
+    LogError << "[VK-DIFF] self-run " << (done ? "finished" : "TIMED OUT") << std::endl;
+    return done;
   }
 
   bool NoggitWindow::captureMapCreaturesToPng(int map_id,

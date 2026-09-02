@@ -1,5 +1,6 @@
 // This file is part of Noggit3, licensed under GNU General Public License (version 3).
 
+#include <noggit/rendering/vulkan/VkParticleFeed.hpp>
 #include <noggit/rendering/Primitives.hpp>
 
 #include <math/bounding_box.hpp>
@@ -468,6 +469,12 @@ void Square::setup_buffers()
           BlizzardArchive::Listfile::FileKey("textures\\Weather\\SnowFlake01.blp"), context);
         _snow_texture->finishLoading();
         _snow_texture->upload();
+        // Underwater particulate motes -- the client's waterParticulates system (MapWeather RE,
+        // docs/client_re/36: FUN_0066f6c0 loads exactly this texture).
+        _particulate_texture = std::make_unique<blp_texture>(
+          BlizzardArchive::Listfile::FileKey("Textures\\WaterPoop02.blp"), context);
+        _particulate_texture->finishLoading();
+        _particulate_texture->upload();
       }
       catch (std::exception const&)
       {
@@ -487,6 +494,7 @@ void Square::setup_buffers()
                           , float animtime_ms
                           , glm::vec3 const& light_color
                           , Noggit::NoggitRenderContext context
+                          , int liquid_family
                           )
   {
     if (type == 0 || intensity <= 0.0f)
@@ -502,19 +510,29 @@ void Square::setup_buffers()
       setup(context);
     }
 
-    blp_texture* tex = (type == 2) ? _snow_texture.get() : _rain_texture.get();
+    bool const motes = (type == 3);
+    blp_texture* tex = motes ? _particulate_texture.get()
+                     : (type == 2) ? _snow_texture.get() : _rain_texture.get();
     if (!tex || !tex->is_uploaded())
     {
       return;
     }
 
     // Client weather volume (MapWeather init): a 44 x 44 horizontal, +-25 vertical box around the
-    // camera. Density: the client's flake pool caps at 0x1800 (6144); scaled down for the editor's
-    // CPU refill and by the intensity slider (the client's weatherDensity works the same way).
-    float const kBoxH = 44.0f;
-    float const kBoxV = 25.0f;
+    // camera. Density LAW extracted from the client (FUN_006749e0, docs/client_re/36): spawn rate =
+    // weatherDensity(0.66 default) x K x intensity with K = 6500 rain / 35000 snow, pool cap 6144.
+    // Steady-state visible count = rate x fall time through the volume: rain ~3400 x intensity;
+    // snow saturates toward the cap. (Fall speeds are still editor approximations.)
+    // Underwater particulates: the client emitter EXACTLY (FUN_0068e5a0 chain, RE doc 36):
+    // ctor(density=1.0, size=1/36, range=30, WaterPoop02): count = ftol(density x 4000), placement
+    // +-range/2 = +-15yd cube around the camera, per-particle half-size rand[0.5,1.5] x 1/36,
+    // sprite frame = index & 7 (cells 0-7 of the 4x4 sheet = the soft blobs), ONE shared slow
+    // current (up-biased), white untinted color. Rain/snow keep the 44x44x25 weather box.
+    float const kBoxH = motes ? 15.0f : 44.0f;
+    float const kBoxV = motes ? 15.0f : 25.0f;
     bool const snow = (type == 2);
-    int const target = static_cast<int>((snow ? 900 : 1500) * intensity);
+    int const target = motes ? static_cast<int>(4000 * std::min(1.0f, intensity))
+                     : std::min(6144, static_cast<int>((snow ? 5000 : 3400) * intensity));
 
     float dt = (_last_time >= 0.0f) ? (animtime_ms - _last_time) / 1000.0f : 0.016f;
     _last_time = animtime_ms;
@@ -525,10 +543,42 @@ void Square::setup_buffers()
       return a + (b - a) * (static_cast<float>(rng()) / static_cast<float>(rng.max()));
     };
 
+    // CLIENT mote-drift epoch roll (FUN_0068e1c0, constants dumped 2026-08-26): a fully RANDOM
+    // 3D direction (random azimuth; vertical component x0.25 then ABS = always some upward bias),
+    // normalized; freq = rand[1,2] x 0.0125 Hz; amp = rand[1,2] x 0.005 (per client frame);
+    // phase reset. Called on mote activation AND at every half-period boundary (see the drift
+    // computation below) -- the client re-picks the direction every ~20-40 s, with sin() at zero
+    // exactly at the boundary so each epoch is one smooth glide, never a snap.
+    auto roll_mote_epoch = [&]()
+    {
+      float const ra = frand(-3.1415927f, 3.1415927f);
+      float const rb = frand(-3.1415927f, 3.1415927f);
+      glm::vec3 dir(std::cos(rb) * std::sin(ra),
+                    std::abs(std::cos(ra)) * 0.25f,
+                    std::sin(rb) * std::sin(ra));
+      float const len = glm::length(dir);
+      _mote_dir = (len > 1e-6f) ? dir / len : glm::vec3(0.0f, 1.0f, 0.0f);
+      _mote_freq = frand(1.0f, 2.0f) * 0.0125f;
+      _mote_amp = frand(1.0f, 2.0f) * 0.005f;
+      _mote_phase = 0.0f;
+    };
+
+    // CLIENT (FUN_006809c0 -> FUN_0068e720): a liquid-TYPE change re-seeds every particle and
+    // stores the new family -- mirrored by clearing the pool so the refill below re-frames with
+    // the new family's sheet cells (doc 37: water/ocean row {0..7}, magma {9..12}x2, slime {0}x8).
+    if (motes && liquid_family != _mote_family)
+    {
+      _mote_family = liquid_family;
+      _drops.clear();
+    }
     if (_active_type != type)
     {
       _active_type = type;
       _drops.clear();
+      if (motes)
+      {
+        roll_mote_epoch();
+      }
     }
     while (static_cast<int>(_drops.size()) < target)
     {
@@ -536,8 +586,22 @@ void Square::setup_buffers()
       d.pos = glm::vec3(camera_pos.x + frand(-kBoxH, kBoxH),
                         camera_pos.y + frand(-kBoxV, kBoxV),
                         camera_pos.z + frand(-kBoxH, kBoxH));
-      d.speed = snow ? frand(4.0f, 7.0f) : frand(50.0f, 70.0f);
+      // rain/snow fall; motes carry no per-particle velocity (shared current instead)
+      d.speed = motes ? 0.0f
+              : snow ? frand(4.0f, 7.0f) : frand(50.0f, 70.0f);
       d.seed = frand(0.0f, 6.2831853f);
+      // Client size = FULL quad width (billboard corner table FUN_0068eb30 is +-0.5): half = /2.
+      d.size = motes ? frand(0.5f, 1.5f) * (1.0f / 72.0f) : 0.0f;
+      // Client frame law (FUN_0068efe0): cell = DAT_0086a0a0[(index & 7) + family * 8].
+      // Rows: water {0..7}, ocean {0..7}, magma {9,10,11,12,9,10,11,12}, slime {0,0,0,0,0,0,0,0}.
+      static constexpr int kFamilyFrames[4][8] = {
+        {0, 1, 2, 3, 4, 5, 6, 7},
+        {0, 1, 2, 3, 4, 5, 6, 7},
+        {9, 10, 11, 12, 9, 10, 11, 12},
+        {0, 0, 0, 0, 0, 0, 0, 0},
+      };
+      int const fam = motes ? (_mote_family & 3) : 0;
+      d.frame = kFamilyFrames[fam][static_cast<int>(_drops.size()) & 7];
       _drops.push_back(d);
     }
     if (static_cast<int>(_drops.size()) > target)
@@ -545,21 +609,68 @@ void Square::setup_buffers()
       _drops.resize(target);
     }
 
+    // CLIENT drift (FUN_0068e4f0, exact -- 2026-08-26, user: "in game they move in a sliding
+    // animation... ours don't"): the OLD port added amp as yd/SECOND, but the client adds the
+    // sine value PER FRAME -> ~30x faster than we ran (peak ~0.3-0.6 yd/s at 60 fps): the visible
+    // slide. dt*60 normalises the per-frame add to the 60 fps feel (the client itself is
+    // frame-rate dependent here -- documented derivation). MAGMA family: constant SINK at
+    // -0.02 yd/s (dumped, dt-scaled in the client -- heavy ash, not rising embers). SLIME: still.
+    glm::vec3 mote_drift(0.0f);
+    if (motes)
+    {
+      if (_mote_family <= 1)
+      {
+        _mote_phase += dt;
+        if (_mote_phase * _mote_freq > 0.5f)
+        {
+          roll_mote_epoch(); // new random direction/freq/amp at the sine zero -- seamless
+        }
+        mote_drift = _mote_dir
+                   * (std::sin(6.2831853f * _mote_phase * _mote_freq) * _mote_amp * dt * 60.0f);
+      }
+      else if (_mote_family == 2)
+      {
+        mote_drift = glm::vec3(0.0f, -0.02f * dt, 0.0f);
+      }
+    }
     float const t_s = animtime_ms / 1000.0f;
     for (Drop& d : _drops)
     {
-      d.pos.y -= d.speed * dt;
-      if (snow)
+      if (motes)
       {
-        d.pos.x += std::sin(t_s * 0.9f + d.seed) * 1.2f * dt;
-        d.pos.z += std::cos(t_s * 0.7f + d.seed) * 1.0f * dt;
+        d.pos += mote_drift; // ONE shared current for the whole pool (client FUN_0068e930)
       }
-      // Keep the volume centered on the (moving) camera: wrap on every axis.
-      if (d.pos.y < camera_pos.y - kBoxV)
+      else
       {
-        d.pos.y += 2.0f * kBoxV;
-        d.pos.x = camera_pos.x + frand(-kBoxH, kBoxH);
-        d.pos.z = camera_pos.z + frand(-kBoxH, kBoxH);
+        d.pos.y -= d.speed * dt;
+        if (snow)
+        {
+          float const sway = 1.2f;
+          d.pos.x += std::sin(t_s * 0.9f + d.seed) * sway * dt;
+          d.pos.z += std::cos(t_s * 0.7f + d.seed) * sway * 0.85f * dt;
+        }
+      }
+      // Keep the volume centered on the (moving) camera: wrap on every axis. Motes wrap plainly on
+      // Y too (client cube wrap); falling rain/snow respawns X/Z on a Y wrap so streaks vary.
+      if (motes)
+      {
+        if (d.pos.y < camera_pos.y - kBoxV) d.pos.y += 2.0f * kBoxV;
+        if (d.pos.y > camera_pos.y + kBoxV) d.pos.y -= 2.0f * kBoxV;
+      }
+      else
+      {
+        if (d.pos.y < camera_pos.y - kBoxV)
+        {
+          d.pos.y += 2.0f * kBoxV;
+          d.pos.x = camera_pos.x + frand(-kBoxH, kBoxH);
+          d.pos.z = camera_pos.z + frand(-kBoxH, kBoxH);
+        }
+        if (d.pos.y > camera_pos.y + kBoxV)
+        {
+          d.pos.y -= 2.0f * kBoxV;
+          d.pos.x = camera_pos.x + frand(-kBoxH, kBoxH);
+          d.pos.z = camera_pos.z + frand(-kBoxH, kBoxH);
+        }
       }
       if (d.pos.x < camera_pos.x - kBoxH) d.pos.x += 2.0f * kBoxH;
       if (d.pos.x > camera_pos.x + kBoxH) d.pos.x -= 2.0f * kBoxH;
@@ -567,18 +678,33 @@ void Square::setup_buffers()
       if (d.pos.z > camera_pos.z + kBoxH) d.pos.z -= 2.0f * kBoxH;
     }
 
-    // Build camera-facing quads: rain = tall thin streak, snow = small flake.
-    float const half_w = snow ? 0.09f : 0.03f;
-    float const half_h = snow ? 0.09f : 0.9f;
+    // Build camera-facing quads: rain = tall thin streak, snow = small flake, motes = tiny specks
+    // (per-particle size + one 64px cell of the 4x4 WaterPoop02 sheet each).
     _vertex_data.clear();
     _vertex_data.reserve(_drops.size() * 6 * 5);
     for (Drop const& d : _drops)
     {
+      float const half_w = motes ? d.size : snow ? 0.09f : 0.03f;
+      float const half_h = motes ? d.size : snow ? 0.09f : 0.9f;
       glm::vec3 const to_cam = camera_pos - d.pos;
       glm::vec3 right = glm::cross(glm::vec3(0.0f, 1.0f, 0.0f), to_cam);
       float const len2 = glm::dot(right, right);
       right = (len2 > 1e-6f) ? right * (half_w / std::sqrt(len2)) : glm::vec3(half_w, 0.0f, 0.0f);
       glm::vec3 const up(0.0f, half_h, 0.0f);
+
+      float u0 = 0.f, v0 = 0.f, u1 = 1.f, v1 = 1.f;
+      if (motes)
+      {
+        // CLIENT-EXACT frame rects (UV table builder FUN_0068ebf0): the sheet is a grid of
+        // 51/256 = 0.19921875 cells, frames 0-7 = columns 0-3 of rows 0-1. The smiley-face
+        // easter-egg sprite lives in COLUMN 4 (frame 8, not in the water set) -- a 0.25 cell
+        // size wrongly reached into it and sliced the real sprites.
+        float const cell = 0.19921875f; // _DAT_00810334 = 51/256
+        u0 = static_cast<float>(d.frame % 4) * cell;
+        v0 = static_cast<float>(d.frame / 4) * cell;
+        u1 = u0 + cell;
+        v1 = v0 + cell;
+      }
 
       glm::vec3 const a = d.pos - right - up;
       glm::vec3 const b = d.pos + right - up;
@@ -588,8 +714,8 @@ void Square::setup_buffers()
         _vertex_data.push_back(p.x); _vertex_data.push_back(p.y); _vertex_data.push_back(p.z);
         _vertex_data.push_back(u);   _vertex_data.push_back(v);
       };
-      push(a, 0.f, 1.f); push(b, 1.f, 1.f); push(c, 1.f, 0.f);
-      push(a, 0.f, 1.f); push(c, 1.f, 0.f); push(e, 0.f, 0.f);
+      push(a, u0, v1); push(b, u1, v1); push(c, u1, v0);
+      push(a, u0, v1); push(c, u1, v0); push(e, u0, v0);
     }
     if (_vertex_data.empty())
     {
@@ -598,7 +724,10 @@ void Square::setup_buffers()
 
     OpenGL::Scoped::use_program sp (*_program.get());
     sp.uniform("mvp", mvp);
-    sp.uniform("color", glm::vec4(light_color, snow ? 0.85f : 0.55f));
+    // Motes: the client writes 0xFFFFFFFF vertex color -- untinted white, the DXT3 alpha shapes
+    // the dot. Rain/snow stay light-tinted (editor approximation).
+    sp.uniform("color", motes ? glm::vec4(1.0f)
+                              : glm::vec4(light_color, snow ? 0.85f : 0.55f));
     gl.activeTexture(GL_TEXTURE0);
     gl.bindTexture(GL_TEXTURE_2D_ARRAY, tex->texture_array());
     sp.uniform("tex", 0);
@@ -609,6 +738,42 @@ void Square::setup_buffers()
     gl.bufferData(GL_ARRAY_BUFFER,
                   static_cast<GLsizeiptr>(_vertex_data.size() * sizeof(float)),
                   _vertex_data.data(), GL_STREAM_DRAW);
+
+    // [VULKAN phase G] mirror the precipitation into the shared quad feed: textured, alpha-blended,
+    // one flat colour -- structurally a particle emitter, so it reuses those pipelines.
+    {
+      auto& feed = Noggit::Rendering::VK::particleFeed();
+      glm::vec4 const wcolor = motes ? glm::vec4(1.0f)
+                                     : glm::vec4(light_color, std::clamp(intensity, 0.f, 1.f));
+      Noggit::Rendering::VK::ParticleFeed::Draw d;
+      d.first_index = static_cast<std::uint32_t>(feed.indices.size());
+      d.index_count = static_cast<std::uint32_t>(_vertex_data.size() / 5u);
+      d.base_vertex = static_cast<std::int32_t>(feed.vertices.size() / 9u);
+      d.blend = 2;            // SRC_ALPHA / ONE_MINUS_SRC_ALPHA
+      d.alpha_test = 0.f;
+      d.alpha_mod = 1.f;
+      d.ribbon = true;        // no black-fringe divide: this is not a particle sprite sheet
+      d.blp = tex && tex->file_key().hasFilepath() ? tex->file_key().filepath() : std::string();
+      for (std::size_t i = 0; i + 4 < _vertex_data.size(); i += 5)
+      {
+        feed.vertices.push_back(_vertex_data[i]);
+        feed.vertices.push_back(_vertex_data[i + 1]);
+        feed.vertices.push_back(_vertex_data[i + 2]);
+        feed.vertices.push_back(_vertex_data[i + 3]);
+        feed.vertices.push_back(_vertex_data[i + 4]);
+        feed.vertices.push_back(wcolor.x); feed.vertices.push_back(wcolor.y);
+        feed.vertices.push_back(wcolor.z); feed.vertices.push_back(wcolor.w);
+      }
+      // The GL draw is a plain drawArrays; the shared feed is indexed, so number the triangles.
+      for (std::uint32_t i = 0; i < d.index_count; ++i)
+        feed.indices.push_back(i);
+      if (d.index_count)
+        feed.draws.push_back(std::move(d));
+    }
+    if (Noggit::Rendering::VK::vkOwnsParticles())
+    {
+      return;   // Vulkan draws the precipitation
+    }
 
     OpenGL::Scoped::bool_setter<GL_BLEND, GL_TRUE> const blend;
     gl.blendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
@@ -1200,4 +1365,196 @@ void Square::setup_buffers()
 
       _buffers_are_setup = false;
 
+  }
+
+  // ==================== WaterRipples (client Water0Ripple port, RE doc 36) ====================
+
+  WaterRipples::WaterRipples() = default;
+  WaterRipples::~WaterRipples() = default;
+
+  void WaterRipples::setup(Noggit::NoggitRenderContext context)
+  {
+    _program.reset(new OpenGL::program(
+      { { GL_VERTEX_SHADER
+        , R"code(
+#version 330 core
+uniform mat4 mvp;
+in vec3 position;
+in vec2 tex_coord;
+out vec2 uv_;
+void main()
+{
+  uv_ = tex_coord;
+  gl_Position = mvp * vec4(position, 1.0);
+}
+)code" }
+      , { GL_FRAGMENT_SHADER
+        , R"code(
+#version 330 core
+uniform sampler2DArray tex;
+uniform float tex_index;
+uniform float ripple_alpha;
+in vec2 uv_;
+out vec4 out_color;
+void main()
+{
+  vec4 t = texture(tex, vec3(uv_, tex_index));
+  // white x alpha additive (the client draws vertex colour alpha<<24|0xFFFFFF)
+  out_color = vec4(t.rgb, t.a) * ripple_alpha;
+}
+)code" } }));
+
+    auto load_tex = [&](std::unique_ptr<blp_texture>& slot, char const* path)
+    {
+      try
+      {
+        slot = std::make_unique<blp_texture>(BlizzardArchive::Listfile::FileKey(path), context);
+        slot->finishLoading();
+        slot->upload();
+      }
+      catch (std::exception const&)
+      {
+        _texture_failed = true;
+      }
+    };
+    load_tex(_wake_texture, "XTextures\\splash\\wake.blp");
+    load_tex(_splash_texture, "XTextures\\splash\\splash.blp");
+
+    _vao.upload();
+    _buffers.upload();
+    _buffers_are_setup = true;
+  }
+
+  void WaterRipples::spawn(glm::vec3 const& surface_pos, float rotation_rad, float size0,
+                           float growth, float lifetime_s, float alpha_peak, int kind)
+  {
+    if (_entries.size() >= 128) // client pool size
+    {
+      _entries.erase(_entries.begin());
+    }
+    RippleEntry e;
+    e.pos = surface_pos;
+    e.rot = rotation_rad;
+    e.size0 = size0;
+    e.growth = growth;
+    e.birth_ms = -1.0f; // stamped on first draw (animtime supplied there)
+    e.lifetime_ms = lifetime_s * 1000.0f;
+    e.alpha_peak = alpha_peak;
+    e.kind = kind;
+    _entries.push_back(e);
+  }
+
+  void WaterRipples::draw(glm::mat4x4 const& mvp, float animtime_ms,
+                          Noggit::NoggitRenderContext context)
+  {
+    if (_entries.empty())
+    {
+      return;
+    }
+    if (!_buffers_are_setup)
+    {
+      setup(context);
+    }
+    // RIPPLE-DIAG (one-shot): proves the DRAW stage runs and names the texture state.
+    {
+      static bool s_ripple_draw_diag = false;
+      if (!s_ripple_draw_diag)
+      {
+        s_ripple_draw_diag = true;
+        LogError << "RIPPLE-DIAG draw: entries=" << _entries.size()
+                 << " tex_failed=" << (_texture_failed ? 1 : 0)
+                 << " wake=" << (_wake_texture ? (_wake_texture->is_uploaded() ? "up" : "not-up") : "null")
+                 << " splash=" << (_splash_texture ? (_splash_texture->is_uploaded() ? "up" : "not-up") : "null")
+                 << std::endl;
+      }
+    }
+    if (_texture_failed || !_wake_texture || !_splash_texture
+        || !_wake_texture->is_uploaded() || !_splash_texture->is_uploaded())
+    {
+      return;
+    }
+
+    for (auto& e : _entries)
+    {
+      if (e.birth_ms < 0.0f)
+      {
+        e.birth_ms = animtime_ms;
+      }
+    }
+    _entries.erase(std::remove_if(_entries.begin(), _entries.end(),
+                                  [&](RippleEntry const& e)
+                                  { return animtime_ms - e.birth_ms > e.lifetime_ms; }),
+                   _entries.end());
+    if (_entries.empty())
+    {
+      return;
+    }
+
+    OpenGL::Scoped::use_program sp(*_program.get());
+    sp.uniform("mvp", mvp);
+    OpenGL::Scoped::vao_binder const _(_vao[0]);
+    OpenGL::Scoped::bool_setter<GL_BLEND, GL_TRUE> const blend;
+    gl.blendFunc(GL_SRC_ALPHA, GL_ONE); // additive over the water surface
+    OpenGL::Scoped::depth_mask_setter<GL_FALSE> const no_depth_write;
+    // USER-DIAGNOSED 2026-08-26 ("they all draw under water only, on the underwater side of the
+    // surface"): the quad winding faced DOWN (ax x az = (0,-1,0)), so back-face culling showed the
+    // rings only from below. Double-side the pass -- a flat surface ring must read from above AND
+    // (harmlessly) from underwater.
+    OpenGL::Scoped::bool_setter<GL_CULL_FACE, GL_FALSE> const no_cull;
+
+    for (RippleEntry const& e : _entries)
+    {
+      float const age = std::clamp((animtime_ms - e.birth_ms) / e.lifetime_ms, 0.0f, 1.0f);
+      // client laws: linear growth over life; alpha attack to 40% of life then decay (K = 0.4)
+      float const size = e.size0 + e.growth * age * (e.lifetime_ms / 1000.0f);
+      float const alpha = e.alpha_peak * (age < 0.4f ? age / 0.4f : (1.0f - age) / 0.6f);
+      float const c = std::cos(e.rot);
+      float const s = std::sin(e.rot);
+      glm::vec3 const ax(c * size, 0.0f, s * size);
+      glm::vec3 const az(-s * size, 0.0f, c * size);
+      glm::vec3 const p(e.pos.x, e.pos.y + 0.05f, e.pos.z);
+
+      glm::vec3 const va = p - ax - az;
+      glm::vec3 const vb = p + ax - az;
+      glm::vec3 const vc = p + ax + az;
+      glm::vec3 const vd = p - ax + az;
+      _vertex_data.clear();
+      auto push = [&](glm::vec3 const& v, float u, float w)
+      {
+        _vertex_data.push_back(v.x); _vertex_data.push_back(v.y); _vertex_data.push_back(v.z);
+        _vertex_data.push_back(u);   _vertex_data.push_back(w);
+      };
+      // Winding flipped up-facing (see the cull note above) -- kept correct even if a future
+      // change re-enables culling in this pass.
+      push(va, 0.f, 0.f); push(vc, 1.f, 1.f); push(vb, 1.f, 0.f);
+      push(va, 0.f, 0.f); push(vd, 0.f, 1.f); push(vc, 1.f, 1.f);
+
+      blp_texture* tex = (e.kind == 0) ? _wake_texture.get() : _splash_texture.get();
+      gl.activeTexture(GL_TEXTURE0);
+      gl.bindTexture(GL_TEXTURE_2D_ARRAY, tex->texture_array());
+      sp.uniform("tex", 0);
+      sp.uniform("tex_index", static_cast<float>(tex->array_index()));
+      sp.uniform("ripple_alpha", alpha);
+
+      OpenGL::Scoped::buffer_binder<GL_ARRAY_BUFFER> const vb_bind(_vbo);
+      gl.bufferData(GL_ARRAY_BUFFER,
+                    static_cast<GLsizeiptr>(_vertex_data.size() * sizeof(float)),
+                    _vertex_data.data(), GL_STREAM_DRAW);
+      sp.attrib("position", 3, GL_FLOAT, GL_FALSE, 5 * sizeof(float), 0);
+      sp.attrib("tex_coord", 2, GL_FLOAT, GL_FALSE, 5 * sizeof(float),
+                reinterpret_cast<void*>(3 * sizeof(float)));
+      gl.drawArraysInstanced(GL_TRIANGLES, 0, 6, 1);
+    }
+  }
+
+  void WaterRipples::unload()
+  {
+    _vao.unload();
+    _buffers.unload();
+    _program.reset();
+    _wake_texture.reset();
+    _splash_texture.reset();
+    _buffers_are_setup = false;
+    _texture_failed = false;
+    _entries.clear();
   }

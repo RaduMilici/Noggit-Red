@@ -76,6 +76,19 @@ namespace Noggit::Rendering
     std::vector<WMOBatchSpan> spans;
   };
 
+  // [VULKAN phase D] One interleaved vertex for the VK WMO pipeline. upload() frees the separate
+  // CPU streams, so this mirror is built there and kept.
+  struct VkWmoVertex
+  {
+    glm::vec3 pos;
+    glm::vec3 normal;
+    glm::vec2 uv0;
+    glm::vec2 uv1;
+    glm::vec4 color;
+    std::uint32_t batch_id;   // == GL's per-vertex batch_mapping attribute
+    std::uint32_t _pad;       // keep the stride at 64 so the VK attribute offsets stay aligned
+  };
+
   class WMOGroupRender : public BaseRender
   {
   public:
@@ -96,6 +109,45 @@ namespace Noggit::Rendering
 
     void initRenderBatches();
 
+    // [VULKAN phase D] geometry mirror for the VK backend -- captured during upload(), before the
+    // CPU streams are freed. _vk_dirty is cleared once the backend has taken a copy.
+    std::vector<VkWmoVertex> const& vkVertices() const { return _vk_verts; }
+    std::vector<std::uint16_t> const& vkIndices() const { return _vk_indices; }
+    std::vector<WMORenderBatch> const& vkBatches() const { return _vk_batches; }
+    // BLP file names per batch, parallel to vkBatches(); VK addresses textures by name -> bindless id
+    std::vector<std::pair<std::string, std::string>> const& vkBatchBlps() const { return _vk_batch_blps; }
+    std::vector<unsigned> const& vkBatchMapping() const { return _vk_batch_mapping; }
+    std::vector<WMOCombinedDrawCall> const& vkDrawCalls() const { return _draw_calls; }
+    bool vkMirrorDirty() const { return _vk_dirty; }
+    void clearVkMirrorDirty() { _vk_dirty = false; }
+    // Called once the VK arena has copied this group; the arena is append-only and keyed per group,
+    // so holding the mirror afterwards just duplicates ~65 MB of geometry in RAM.
+    void releaseVkMirror()
+    {
+      _vk_verts.clear(); _vk_verts.shrink_to_fit();
+      _vk_indices.clear(); _vk_indices.shrink_to_fit();
+      _vk_batches.clear(); _vk_batches.shrink_to_fit();
+      _vk_batch_mapping.clear(); _vk_batch_mapping.shrink_to_fit();
+      _vk_batch_blps.clear(); _vk_batch_blps.shrink_to_fit();
+      _vk_mirror_taken = true;
+      _vk_dirty = false;
+    }
+    // true once the arena has taken this group -- distinguishes "already copied" from "no geometry"
+    bool vkMirrorTaken() const { return _vk_mirror_taken; }
+
+    // The runs GL actually emitted for this group in the most recent draw(), with the owning draw
+    // call's pipeline state. Overwritten every draw, so read it straight after the instance drew.
+    struct VkRun
+    {
+      std::uint32_t index_start = 0;
+      std::uint32_t index_count = 0;
+      std::int32_t blend_mode = 0;
+      std::int32_t backface_cull = 0;
+    };
+    std::vector<VkRun> const& vkLastRuns() const { return _vk_last_runs; }
+    // frame the runs above were captured in; stale records must not be replayed
+    unsigned vkLastRunFrame() const { return _vk_last_run_frame; }
+
   private:
 
     void setupVao(OpenGL::Scoped::use_program& wmo_shader);
@@ -105,6 +157,17 @@ namespace Noggit::Rendering
     std::vector<unsigned> _render_batch_mapping;
     std::vector<WMORenderBatch> _render_batches;
     std::vector<WMOCombinedDrawCall> _draw_calls;
+
+    std::vector<VkWmoVertex> _vk_verts;
+    std::vector<std::uint16_t> _vk_indices;
+    std::vector<WMORenderBatch> _vk_batches;
+    std::vector<unsigned> _vk_batch_mapping;
+    std::vector<std::pair<std::string, std::string>> _render_batch_blps;
+    std::vector<std::pair<std::string, std::string>> _vk_batch_blps;
+    bool _vk_dirty = false;
+    bool _vk_mirror_taken = false;
+    std::vector<VkRun> _vk_last_runs;
+    unsigned _vk_last_run_frame = 0;
 
     OpenGL::Scoped::deferred_upload_vertex_arrays<1> _vertex_array;
     GLuint const& _vao = _vertex_array[0];

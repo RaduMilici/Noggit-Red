@@ -21,6 +21,7 @@ uniform float water_alpha_mult; // dev opacity lever (1 = unchanged)
 uniform vec3 camera;                 // for the water specular view direction
 uniform vec3 sun_spec_color;         // sun-band colour (LightIntBand band 9), same as terrain specular
 uniform int draw_water_specular;     // toggle (render/water_specular)
+uniform vec3 sheen_dir;              // TO the drawn sun/moon disc (WorldRender celestial_dir)
 
 in float depth_;
 in vec2 tex_coord_;
@@ -275,7 +276,9 @@ void main()
     // Base water body = the depth-tinted zone ocean/river colour (lighter coast -> darker deep). The
     // surface texture is NOT modulated in here -- the client adds it additively (see below), so the
     // base stays a clean blue/teal and the texture shows up as the bright shine on top.
-    vec3 water_rgb = lerp.rgb;
+    // Round 20 (user): the SURFACE body colour a tad darker -- x0.85 on the depth-mixed zone band
+    // (the sliding-texture layer stays at its strength; underwater tint untouched).
+    vec3 water_rgb = lerp.rgb * 0.85;
 
     // WATER SHINE -- reverse-engineered from wow_cap_westfall_ocean.trace. The 1.12 client draws the
     // ocean surface ADDITIVELY (SRCBLEND=SRCALPHA, DESTBLEND=ONE) with LIGHTING=FALSE, SPECULARENABLE
@@ -311,9 +314,48 @@ void main()
       // VISIBLE. It was too faint because texel*lerp self-dims to ~nothing on WPL's dark water, so add a
       // direct (non-modulated) texel component too, then the water-colour-modulated part on top, plus
       // the sun-band glint.
-      water_rgb += texel.rgb * 0.8
-                 + texel.rgb * lerp.rgb * 1.2
-                 + sun_spec_color * ripple * lerp.rgb * 2.0 * sun_sheen;
+      // [2026-08-24 UNIFIED SURFACE LAYER] The 1.12 water textures (lake_a / ocean_h) store the
+      // sliding pattern in ALPHA -- their RGB is near-black (measured mean 4-7/255), so every
+      // texel.rgb term here was multiplying ~zero. Pattern = texel.a, ONE strength across all
+      // water bodies (ADT + WMO). NO sun/view glint term: the CLIENT draws water with
+      // LIGHTING=FALSE, no SetMaterial, no specular -- its only "shine" is this modulated
+      // additive pass (trace-proven, wow_cap_westfall_ocean). The old sun_sheen half-vector hack
+      // was ours and read as "shine from every direction" (user round 11) -- removed.
+      float pat = texel.a;
+      // USER-DIRECTED GLITTER (2026-08-25: "surface sliding texture too bright... needs to shine
+      // brighter when angled at moon or source of light"). DELIBERATE DEVIATION from the trace
+      // (the 1.12 client's water pattern is direction-constant): the pattern layer is now dim at
+      // baseline and blooms in a sun/moon-aligned lobe -- view reflected off the flat surface vs
+      // the day/night light direction (LightDir tracks the moon at night, so night glitter is
+      // moonlight automatically). Peak (perfect alignment) = 1.5x the old constant strength.
+      // Round 2 (user: "isn't working, same opacity all across" + "underwater dark again"):
+      //  - guard a degenerate/below-horizon light dir (night hours author the sun under the
+      //    horizon -> the lobe never aligned -> uniform 0.15 everywhere). Lift the dir to at
+      //    least 8deg above the horizon so a glitter band always exists toward the light azimuth.
+      //  - lobe widened pow 20 -> 8 (a broad glare band like sun on wet ground, not a pinpoint).
+      //  - baseline raised 0.15 -> 0.25.
+      //  - camera UNDER the surface keeps the full constant pattern: the dimmed layer seen from
+      //    below is what read as "underwater dark again".
+      float sheen = 1.0;
+      if (camera.y >= world_pos_.y)
+      {
+        vec3 sheen_V = normalize(camera - world_pos_);
+        // ROUND 3 (user: "backwards -- I have to put my back to the sun"): key the lobe on the
+        // DRAWN sun/moon disc (celestial_dir: true render frame, sun by day / moon by night).
+        // The old lighting dayDir sits in the terrain-normal frame, which mirrored the azimuth.
+        vec3 sheen_L = sheen_dir;
+        float L_len = length(sheen_L);
+        if (L_len > 0.001)
+        {
+          sheen_L /= L_len;
+          sheen_L.y = max(sheen_L.y, 0.14); // keep the disc at least ~8deg above the horizon
+          sheen_L = normalize(sheen_L);
+          float sheen_align = clamp(dot(reflect(-sheen_V, vec3(0.0, 1.0, 0.0)), sheen_L), 0.0, 1.0);
+          sheen = 0.25 + 1.25 * pow(sheen_align, 8.0);
+        }
+      }
+      water_rgb += (vec3(pat) * 0.30
+                 + pat * lerp.rgb * 1.0) * sheen;
     }
     water_rgb = clamp(water_rgb, 0.0, 1.0);
 
@@ -354,5 +396,23 @@ void main()
     float fogFactor = 1.0 - f4;
 
     out_color.rgb = mix(out_color.rgb, FogColor_FogOn.rgb, fogFactor);
+
+    // FOGGED-OUT EMISSIVE LIQUID MUST STOP BLOOMING (round 28): the bloom bright pass treats
+    // alpha > 0.88 as emissive and re-brightens those texels AFTER fog. Lava writes alpha 1.0 at
+    // any distance, so a fully-fogged lava plane still glowed and drew a hard seam against the
+    // (correctly dark) fogged terrain -- the "terrain line in the distance" seen from under lava.
+    // Fade the emissive flag out with visibility f4; min() leaves ordinary water alpha untouched.
+    out_color.a = min(out_color.a, mix(0.85, 1.0, f4));
+  }
+
+  // [2026-08-27 user: "blue sky horizon band underwater"] Seen from BELOW, the distant surface
+  // must sink into the water fog like the terrain does -- but deep water writes alpha ~1.0 and
+  // the bloom bright-pass treats >0.88 as EMISSIVE, re-brightening it AFTER fog (the round-28
+  // lava-seam mechanism). At partial fog the f4 fade above still allows alpha >0.88, so the
+  // half-fogged surface glowed as a bright stripe across the view. Underwater, water (not lava)
+  // never enters the emissive range.
+  if (type != 2 && camera.y < world_pos_.y)
+  {
+    out_color.a = min(out_color.a, 0.85);
   }
 }

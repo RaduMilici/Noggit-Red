@@ -15,7 +15,11 @@ namespace
 {
   inline glm::vec2 default_uv(int px, int pz)
   {
-    return {static_cast<float>(px) / 4.f, static_cast<float>(pz) / 4.f};
+    // ONE texture repeat per liquid CELL (4.1666yd) -- the client's scale (the WMO water builder
+    // FUN_006b6630 emits per-tile (i,j) UVs on the same 4.1666yd tiles). The old /4 made the
+    // texture repeat every 4 cells (~16.7yd) = a 4x zoom ("water texture looks 5-10x enlarged
+    // up close", 2026-08-25).
+    return {static_cast<float>(px), static_cast<float>(pz)};
   }
 
   // WoW LiquidType.dbc ids run in groups of four — water, ocean, magma, slime — repeated for the

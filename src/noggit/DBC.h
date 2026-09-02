@@ -205,6 +205,8 @@ public:
   /// Fields
   static const size_t ID = 0;        // uint
   static const size_t Name = 1;      // string
+  // WotLK Type column. NOTE: on Vanilla/Classic data field 3 is SpellID -- use TypeField() /
+  // liquidClass() below instead of this raw constant (kept for the WotLK-only call sites).
   static const size_t Type = 3;      // uint
   static const size_t ShaderType = 14;  // uint
   static const size_t TextureFilenames = 15;    // string[6]
@@ -215,6 +217,24 @@ public:
 
   static int getLiquidType(int pID);
   static std::string getLiquidName(int pID);
+
+  // ===== VERSION-GATED liquid classification (2026-08-27; the two eras differ in BOTH the
+  // column index AND the enum, verified against the shipped DBCs):
+  //   1.12 / Turtle (4 fields):  Type at field 2, enum {0 = magma, 2 = slime, 3 = water AND
+  //                              ocean} -- it CANNOT separate water from ocean, so the class
+  //                              must come from the liquid ID (only 1,2,3,4,21 exist).
+  //   3.3.5a (45 fields):        Type at field 3, enum {0 water, 1 ocean, 2 magma, 3 slime} --
+  //                              authoritative for every id (incl. 100 "Basic Procedural
+  //                              Water" = OCEAN and 121 "CoA Black - Magma" = MAGMA, both of
+  //                              which an id-modulo guess gets wrong).
+  // Gated on the loaded DBC's field count (data-driven, same test liquid_layer.cpp uses).
+  static size_t TypeField();
+  // Normalized base class of a liquid id: 0 water/river, 1 ocean, 2 magma, 3 slime.
+  static int liquidClass(int liquid_id);
+  // WotLK-only: the ambient LOOP SoundEntries authored on the row (field 4) -- exact per flow
+  // variant (Water 1111 / Slow 1112 / Fast 1113, Magma 3072, Slow+Fast Magma 3052, Ocean 1114,
+  // Slime 3880). 0 on Classic data, which has no such column (use SoundWaterType.dbc there).
+  static int loopSound(int liquid_id);
 };
 
 class SoundProviderPreferencesDB : public DBCFile
@@ -297,6 +317,79 @@ public:
     static const size_t soundEntriesAdvancedID = 29;        // int
 };
 
+// ===== footstep-sound chain DBCs (client RE doc 38, 2026-08-27) =====
+
+class SoundWaterTypeDB : public DBCFile
+{
+public:
+    SoundWaterTypeDB() :
+        DBCFile("DBFilesClient\\SoundWaterType.dbc")
+    { }
+
+    // THE liquid-loop selector (doc 38, dumped complete): 12 rows mapping
+    // {liquid class, flow class} -> the looping SoundEntries. river(0): still 1111 / slow 1112
+    // / fast 1113; ocean(1): always 1114; magma(2): still LavaPoolLoop 3072 / moving
+    // LavaFlowLoop 3052; slime(3): always SlimeLoop 3880. UnderWaterLoop(4123) is the separate
+    // submerged-listener loop, not in this table.
+    static const size_t ID = 0;
+    static const size_t LiquidClass = 1;  // 0 river, 1 ocean, 2 magma, 3 slime
+    static const size_t FluidSpeed = 2;   // 0 still, 4 slow, 8 fast
+    static const size_t Sound = 3;        // SoundEntries id (type 22 loop)
+};
+
+class CreatureSoundDataDB : public DBCFile
+{
+public:
+    CreatureSoundDataDB() :
+        DBCFile("DBFilesClient\\CreatureSoundData.dbc")
+    { }
+
+    static const size_t ID = 0;
+    // CreatureFootstepID into FootstepTerrainLookup (data cross-check: rows 2/3/4 carry the
+    // 8/10/11 seen as FootstepTerrainLookup CreatureFootstepID; binary confirm pending).
+    static const size_t Footstep = 9;
+    // Damage-taken vocals, resolved by NAME against SoundEntries across HumanMale(49)/Basilisk(1)/
+    // BogBeast(2) (doc 38 round 14): col1 attack, col2 exertionCrit, col3 WOUND, col4 woundCrit,
+    // col6 death. The wound line is what a creature yells on fall damage.
+    static const size_t Wound = 3;
+    static const size_t WoundCritical = 4;
+    // Fidget SoundEntries: client reads csd+0x38+slot*4, slot<4 (FUN_006230a0) = columns 14..17
+    static const size_t Fidget1 = 14;
+};
+
+class FootstepTerrainLookupDB : public DBCFile
+{
+public:
+    FootstepTerrainLookupDB() :
+        DBCFile("DBFilesClient\\FootstepTerrainLookup.dbc")
+    { }
+
+    // binary-confirmed row layout (FUN_00457040 bake + FUN_00458450 resolve)
+    static const size_t ID = 0;
+    static const size_t CreatureFootstepID = 1;
+    static const size_t TerrainSoundID = 2;     // matches TerrainType.SoundClass (f4)
+    static const size_t SoundID = 3;            // normal step SoundEntries
+    static const size_t SoundIDSplash = 4;      // wet step SoundEntries
+};
+
+class TerrainTypeDB : public DBCFile
+{
+public:
+    TerrainTypeDB() :
+        DBCFile("DBFilesClient\\TerrainType.dbc")
+    { }
+
+    // binary-confirmed columns (FUN_00458450 / footprint placer FUN_005fbf70). NOTE: the
+    // client's loader overwrites the LAST field with the row ordinal and keys on it -- rows
+    // are effectively ordinals 0..10 in 1.12 data.
+    static const size_t ID = 0;
+    static const size_t Description = 1;    // string
+    static const size_t FootprintRun = 2;   // FootprintTextures row (running)
+    static const size_t FootprintWalk = 3;  // FootprintTextures row (walking)
+    static const size_t SoundClass = 4;     // the FootstepTerrainLookup TerrainSoundID axis
+    static const size_t Flags = 5;          // bit0 = leaves footprint decals
+};
+
   class CreatureDisplayInfoDB : public DBCFile
   {
   public:
@@ -306,6 +399,8 @@ public:
 
     static const size_t ID = 0;
     static const size_t ModelID = 1;
+    // CreatureSoundData override for this display (0 = fall back to CreatureModelData.SoundID).
+    static const size_t Sound = 2;
     static const size_t ExtendedDisplayInfoID = 3;
     // WotLK-only column (16-field layout): ParticleColor.dbc row id for recolored creature variants.
     // Returns 0 on classic layouts (no such column) -- gate on the value like CapeDisplayID().
@@ -370,6 +465,12 @@ public:
     static const size_t ModelName = 2;
     static const size_t SizeClass = 3;
     static const size_t ModelScale = 4;
+    // Turtle/1.12 16-field layout, last float column (f15). Verified from the extracted DBC:
+    // HumanMale(49) 2.031, HumanFemale(50) 1.913, DwarfMale(53) 1.667, DwarfFemale(54) 1.528.
+    static const size_t CollisionHeight = 15;
+    // CreatureSoundData row for this model (f13; HumanMale 49 -> CSD 49). Display's Sound
+    // column overrides when non-zero (client resolution order).
+    static const size_t SoundID = 13;
   };
 
   class ItemDisplayInfoDB : public DBCFile
@@ -453,6 +554,7 @@ public:
     static const size_t Facial1Flags = 2;
     static const size_t Facial2Flags = 3;
     static const size_t Facial3Flags = 4;
+    static const size_t EarsFlags = 5; // 6th 1.12 column (row 248 full helms set it)
   };
 
   // WotLK-only (absent from 1.12 data; open() no-ops there and the record count stays 0).
@@ -781,6 +883,10 @@ extern SoundAmbienceDB gSoundAmbienceDB;
 extern ZoneMusicDB gZoneMusicDB;
 extern ZoneIntroMusicTableDB gZoneIntroMusicTableDB;
 extern SoundEntriesDB gSoundEntriesDB;
+extern CreatureSoundDataDB gCreatureSoundDataDB;
+extern SoundWaterTypeDB gSoundWaterTypeDB;
+extern FootstepTerrainLookupDB gFootstepTerrainLookupDB;
+extern TerrainTypeDB gTerrainTypeDB;
 extern CreatureDisplayInfoDB gCreatureDisplayInfoDB;
 extern CreatureDisplayInfoExtraDB gCreatureDisplayInfoExtraDB;
 extern CreatureModelDataDB gCreatureModelDataDB;

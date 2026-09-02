@@ -26,6 +26,7 @@
 #include <noggit/rendering/LiquidTextureManager.hpp>
 #include <algorithm>
 #include <optional>
+#include <utility>
 #include <QtCore/QSettings>
 #include <map>
 #include <set>
@@ -67,12 +68,19 @@ public:
     struct AttachmentModel
     {
       int attachment_id = -1;
+      // Aura state-kit effect model rather than worn equipment: exempt from the unit's
+      // CreatureModelAlpha/ghost tint propagation (client-verified: Anomalus body alpha 200,
+      // its chest sparkles render full-opacity).
+      bool is_aura_kit = false;
       std::optional<ModelInstance> model_instance;
       // Transform the particle pass draws this attachment's emitters with. Set each frame in the body
       // pass: the full animated attachment matrix when the model's emitters ride their parent (flag
       // 0x10), else the BIND-pose placement so world-space particles (aura sparkles) don't get
       // dragged around by the animated bone.
       glm::mat4x4 particle_transform = glm::mat4x4(1.0f);
+      // World height above which this attachment's world-space particles die (the liquid surface
+      // for breath bubbles). Effectively unset by default.
+      float particle_kill_plane_y = 1.0e30f;
     };
 
     std::uint32_t guid = 0;
@@ -257,6 +265,19 @@ public:
   // drives the precipitation pass). 0 = none, 1 = rain, 2 = snow; intensity 0..1. Runtime-only.
   int weather_type = 0;
   float weather_intensity = 1.0f;
+  // Surface splash/wake ripple spawn requests (client Water0Ripple port, RE doc 36): game-mode
+  // code pushes; WorldRender drains into its ripple pool each frame. kind 0 = wake, 1 = splash.
+  struct WaterRippleSpawn
+  {
+    glm::vec3 pos;
+    float rot;
+    float size0;
+    float growth;
+    float lifetime_s;
+    float alpha_peak;
+    int kind;
+  };
+  std::vector<WaterRippleSpawn> pending_ripples;
   // Like animtime but only advances while model animations are enabled, so toggling animations off
   // freezes (pauses) model/particle animation in place while liquid/terrain keep churning on animtime.
   float model_animtime = 0.0f;
@@ -304,8 +325,11 @@ public:
   // One-shot INTRO music id (ZoneIntroMusicTable) for a position -- same resolution as getZoneMusic
   // but reads the IntroSound columns. 0 = no intro authored.
   int getZoneIntroMusic(glm::vec3 const&);
-  // Shared resolver behind getZoneMusic/getZoneIntroMusic: wmo_field / area_field pick which
-  // WMOAreaTable / AreaTable column to read (ZoneMusic or IntroSound).
+  // Zone ambience id (SoundAmbience.dbc) for a position -- same resolution walk over the
+  // SoundAmbience columns (WMOAreaTable col 6, AreaTable col 7). 0 = none authored. (doc 38)
+  int getZoneAmbience(glm::vec3 const&);
+  // Shared resolver behind getZoneMusic/getZoneIntroMusic/getZoneAmbience: wmo_field /
+  // area_field pick which WMOAreaTable / AreaTable column to read.
   int getZoneMusicField(glm::vec3 const&, size_t wmo_field, size_t area_field);
   // True if pos falls inside a loaded WMO's group AABB (i.e. the camera is standing inside a building/
   // dungeon interior, not merely inside its loose outer AABB). Used to drop the client's outdoor
@@ -660,6 +684,11 @@ public:
   void ensureCreatureSpawnsLoaded();
   void clearCreatureSpawns();
   bool ensureCreatureSpawnModel(CreatureSpawnOverlay& spawn);
+  // [mem 2026-08-26] inverse of ensureCreatureSpawnModel: frees the spawn's model/mount/attachment
+  // instances AND the per-instance state they parked on the shared models. Called by the render
+  // loop for spawns far past the draw distance -- without it every spawn ever approached kept its
+  // models (and their texture refs) for the whole session.
+  void releaseCreatureSpawnModel(CreatureSpawnOverlay& spawn);
   bool ensureGameObjectSpawnModel(GameObjectSpawnOverlay& spawn);
   std::vector<std::pair<std::size_t, std::string>> applyCreatureSpawnModelAppearance(CreatureSpawnOverlay const& spawn,
                                                                                      ModelInstance& model_instance,
@@ -736,12 +765,16 @@ public:
   bool setGameCharacterDisplayId(std::uint32_t display_id);
   void updateGameCharacter(glm::vec3 const& pos, float orientation_deg, int anim_id,
                            float lower_body_twist_rad = 0.0f, float anim_time_scale = 1.0f,
-                           float body_pitch_deg = 0.0f);
+                           float body_pitch_deg = 0.0f, bool force_anim_restart = false);
   // Authored moveSpeed (yd/s) of one of the character's animations; 0 when unavailable.
   float gameCharacterAnimMoveSpeed(int anim_id);
   // Underwater breath bubbles (client: HARDCODED "Breath Underwater" -> Particles\Bubbles.m2 at
   // the Breath attachment 17), toggled while the character's head is below the water surface.
-  void setGameCharacterBubbles(bool on);
+  void setGameCharacterBubbles(bool on, float surface_y = 1.0e30f);
+  // [game mode] client swim law (335a FUN_00730d10): thresholds scale with the UNIT's collision
+  // height -- CreatureModelData.CollisionHeight x display scale for the CURRENT character
+  // display, cached by setGameCharacterDisplayId (Turtle HumanMale = 2.031).
+  float gameCharacterCollisionHeight() const { return _game_char_collision_height; }
 
   // [game mode] sorted list of REAL CreatureDisplayInfo row ids (lazy, cached) -- the Game Mode
   // panel's display-id spinner steps through these instead of every integer.
@@ -750,6 +783,32 @@ public:
   // [game mode] ADT liquid surface height covering pos (top-most layer); nullopt when dry.
   // Bilinear over the layer's 9x9 vertex grid, subchunk-coverage aware.
   std::optional<float> getLiquidHeightAt(glm::vec3 const& pos);
+
+  // Like getLiquidHeightAt but also reports WHICH liquid covers pos ({surface height, liquid id}) --
+  // ADT layer liquidID / WMO group liquid id -- for the type-aware submersion effects (motes only
+  // in water, etc). WMO part needs the probe cache (game mode); ADT part always works.
+  std::optional<std::pair<float, int>> getLiquidAt(glm::vec3 const& pos);
+
+  // [doc 38 water loops] Base liquid CLASS of a liquid id: 0 water/river, 1 ocean, 2 magma,
+  // 3 slime -- the SoundWaterType.LiquidClass axis. Mirrors liquid_layer::mclq_liquid_type.
+  static int liquidClassForId(int liquid_id);
+  // [doc 38 footsteps] TerrainType of a ground TEXTURE, gathered from every LOADED tile's
+  // authoring. Blizzard's per-chunk effect ids are inconsistent (the same texture is declared
+  // Stone in one tile and left as an empty placeholder row in the next), so a texture's type is
+  // resolved map-wide rather than per chunk. -1 = nothing authored anywhere loaded.
+  int terrainTypeForTexture(std::string const& texture_filename);
+  // Nearest liquid of each class within `radius` around `center` (surface-plane distance).
+  // Samples a ring of getLiquidAt probes (footstep-rate cost); feeds the WaterSoundPlayer
+  // (doc 38 FUN_00462b50). liquid_id is carried through so the 3.3.5a path can read the
+  // per-variant loop sound straight off LiquidType.dbc.
+  struct WaterLoopSample
+  {
+    bool found = false;
+    float distance = 0.0f;
+    int liquid_id = 0;
+  };
+  void sampleWaterLoopSources(glm::vec3 const& center, float radius,
+                              std::array<WaterLoopSample, 4>& out);
 
   // [game mode] PROBE CACHE: physics/camera rays fire ~15x per frame, and walking the whole
   // instance storage per ray was the game-mode frame lag. The cache holds the collidables near
@@ -760,6 +819,31 @@ public:
   // Authored length (ms) of one of the character's animations; 0 when the model isn't ready or
   // lacks the id. Used to play JumpStart to its real end before switching to the Jump loop.
   int gameCharacterAnimLengthMs(int anim_id);
+  // Fire times (anim-local ms, sorted) of an M2 anim event on the game character's model --
+  // e.g. '$FSD' footfalls of the Run cycle (doc 38). Empty while the model loads / none authored.
+  std::vector<int> gameCharacterAnimEventTimes(std::uint32_t fourcc, int anim_id);
+  // The character's CreatureFootstepID: display.Sound override else CreatureModelData.SoundID
+  // -> CreatureSoundData column 9 (client resolution, doc 38). 0 = none (no footstep sounds).
+  std::uint32_t gameCharacterFootstepId();
+  // The CHARACTER water-entry/exit splash: SoundEntries SoundType 21
+  // ("CharacterSplashSoundSmall/Medium/large", dir Sound\Character\Footsteps\EnterWaterSplash).
+  // This is the BODY hitting/leaving the water -- a different lane from the type-20 footstep
+  // wading splash the FootstepTerrainLookup splash column provides (doc 38 round 18). 0 = the
+  // client data has no such row.
+  int characterSplashSoundEntry();
+
+  // Any other SoundEntries column of the game character's CreatureSoundData row (same display ->
+  // CreatureSoundData resolution as the footstep id): e.g. CreatureSoundDataDB::Wound for the
+  // damage-taken vocal. 0 = the row does not author that lane.
+  std::uint32_t gameCharacterSoundEntry(std::size_t column);
+  // TerrainType ROW under a world position (doc 38): the NEAREST support surface decides --
+  // WMO floor -> the hit face's authored WMOMaterial.ground_type; terrain -> the MCNK
+  // doodadMapping layer -> GroundEffectTexture.TerrainType; M2 (crates) -> 0/Dirt (surface
+  // ground type not yet RE'd). model_view = the camera MV the probe expects (transposed).
+  int groundTerrainTypeAt(glm::vec3 const& pos, glm::mat4x4 const& model_view);
+  // FootstepTerrainLookup resolve: (footstep id x TerrainType row's SoundClass x wet) ->
+  // SoundEntries id (0 = none). Rows scanned once into a cache.
+  int footstepSoundEntry(std::uint32_t footstep_id, int terrain_row, bool splash);
 
   // Spell details for the spawned creatures' permanent auras (fetched once per spawn reload from the
   // server's spell_template). Keyed by spell id; used for aura state-kit visuals and the creature-info
@@ -832,6 +916,11 @@ protected:
   CreatureSpawnOverlay _game_character;
   bool _game_character_visible = false;
   bool _game_character_bubbles = false;
+  float _game_char_collision_height = 2.031f; // see gameCharacterCollisionHeight()
+  // texture filename -> TerrainType row, accumulated from loaded tiles (terrainTypeForTexture)
+  std::map<std::string, int> _texture_terrain_types;
+  unsigned _texture_terrain_tiles_scanned = 0;
+  float _texture_terrain_last_scan_ms = -1.0e9f; // rescan-on-miss throttle (see the .cpp note)
   std::vector<std::uint32_t> _creature_display_ids; // see creatureDisplayIds()
   // [game mode] probe cache state (see ensureProbeCache / intersectProbe)
   static constexpr float k_probe_cache_radius = 45.0f; // covers the 25yd camera boom + corners + margin

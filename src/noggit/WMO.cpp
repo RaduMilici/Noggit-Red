@@ -749,7 +749,17 @@ void WMOGroup::load()
   f.read (&size, 4);
 
   assert (fourcc == 'MOPY');
-  f.seekRelative (size);
+  // PER-TRIANGLE MATERIALS. This chunk used to be SKIPPED outright (`f.seekRelative(size)`), which
+  // left `_material_infos` permanently EMPTY -- so every `tri < _material_infos.size()` test in
+  // this file silently evaluated false: the collidable/detail filter never applied, and the
+  // footstep ground-type lookup could never find a face's material (2026-08-27, the "grass
+  // footsteps on Stormwind stone" report -- it fell through to the terrain BENEATH the city).
+  // Entry = {flags:u8, material:u8}; material 0xFF marks a collision-only (invisible) face.
+  std::vector<wmo_triangle_material_info> mopy_entries(size / sizeof(wmo_triangle_material_info));
+  if (!mopy_entries.empty())
+  {
+    f.read(mopy_entries.data(), mopy_entries.size() * sizeof(wmo_triangle_material_info));
+  }
 
   // - MOVI ----------------------------------------------
 
@@ -761,6 +771,20 @@ void WMOGroup::load()
   _indices.resize (size / sizeof (uint16_t));
 
   f.read (_indices.data (), size);
+
+  // SAFETY: only adopt the table when it matches the triangle count exactly. A short/mismatched
+  // MOPY combined with the collidable filter could otherwise make real FLOOR faces non-collidable
+  // and drop the player through the world -- leaving it empty preserves the old behaviour.
+  if (mopy_entries.size() == _indices.size() / 3)
+  {
+    _material_infos = std::move(mopy_entries);
+  }
+  else if (!mopy_entries.empty())
+  {
+    LogError << "WMO group: MOPY has " << mopy_entries.size() << " entries for "
+             << (_indices.size() / 3) << " triangles -- ignoring (per-face materials unavailable)"
+             << std::endl;
+  }
 
   // - MOVT ----------------------------------------------
 
@@ -1045,6 +1069,8 @@ void WMOGroup::load()
           , fname
           , use_material_color
           , material_color
+          , (bool)header.flags.indoor // city channel (canals) vs open-air pool (see wmo_liquid.hpp)
+          , &_vertices // group mesh for the FLOATLIQ geometric clip (phantom flat-sheet tiles)
       );
 
       // creating the wmo liquid doesn't move the position
@@ -1747,7 +1773,7 @@ bool WMOGroup::is_visible( glm::mat4x4 const& transform
 }
 
 
-std::optional<float> WMOGroup::liquidHeightAtLocal(glm::vec3 const& p) const
+std::optional<float> WMOGroup::liquidHeightAtLocal(glm::vec3 const& p, int* out_liquid_id) const
 {
   if (!lq)
   {
@@ -1759,7 +1785,12 @@ std::optional<float> WMOGroup::liquidHeightAtLocal(glm::vec3 const& p) const
   {
     return std::nullopt;
   }
-  return lq->heightAtLocal(p);
+  auto const h = lq->heightAtLocal(p);
+  if (h && out_liquid_id)
+  {
+    *out_liquid_id = lq->liquid_id();
+  }
+  return h;
 }
 
 // [perf 2026-08-17] Build the lazy 2D (XZ) collision grid over this group's COLLIDABLE triangles. See
@@ -1971,6 +2002,90 @@ void WMOGroup::intersect (math::ray const& ray, std::vector<float>* results, flo
   }
 }
 
+std::optional<std::pair<float, int>> WMOGroup::groundHit(math::ray const& ray, float max_dist) const
+{
+  // [doc 38 footsteps] the physics batch walk (see intersect above) with the hit TRIANGLE kept:
+  // per-tri MOPY material -> WMOMaterial.ground_type = the authored TerrainType row of the
+  // floor the character stands on (bridges, docks, building interiors).
+  // A WMO floor is very often COLLISION-ONLY geometry (MOPY material index 0xFF -- the invisible
+  // physics plane above/below the visible floor). Such a face carries NO material and therefore
+  // no ground type, so track the nearest textured face separately: it is the visible floor whose
+  // material actually declares the type. Returning 0 for a material-less hit (as this did before
+  // 2026-08-27) made every Stormwind step read as an authored "Dirt".
+  std::optional<float> best_any;
+  std::optional<float> best_textured;
+  int best_ground = -1;
+  for (auto&& batch : _batches)
+  {
+    if (batch.index_count == 0)
+    {
+      continue;
+    }
+    for (size_t i (batch.index_start); i < batch.index_start + batch.index_count; i += 3)
+    {
+      size_t const tri = i / 3;
+      // NO collidable/detail filter here. This query asks "what surface am I standing ON", which
+      // is a VISUAL question -- and in Stormwind the visible street is DETAIL|RENDER geometry
+      // (2293 of its walkable faces; only 573 are plain RENDER), while the faces that actually
+      // block movement are separate COLLISION-only ones carrying material 0xFF = no material at
+      // all. Filtering by isCollidable() (the physics rule) therefore threw away every face that
+      // HAS a material and left the query with nothing -- the ground type fell back to the ADT
+      // terrain buried under the city, i.e. grass footsteps on the stone streets (2026-08-27).
+      if ( auto&& distance
+         = ray.intersect_triangle ( _vertices[_indices[i + 0]]
+                                  , _vertices[_indices[i + 1]]
+                                  , _vertices[_indices[i + 2]]
+                                  )
+         )
+      {
+        if (max_dist > 0.0f && *distance > max_dist)
+        {
+          continue;
+        }
+        if (!best_any || *distance < *best_any)
+        {
+          best_any = *distance;
+        }
+        if (tri < _material_infos.size())
+        {
+          std::uint8_t const mat = _material_infos[tri].texture;
+          if (mat != 0xff && mat < wmo->materials.size()
+              && (!best_textured || *distance < *best_textured))
+          {
+            best_textured = *distance;
+            best_ground = static_cast<int>(wmo->materials[mat].ground_type);
+          }
+        }
+      }
+    }
+  }
+  if (best_textured)
+  {
+    return std::make_pair(*best_textured, best_ground);
+  }
+  if (best_any)
+  {
+    return std::make_pair(*best_any, -1); // collision-only hit: type unknown, caller falls back
+  }
+  return std::nullopt;
+}
+
+std::optional<std::pair<float, int>> WMO::groundHit(math::ray const& ray, float max_dist) const
+{
+  std::optional<std::pair<float, int>> best;
+  for (auto const& group : groups)
+  {
+    if (auto const hit = group.groundHit(ray, max_dist))
+    {
+      if (!best || hit->first < best->first)
+      {
+        best = hit;
+      }
+    }
+  }
+  return best;
+}
+
 void WMOGroup::drawLiquid ( glm::mat4x4 const& transform
                           , OpenGL::Scoped::use_program& water_shader
                           , Noggit::Rendering::LiquidTextureManager& texture_manager
@@ -2121,7 +2236,11 @@ void WMOFog::setup()
 
 }
 
-decltype (WMOManager::_) WMOManager::_;
+// [EXIT-CRASH FIX 2026-08-29] Intentionally LEAKED: the three object managers reference each other
+// from their element destructors (~WMO -> ModelManager::_, ~Model -> TextureManager::_), and their
+// cross-TU static destruction order is unspecified, so whichever died first left the others faulting
+// on a destroyed mutex/map during process exit. Never destroying them removes the hazard entirely.
+Noggit::AsyncObjectMultimap<WMO>& WMOManager::_ = *new Noggit::AsyncObjectMultimap<WMO>();
 
 void WMOManager::report()
 {

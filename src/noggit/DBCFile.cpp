@@ -50,6 +50,16 @@ void DBCFile::open(std::shared_ptr<BlizzardArchive::ClientData> clientData)
   f.read(&recordSize, 4);
   f.read(&stringSize, 4);
 
+  // DIAGNOSTIC (grass saga, doc 37 §2b): identify WHICH GroundEffect* copy the chain served --
+  // the archives carry 8 different GroundEffectTexture.dbc versions and the record count alone
+  // distinguishes every one (patch-9=11816, patch-2=12742, dbc.MPQ=8466/11-field, ...). Always-on
+  // LogError: two lines per session, answers "where does noggit's clutter come from" from log.txt.
+  if (filename.find("GroundEffect") != std::string::npos)
+  {
+    LogError << "GRASS-DIAG DBC '" << filename << "' records=" << recordCount
+             << " fields=" << fieldCount << " recordSize=" << recordSize << std::endl;
+  }
+
   if (fieldCount * 4 != recordSize)
   {
     throw std::logic_error ("non four-byte-columns not supported");

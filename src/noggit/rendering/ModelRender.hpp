@@ -76,6 +76,11 @@ namespace Noggit::Rendering
     int    tex_clamp0 = 0;
     int    tex_clamp1 = 0;
     uint16_t blend_mode = 0;
+    // Era bit for the TWO-ERA alpha-key law (doc 40 sec 10): classic v256 models alpha-key at
+    // 128/255 WITH src-alpha blending (1.12 table 0x8120D4 + turtle capture); wotlk models at
+    // 224/255 with blending OFF (3.3.5a FUN_0081fe90 + table 0xa453b0 row 0). Only set for
+    // blend 1 so groups of other blends never split on era.
+    bool   classic_alpha = false;
     bool   backface_cull = true;
     // [pib-MDI 2026-08-07] carried for the billboard-doodad batch only (glow cards are commonly unlit and/or
     // unfogged; the tile-doodad batch always resolves these to false, so its grouping is unchanged).
@@ -84,11 +89,16 @@ namespace Noggit::Rendering
     // per-instance (NOT identity)
     int    layer0 = 0;
     int    layer1 = 0;
+    // [VULKAN phase C] the BLPs behind tex_array0/1 -- the Vulkan backend addresses textures by a bindless
+    // index keyed on the file name, not by (GL array, layer). Excluded from the identity tuple below, like
+    // layer0/layer1: two batches differing only in texture NAME already differ in tex_array/layer.
+    std::string blp0;
+    std::string blp1;
 
     auto identity() const
     {
       return std::tie(tex_array0, tex_array1, tu_lookup0, tu_lookup1, pixel_shader,
-                      tex_clamp0, tex_clamp1, blend_mode, backface_cull, unfogged, unlit);
+                      tex_clamp0, tex_clamp1, blend_mode, classic_alpha, backface_cull, unfogged, unlit);
     }
     bool operator<(StaticBatchKey const& o) const { return identity() < o.identity(); }
   };

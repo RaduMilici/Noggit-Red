@@ -9,6 +9,8 @@
 #include <QString>
 #include <QFile>
 #include <QTimer>
+#include <QScreen>
+#include <QGuiApplication>
 #include <noggit/ui/FontNoggit.hpp>
 
 #include "ui_NoggitProjectSelectionWindow.h"
@@ -80,7 +82,12 @@ NoggitProjectSelectionWindow::NoggitProjectSelectionWindow(Noggit::Application::
       _project_selection_page = std::make_unique<Noggit::Ui::Windows::NoggitWindow>(
           _noggit_application->getConfiguration(),
           project_to_launch);
-      _project_selection_page->showMaximized();
+      // Maximize on the PRIMARY display, not whichever screen holds the cursor (user-rejected default).
+                       if (QScreen* primary_screen = QGuiApplication::primaryScreen())
+                       {
+                         _project_selection_page->setGeometry(primary_screen->availableGeometry());
+                       }
+                       _project_selection_page->showMaximized();
 
       close();
     });
@@ -174,6 +181,11 @@ NoggitProjectSelectionWindow::NoggitProjectSelectionWindow(Noggit::Application::
                        _project_selection_page = std::make_unique<Noggit::Ui::Windows::NoggitWindow>(
                            _noggit_application->getConfiguration(),
                            selected_project);
+                       // Maximize on the PRIMARY display, not whichever screen holds the cursor (user-rejected default).
+                       if (QScreen* primary_screen = QGuiApplication::primaryScreen())
+                       {
+                         _project_selection_page->setGeometry(primary_screen->availableGeometry());
+                       }
                        _project_selection_page->showMaximized();
 
                        close();

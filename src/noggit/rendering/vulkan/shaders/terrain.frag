@@ -7,6 +7,7 @@ layout(location = 0) in vec3 v_world;
 layout(location = 1) in vec3 v_normal;
 layout(location = 2) in vec3 v_mccv;
 layout(location = 0) out vec4 out_color;
+layout(location = 1) out float out_z; // [phase A] depth-as-colour (R32F attachment GL imports)
 
 layout(push_constant) uniform Push
 {
@@ -30,4 +31,5 @@ void main()
   vec3 base = mix(tex, vec3(0.75, 0.73, 0.70), h * h * 0.6);
 
   out_color = vec4(base * (0.40 + 0.60 * ndl) * v_mccv, 1.0);
+  out_z = gl_FragCoord.z;
 }

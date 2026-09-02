@@ -123,6 +123,7 @@ vec3 point_lights(vec3 world_pos, vec3 n)
 
 uniform vec4 mesh_color;
 uniform int blend_mode;
+uniform int alpha_key_classic; // TWO-ERA alpha-key (doc 40 sec 10): 1 = classic v256 model
 uniform int water_surface_effect; // 1 = fishing-pool wake geoset: grey out + luminance-alpha (see below)
 
 uniform sampler2DArray tex1;
@@ -268,6 +269,24 @@ void main()
       }
       case 1: // Alpha_key
       {
+          // TWO-ERA CLIENT LAW (RE'd 2026-08-28, docs/client_re/40 sec 10). 1.12 (classic v256
+          // models): test at 128/255 x w WITH src-alpha blending (binary translate table
+          // 0x008120D4 AlphaKey -> gx2, turtle_water.trace 18,013 draws at ALPHAREF=128+blend).
+          // 3.3.5a (wotlk models): test at 224/255 x w, blending OFF (FUN_0081fe90: ref =
+          // combinedAlpha x 224/255 [_DAT_00a3fdcc]; translate table .rdata:0xa453b0 row 0 maps
+          // blend 1 -> gx1 AlphaKey). Blend state is set by prepareDraw / the batched switches
+          // from the same era bit.
+          // 2026-08-28 ROUND 3: the 224/no-blend reading for WOTLK is CONTRADICTED by observation --
+          // the user's Ascension client renders the SAME HD model + SAME cape texture + SAME
+          // alpha-key material SOLID, while 224 predicts the holey cutout noggit drew. patch-CHA
+          // ships no cape textures and no DBCs, so model/texture/material are identical on both
+          // sides; the only free variable left is this ref. 128+blend is the law proven for 1.12
+          // (table 0x8120D4 + capture) and it demonstrably occurs in 3.3.5a captures too, so both
+          // eras use it until a capture of an alpha-key CHARACTER batch says otherwise.
+          // REVERTED to the client ref (FUN_0081fe90: combinedAlpha x 224/255) -- the 128+blend
+          // experiment made cloaks SEMI-TRANSPARENT, which is flatly wrong: cloaks are fully
+          // opaque in game, never alpha < 1 (user 2026-08-28). Alpha-key must therefore be a
+          // hard test with NO blending; the remaining question is only which texels pass it.
           alpha_test = (224.f / 255.f) * mesh_color.w;
           fog_mode = 1;
           break;
@@ -623,18 +642,23 @@ void main()
         ground_n = vec3(v_interior.z, 0.0, v_interior.w);
         ground_n.y = sqrt(max(0.0, 1.0 - dot(ground_n.xz, ground_n.xz)));
       }
-      // Terrain-frame N.L (same to_light expression as terrain_frag ~328; the baked normal is in the
-      // terrain vertex frame, not the M2 fixCoordSystem frame).
-      vec3 to_light = -normalize(vec3(LightDir_FogRate.x, LightDir_FogRate.z, LightDir_FogRate.y));
-      float ndl = clamp(dot(ground_n, to_light), 0.0, 1.0);
-      // Dynamic shadow folds into the client's 0.3x+0.7 shade term (floor 0.7), like the PCF PS
-      // permutations -- NOT a multiplier on the diffuse. Remap dyn_shadow_factor's [floor..1] to [0..1].
+      // 1.12 CLIENT LAW (round 2026-08-25 -- this branch previously ran the 3.3.5a DetailDoodad.bls
+      // law, which is BRIGHTER: it adds a ground-normal N.L diffuse term and floors shadow at 0.70;
+      // the parity target is the 1.12 turtle client). The 1.12 scatter chain (FUN_006bfc10 +
+      // per-blade store FUN_006b2920, wowdecomp/frill112*.c) samples the chunk MCSH texel per blade
+      // and stores the RAW shadow flag with the placement -- no normal is stored and no N.L is ever
+      // computed for grass. Blade colour (decomp_sky7 finding, recorded in MapChunk.h):
+      //   vertColor = Ambient + Directional * shade, shade mapped into [0.25 .. 0.75]
+      // -- an unshadowed blade only ever gets 0.75 of the directional light, an MCSH-shadowed one
+      // 0.25. That band is what keeps client grass sunk into dark/shadowed terrain (Un'Goro soil,
+      // shaded mountainsides); the 335a ndl+0.70-floor law read up to ~3x brighter there
+      // (user 2026-08-25: "grass standing out too bright, not matching the terrain under them").
+      // Dynamic (editor) shadows fold into the same shade term like the MCSH bit they emulate.
       float dyn01 = clamp((dyn_shadow_factor(m2_world_pos) - ShadowParams.y)
                           / max(1.0 - ShadowParams.y, 1e-4), 0.0, 1.0);
-      float shade = 0.3 * min(blade_shadow, dyn01) + 0.7;
-      // All factors <= 1, so the shared clamp(currColor + lDiffuse) below is a no-op: byte-exact.
-      currColor = min(AmbientColor_FogEnd.xyz + DiffuseColor_FogStart.xyz * ndl, vec3(1.0))
-                * blade_tint * shade;
+      float shade = mix(0.25, 0.75, min(blade_shadow, dyn01));
+      currColor = min(AmbientColor_FogEnd.xyz + DiffuseColor_FogStart.xyz * shade, vec3(1.0))
+                * blade_tint;
       lDiffuse = vec3(0.0);
       accumlatedLight = vec3(0.0, 0.0, 0.0);
   }

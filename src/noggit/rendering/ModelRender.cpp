@@ -1,5 +1,6 @@
 // This file is part of Noggit3, licensed under GNU General Public License (version 3).
 
+#include <noggit/rendering/vulkan/VkParticleFeed.hpp>
 #include "ModelRender.hpp"
 #include <noggit/Model.h>
 #include <noggit/ModelInstance.h>
@@ -335,6 +336,10 @@ void ModelRender::unload()
   _vao_setup = false;
 }
 
+// [PIPELINE scope] How many GL draws the traversal STILL issues in VK mode. The record/replay
+// project's size is the number of sites that actually fire, not the number that exist in source.
+unsigned g_gl_draw_instanced = 0, g_gl_draw_single = 0, g_gl_draw_persistent = 0;
+unsigned g_gl_draw_particles = 0, g_gl_draw_ribbons = 0;
 void ModelRender::draw(glm::mat4x4 const& model_view
     , ModelInstance& instance
     , OpenGL::Scoped::use_program& m2_shader
@@ -351,6 +356,7 @@ void ModelRender::draw(glm::mat4x4 const& model_view
     , bool skip_animate
 )
 {
+  extern unsigned g_gl_draw_single; ++g_gl_draw_single;
   if (!_model->finishedLoading() || _model->loading_failed())
   {
     return;
@@ -688,6 +694,7 @@ void ModelRender::draw(glm::mat4x4 const& model_view
     , std::vector<glm::mat4x4> const& per_instance_bones
 )
 {
+  extern unsigned g_gl_draw_instanced; ++g_gl_draw_instanced;
   ZoneScopedN(NOGGIT_CURRENT_FUNCTION);
   bool const skip_mesh_passes = is_classic_effect_shell_model(_model);
   // Per-instance bone slices (perf 2026-07-20): non-empty => each instance owns bone_matrices.size()
@@ -1083,6 +1090,7 @@ void ModelRender::drawPersistent(glm::mat4x4 const& model_view
     , float extra_alpha
 )
 {
+  extern unsigned g_gl_draw_persistent; ++g_gl_draw_persistent;
   ZoneScopedN(NOGGIT_CURRENT_FUNCTION);
 
   if (!_model->finishedLoading() || _model->loading_failed() || is_classic_effect_shell_model(_model))
@@ -1227,6 +1235,14 @@ void ModelRender::drawRibbonsFiltered(OpenGL::Scoped::use_program& ribbons_shade
     OpenGL::Scoped::buffer_binder<GL_ARRAY_BUFFER> const transform_binder(_transform_buffer);
     gl.bufferData(GL_ARRAY_BUFFER, transforms.size() * sizeof(glm::mat4x4), transforms.data(), GL_DYNAMIC_DRAW);
   }
+  // [VULKAN phase G] same problem as the particles: GL reads these transforms from a VBO the emitter
+  // cannot read back, so publish them for the ribbon mirror in RibbonEmitter::draw.
+  {
+    auto& rctx = Noggit::Rendering::VK::ribbonDrawContext();
+    rctx.transforms.assign(reinterpret_cast<float const*>(transforms.data()),
+                           reinterpret_cast<float const*>(transforms.data()) + transforms.size() * 16u);
+    rctx.valid = true;
+  }
   drawRibbons(ribbons_shader, transforms.size());
 }
 
@@ -1248,6 +1264,15 @@ void ModelRender::drawParticlesForInstance(glm::mat4x4 const& model_view
     OpenGL::Scoped::buffer_binder<GL_ARRAY_BUFFER> const transform_binder(_transform_buffer);
     gl.bufferData(GL_ARRAY_BUFFER, sizeof(glm::mat4x4), &transform, GL_DYNAMIC_DRAW);
   }
+  // [VULKAN phase G] the emitter builds its quads in MODEL space and GL applies this transform via a
+  // vertex attribute it reads from the VBO above -- which the emitter itself cannot read back. Publish
+  // it (and the creature alpha) so ParticleSystem::draw can bake world-space vertices for Vulkan.
+  {
+    auto& ctx = Noggit::Rendering::VK::particleDrawContext();
+    std::memcpy(ctx.transform, &transform[0][0], sizeof(ctx.transform));
+    ctx.alpha_mod = model_alpha;
+    ctx.valid = true;
+  }
   // Apply CreatureModelAlpha to the particles (same value the mesh uses). The client fades the whole
   // model -- so the energy-elemental feet smoke that was rendering full-opacity now tracks the body.
   particles_shader.uniform("particle_alpha_mod", model_alpha);
@@ -1259,6 +1284,7 @@ void ModelRender::drawRibbons( OpenGL::Scoped::use_program& ribbons_shader
     , std::size_t instance_count
 )
 {
+  extern unsigned g_gl_draw_ribbons; ++g_gl_draw_ribbons;
   for (auto& r : _model->_ribbons)
   {
     r.draw(ribbons_shader, _transform_buffer, static_cast<int>(instance_count));
@@ -2264,16 +2290,28 @@ bool ModelRenderPass::prepareDraw(OpenGL::Scoped::use_program& m2_shader, Model 
   bool const promote_to_alpha_blend = translucent_display
     && (effective_blend == static_cast<uint16_t>(M2Blend::Opaque)
         || effective_blend == static_cast<uint16_t>(M2Blend::Alpha_Key));
-  uint16_t const blend_state_key = effective_blend | (promote_to_alpha_blend ? 0x100 : 0);
+  // TWO-ERA ALPHA-KEY LAW (doc 40 sec 10): classic v256 models alpha-key at 128/255 WITH
+  // src-alpha blending (1.12: table 0x8120D4 AlphaKey->gx2 + turtle capture 18k draws at
+  // ALPHAREF=128+blend); wotlk models at 224/255 with blending OFF (3.3.5a: FUN_0081fe90 ref =
+  // combinedAlpha x 224/255 [_DAT_00a3fdcc], translate table .rdata:0xa453b0 row 0 maps blend 1
+  // -> gx1 AlphaKey = blend disabled). The era bit joins the state key so consecutive models of
+  // different eras re-apply GL state, and rides to m2_frag as alpha_key_classic for the test ref.
+  bool const classic_alpha_key = m->_uses_classic_layout
+    && effective_blend == static_cast<uint16_t>(M2Blend::Alpha_Key);
+  uint16_t const blend_state_key = effective_blend | (promote_to_alpha_blend ? 0x100 : 0)
+                                 | (classic_alpha_key ? 0x200 : 0);
 
   if (model_render_state.blend != blend_state_key)
   {
+    m2_shader.uniform("alpha_key_classic", classic_alpha_key ? 1 : 0);
     switch (promote_to_alpha_blend ? M2Blend::Alpha : static_cast<M2Blend>(effective_blend))
     {
       default:
       case M2Blend::Opaque:
-      case M2Blend::Alpha_Key:
         gl.disable(GL_BLEND);
+        break;
+      case M2Blend::Alpha_Key:
+        gl.disable(GL_BLEND); // alpha-key never blends (cloaks are opaque in game, never alpha<1)
         break;
       case M2Blend::Alpha:
         gl.enable(GL_BLEND);
@@ -2309,6 +2347,52 @@ bool ModelRenderPass::prepareDraw(OpenGL::Scoped::use_program& m2_shader, Model 
   {
     m2_shader.uniform("masked_additive", static_cast<int>(masked_additive));
     model_render_state.masked_additive = masked_additive;
+  }
+
+  // [CAPE-TRACE 2026-08-28 TEMP] the user's "cloak renders with the wrong texture type, the texture
+  // background is see thru" on creature display 29089 (DraeneiMale, cape geoset 1502, ItemDisplayInfo
+  // 49102 -> Cape_Robe_Sunwell_D_02Black). The M2 authors that pass material 1 = {flags 4 two-sided,
+  // blend 0 OPAQUE}, so the client never consults the cape texture's DXT5 alpha at all. Anything
+  // see-through means noggit is drawing it with an alpha blend/test. Log what the pass actually
+  // resolves to, once per (model, geoset), so the render state can be read back off log.txt.
+  if (geoset_id >= 1500 && geoset_id < 1600)
+  {
+    static std::set<std::pair<std::string, int>> s_seen_cape;
+    auto const key = std::make_pair(m->file_key().filepath(), static_cast<int>(geoset_id));
+    if (s_seen_cape.insert(key).second)
+    {
+      // resolve EXACTLY like the draw path: textures[0] is a COMBO index through _texture_lookup
+      std::string tex0 = "(combo OOR)";
+      int tex0_type = -2;
+      int resolved_tex = -1;
+      if (textures[0] < m->_texture_lookup.size())
+      {
+        resolved_tex = m->_texture_lookup[textures[0]];
+        tex0_type = resolved_tex < static_cast<int>(m->_specialTextures.size())
+                  ? m->_specialTextures[resolved_tex] : -3;
+        tex0 = resolved_tex < static_cast<int>(m->_textureFilenames.size())
+             ? m->_textureFilenames[resolved_tex] : "(tex OOR)";
+      }
+      LogError << "[CAPE-TRACE] model='" << key.first << "' geoset=" << geoset_id
+               << " authoredBlend=" << renderflag.blend
+               << " effectiveBlend=" << effective_blend
+               << " promoteAlpha=" << (promote_to_alpha_blend ? 1 : 0)
+               << " instAlpha=" << inst_alpha
+               << " twoSided=" << renderflag.flags.two_sided
+               << " unlit=" << renderflag.flags.unlit
+               << " classicLayout=" << (m->_uses_classic_layout ? 1 : 0)
+               << " comboIdx=" << textures[0] << " lookupSize=" << m->_texture_lookup.size()
+               << " nTex=" << m->_textureFilenames.size()
+               << " resolvedTex=" << resolved_tex << " texType=" << tex0_type
+               << " tex0='" << tex0 << "'"
+               << " instOverride=" << (instance ? 1 : 0)
+               << " instSlot2='" << (instance && instance->replaceTextures().count(2)
+                    ? instance->replaceTextures().at(2)->file_key().stringRepr() : "(none)") << "'"
+               << " instSlots=" << (instance ? static_cast<int>(instance->replaceTextures().size()) : -1)
+               << " replaceSlots=" << m->_replaceTextures.size()
+               << " pixelShader=" << (pixel_shader ? static_cast<int>(pixel_shader.value()) : -1)
+               << std::endl;
+    }
   }
 
   bool const classic_alpha_pass = m->_uses_classic_layout && effective_blend != static_cast<uint16_t>(M2Blend::Opaque);
@@ -2620,12 +2704,23 @@ bool ModelRenderPass::bindTexture(size_t index, Model* m, ModelInstance const* i
 
   uint16_t tex = m->_texture_lookup[textures[index]];
 
-  if (tex >= m->_specialTextures.size() || tex >= m->_textures.size())
+  // OVERRIDE-TOLERANT GUARD (2026-08-28, doc 40): a special texture resolved through an instance/
+  // model override never touches m->_textures[tex], so its bind must not die on _textures being
+  // short (Ascension's served DraeneiMale hits this: the cape override is installed and sufficient,
+  // yet the old combined guard skipped the pass entirely -> invisible cape). Only the fallback to
+  // the model's own texture requires _textures[tex] to exist -- checked below where it is used.
+  if (tex >= m->_specialTextures.size())
   {
     return false;
   }
+  bool const model_texture_exists = tex < m->_textures.size();
+  if (m->_specialTextures[tex] == -1 && !model_texture_exists)
+  {
+    return false; // plain texture with no backing entry: nothing can be bound
+  }
 
   scoped_blp_texture_reference const* selected_texture = nullptr;
+  bool selected_is_override = false; // true = came from instance/model override, not m->_textures
   bool unresolved_special_texture = false;
 
   if (m->_specialTextures[tex] != -1)
@@ -2650,10 +2745,17 @@ bool ModelRenderPass::bindTexture(size_t index, Model* m, ModelInstance const* i
     }
 
     unresolved_special_texture = !selected_texture;
+    selected_is_override = selected_texture != nullptr;
   }
 
   if (!selected_texture)
   {
+    if (unresolved_special_texture || !model_texture_exists)
+    {
+      // special with no override yet (retried next frame once the dressing installs it), or a
+      // short _textures with nothing to fall back to -- either way nothing bindable this frame.
+      return false;
+    }
     selected_texture = &m->_textures[tex];
   }
 
@@ -2661,7 +2763,7 @@ bool ModelRenderPass::bindTexture(size_t index, Model* m, ModelInstance const* i
   {
     std::uint32_t const special_type = static_cast<std::uint32_t>(m->_specialTextures[tex]);
     std::uint32_t const special_bit = (1u << special_type);
-    bool const using_placeholder = selected_texture == &m->_textures[tex];
+    bool const using_placeholder = !selected_is_override;
 
     if (using_placeholder && (m->_logged_missing_special_texture_mask & special_bit) == 0)
     {
@@ -2680,7 +2782,7 @@ bool ModelRenderPass::bindTexture(size_t index, Model* m, ModelInstance const* i
     return false;
   }
 
-  bool const using_black_placeholder = selected_texture == &m->_textures[tex]
+  bool const using_black_placeholder = !selected_is_override
                                     && tex < m->_textureFilenames.size()
                                     && m->_textureFilenames[tex] == "tileset/generic/black.blp";
   bool const non_opaque_classic_pass = m->_uses_classic_layout
@@ -2699,12 +2801,17 @@ bool ModelRenderPass::bindTexture(size_t index, Model* m, ModelInstance const* i
 
   // For classic creature/character overrides, give the selected replacement a
   // chance to finish loading before falling back to black.
-  if (selected_texture != &m->_textures[tex])
+  if (selected_is_override)
   {
     auto& override_tex = *selected_texture;
     if (override_tex->loading_failed() || !override_tex->finishedLoading())
     {
+      if (!model_texture_exists)
+      {
+        return false; // no model fallback exists; retry next frame once the override loads
+      }
       selected_texture = &m->_textures[tex];
+      selected_is_override = false;
     }
   }
 
@@ -2756,6 +2863,8 @@ bool ModelRenderPass::bindTexture(size_t index, Model* m, ModelInstance const* i
 // [CRE-BODY-DIAG 2026-08-19] the last rej() code, read by WorldRender::drawCreatureBodiesBatched to attribute
 // creature-group batch failures to a specific gate (the shared s_rej histogram mixes doodads + creatures).
 thread_local int g_last_static_batch_reject = 0;
+// [VK] sub-reason for reject 12 (texture unit 0 unresolved) -- which branch of resolve_unit bailed.
+thread_local int g_last_tex_unit_reject = 0;
 
 bool ModelRenderPass::resolveStaticBatch(Model* m, StaticBatchKey& out, bool for_pib, ModelInstance const* rep) const
 {
@@ -2770,7 +2879,12 @@ bool ModelRenderPass::resolveStaticBatch(Model* m, StaticBatchKey& out, bool for
   ++s_calls;
   auto dump = [&]()
   {
-    if (s_calls % 200000ul != 0ul) return;
+    // [VK phase C] NOGGIT_MDI_REJECT_EVERY lowers the dump interval so a 30s harness run reports it
+    static unsigned long const s_every = []() -> unsigned long {
+      char const* v = std::getenv("NOGGIT_MDI_REJECT_EVERY");
+      return (v && *v) ? std::strtoul(v, nullptr, 10) : 200000ul;
+    }();
+    if (s_calls % s_every != 0ul) return;
     LogError << "[MDI-REJECT] calls=" << s_calls << " ok=" << s_ok
              << " renderflag=" << s_rej[1] << " no_ps=" << s_rej[2] << " blend=" << s_rej[3]
              << " flags=" << s_rej[4] << " color=" << s_rej[5] << " transp=" << s_rej[6]
@@ -2921,12 +3035,15 @@ bool ModelRenderPass::resolveStaticBatch(Model* m, StaticBatchKey& out, bool for
                     // unbatched fallback animates it and a later rebuild picks it up with a real bone block
 
   // BASE-texture resolution per unit (instance-independent). ret: 1 ok, 0 unit unused, -1 reject/defer.
-  auto resolve_unit = [&](std::size_t index, GLuint& arr, int& layer, int& clamp) -> int
+  auto resolve_unit = [&](std::size_t index, GLuint& arr, int& layer, int& clamp, std::string& blp_name) -> int
   {
     if (index >= texture_count) { arr = 0; layer = 0; clamp = 0; return 0; }
-    if (textures[index] >= m->_texture_lookup.size()) return -1;
+    if (textures[index] >= m->_texture_lookup.size()) { g_last_tex_unit_reject = 1; return -1; }
     uint16_t const tex = m->_texture_lookup[textures[index]];
-    if (tex >= m->_specialTextures.size() || tex >= m->_textures.size()) return -1;
+    // override-tolerant like bindTexture (doc 40): a resolved special override does not need
+    // m->_textures[tex]; only the non-special / fallback path does (guarded at use below).
+    if (tex >= m->_specialTextures.size()) { g_last_tex_unit_reject = 2; return -1; }
+    if (m->_specialTextures[tex] == -1 && tex >= m->_textures.size()) { g_last_tex_unit_reject = 3; return -1; }
     scoped_blp_texture_reference const* sel = nullptr;
     if (m->_specialTextures[tex] != -1)
     {
@@ -2934,7 +3051,7 @@ bool ModelRenderPass::resolveStaticBatch(Model* m, StaticBatchKey& out, bool for
       // A creature batch (rep) resolves the display's skin from the representative instance's replaceTextures
       // (then the model default), mirroring ModelRenderPass::bindTexture. Since the group is keyed by
       // display_id, all instances share this (array,layer) -> it rides inst_tex.x/y like a doodad's layer.
-      if (!rep) return -1;
+      if (!rep) { g_last_tex_unit_reject = 4; return -1; }
       auto const special = static_cast<std::size_t>(m->_specialTextures[tex]);
       auto const& repl = rep->replaceTextures();
       auto it = repl.find(special);
@@ -2944,23 +3061,24 @@ bool ModelRenderPass::resolveStaticBatch(Model* m, StaticBatchKey& out, bool for
         auto mr = m->_replaceTextures.find(special);
         if (mr != m->_replaceTextures.end()) { sel = &mr->second; }
       }
-      if (!sel) return -1; // unresolved special skin this frame -> fall back (retried next frame)
+      if (!sel) { g_last_tex_unit_reject = 5; return -1; } // unresolved special skin this frame
     }
     scoped_blp_texture_reference const& t = sel ? *sel : m->_textures[tex];
-    if (t->loading_failed() || !t->finishedLoading()) return -1; // defer until loaded (retried next frame)
+    if (t->loading_failed() || !t->finishedLoading()) { g_last_tex_unit_reject = 6; return -1; }
     t->upload();
-    if (!t->is_uploaded()) return -1;
+    if (!t->is_uploaded()) { g_last_tex_unit_reject = 7; return -1; }
     arr = t->texture_array();
     layer = t->array_index();
+    blp_name = t->file_key().hasFilepath() ? t->file_key().filepath() : std::string();
     uint32_t const wrap = tex < m->_texture_flags.size() ? m->_texture_flags[tex] : 0x3;
     clamp = static_cast<int>((~wrap) & 0x3);
     return 1;
   };
 
-  int const r0 = resolve_unit(0, out.tex_array0, out.layer0, out.tex_clamp0);
+  int const r0 = resolve_unit(0, out.tex_array0, out.layer0, out.tex_clamp0, out.blp0);
   if (r0 != 1)
     return rej(12); // unit 0 must resolve
-  int const r1 = resolve_unit(1, out.tex_array1, out.layer1, out.tex_clamp1);
+  int const r1 = resolve_unit(1, out.tex_array1, out.layer1, out.tex_clamp1, out.blp1);
   if (r1 == -1)
     return rej(13); // unit 1 present but not batchable/deferred
 
@@ -2980,6 +3098,7 @@ bool ModelRenderPass::resolveStaticBatch(Model* m, StaticBatchKey& out, bool for
   out.tu_lookup1 = static_cast<int>(tu_lookups[1]);
   out.pixel_shader = static_cast<int>(ps.value());
   out.blend_mode = blend;
+  out.classic_alpha = m->_uses_classic_layout && blend == static_cast<uint16_t>(M2Blend::Alpha_Key);
   out.unfogged = for_pib && renderflag.flags.unfogged; // tile batch always resolves these false (gated above)
   out.unlit = for_pib && renderflag.flags.unlit;
   bool const classic_alpha_pass = m->_uses_classic_layout && blend != static_cast<uint16_t>(M2Blend::Opaque);

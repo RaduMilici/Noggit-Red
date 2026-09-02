@@ -2,6 +2,7 @@
 
 #include <noggit/DBC.h>
 #include <noggit/Log.h>
+#include <noggit/Sky.h>
 #include <noggit/World.h>
 #include <noggit/rendering/LiquidTextureManager.hpp>
 #include <noggit/wmo_liquid.hpp>
@@ -147,14 +148,69 @@ wmo_liquid::wmo_liquid(BlizzardArchive::ClientFile* f,
                        bool is_ocean,
                        std::string const& wmo_path,
                        bool interior_material_color,
-                       glm::vec3 const& material_color)
+                       glm::vec3 const& material_color,
+                       bool indoor_channel,
+                       std::vector<glm::vec3> const* group_vertices)
   : pos(glm::vec3(header.pos.x, header.pos.z, -header.pos.y))
   , xtiles(header.A)
   , ytiles(header.B)
   , _debug_wmo_path(wmo_path)
   , _use_material_color(interior_material_color)
   , _material_color(material_color)
+  , _indoor_channel(indoor_channel)
 {
+  // FLOATLIQ GEOMETRIC CLIP (2026-08-25) -- the exact rules of the PROVEN 3.3.5a data fix
+  // (twmoa_toolkit/wmo/wmo_liquid_geometric_clip.py): Turtle authored flat liquid sheets covering a
+  // group's whole footprint; the sheet is real data (the live turtle CLIENT shows the same slab at
+  // Northshire's abbeygate waterfall) but the 3.3.5a port hides the phantom part. Port: for a FLAT
+  // sheet (vertex height span <= 0.5) on a mostly-above-water group (<= 50% mesh verts below), keep
+  // only tiles whose cell holds a group mesh vertex at/below waterLevel + 0.5 (a genuine basin).
+  // All frames are the noggit swizzle (x, z, -y); wl = baseCoords.z = pos.y.
+  if (group_vertices && !group_vertices->empty() && xtiles > 0 && ytiles > 0)
+  {
+    LiquidVertex const* map = reinterpret_cast<LiquidVertex const*>(f->getPointer());
+    int const n_verts = (xtiles + 1) * (ytiles + 1);
+    float hmin = std::numeric_limits<float>::max();
+    float hmax = std::numeric_limits<float>::lowest();
+    for (int v = 0; v < n_verts; ++v)
+    {
+      hmin = std::min(hmin, map[v].height);
+      hmax = std::max(hmax, map[v].height);
+    }
+    if (hmax - hmin <= 0.5f) // flat sheet only
+    {
+      float const wl = pos.y;
+      float constexpr TS = 4.1666666f;
+      std::size_t below = 0;
+      std::vector<float> cell_floor(static_cast<std::size_t>(xtiles) * ytiles,
+                                    std::numeric_limits<float>::max());
+      for (glm::vec3 const& v : *group_vertices)
+      {
+        if (v.y <= wl)
+        {
+          ++below;
+        }
+        int const ti = static_cast<int>((v.x - pos.x) / TS);
+        int const tj = static_cast<int>((pos.z - v.z) / TS);
+        if (ti >= 0 && ti < xtiles && tj >= 0 && tj < ytiles)
+        {
+          float& fl = cell_floor[static_cast<std::size_t>(tj) * xtiles + ti];
+          fl = std::min(fl, v.y);
+        }
+      }
+      if (below <= group_vertices->size() / 2) // genuinely-submerged pools are left alone
+      {
+        _clip_hidden.assign(static_cast<std::size_t>(xtiles) * ytiles, 0);
+        for (std::size_t k = 0; k < _clip_hidden.size(); ++k)
+        {
+          if (cell_floor[k] > wl + 0.5f)
+          {
+            _clip_hidden[k] = 1;
+          }
+        }
+      }
+    }
+  }
   // Lava (LIQUID_Green_Lava) WMOs store authored per-vertex magma s/t flow UVs on EVERY
   // liquid vertex, but the per-tile `tile.liquid & 2` bit is unreliable on these maps:
   // many lava tiles have it clear and were wrongly routed to the water UV path (flat (i,j)
@@ -231,6 +287,7 @@ wmo_liquid::wmo_liquid(wmo_liquid const& other)
   , _debug_wmo_path(other._debug_wmo_path)
   , _use_material_color(other._use_material_color)
   , _material_color(other._material_color)
+  , _indoor_channel(other._indoor_channel)
   , depths(other.depths)
   , tex_coords(other.tex_coords)
   , vertices(other.vertices)
@@ -240,6 +297,11 @@ wmo_liquid::wmo_liquid(wmo_liquid const& other)
 
 }
 
+
+unsigned wmo_liquid::vkTextureProfileId(int liquid_id)
+{
+  return wmo_liquid_texture_profile_id(liquid_id);
+}
 
 int wmo_liquid::initGeometry(BlizzardArchive::ClientFile* f, std::string const& wmo_path, bool force_magma_uv)
 {
@@ -274,6 +336,21 @@ int wmo_liquid::initGeometry(BlizzardArchive::ClientFile* f, std::string const& 
     }
   }
 
+  // Probe data (heightAtLocal, FLOATLIQ 2026-08-24): the full vertex-height grid + per-tile
+  // rendered flags, so submersion tests are per-tile like the client instead of pool-AABB/max.
+  _grid_heights.resize((xtiles + 1) * (ytiles + 1));
+  for (int v = 0; v < (xtiles + 1) * (ytiles + 1); ++v)
+  {
+    _grid_heights[v] = map[v].height;
+  }
+  _tile_rendered.assign(static_cast<std::size_t>(xtiles) * ytiles, 0);
+
+  // CLIENT-EXACT legacy type resolution (wow112 FUN_006ba970): the FIRST tile whose low nibble is
+  // not 0xF ("no liquid") gives the group's type nibble. (Was: the LAST rendered tile's value,
+  // which let one stray trailing tile re-type the whole pool -- the Stormwind-canal-green bug.)
+  int first_liquid_nibble = 0xF;
+  bool first_liquid_found = false;
+
   std::uint16_t index (0);
 
   for (int j = 0; j<ytiles; j++)
@@ -288,10 +365,17 @@ int wmo_liquid::initGeometry(BlizzardArchive::ClientFile* f, std::string const& 
         ++shared_tile_count;
       }
 
-      bool render_tile = (tile.liquid & 0x8) == 0;
+      bool render_tile = (tile.liquid & 0x8) == 0
+                       && (_clip_hidden.empty() || !_clip_hidden[static_cast<std::size_t>(j) * xtiles + i]);
       if (!render_tile)
       {
         ++hidden_tile_count;
+      }
+      _tile_rendered[static_cast<std::size_t>(j) * xtiles + i] = render_tile ? 1 : 0;
+      if (!first_liquid_found && (raw_tile & 0xF) != 0xF)
+      {
+        first_liquid_nibble = raw_tile & 0xF;
+        first_liquid_found = true;
       }
 
       // it seems that if (liquid & 8) != 0 => do not render
@@ -390,6 +474,23 @@ int wmo_liquid::initGeometry(BlizzardArchive::ClientFile* f, std::string const& 
     }
   }
 
+  // [VULKAN] mirror the finished geometry: GL uploads `vertices`/`indices` from locals that go out of
+  // scope here, and `depths`/`tex_coords` are parallel to the vertex list.
+  {
+    _vk_verts.clear();
+    _vk_verts.reserve(vertices.size() * 6);
+    for (std::size_t i = 0; i < vertices.size(); ++i)
+    {
+      _vk_verts.push_back(vertices[i].x);
+      _vk_verts.push_back(vertices[i].y);
+      _vk_verts.push_back(vertices[i].z);
+      _vk_verts.push_back(i < depths.size() ? depths[i] : 1.f);
+      _vk_verts.push_back(i < tex_coords.size() ? tex_coords[i].x : 0.f);
+      _vk_verts.push_back(i < tex_coords.size() ? tex_coords[i].y : 0.f);
+    }
+    _vk_indices.assign(indices.begin(), indices.end());
+  }
+
   _indices_count = static_cast<int>(indices.size());
 
   if (wmo_liquid_debug_enabled() && is_timbermaw_wmo_path(wmo_path))
@@ -425,6 +526,11 @@ int wmo_liquid::initGeometry(BlizzardArchive::ClientFile* f, std::string const& 
              << std::endl;
   }
 
+  // Client rule (FUN_006ba970): first non-0xF tile nibble; all-0xF -> 0xF (callers mask & 3).
+  if (first_liquid_found)
+  {
+    return first_liquid_nibble;
+  }
   return last_liquid_id;
 }
 
@@ -531,6 +637,12 @@ void wmo_liquid::draw ( glm::mat4x4 const& transform
   water_shader.uniform ("magma_flow_speed", magma_flow_speed);
   water_shader.uniform ("use_material_color", _use_material_color ? 1 : 0);
   water_shader.uniform ("material_color", _material_color);
+  // Exterior WMO water flat colour = the WATER param's river-deep band (Skies computes it per
+  // frame) -- the CLEAR param's band is the muddy teal, the WATER param's is the canal dark blue.
+  water_shader.uniform ("wmo_water_river_dark", Skies::water_river_dark());
+  // City channel (indoor+exterior_lit: canals/harbor/Booty Bay) vs open-air WMO pool (abbeygate
+  // stream) -- picks the ocean-dark opaque look vs the river-blend look in the shader.
+  water_shader.uniform ("wmo_indoor_channel", _indoor_channel ? 1 : 0);
   water_shader.uniform ("debug_liquid_color", wmo_liquid_debug_color_enabled()
                                                   ? debug_color_from_path(_debug_wmo_path)
                                                   : glm::vec4(0.0f));
@@ -554,5 +666,18 @@ void wmo_liquid::draw ( glm::mat4x4 const& transform
   OpenGL::Scoped::vao_binder const _ (_vao);
 
   OpenGL::Scoped::bool_setter<GL_CULL_FACE, GL_FALSE> const cull;
+  // Water/slime: do NOT write framebuffer alpha (the scene alpha channel is the bloom's emissive
+  // mask). This lets the blend alpha reach the client's authored 1.0 (deep canal water is OPAQUE --
+  // the old 0.85 cap kept the bottom visible) without water registering as emissive. Lava keeps
+  // its alpha write (alpha 1.0 IS its emissive/bloom flag).
+  bool const is_lava = (liquid_type == 2);
+  if (!is_lava)
+  {
+    gl.colorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_FALSE);
+  }
   gl.drawElements(GL_TRIANGLES, static_cast<GLsizei>(indices.size()), GL_UNSIGNED_SHORT, nullptr);
+  if (!is_lava)
+  {
+    gl.colorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+  }
 }

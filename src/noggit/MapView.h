@@ -141,6 +141,12 @@ public:
 
   std::unique_ptr<World> _world;
   Noggit::Camera _camera;
+  // [harness] Screenshot requested for THIS frame, captured at the end of paintGL. Reading after
+  // paintGL returns samples whatever framebuffer happens to be bound then, which is not reliably
+  // the one the frame was drawn into -- that produced a pure-black capture of a scene that had in
+  // fact rendered correctly (twice: findings 47c and 60).
+  std::string _pending_screenshot;
+  void captureFrameNow(std::string const& path);
 
 private:
 
@@ -218,6 +224,41 @@ public:
   // client swim state (RE'd 3.3.5a FUN_00730d10): enter at depth > 0.75*collisionHeight, exit
   // below (enter - 1/36); space near the surface converts into a REAL jump (the dolphin leap).
   bool _game_swimming = false;
+  // Camera-vs-water STICKY SIDE (client behaviour: the water surface is a camera wall; the side
+  // flips only when the character has stepped clearly into the other medium). 1 = camera held
+  // above the surface, -1 = held below, 0 = no liquid context. Hysteresis kills the surface-bob
+  // flapping. Enforced by waterBoomLimit() in both the tick's boom resolution and the pre-draw clamp.
+  int _game_cam_water_side = 0;
+  float waterBoomLimit(glm::vec3 const& head, glm::vec3 const& look, float dist) const;
+  // GAME MODE (round 26): the Y push applied to the RENDERED boom eye so it never sits inside the
+  // water-surface band. Computed in snapCameraOffWaterSurface, added to the eye in BOTH model_view()
+  // and the render_eye that drives the underwater test -> view and effect always agree, character
+  // untouched (no swim trap). 0 = no push.
+  float _game_render_eye_dy = 0.0f;
+  // The camera may NEVER dwell inside the water-surface band (user spec: snap to the very next
+  // position inside or outside, so a grazing/edge-on surface view cannot exist and the underwater
+  // effect side always matches). Applies to BOTH editor and game cameras each frame.
+  void snapCameraOffWaterSurface();
+  // Surface ripple cadence (client Water0Ripple port): next wake time + the swim edge for the
+  // entry splash.
+  float _game_next_wake_ms = 0.0f;
+  // FOOTSTEPS (doc 38): $FSD anim-event crossing state -- the playing anim's event times are
+  // cached on anim change; each tick fires the events crossed since the previous tick.
+  int _game_fs_anim = -2;              // anim id the cache below belongs to (-2 = never)
+  long long _game_fs_start_ms = 0;     // global anim ms when that anim started (cycle phase 0)
+  int _game_fs_prev_t = 0;             // anim-local ms at the previous tick
+  int _game_fs_len = 0;                // cycle length ms
+  std::vector<int> _game_fs_events;    // sorted $FSD fire times (anim-local ms)
+  float _game_splash_cd_ms = 0.0f;     // dive-splash cooldown (surface bob must not re-splash)
+  // Last liquid surface height seen under the player. The swim-EXIT splash needs it because the
+  // frame that ends swimming is often already PAST the liquid edge (jumping out at a shoreline),
+  // where the live water query returns nothing -- see the exit branch in the game tick.
+  std::optional<float> _game_last_water_y;
+  // (_game_was_swimming_ripple removed 2026-08-26: the splash now fires on the swim-ENTER event)
+  // Set at every jump LAUNCH: forces the character animation to restart even when the chosen anim
+  // id is unchanged. Holding space over water dolphin-hops relaunches with JumpStart(37) already
+  // active -- without a restart the model froze at JumpStart's end pose until key release.
+  bool _game_anim_restart_pending = false;
   // surface micro-dip: rising through the exit depth hands to air physics for a few frames
   // before the depth check re-enters swim; the swim pose is held through it (no upright flash)
   bool _game_breaching = false;
@@ -245,6 +286,9 @@ public:
   int _game_land_anim = 0; // 39 JumpEnd / 187 JumpLandRun / 0 none
   float _game_land_anim_timer = 0.0f;
   float _game_air_time = 0.0f;
+  // Highest feet height reached since the feet last left the ground -- the fall distance at
+  // touchdown decides the ground-contact sound and the fall-damage vocal.
+  float _game_fall_peak_y = 0.0f;
   // lower-body strafe twist, smoothed by the client's critically-damped spring (RE'd 3.3.5a
   // FUN_00719660: rate 20/s, k = 1/(1 + x + 0.48x^2 + 0.235x^3)); radians, + = left.
   float _game_twist = 0.0f;
@@ -419,6 +463,14 @@ public:
   Noggit::Camera* getCamera() { return &_camera; };
   void setCameraForCapture(glm::vec3 const& position, math::degrees yaw, math::degrees pitch);
   QImage grabRenderedFrameForCapture();
+  // [VULKAN 2026-08-29] one headless frame for the self-run parity loop (no readback, no window update)
+  void renderFrameForHarness();
+  // [phase J] Grab the finished viewport to a PNG. Parity mode disables every VK ownership gate,
+  // so the GATED path (the one users actually run) has no image test at all -- this gives it one.
+  void saveHarnessScreenshot(std::string const& path);
+  static void setVkParityForced(std::string const& cams_file); // force api=Vulkan + parity check + camera list
+  static bool vkParityFinished();                               // harness logged its SUMMARY
+  void muteAudioForHarness();                                   // zone music/ambience + sfx off (off-screen runs)
   void randomizeTerrainRotation();
   void randomizeTexturingRotation();
   void randomizeShaderRotation();

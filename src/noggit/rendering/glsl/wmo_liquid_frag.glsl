@@ -42,6 +42,15 @@ uniform vec4 debug_liquid_color;
 // EXTERIOR/exterior-lit flags (MOGP & 0x48) in WMO.cpp.
 uniform int use_material_color;
 uniform vec3 material_color;
+// Exterior WMO water flat colour: the WATER param's RIVER_COLOR_DARK band (SW noon #234A69 --
+// the canal dark blue). The CLEAR param's band 17 is the muddy teal; the client's canal hue
+// matches the WATER param family, so Skies feeds this per frame from CLEAR_WATER.
+uniform vec3 wmo_water_river_dark;
+// 1 = city water channel (MOGP indoor 0x2000 + exterior_lit: SW canals/harbor, Booty Bay) -> the
+// ocean-dark opaque look; 0 = open-air WMO pool (Northshire abbeygate stream) -> river blend.
+uniform int wmo_indoor_channel;
+uniform vec3 camera; // for the user-directed sun/moon glitter lobe on exterior WMO water
+uniform vec3 sheen_dir; // TO the drawn sun/moon disc (WorldRender celestial_dir)
 
 in vec2 tex_coord_;
 in float depth_;
@@ -116,19 +125,71 @@ void main()
     }
     else
     {
-      // EXTERIOR water (client FUN_006b6630): zone day/night water light colour used DIRECTLY (client
-      // draws liquid with LIGHTING=FALSE, so no ambient/diffuse multiply), plus the texture as an
-      // additive shine for the ocean look. Sun band direction-corrected exactly like liquid_frag:
-      // to_light in the NORMAL frame; to_view from camera_pos->world_pos converted position->normal
-      // via (-z,y,-x). Neutral-warm shine tint (NOT the WMO DiffuseColor).
-      water_rgb = liquid_color.rgb;
-      float ripple = dot(texel.rgb, vec3(0.299, 0.587, 0.114));
-      vec3 to_light   = -normalize(vec3(LightDir_FogRate.x, LightDir_FogRate.z, LightDir_FogRate.y));
-      vec3 to_view_ps = normalize(camera_pos.xyz - world_pos_);
-      vec3 to_view    = vec3(-to_view_ps.z, to_view_ps.y, -to_view_ps.x);
-      vec3 half_vec   = normalize(to_light + to_view);
-      float sun_sheen = pow(clamp(dot(vec3(0.0, 1.0, 0.0), half_vec), 0.0, 1.0), 8.0);
-      water_rgb += vec3(0.85, 0.88, 0.95) * ripple * (1.2 + 3.0 * sun_sheen);
+      // EXTERIOR water (client FUN_006b6630, PINNED 2026-08-24): the vertex colour is ONE FLAT zone
+      // colour -- light-manager bytes +0xec, which the band evaluator (FUN_006d64d0 slot map) proves
+      // is Light band 17 = RIVER DEEP. No shallow/deep depth mix, no ocean-band branch (the legacy
+      // dispatcher has no ocean case). Stormwind canals: #27372F from above / #234A69 (dark blue)
+      // when the CLEAR_WATER param is active -- the user's expected canal colour. Depth still drives
+      // the ALPHA (client depth LUT, kept above). Texture rides as the additive shine below.
+      // MEASURED (wow_cap_fountain.trace state distribution): stage-0 COLOROP is NEVER ADD in the
+      // whole capture -- exterior WMO water is the SAME TWO-PASS model as ADT water:
+      //   base pass    = MODULATE(texture x flat diffuse)  -> tex * dark colour, much darker than
+      //                  the flat colour alone (the "not dark enough" gap), alpha-blended;
+      //   additive pass = the texture again with DESTBLEND=ONE -> full-brightness sparkles on top.
+      // Emulated in one pass with the ADT-water additive strengths the user already validated
+      // (liquid_frag.glsl shine block), minus the sun-glint term (no sun uniform here).
+      // ROUND 6 -- the sparkle was NEVER visible because lake_a.*.blp stores the water pattern in
+      // ALPHA (measured: RGB mean 4/255 near-black, alpha mean 54 with caustic lines to 255 -- the
+      // classic 1.12 alpha-replicate water texture). Every texel.rgb term multiplied by ~zero.
+      // Pattern = texel.a; base = the WATER param's river-deep band (#234A69 SW noon).
+      // The sliding-texture pattern lives in ALPHA on the 1.12 water textures (RGB is near-black).
+      // UNIFIED surface-layer strength across ALL water bodies (user round 10): pat*0.55 raw +
+      // pat*body*1.0 -- between the old canal punch and the old ocean shine. liquid_frag (ADT)
+      // uses the same law.
+      float pattern = texel.a;
+      if (wmo_indoor_channel == 1)
+      {
+        // CITY CHANNEL (canals/harbor/Booty Bay): ocean-deep navy body, fully opaque
+        // (user-directed rounds 8-9; round 19: "a tad darker" -> x0.8). ROUND 21 (2026-08-28,
+        // "canal water is too dark in color and shade so lower the dark blue a bit"): the x0.8
+        // darkening is dropped and the body is lifted 15% toward the shallow ocean band, which
+        // takes depth out of the navy without changing its hue family. USER-DIRECTED, not a
+        // client law -- the exterior client law is flat river-deep (see above).
+        water_rgb = mix(OceanColorDark.rgb, OceanColorLight.rgb, 0.12) * 0.85;
+        water_alpha = RiverColorDark.a * water_alpha_mult;
+      }
+      else
+      {
+        // OPEN-AIR WMO POOL (Northshire abbeygate stream): the SAME depth-mixed shallow->deep
+        // colour ADT rivers use (flat river-deep still stuck out darker than the river beside
+        // it -- user round 11). liquid_color is already that mix. x0.85 = the round-20 surface
+        // darkening, matching liquid_frag so pools stay flush with the rivers they feed.
+        water_rgb = liquid_color.rgb * 0.85;
+      }
+      // Unified surface layer, lowered (user round 11: 0.55 raw was too speckly).
+      // USER-DIRECTED GLITTER (2026-08-25, same law as liquid_frag): exterior WMO water dims the
+      // pattern at baseline and blooms it toward the sun/moon. INDOOR CHANNELS (canals) keep the
+      // constant user-validated strength -- their look was tuned over 9 rounds; no roof-borne sun.
+      // User 2026-08-26 (canal screenshot: "same shine all over, too bright"): the canal exemption
+      // is GONE -- city channels take the directional law like every other water.
+      float sheen = 1.0;
+      if (camera.y >= world_pos_.y) // from below: full pattern (see liquid_frag)
+      {
+        vec3 sheen_V = normalize(camera - world_pos_);
+        // ROUND 3: keyed on the DRAWN sun/moon disc (see liquid_frag) -- the dayDir frame mirrored
+        // the azimuth ("back to the sun" report).
+        vec3 sheen_L = sheen_dir;
+        float L_len = length(sheen_L);
+        if (L_len > 0.001)
+        {
+          sheen_L /= L_len;
+          sheen_L.y = max(sheen_L.y, 0.14); // disc lifted >= ~8deg above horizon (night moon band)
+          sheen_L = normalize(sheen_L);
+          float sheen_align = clamp(dot(reflect(-sheen_V, vec3(0.0, 1.0, 0.0)), sheen_L), 0.0, 1.0);
+          sheen = 0.25 + 1.25 * pow(sheen_align, 8.0);
+        }
+      }
+      water_rgb += (vec3(pattern) * 0.30 + pattern * water_rgb * 1.0) * sheen;
     }
     out_color = vec4(clamp(water_rgb, 0.0, 1.0), water_alpha);
   }
@@ -154,12 +215,13 @@ void main()
     float f4 = min(f3, 1.0);
 
     out_color.rgb = mix(out_color.rgb, fog_color_l, 1.0 - f4);
+
+    // Same as liquid_frag (round 28): a fully-fogged emissive liquid must not bloom back through
+    // the fog (alpha > 0.88 is the bright pass's emissive mask). Ordinary water alpha is untouched.
+    out_color.a = min(out_color.a, mix(0.85, 1.0, f4));
   }
 
-  // Only lava is emissive (writes alpha 1.0 so the bloom bright-pass makes it glow). Keep slime/water
-  // below the reserved emissive range (>0.88) so they don't bloom.
-  if (liquid_type != 2)
-  {
-    out_color.a = min(out_color.a, 0.85);
-  }
+  // No alpha cap: water/slime draws mask the framebuffer alpha channel (wmo_liquid::draw), so the
+  // authored blend alpha can reach the client's 1.0 (opaque deep canal water) without polluting
+  // the bloom's emissive mask. Lava still writes alpha 1.0 as its emissive flag.
 }

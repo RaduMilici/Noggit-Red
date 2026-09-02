@@ -35,6 +35,17 @@ namespace Noggit::Project
           if (project_configuration.contains("ProjectName"))
             project.ProjectName = project_configuration["ProjectName"].toString().toStdString();
 
+          // Optional list of archive basenames this project must not mount (see NoggitProject).
+          if (project_configuration.contains("IgnoredArchives") && project_configuration["IgnoredArchives"].isArray())
+          {
+            for (auto const& ignored : project_configuration["IgnoredArchives"].toArray())
+            {
+              auto const name = ignored.toString().toStdString();
+              if (!name.empty())
+                project.IgnoredArchives.push_back(name);
+            }
+          }
+
           if (project_configuration.contains("Bookmarks") && project_configuration["Bookmarks"].isArray())
           {
             auto project_bookmarks = project_configuration["Bookmarks"].toArray();

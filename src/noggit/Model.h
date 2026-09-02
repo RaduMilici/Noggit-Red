@@ -14,6 +14,8 @@
 #include <opengl/scoped.hpp>
 #include <opengl/shader.fwd.hpp>
 #include <ClientFile.hpp>
+#include <algorithm>
+#include <cctype>
 #include <optional>
 #include <string>
 #include <vector>
@@ -226,6 +228,11 @@ public:
   // that stays on the shared/global clock) using the bones/setup that animate() just applied.
   void swapInstanceEmitterState(std::uint64_t instance_key);
   void updateParticleSystems(float dt);
+  // World-space particle emission for this model's NON-riding emitters (riding ones stay local by
+  // definition). Set per frame before the sim ticks with the emitting instance's placement matrix;
+  // the particle draw for such a model must use IDENTITY. Breath bubbles (see Particle.h).
+  void setWorldSpaceParticleEmission(glm::mat4x4 const& m, float kill_plane_y = 1.0e30f);
+  void clearWorldSpaceParticleEmission();
   void dropInstanceEmitterState(std::uint64_t instance_key);
 
   // True if any particle emitter has flag 0x10 ("particles ride the emitter transform"). Used by the
@@ -258,13 +265,26 @@ public:
   [[nodiscard]]
   bool is_required_when_saving() const override
   {
-    return true;
+    // A MISSING M2 CANNOT AFFECT WHAT A SAVE WRITES -- user decision 2026-08-25, and the save path
+    // proves it: MapTile::saveTile collects instances BY UID and writes MDDF straight from each
+    // instance's own transform (nameID, uid, pos, rot, scale, flags). MDDF stores NO derived data,
+    // there is no filter on load state, so a doodad whose file is absent round-trips byte-perfect.
+    // The old blanket `true` therefore raised "saving will cause collision and culling issues" for
+    // a risk that does not exist for models -- and fired constantly here, because turtle's own
+    // Azeroth ADTs place WotLK doodads (hu_brick_pile01 x5, zuldrak_bats_lower_01 x4) that the
+    // turtle asset tree never shipped, plus editor-only overlays (equipment, creature/GO previews).
+    // WMOs KEEP the guard (WMO::is_required_when_saving): MODF writes extents[] derived from the
+    // loaded object, so a failed WMO really would degrade the saved tile.
+    return false;
   }
 
   [[nodiscard]]
   Noggit::Rendering::ModelRender* renderer() { return &_renderer; }
 
   [[nodiscard]] bool usesClassicLayout() const { return _uses_classic_layout; }
+  // Read-only view of the material table (renderflag/blend pairs) -- the WorldRender light-shaft
+  // deferral inspects pass unlit flags through this (Model::_render_flags itself is private).
+  [[nodiscard]] std::vector<ModelRenderFlags> const& renderFlagsTable() const { return _render_flags; }
   [[nodiscard]] bool supportsTrackAnimations() const { return !_uses_classic_layout && !_animations_seq_per_id.empty(); }
   // True if this model actually has the given animation id (with sequences). Used to fall back to
   // Stand (0) when a forced weapon-idle (Ready1H/Ready2H) is requested on a model that lacks it.
@@ -299,6 +319,18 @@ public:
   std::vector<bool> _useReplaceTextures;
   std::vector<int16_t> _texture_unit_lookup;
   std::vector<ModelAttachmentDef> _attachments;
+
+  // ===== M2 ANIM EVENTS (classic v256 models; doc 38 audio RE) =====
+  // Parsed from the event defs' classic tracks: fire times per ANIMATION ID (anim-local ms,
+  // normalized t - times[range.start] like every classic track). Multiple events can share a
+  // fourcc (e.g. one $FSD per foot); variations of one anim id are merged into one list.
+  struct ModelAnimEvent
+  {
+    std::uint32_t fourcc = 0;
+    std::int32_t data = 0;
+    std::map<std::int16_t, std::vector<int>> times_per_anim;
+  };
+  std::vector<ModelAnimEvent> _anim_events;
   std::vector<int16_t> _attachment_lookup;
 
   // ===============================
@@ -597,6 +629,17 @@ public:
   {
     _instance_particle_color_sets[key] = sets;
   }
+
+  // [mem 2026-08-26] inverse for spawn eviction: per-instance data stored on the SHARED model
+  // must die with the instance or it outlives every evicted spawn for the whole session.
+  void dropInstanceParticleColorSets(std::uint64_t key)
+  {
+    _instance_particle_color_sets.erase(key);
+  }
+
+  // All fire times (anim-local ms, sorted) of the given M2 event FourCC in animation anim_id --
+  // e.g. '$FSD' footfalls of the Run cycle. Empty when the model authors none. (doc 38)
+  std::vector<int> animEventTimes(std::uint32_t fourcc, std::int16_t anim_id) const;
 
   // GEOMETRY-MODEL particles (checklist 12.2): true when any emitter authors a geometry model.
   // WorldRender collects per-particle world transforms (inside the placement's live-state swap) and

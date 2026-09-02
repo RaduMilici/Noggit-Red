@@ -21,6 +21,7 @@
 #include <qcommandlineoption.h>
 #include <QtWidgets/QApplication>
 #include <QtGui/QSurfaceFormat>
+#include <QtGui/QScreen>
 #include <QtWidgets/QFileDialog>
 #include <QtWidgets/QMessageBox>
 #include <QSplashScreen>
@@ -340,6 +341,15 @@ QCommandLineParser* ProcessCommandLine()
       {"force-changelog", QApplication::translate("main", "Force displaying the changelog popup.")}
         });
 
+    // [VULKAN 2026-08-29] self-run GL-vs-VK parity loop (off-screen, no user interaction)
+    parser->addOption({"vk-parity-project", QApplication::translate("main", "Project path for --vk-parity-map-id."),
+                       QApplication::translate("main", "project")});
+    parser->addOption({"vk-parity-map-id", QApplication::translate("main", "Map id to open for the VK parity run."),
+                       QApplication::translate("main", "id")});
+    parser->addOption({"vk-parity-cams", QApplication::translate("main", "Camera list file (name x y z yaw pitch per line)."),
+                       QApplication::translate("main", "file")});
+    parser->addOption({"vk-parity-out", QApplication::translate("main", "Output directory for the parity PNGs."),
+                       QApplication::translate("main", "dir")});
     parser->addOption({"probe-project-load",
                QApplication::translate("main", "Load a Noggit project and exit with code 0 on success."),
                QApplication::translate("main", "project")});
@@ -636,7 +646,36 @@ int main(int argc, char *argv[])
                                  camera_pitch);
   }
 
+  // [VULKAN 2026-08-29] --vk-parity-*: off-screen GL-vs-VK parity run, then exit (0 = harness finished)
+  if (parser->isSet("vk-parity-project"))
+  {
+    if (!parser->isSet("vk-parity-map-id") || !parser->isSet("vk-parity-cams"))
+    {
+      LogError << "vk-parity: need --vk-parity-map-id and --vk-parity-cams" << std::endl;
+      return 2;
+    }
+    auto loaded_project = loadProbeProject(std::filesystem::path(parser->value("vk-parity-project").toStdString()));
+    if (!loaded_project)
+    {
+      LogError << "vk-parity: failed to load project" << std::endl;
+      return 2;
+    }
+    auto window = std::make_unique<Noggit::Ui::Windows::NoggitWindow>(noggit->getConfiguration(), loaded_project);
+    bool const ok = window->runVkParity(parser->value("vk-parity-map-id").toInt(),
+                                        parser->value("vk-parity-cams"),
+                                        parser->isSet("vk-parity-out") ? parser->value("vk-parity-out") : QString("vk_diff"),
+                                        1600, 900);
+    std::fflush(nullptr);
+    std::_Exit(ok ? 0 : 3);
+  }
+
   auto project_selection = new Noggit::Ui::Windows::NoggitProjectSelectionWindow(noggit);
+  // Always open on the PRIMARY display (Qt's default places new windows on whichever screen holds
+  // the mouse cursor -- user-rejected). Same rule for the main editor window (NoggitProjectSelectionWindow).
+  if (QScreen* primary_screen = QGuiApplication::primaryScreen())
+  {
+    project_selection->move(primary_screen->availableGeometry().center() - project_selection->rect().center());
+  }
   project_selection->show();
 
   return q_application.exec();

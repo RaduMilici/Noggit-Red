@@ -55,6 +55,23 @@ namespace Noggit
 
     free (strings);
 #else
+    // RE-ENTRANCY GUARD. StackWalker formats frames with _snprintf_s; an unresolvable frame can trip
+    // the CRT invalid-parameter handler, which calls back into here -- an infinite two-frame loop that
+    // overwrites the real crash report. Walk once; report (don't recurse on) a fault during the walk.
+    static std::atomic<bool> s_walking{false};
+    bool expected = false;
+    if (!s_walking.compare_exchange_strong(expected, true))
+    {
+      LogError << "  <fault raised while walking the stack -- suppressed to preserve the report above>"
+               << std::endl;
+      return;
+    }
+    struct ClearOnExit
+    {
+      std::atomic<bool>& flag;
+      ~ClearOnExit() { flag.store(false); }
+    } clear_on_exit{s_walking};
+
     LogStackWalker sw;
     sw.ShowCallstack();
 #endif
@@ -234,6 +251,14 @@ namespace Noggit
     // call BOTH __fastfail silently by default. Route them through the stack logger too.
     void on_invalid_parameter(wchar_t const*, wchar_t const*, wchar_t const*, unsigned int, uintptr_t)
     {
+      // A second fatal event (including one raised by the stack walk itself) must not restart the
+      // report -- abort straight away so the FIRST report survives intact.
+      static std::atomic<bool> s_in_handler{false};
+      bool expected = false;
+      if (!s_in_handler.compare_exchange_strong(expected, true))
+      {
+        std::abort();
+      }
       LogError << "\n=== CRT invalid parameter (thread " << GetCurrentThreadId() << ") ===" << std::endl;
       printStacktrace();
       std::cerr.flush();

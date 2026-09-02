@@ -145,6 +145,10 @@ private:
 
   glm::vec3 pos;
   uint16_t _texture_id;
+  // World-space emission state (see setWorldSpaceEmission).
+  glm::mat4x4 _emission_base = glm::mat4x4(1.0f);
+  bool _world_space_emission = false;
+  float _kill_plane_y = 1.0e30f;
   ParticleList particles;
   int blend, order, type;
   int manim, mtime;
@@ -239,6 +243,22 @@ public:
   // and draw() transforms by the bone's CURRENT matrix. Without the flag, spawn bakes the bone
   // matrix and particles stay where they were emitted (trailing behind an animated bone).
   bool ridesParent() const { return (flags & 0x10) != 0 && parent != nullptr; }
+
+  // WORLD-SPACE EMISSION (breath bubbles fix, 2026-08-25): the client simulates non-riding
+  // particles in WORLD space -- a swimming character's bubbles trail behind, rising where they
+  // were exhaled. noggit's model-space sim re-drags the whole cloud with the instance transform
+  // each frame ("the bubbles follow the character"). When enabled, each spawned particle is baked
+  // through this matrix at emission and the caller draws the system with IDENTITY.
+  // kill_plane_y: world height at which world-space particles DIE (the liquid surface -- bubbles
+  // pop there instead of rising into open air). Default = effectively none.
+  void setWorldSpaceEmission(glm::mat4x4 const& m, float kill_plane_y = 1.0e30f)
+  {
+    _emission_base = m;
+    _world_space_emission = true;
+    _kill_plane_y = kill_plane_y;
+  }
+  void clearWorldSpaceEmission() { _world_space_emission = false; _kill_plane_y = 1.0e30f; }
+  bool worldSpaceEmission() const { return _world_space_emission; }
 
   // Swap this emitter's live simulation state (particle list, spawn remainder, pre-warm guard) with an
   // external holder. Symmetric: call once to swap a spawn's state IN, again to swap it back OUT. Used to

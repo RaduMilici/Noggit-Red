@@ -172,7 +172,23 @@ void WMOInstance::intersect (math::ray const& ray, selection_result* results, bo
   }
 }
 
-std::optional<float> WMOInstance::liquidHeightAt (glm::vec3 const& world_pos)
+std::optional<std::pair<float, int>> WMOInstance::groundHit(math::ray const& ray, float max_dist)
+{
+  // [doc 38 footsteps] world-ray -> model space like intersect(); unscaled instances keep
+  // distances 1:1. Returns {world distance, the hit face's authored TerrainType row}.
+  if (!ray.intersect_bounds (extents[0], extents[1]))
+  {
+    return std::nullopt;
+  }
+  if (!wmo->finishedLoading() || wmo->loading_failed())
+  {
+    return std::nullopt;
+  }
+  math::ray subray(_transform_mat_inverted, ray);
+  return wmo->groundHit(subray, max_dist);
+}
+
+std::optional<float> WMOInstance::liquidHeightAt (glm::vec3 const& world_pos, int* out_liquid_id)
 {
   if (!wmo->finishedLoading() || wmo->loading_failed())
   {
@@ -187,12 +203,17 @@ std::optional<float> WMOInstance::liquidHeightAt (glm::vec3 const& world_pos)
   std::optional<float> best;
   for (auto const& group : wmo->groups)
   {
-    if (auto const h = group.liquidHeightAtLocal(local))
+    int group_liquid_id = 0;
+    if (auto const h = group.liquidHeightAtLocal(local, &group_liquid_id))
     {
       glm::vec3 const world_surface(_transform_mat * glm::vec4(local.x, *h, local.z, 1.0f));
       if (!best || world_surface.y > *best)
       {
         best = world_surface.y;
+        if (out_liquid_id)
+        {
+          *out_liquid_id = group_liquid_id;
+        }
       }
     }
   }

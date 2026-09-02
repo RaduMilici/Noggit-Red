@@ -1,5 +1,6 @@
 // This file is part of Noggit3, licensed under GNU General Public License (version 3).
 
+#include <noggit/rendering/vulkan/VkParticleFeed.hpp>
 #include "WorldRender.hpp"
 #include <external/tracy/Tracy.hpp>
 #include <math/frustum.hpp>
@@ -425,11 +426,15 @@ namespace
     return enabled;
   }
 
-  // True for M2 models that have at least one additive pass (No_Add_Alpha / Add) and NO solid
-  // (Opaque / Alpha_Key) pass — i.e. pure additive glows (god rays / lightshafts). Drawn AFTER the
-  // water so it doesn't paint over them. NOTE: deliberately NOT broadened to all translucent-only
-  // models — deferring Alpha effects like waterfalls and collecting their particles crashed in
-  // ParticleSystem::draw (the deferred mesh path left their transform buffer in a bad state).
+  // True for M2 "light shaft" models that must draw AFTER the water so it doesn't paint over
+  // them. Two shapes qualify (both with NO solid Opaque/Alpha_Key pass):
+  //  (a) at least one additive pass (No_Add_Alpha / Add) — the classic god-ray glows;
+  //  (b) 2026-08-26: every pass UNLIT and translucent — the Stormwind LIGHTHOUSEEFFECT beam is a
+  //      single blend=2 Alpha pass with renderflags unlit+unfogged, which (a) never matched (the
+  //      "beam renders under the harbor water" bug on every draw path).
+  // Ordinary LIT alpha doodads (trees, waterfalls) stay excluded by the unlit test, and every
+  // deferral call site additionally requires no particle/ribbon emitters (the historical
+  // waterfall-particle crash), so this widening cannot reroute them.
   bool is_pure_additive_light_effect(Model* model)
   {
     if (!model)
@@ -444,6 +449,7 @@ namespace
     }
 
     bool has_additive = false;
+    bool all_unlit = true;
     for (auto const& pass : passes)
     {
       auto const blend = static_cast<M2Blend>(pass.blend_mode);
@@ -455,9 +461,14 @@ namespace
       {
         has_additive = true;
       }
+      if (pass.renderflag_index >= model->renderFlagsTable().size()
+          || !model->renderFlagsTable()[pass.renderflag_index].flags.unlit)
+      {
+        all_unlit = false;
+      }
     }
 
-    return has_additive;
+    return has_additive || all_unlit;
   }
 
   ModelAttachmentDef const* find_attachment_def(Model const* model, int attachment_id)
@@ -795,6 +806,15 @@ bool WorldRender::mdiEnsureModelInArena(Model* m)
   gl.bufferSubData(GL_ARRAY_BUFFER, voff, vbytes, verts.data());
   gl.bindBuffer(GL_ELEMENT_ARRAY_BUFFER, _mdi_buffers[1]);
   gl.bufferSubData(GL_ELEMENT_ARRAY_BUFFER, ioff, ibytes, indices.data());
+  // [VULKAN phase C] mirror the same bytes at the same offsets for the VK M2 arena
+  {
+    auto const* vb = reinterpret_cast<unsigned char const*>(verts.data());
+    _mdi_mirror_verts.resize(static_cast<std::size_t>(voff));
+    _mdi_mirror_verts.insert(_mdi_mirror_verts.end(), vb, vb + vbytes);
+    _mdi_mirror_idx.resize(static_cast<std::size_t>(_mdi_arena_idx));
+    _mdi_mirror_idx.insert(_mdi_mirror_idx.end(), indices.begin(), indices.end());
+    _mdi_mirror_dirty = true;
+  }
   _mdi_arena_vtx += static_cast<GLsizei>(verts.size());
   _mdi_arena_idx += static_cast<GLsizei>(indices.size());
   slot.ok = true;
@@ -968,6 +988,7 @@ void WorldRender::drawDoodadsBatched(
   _mdi_scratch_interior.clear();
   _mdi_scratch_tex.clear();
   _mdi_scratch_cmds.clear();
+  _mdi_issued = 0;
   _mdi_cached_groups.clear();
   _mdi_cached_groups.reserve(groups.size());
 
@@ -1118,9 +1139,14 @@ void WorldRender::drawMdiGroups()
     if (gr.key.tex_array1 && gr.key.tex_array1 != last_a1)
     { gl.activeTexture(static_cast<GLenum>(GL_TEXTURE0 + 2)); gl.bindTexture(GL_TEXTURE_2D_ARRAY, gr.key.tex_array1); last_a1 = gr.key.tex_array1; }
 
+    // [phase I] VK owns the M2 batches: skip GL's MDI draw but keep everything above it, because the
+    // VK feed is built out of this same grouping. Gating only the CLASSIC per-bucket path left these
+    // five batched draws still submitting the models Vulkan had already drawn.
+    if (!vk_owns_m2)
     gl.multiDrawElementsIndirect(GL_TRIANGLES, GL_UNSIGNED_SHORT,
         reinterpret_cast<void*>(static_cast<std::size_t>(gr.first_cmd) * sizeof(OpenGL::DrawElementsIndirectCommand)),
         static_cast<GLsizei>(gr.cmd_count), 0);
+    _mdi_issued += gr.cmd_count;   // [VK-DIFF] GL-only doodad path
   }
 
   gl.bindVertexArray(0);
@@ -1254,6 +1280,12 @@ void WorldRender::drawPibBatched(std::vector<PibGroup>& groups)
   ensurePibMdi();
 
   _pib_scratch_tf.clear();
+  _pib_scratch_blp_idx.clear();   // [VULKAN phase C] stays in lockstep with _pib_scratch_tf
+  _pib_scratch_state.clear();
+  _pib_scratch_src = 1;   // [VK-DIFF] provenance of the arrays VK feeds from
+  _pib_scratch_groups.clear();
+  _pib_scratch_issued = 0;
+  _pib_batch_blps.clear();
   _pib_scratch_interior.clear();
   _pib_scratch_tex.clear();
   _pib_scratch_cmds.clear();
@@ -1311,6 +1343,8 @@ void WorldRender::drawPibBatched(std::vector<PibGroup>& groups)
       for (std::size_t i = 0; i < g.transforms.size(); ++i)
       {
         _pib_scratch_tf.push_back(g.transforms[i]);
+        _pib_scratch_blp_idx.push_back(batchBlpPairIndex(keys[pi].blp0, keys[pi].blp1));
+        _pib_scratch_state.push_back(batchStateVec(keys[pi]));
         _pib_scratch_interior.push_back(g.interiors.size() > i ? g.interiors[i] : glm::vec4(0.0f));
         _pib_scratch_tex.push_back(glm::ivec4(keys[pi].layer0, keys[pi].layer1,
                                               static_cast<int>(bone_base + static_cast<std::uint32_t>(i) * bone_count),
@@ -1340,7 +1374,23 @@ void WorldRender::drawPibBatched(std::vector<PibGroup>& groups)
       _pib_scratch_cmds.insert(_pib_scratch_cmds.end(), kv.second.begin(), kv.second.end());
       dg.cmd_count = static_cast<std::uint32_t>(kv.second.size());
       draw_groups.push_back(dg);
+      // [VULKAN] y carries cull in bit0 and CLASSIC ALPHA-KEY in bit1: a v256 alpha-key pass blends
+      // with SRC_ALPHA in GL (doc 40 two-era law), so the VK pipeline must pick the blending variant
+      // for it. Keying the variant on blend_mode alone drew every classic leaf/blade cutout opaque.
+      _pib_scratch_groups.emplace_back(static_cast<int>(dg.key.blend_mode),
+                                       (dg.key.backface_cull ? 1 : 0) | (dg.key.classic_alpha ? 2 : 0),
+                                       static_cast<int>(dg.first_cmd),
+                                       static_cast<int>(dg.cmd_count));
     }
+  }
+
+  // [finding 101] VK owns M2: the arrays above are the VK feed and are already built. The GL
+  // upload + program + state loop below serve a multiDrawElementsIndirect that is gated off, so
+  // they move several hundred KB per frame into buffers nothing draws from.
+  if (vk_owns_m2)
+  {
+    _pib_scratch_slice = 0.0f;   // VK reads this back for its own slice
+    return;
   }
 
   // Upload the per-frame streams + commands + bone SSBO (all STREAM -- the visible pib set changes per frame).
@@ -1371,6 +1421,7 @@ void WorldRender::drawPibBatched(std::vector<PibGroup>& groups)
   OpenGL::Scoped::use_program batched {*_m2_batched_program.get()};
   batched.uniform("model_origin", glm::vec3(0.0f));
   batched.uniform("slice_dist", 0.0f); // WMO doodads: no distance slice (matches the old pib path)
+  _pib_scratch_slice = 0.0f;   // VK reads this back for its own slice
   batched.uniform("masked_additive", 0);
   batched.uniform("detail_doodad", -1);
   batched.uniform("foliage_aa", 0); // A2C reverted (black-canopy/black-world regression)
@@ -1399,14 +1450,18 @@ void WorldRender::drawPibBatched(std::vector<PibGroup>& groups)
       if (want_cull) gl.enable(GL_CULL_FACE); else gl.disable(GL_CULL_FACE);
       last_cull = want_cull;
     }
-    if (static_cast<int>(gr.key.blend_mode) != last_blend)
+    int const cur_blend = static_cast<int>(gr.key.blend_mode) | (gr.key.classic_alpha ? 0x100 : 0);
+    if (cur_blend != last_blend)
     {
+      batched.uniform("alpha_key_classic", gr.key.classic_alpha ? 1 : 0);
       switch (static_cast<M2Blend>(gr.key.blend_mode))
       {
         default:
         case M2Blend::Opaque:
-        case M2Blend::Alpha_Key:
           gl.disable(GL_BLEND);
+          break;
+        case M2Blend::Alpha_Key:
+          gl.disable(GL_BLEND); // alpha-key never blends (opaque cloaks; see m2_frag)
           break;
         case M2Blend::Alpha:
           gl.enable(GL_BLEND);
@@ -1419,7 +1474,7 @@ void WorldRender::drawPibBatched(std::vector<PibGroup>& groups)
           break;
       }
       batched.uniform("blend_mode", static_cast<int>(gr.key.blend_mode));
-      last_blend = static_cast<int>(gr.key.blend_mode);
+      last_blend = cur_blend;
     }
     if (static_cast<int>(gr.key.unfogged) != last_unfogged)
     { batched.uniform("unfogged", static_cast<int>(gr.key.unfogged)); last_unfogged = static_cast<int>(gr.key.unfogged); }
@@ -1440,9 +1495,14 @@ void WorldRender::drawPibBatched(std::vector<PibGroup>& groups)
     if (gr.key.tex_array1 && gr.key.tex_array1 != last_a1)
     { gl.activeTexture(static_cast<GLenum>(GL_TEXTURE0 + 2)); gl.bindTexture(GL_TEXTURE_2D_ARRAY, gr.key.tex_array1); last_a1 = gr.key.tex_array1; }
 
+    // [phase I] VK owns the M2 batches: skip GL's MDI draw but keep everything above it, because the
+    // VK feed is built out of this same grouping. Gating only the CLASSIC per-bucket path left these
+    // five batched draws still submitting the models Vulkan had already drawn.
+    if (!vk_owns_m2)
     gl.multiDrawElementsIndirect(GL_TRIANGLES, GL_UNSIGNED_SHORT,
         reinterpret_cast<void*>(static_cast<std::size_t>(gr.first_cmd) * sizeof(OpenGL::DrawElementsIndirectCommand)),
         static_cast<GLsizei>(gr.cmd_count), 0);
+    _pib_scratch_issued += gr.cmd_count;   // [VK-DIFF] what GL really drew
   }
 
   gl.bindVertexArray(0);
@@ -1461,6 +1521,546 @@ void WorldRender::drawPibBatched(std::vector<PibGroup>& groups)
 // GO buckets (own fade/slice semantics), ground clutter (_force_unlit: needs the detail_doodad day/night +
 // A2C path), deferred pure-additive light effects (must draw after water), any bucket mid-distance-fade
 // (fade < 1 needs the per-instance translucent promote), and anything resolveStaticBatch rejects.
+// [VULKAN phase C] index of a batch's (blp0, blp1) pair in the small unique table the VK feed reads.
+// EVERY path that pushes to _pib_scratch_tf must push one of these too, or the streams desynchronise
+// and the Vulkan feed rejects the frame.
+glm::ivec4 WorldRender::batchStateVec(StaticBatchKey const& k)
+{
+  int flags = 0;
+  if (k.unlit) flags |= 1;
+  if (k.unfogged) flags |= 2;
+  if (k.classic_alpha) flags |= 4;
+  if (k.backface_cull) flags |= 8;
+  // w packs the tu lookups AND the per-unit UV clamp masks (bits 16-17 / 18-19). GL clamps blade and
+  // leaf cards to the texture edge (clamp_uv); VK sampled them unclamped, which differed on exactly
+  // the edge texels of every alpha-tested cutout.
+  return glm::ivec4(static_cast<int>(k.blend_mode), flags, k.pixel_shader,
+                    (k.tu_lookup0 & 0xFF) | ((k.tu_lookup1 & 0xFF) << 8)
+                      | ((k.tex_clamp0 & 0x3) << 16) | ((k.tex_clamp1 & 0x3) << 18));
+}
+
+int WorldRender::batchBlpPairIndex(std::string const& blp0, std::string const& blp1)
+{
+  std::pair<std::string, std::string> const names(blp0, blp1);
+  for (std::size_t i = 0; i < _pib_batch_blps.size(); ++i)
+    if (_pib_batch_blps[i] == names) return static_cast<int>(i);
+  _pib_batch_blps.push_back(names);
+  return static_cast<int>(_pib_batch_blps.size() - 1);
+}
+
+// [VULKAN phase D] Per-frame WMO feed. Called straight after the instance has been drawn by GL, so
+// GL's own rendering is untouched; this only appends to the arrays MapView hands to Vulkan.
+//
+// Geometry lands in an append-only arena keyed by (wmo file, group index) -- the same design the M2
+// arena uses -- and each of the group's draw calls becomes one VK draw carrying its blend mode and
+// cull flag (the pipeline key). Groups whose mirror is empty are counted as fallback: they are still
+// GL-only and phase D cannot close while that counter is non-zero.
+extern unsigned g_gl_wmo_draw_calls;   // WMOGroupRender.cpp -- what GL really issued
+extern unsigned g_wmo_frame_stamp;     // WMOGroupRender.cpp -- marks this frame's run captures
+// [phase J] Where GL's remaining scene pass goes in VK mode. VK's feeds are produced as a side
+// effect of these sections, so this says which of them are real scene work VK needs vs GL-only cost.
+// The scene pass costs the SAME under both APIs (6.96 GL vs 7.01 VK), so gating GL's draws
+// bought nothing -- the VK feed construction that replaced them costs about the same. This
+// measures that construction directly: how much of the scene pass is building VK's feeds.
+double g_vk_feedbuild_ms = 0.0;
+double g_vk_sec_terrain_ms = 0.0;
+double g_vk_sec_wmo_ms = 0.0;
+double g_vk_sec_m2_ms = 0.0;
+double g_vk_sec_gather_ms = 0.0;
+double g_vk_sec_ddraw_ms = 0.0;
+double g_vk_sec_indiv_ms = 0.0;
+double g_vk_sec_clutter_ms = 0.0;
+double g_vk_sec_submit_ms = 0.0;
+namespace
+{
+  struct SecTimer
+  {
+    double& sink;
+    std::chrono::steady_clock::time_point t0;
+    explicit SecTimer(double& s) : sink(s), t0(std::chrono::steady_clock::now()) {}
+    ~SecTimer() { sink += std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - t0).count(); }
+  };
+}
+
+extern bool g_vk_owns_wmo;             // WMOGroupRender.cpp -- gate GL's WMO draw, keep its recording
+
+void WorldRender::vkResetWmoFrame()
+{
+  g_gl_wmo_draw_calls = 0;
+  ++g_wmo_frame_stamp;
+  // NOGGIT_VK_NO_WMO_GATE=1 puts GL's WMO draw back (A/B for isolating the compose from the port)
+  static bool const s_no_gate = std::getenv("NOGGIT_VK_NO_WMO_GATE") != nullptr;
+  g_vk_owns_wmo = _vk_owns_wmo && !s_no_gate;
+  _vk_wmo_draws.clear();
+  _vk_wmo_xforms.clear();
+  _vk_wmo_ambients.clear();
+  _vk_wmo_fallback = 0;
+}
+
+std::size_t WorldRender::glWmoDrawCalls() const { return g_gl_wmo_draw_calls; }
+
+// De-duplicated (tex0, tex1) name pairs for the WMO arena batches -- VK addresses textures by
+// bindless id, resolved from these names in MapView using the same cache the M2 batches use.
+int WorldRender::vkWmoBlpPairIndex(std::string const& a, std::string const& b)
+{
+  for (std::size_t i = 0; i < _vk_wmo_blp_pairs.size(); ++i)
+  {
+    if (_vk_wmo_blp_pairs[i].first == a && _vk_wmo_blp_pairs[i].second == b)
+      return static_cast<int>(i);
+  }
+  _vk_wmo_blp_pairs.emplace_back(a, b);
+  return static_cast<int>(_vk_wmo_blp_pairs.size() - 1);
+}
+
+// [PIPELINE step 1] Replay the buckets Vulkan refused, on the render thread, after draw() has
+// returned. This exists so the traversal can eventually run on a worker: GL calls are not legal
+// there, and these instances cannot just be dropped (finding 54 -- doing that loses ~230 pixels).
+// Mirrors the instanced-bucket program and state setup exactly, because that is the scope the
+// original inline draw ran in.
+void WorldRender::drawDeferredGlFallback()
+{
+  if ((_vk_gl_deferred.empty() && _vk_gl_deferred_pi.empty()) || !_m2_instanced_program)
+    return;
+
+  math::frustum const frustum(_vk_def_mvp);
+  // debug boxes (draw_models_with_box, off by default): replayed models get their own scratch map
+  // rather than the main list, which the box pass has already consumed by now
+  std::unordered_map<Model*, std::size_t> boxes;
+
+  OpenGL::Scoped::use_program m2_shader{*_m2_instanced_program.get()};
+
+  OpenGL::M2RenderState model_render_state;
+  model_render_state.tex_arrays = {0, 0};
+  model_render_state.tex_indices = {0, 0};
+  model_render_state.tex_unit_lookups = {0, 0};
+  gl.blendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+  gl.disable(GL_BLEND);
+  gl.depthMask(GL_TRUE);
+  gl.enable(GL_CULL_FACE);
+  m2_shader.uniform("blend_mode", 0);
+  m2_shader.uniform("unfogged", static_cast<int>(model_render_state.unfogged));
+  m2_shader.uniform("unlit", static_cast<int>(model_render_state.unlit));
+  m2_shader.uniform("tex_unit_lookup_1", 0);
+  m2_shader.uniform("tex_unit_lookup_2", 0);
+  m2_shader.uniform("pixel_shader", 0);
+  m2_shader.uniform("model_origin", glm::vec3(0.0f));
+
+  for (auto& d : _vk_gl_deferred)
+  {
+    if (!d.model || d.transforms.empty() || !d.model->renderer())
+      continue;
+    m2_shader.uniform("slice_dist", d.slice_dist);   // per bucket, as the inline draw had it
+    d.interiors.resize(d.transforms.size(), glm::vec4(0.0f));
+    d.fades.resize(d.transforms.size(), 1.0f);
+    d.model->renderer()->draw(_vk_def_model_view, d.transforms, m2_shader, model_render_state,
+                              frustum, _cull_distance, _vk_def_camera_pos,
+                              _world->model_animtime, _vk_def_boxes, boxes, _vk_def_display,
+                              /*no_cull*/ false, /*representative*/ nullptr,
+                              d.interiors, d.fades);
+  }
+  _vk_gl_deferred.clear();
+
+  // per-instance doodads: non-instanced overload, _m2_program, mirroring the per-instance section
+  if (!_vk_gl_deferred_pi.empty() && _m2_program)
+  {
+    OpenGL::Scoped::use_program doodad_shader{*_m2_program.get()};
+    OpenGL::M2RenderState doodad_render_state;
+    doodad_render_state.tex_arrays = {0, 0};
+    doodad_render_state.tex_indices = {0, 0};
+    doodad_render_state.tex_unit_lookups = {0, 0};
+    gl.blendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    gl.disable(GL_BLEND);
+    gl.depthMask(GL_TRUE);
+    gl.enable(GL_CULL_FACE);
+    doodad_shader.uniform("blend_mode", 0);
+    doodad_shader.uniform("unfogged", static_cast<int>(doodad_render_state.unfogged));
+    doodad_shader.uniform("unlit", static_cast<int>(doodad_render_state.unlit));
+    doodad_shader.uniform("tex_unit_lookup_1", 0);
+    doodad_shader.uniform("tex_unit_lookup_2", 0);
+    doodad_shader.uniform("pixel_shader", 0);
+    for (auto& d : _vk_gl_deferred_pi)
+    {
+      if (!d.model || !d.instance || !d.model->renderer())
+        continue;
+      d.model->renderer()->draw(_vk_def_model_view, *d.instance, doodad_shader, doodad_render_state,
+                                frustum, _cull_distance, _vk_def_camera_pos,
+                                static_cast<int>(_world->model_animtime), _vk_def_display,
+                                /*no_cull*/ false, /*bloom_mask_only*/ false, d.interior);
+    }
+    _vk_gl_deferred_pi.clear();
+  }
+}
+
+void WorldRender::vkFeedWmoInstance(WMOInstance* instance)
+{
+  if (!vk_feeding)
+    return;                                     // pure GL frame: no VK consumer
+  SecTimer _feed_t(g_vk_feedbuild_ms);
+  if (!instance || !instance->wmo.get() || !instance->wmo->finishedLoading())
+    return;
+
+  WMO* wmo = instance->wmo.get();
+  std::string const& wmo_key = wmo->file_key().stringRepr();
+
+  std::uint32_t const xform_index = static_cast<std::uint32_t>(_vk_wmo_xforms.size());
+  _vk_wmo_xforms.push_back(instance->transformMatrix());
+  // MOHD ambient: the interior branch's light for this WMO (GL sets it per WMO as a uniform)
+  // [0] = MOHD ambient rgb, w = fog mode (0 = zone fog, else 1.0 + start_frac; the bias keeps
+  // "off" exactly 0 while still allowing GL's negative mist scaler). [1] = WMO fog colour + end.
+  auto const& fogctx = wmo->renderer()->vkFogContext();
+  _vk_wmo_ambients.emplace_back(wmo->ambient_light_color.x, wmo->ambient_light_color.y,
+                                wmo->ambient_light_color.z,
+                                fogctx.use_wmo_fog ? (1.0f + fogctx.start_frac) : 0.0f);
+  _vk_wmo_ambients.emplace_back(fogctx.color.x, fogctx.color.y, fogctx.color.z, fogctx.end);
+  // [2].x = MOHD 0x2 unified render path: the MapObjU shaders ADD the baked MOCV on top of the
+  // light, on both interior and exterior batches.
+  _vk_wmo_ambients.emplace_back(wmo->flags.use_unified_render_path ? 1.0f : 0.0f, 0.f, 0.f, 0.f);
+
+  // Portal/frustum visibility for THIS frame, written by the draw above. Empty = all visible.
+  auto const& vis = instance->portal_group_visibility;
+
+  bool any = false;
+  for (std::size_t gi = 0; gi < wmo->groups.size(); ++gi)
+  {
+    // NOTE: no portal_group_visibility test here. The frame stamp below is the authoritative
+    // "GL drew this group this frame" signal -- it is set by the group draw itself. Testing
+    // visibility as well over-culled badly (1 draw emitted against 6 GL issued), because the
+    // vector's semantics do not line up one-to-one with what the group draw actually decided.
+    auto* gr = wmo->groups[gi].renderer();
+    if (!gr)
+      continue;
+
+    auto const& verts = gr->vkVertices();
+    auto const& idx = gr->vkIndices();
+    bool const already_in_arena = gr->vkMirrorTaken();
+    if ((verts.empty() || idx.empty()) && !already_in_arena)
+    {
+      // Not yet uploaded (transient, self-heals as streaming completes) or genuinely empty. Either
+      // way VK cannot draw it this frame -- counted so the remaining GL-only geometry stays visible.
+      ++_vk_wmo_fallback;
+      continue;
+    }
+
+    std::string const key = wmo_key + "#" + std::to_string(gi);
+    auto slot_it = _vk_wmo_slots.find(key);
+    if (slot_it == _vk_wmo_slots.end())
+    {
+      VkWmoSlot slot;
+      if (verts.empty() || idx.empty())
+      {
+        ++_vk_wmo_fallback;   // taken flag set but no arena slot -> nothing to draw
+        continue;
+      }
+      slot.base_vertex = static_cast<std::int32_t>(_vk_wmo_verts.size());
+      slot.index_base = static_cast<std::uint32_t>(_vk_wmo_idx.size());
+      slot.batch_base = static_cast<std::uint32_t>(_vk_wmo_batches.size());
+
+      // Copy the vertices, rebasing each batch id into the GLOBAL batch table.
+      std::size_t const first_v = _vk_wmo_verts.size();
+      _vk_wmo_verts.insert(_vk_wmo_verts.end(), verts.begin(), verts.end());
+      // The mapping is 1-BASED (WMOGroupRender writes batch_counter + 1); 0 = no batch, which GL
+      // discards outright. Convert to a 0-based GLOBAL index here and keep 0 as the sentinel.
+      for (std::size_t vi = first_v; vi < _vk_wmo_verts.size(); ++vi)
+      {
+        std::uint32_t const local = _vk_wmo_verts[vi].batch_id;
+        _vk_wmo_verts[vi].batch_id = local ? (local - 1u + slot.batch_base + 1u) : 0u;
+      }
+
+      // Concatenate this group's batch records, keyed to the shared BLP pair table.
+      auto const& blps = gr->vkBatchBlps();
+      auto const& bts = gr->vkBatches();
+      // A group whose batch table is EMPTY while its vertices carry batch ids would leave those ids
+      // pointing into the NEXT group's records -- wrong textures on that geometry. Refuse it instead
+      // (counted as fallback) so the global table stays consistent.
+      if (bts.empty())
+      {
+        std::uint32_t max_id = 0;
+        for (auto const& vtx : verts) max_id = std::max(max_id, vtx.batch_id);
+        if (max_id != 0)
+        {
+          ++_vk_wmo_fallback;
+          _vk_wmo_verts.resize(first_v);   // roll the copy back
+          continue;
+        }
+      }
+      for (std::size_t bi = 0; bi < bts.size(); ++bi)
+      {
+        std::string const& b0 = bi < blps.size() ? blps[bi].first : std::string();
+        std::string const& b1 = bi < blps.size() ? blps[bi].second : std::string();
+        _vk_wmo_batches.emplace_back(vkWmoBlpPairIndex(b0, b1),
+                                     static_cast<int>(bts[bi].shader),
+                                     static_cast<int>(bts[bi].flags),
+                                     static_cast<int>(bts[bi].alpha_test_mode));
+      }
+      _vk_wmo_batches_dirty = true;
+
+      _vk_wmo_idx.insert(_vk_wmo_idx.end(), idx.begin(), idx.end());
+      slot.ok = true;
+      _vk_wmo_arena_dirty = true;
+      slot_it = _vk_wmo_slots.emplace(key, slot).first;
+      gr->releaseVkMirror();   // the arena owns it now -- do not keep a second copy in RAM
+    }
+    if (!slot_it->second.ok)
+    {
+      ++_vk_wmo_fallback;
+      continue;
+    }
+
+    // Replay exactly the runs GL emitted for this group (per-batch frustum culling already
+    // applied inside its draw). Re-deriving them here would be a second source of truth and would
+    // drift -- the feed over-drew 8x before this.
+    if (gr->vkLastRunFrame() != g_wmo_frame_stamp)
+    {
+      // GL did not draw this group this frame (frustum/portal culled inside WMORender::draw), so
+      // its capture is stale. Not a fallback -- there is simply nothing to draw.
+      continue;
+    }
+
+    for (auto const& run : gr->vkLastRuns())
+    {
+      if (!run.index_count)
+        continue;
+      VkWmoDraw d;
+      d.index_count = run.index_count;
+      d.first_index = slot_it->second.index_base + run.index_start;
+      d.base_vertex = slot_it->second.base_vertex;
+      d.xform_index = xform_index;
+      d.blend_mode = run.blend_mode;
+      d.backface_cull = run.backface_cull;
+      _vk_wmo_draws.push_back(d);
+      any = true;
+    }
+  }
+  (void)any;
+}
+
+int WorldRender::vkM2BlpPairIndex(std::string const& a, std::string const& b)
+{
+  std::string key;
+  key.reserve(a.size() + b.size() + 1);
+  key.append(a).push_back('\x1f');   // unit separator: cannot appear in a file path
+  key.append(b);
+
+  auto const it = _vk_m2_blp_pair_index.find(key);
+  if (it != _vk_m2_blp_pair_index.end())
+    return it->second;
+
+  int const idx = static_cast<int>(_vk_m2_blp_pairs.size());
+  _vk_m2_blp_pairs.emplace_back(a, b);
+  _vk_m2_blp_pair_index.emplace(std::move(key), idx);
+  return idx;
+}
+
+void WorldRender::vkM2SnapshotClear()
+{
+  _vk_m2_tf.clear(); _vk_m2_interior.clear(); _vk_m2_tex.clear(); _vk_m2_blp_idx.clear();
+  _vk_m2_state.clear(); _vk_m2_bones.clear(); _vk_m2_cmds.clear(); _vk_m2_groups.clear();
+  _vk_m2_blp_pairs.clear();
+  _vk_m2_blp_pair_index.clear();
+}
+
+// Append whatever is currently in the scratch arrays, rebasing instance and bone indices onto what
+// the snapshot already holds. Called after each producer, because the next one clears the scratch.
+void WorldRender::vkM2SnapshotAppend()
+{
+  if (_pib_scratch_tf.empty() || _pib_scratch_cmds.empty())
+    return;
+  if (_pib_scratch_blp_idx.size() != _pib_scratch_tf.size()
+      || _pib_scratch_state.size() != _pib_scratch_tf.size()
+      || _pib_scratch_interior.size() != _pib_scratch_tf.size()
+      || _pib_scratch_tex.size() != _pib_scratch_tf.size())
+    return;   // desynced streams -- never hand VK a mismatched set
+
+  std::uint32_t const inst_base = static_cast<std::uint32_t>(_vk_m2_tf.size());
+  std::uint32_t const bone_base = static_cast<std::uint32_t>(_vk_m2_bones.size());
+  std::uint32_t const cmd_base = static_cast<std::uint32_t>(_vk_m2_cmds.size());
+
+  _vk_m2_tf.insert(_vk_m2_tf.end(), _pib_scratch_tf.begin(), _pib_scratch_tf.end());
+  _vk_m2_interior.insert(_vk_m2_interior.end(), _pib_scratch_interior.begin(), _pib_scratch_interior.end());
+  // blpidx points into the PRODUCER's pair table, which the next producer clears -- remap each one
+  // into the snapshot's own table or the textures resolve to -1.
+  for (int idx : _pib_scratch_blp_idx)
+  {
+    if (idx >= 0 && idx < static_cast<int>(_pib_batch_blps.size()))
+      _vk_m2_blp_idx.push_back(vkM2BlpPairIndex(_pib_batch_blps[idx].first, _pib_batch_blps[idx].second));
+    else
+      _vk_m2_blp_idx.push_back(-1);
+  }
+  _vk_m2_state.insert(_vk_m2_state.end(), _pib_scratch_state.begin(), _pib_scratch_state.end());
+  _vk_m2_bones.insert(_vk_m2_bones.end(), _pib_scratch_bones.begin(), _pib_scratch_bones.end());
+
+  // tex info carries the bone base in .z -- rebase it onto the snapshot's bone array
+  for (glm::ivec4 t : _pib_scratch_tex)
+  {
+    if (t.w > 0)
+      t.z += static_cast<int>(bone_base);
+    _vk_m2_tex.push_back(t);
+  }
+  for (OpenGL::DrawElementsIndirectCommand c : _pib_scratch_cmds)
+  {
+    c.baseInstance += inst_base;
+    _vk_m2_cmds.push_back(c);
+  }
+  for (glm::ivec4 g : _pib_scratch_groups)
+  {
+    g.z += static_cast<int>(cmd_base);   // first_cmd
+    _vk_m2_groups.push_back(g);
+  }
+}
+
+// [VULKAN phase C] Append a CLASSIC-path bucket to the VK feed arrays.
+//
+// GL draws these buckets with the per-model instanced loop and is not touched here: this runs AFTER
+// GL has issued its draws for the frame, and only appends to the scratch arrays MapView hands to
+// Vulkan. Anything whose passes do not resolve stays GL-only and is a tracked TODO (the port is not
+// done while a single fallback remains).
+bool WorldRender::vkFeedClassicBucket(Model* m, std::vector<glm::mat4x4> const& transforms,
+                                      std::vector<glm::vec4> const* interiors)
+{
+  _vk_last_feed_nothing = false;
+  if (!vk_feeding)
+    return false;                               // pure GL frame: nobody consumes this bucket
+  SecTimer _feed_t(g_vk_feedbuild_ms);
+  if (!m || transforms.empty() || !m->renderer())
+  {
+    if (m && !transforms.empty())
+      _vk_fb_empty += transforms.size();
+    return false;
+  }
+
+  auto const& passes = m->renderer()->renderPasses();
+  if (passes.empty())
+  {
+    _vk_fb_empty += transforms.size();
+    if (_vk_fb_names.size() < 8)
+      _vk_fb_names.push_back("empty " + m->file_key().stringRepr());
+    return false;
+  }
+
+  // rej code 4 = the pass's geoset is HIDDEN. GL rejects the whole model for that so the individual
+  // path can skip the submesh; here the equivalent is to skip just that pass -- GL does not draw it
+  // either -- and batch the rest. Any other rejection still drops the model (those passes need
+  // rendering a static batch cannot express).
+  extern thread_local int g_last_static_batch_reject;
+  constexpr int kRejHiddenGeoset = 4;
+
+  std::vector<StaticBatchKey> keys;
+  std::vector<std::uint32_t> pass_index;
+  keys.reserve(passes.size());
+  pass_index.reserve(passes.size());
+  for (std::uint32_t pi = 0; pi < passes.size(); ++pi)
+  {
+    StaticBatchKey k;
+    g_last_static_batch_reject = 0;
+    if (!passes[pi].resolveStaticBatch(m, k, /*for_pib=*/ true))
+    {
+      if (g_last_static_batch_reject == kRejHiddenGeoset)
+        continue;                         // hidden submesh -- GL skips it too
+      _vk_fb_pass += transforms.size();   // TODO: billboards / animated UV / clamp variants
+      {
+        // One line per distinct model, once: which model still needs GL and WHY. The port is not
+        // done while this prints anything.
+        extern thread_local int g_last_tex_unit_reject;
+        if (_vk_fb_names.size() < 8)
+          _vk_fb_names.push_back("rej" + std::to_string(g_last_static_batch_reject)
+                                 + "/tex" + std::to_string(g_last_tex_unit_reject) + " "
+                                 + m->file_key().stringRepr());
+      }
+      return false;                             // stays GL-only
+    }
+    keys.push_back(k);
+    pass_index.push_back(pi);
+  }
+  if (keys.empty())
+  {
+    // [GL-COST HUNT] This return counted nothing, so these instances showed up as "GL still drew
+    // them" with no recorded reason. Every pass is a hidden geoset: VK correctly declines, and GL
+    // then draws a model whose every submesh it also skips -- work that produces no pixels.
+    _vk_fb_hidden += transforms.size();
+    // ~98% of the instances GL still draws in VK mode land here (allHidden 135 of 138). It is
+    // TEMPTING to skip GL's draw for them on the grounds that every submesh is hidden -- that was
+    // tried and is WRONG: it dropped ~226 pixels (static check 3.70% -> 3.720%, stable over repeats).
+    // VK's static-batch hidden test is not equivalent to "GL renders nothing"; GL's own geoset test
+    // still draws something here. These have to be deferred to the render thread, not dropped.
+    _vk_last_feed_nothing = true;
+    return false;   // every pass hidden for the STATIC BATCH path -> GL still owns it
+  }
+
+  // shared arena slot (append-only, and it mirrors itself into the VK arena)
+  if (!mdiEnsureModelInArena(m))
+  {
+    _vk_fb_arena += transforms.size();
+    return false;
+  }
+  auto const slot_it = _mdi_slots.find(m->file_key().stringRepr());
+  if (slot_it == _mdi_slots.end() || !slot_it->second.ok)
+  {
+    _vk_fb_arena += transforms.size();
+    return false;
+  }
+  MdiArenaSlot const& slot = slot_it->second;
+
+  // shared pose, exactly like the batched path
+  std::uint32_t bone_base = 0, bone_count = 0;
+  if (m->animBones && !m->bone_matrices.empty())
+  {
+    bone_count = static_cast<std::uint32_t>(m->bone_matrices.size());
+    bone_base = static_cast<std::uint32_t>(_vk_m2_bones.size());
+    _vk_m2_bones.insert(_vk_m2_bones.end(), m->bone_matrices.begin(), m->bone_matrices.end());
+  }
+
+  for (std::uint32_t ki = 0; ki < keys.size(); ++ki)
+  {
+    std::uint32_t const pi = ki;   // index into keys
+    ModelRenderPass const& pass = passes[pass_index[ki]];
+    OpenGL::DrawElementsIndirectCommand cmd;
+    cmd.count = pass.index_count;
+    cmd.instanceCount = static_cast<GLuint>(transforms.size());
+    cmd.firstIndex = slot.index_base + pass.index_start;
+    cmd.baseVertex = slot.base_vertex;
+    cmd.baseInstance = static_cast<GLuint>(_vk_m2_tf.size());
+
+    // one group per command: these are appended after the pib groups, so blended classic passes
+    // still composite after every opaque pib pass (GL orders opaque-then-blended the same way).
+    _vk_m2_groups.emplace_back(static_cast<int>(keys[pi].blend_mode),
+                               (keys[pi].backface_cull ? 1 : 0)
+                                 | (keys[pi].classic_alpha ? 2 : 0),   // [VULKAN] see below
+                               static_cast<int>(_vk_m2_cmds.size()), 1);
+    _vk_m2_cmds.push_back(cmd);
+
+    glm::ivec4 const tex(keys[pi].layer0, keys[pi].layer1,
+                         static_cast<int>(bone_base), static_cast<int>(bone_count));
+    int const blp_idx = vkM2BlpPairIndex(keys[pi].blp0, keys[pi].blp1);
+    for (std::size_t i = 0; i < transforms.size(); ++i)
+    {
+      _vk_m2_tf.push_back(transforms[i]);
+      _vk_m2_interior.push_back(interiors && interiors->size() > i ? (*interiors)[i] : glm::vec4(0.0f));
+      _vk_m2_tex.push_back(tex);
+      _vk_m2_blp_idx.push_back(blp_idx);
+      // [VULKAN] flag bit 16 = GROUND CLUTTER. GL decides this per draw from m->_force_unlit and
+      // runs a completely different shading law for it (detail_doodad in m2_frag); the batched GL
+      // program never takes that branch, so the VK M2 shader has to carry the flag itself.
+      glm::ivec4 state = batchStateVec(keys[pi]);
+      if (m->_force_unlit)
+        state.y |= 16;
+      // Sphere-mapped (env) texture units are the one UV mode the VK shader cannot express without
+      // the view basis. Count them so "is this content affected?" is a number, not a guess.
+      if (keys[pi].tu_lookup0 == 0 || keys[pi].tu_lookup1 == 0)
+      {
+        static std::set<std::string> s_sphere_seen;
+        std::string const key = m->file_key().stringRepr();
+        if (s_sphere_seen.insert(key).second)
+          LogError << "[VK] M2 SPHERE-MAP uv unit (tracked TODO): " << key
+                   << " tu=(" << keys[pi].tu_lookup0 << "," << keys[pi].tu_lookup1 << ")" << std::endl;
+      }
+      _vk_m2_state.push_back(state);
+    }
+    _vk_classic_fed += transforms.size();
+  }
+  return true;   // VK took this bucket -- the caller may skip GL's draw for it
+}
+
 void WorldRender::drawDynamicBatched(tsl::robin_map<Model*, std::vector<glm::mat4x4>> const& buckets,
                                      tsl::robin_map<Model*, std::vector<glm::vec4>>& interiors,
                                      tsl::robin_map<Model*, std::vector<float>>& fades,
@@ -1475,6 +2075,12 @@ void WorldRender::drawDynamicBatched(tsl::robin_map<Model*, std::vector<glm::mat
   ensurePibMdi();
 
   _pib_scratch_tf.clear();
+  _pib_scratch_blp_idx.clear();   // [VULKAN phase C] stays in lockstep with _pib_scratch_tf
+  _pib_scratch_state.clear();
+  _pib_scratch_src = 2;   // [VK-DIFF] provenance of the arrays VK feeds from
+  _pib_scratch_groups.clear();
+  _pib_scratch_issued = 0;
+  _pib_batch_blps.clear();
   _pib_scratch_interior.clear();
   _pib_scratch_tex.clear();
   _pib_scratch_cmds.clear();
@@ -1566,11 +2172,16 @@ void WorldRender::drawDynamicBatched(tsl::robin_map<Model*, std::vector<glm::mat
 
       glm::ivec4 const tex(keys[pi].layer0, keys[pi].layer1,
                            static_cast<int>(bone_base), static_cast<int>(bone_count));
+      // [VULKAN phase C] which BLP pair this batch samples -- VK addresses textures by bindless index
+      // keyed on the file name, so the per-instance stream carries an index into a small unique table.
+      int const blp_idx = batchBlpPairIndex(keys[pi].blp0, keys[pi].blp1);
       for (std::size_t i = 0; i < transforms.size(); ++i)
       {
         _pib_scratch_tf.push_back(transforms[i]);
         _pib_scratch_interior.push_back(inter && inter->size() > i ? (*inter)[i] : glm::vec4(0.0f));
         _pib_scratch_tex.push_back(tex);
+        _pib_scratch_blp_idx.push_back(blp_idx);
+        _pib_scratch_state.push_back(batchStateVec(keys[pi]));
       }
     }
     _dyn_batched_models.emplace(m, static_cast<std::uint8_t>(1));
@@ -1597,34 +2208,49 @@ void WorldRender::drawDynamicBatched(tsl::robin_map<Model*, std::vector<glm::mat
       _pib_scratch_cmds.insert(_pib_scratch_cmds.end(), kv.second.begin(), kv.second.end());
       dg.cmd_count = static_cast<std::uint32_t>(kv.second.size());
       draw_groups.push_back(dg);
+      // [VULKAN] y carries cull in bit0 and CLASSIC ALPHA-KEY in bit1: a v256 alpha-key pass blends
+      // with SRC_ALPHA in GL (doc 40 two-era law), so the VK pipeline must pick the blending variant
+      // for it. Keying the variant on blend_mode alone drew every classic leaf/blade cutout opaque.
+      _pib_scratch_groups.emplace_back(static_cast<int>(dg.key.blend_mode),
+                                       (dg.key.backface_cull ? 1 : 0) | (dg.key.classic_alpha ? 2 : 0),
+                                       static_cast<int>(dg.first_cmd),
+                                       static_cast<int>(dg.cmd_count));
     }
   }
 
-  // Upload (bufferData orphaning -> safe to reuse the pib buffers; the later pib pass re-orphans them).
-  gl.bindBuffer(GL_ARRAY_BUFFER, _pib_buffers[0]);
-  gl.bufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(_pib_scratch_tf.size() * sizeof(glm::mat4x4)), _pib_scratch_tf.data(), GL_STREAM_DRAW);
-  gl.bindBuffer(GL_ARRAY_BUFFER, _pib_buffers[1]);
-  gl.bufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(_pib_scratch_interior.size() * sizeof(glm::vec4)), _pib_scratch_interior.data(), GL_STREAM_DRAW);
-  gl.bindBuffer(GL_ARRAY_BUFFER, _pib_buffers[2]);
-  gl.bufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(_pib_scratch_tex.size() * sizeof(glm::ivec4)), _pib_scratch_tex.data(), GL_STREAM_DRAW);
-  gl.bindBuffer(GL_ARRAY_BUFFER, 0);
-  gl.bindBuffer(GL_DRAW_INDIRECT_BUFFER, _pib_buffers[3]);
-  gl.bufferData(GL_DRAW_INDIRECT_BUFFER, static_cast<GLsizeiptr>(_pib_scratch_cmds.size() * sizeof(OpenGL::DrawElementsIndirectCommand)), _pib_scratch_cmds.data(), GL_STREAM_DRAW);
-
-  constexpr GLenum SSBO_TARGET = 0x90D2;
-  if (!_pib_scratch_bones.empty())
+  // [phase J] VK owns these batches, so GL's copies of the instance / interior / tex /
+  // indirect / bone streams are pure waste -- the draw that would read them is gated. The
+  // SCRATCH arrays above are still built, because the VK feed is made out of them; only the
+  // GL uploads are skipped. Measured: the M2 section was 4.13 of the 4.84 ms GL still cost.
+  if (!vk_owns_m2)
   {
-    GLsizeiptr const bone_bytes = static_cast<GLsizeiptr>(_pib_scratch_bones.size() * sizeof(glm::mat4x4));
-    gl.bindBuffer(SSBO_TARGET, _pib_buffers[4]);
-    gl.bufferData(SSBO_TARGET, bone_bytes, _pib_scratch_bones.data(), GL_STREAM_DRAW);
-    gl.bindBuffer(SSBO_TARGET, 0);
-    gl.bindBufferRange(SSBO_TARGET, 0, _pib_buffers[4], 0, bone_bytes);
+    // Upload (bufferData orphaning -> safe to reuse the pib buffers; the later pib pass re-orphans them).
+    gl.bindBuffer(GL_ARRAY_BUFFER, _pib_buffers[0]);
+    gl.bufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(_pib_scratch_tf.size() * sizeof(glm::mat4x4)), _pib_scratch_tf.data(), GL_STREAM_DRAW);
+    gl.bindBuffer(GL_ARRAY_BUFFER, _pib_buffers[1]);
+    gl.bufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(_pib_scratch_interior.size() * sizeof(glm::vec4)), _pib_scratch_interior.data(), GL_STREAM_DRAW);
+    gl.bindBuffer(GL_ARRAY_BUFFER, _pib_buffers[2]);
+    gl.bufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(_pib_scratch_tex.size() * sizeof(glm::ivec4)), _pib_scratch_tex.data(), GL_STREAM_DRAW);
+    gl.bindBuffer(GL_ARRAY_BUFFER, 0);
+    gl.bindBuffer(GL_DRAW_INDIRECT_BUFFER, _pib_buffers[3]);
+    gl.bufferData(GL_DRAW_INDIRECT_BUFFER, static_cast<GLsizeiptr>(_pib_scratch_cmds.size() * sizeof(OpenGL::DrawElementsIndirectCommand)), _pib_scratch_cmds.data(), GL_STREAM_DRAW);
+
+    constexpr GLenum SSBO_TARGET = 0x90D2;
+    if (!_pib_scratch_bones.empty())
+    {
+      GLsizeiptr const bone_bytes = static_cast<GLsizeiptr>(_pib_scratch_bones.size() * sizeof(glm::mat4x4));
+      gl.bindBuffer(SSBO_TARGET, _pib_buffers[4]);
+      gl.bufferData(SSBO_TARGET, bone_bytes, _pib_scratch_bones.data(), GL_STREAM_DRAW);
+      gl.bindBuffer(SSBO_TARGET, 0);
+      gl.bindBufferRange(SSBO_TARGET, 0, _pib_buffers[4], 0, bone_bytes);
+    }
   }
 
   OpenGL::Scoped::use_program batched {*_m2_batched_program.get()};
   static bool const s_no_dist_fade = std::getenv("NOGGIT_NO_DIST_FADE") != nullptr;
   batched.uniform("model_origin", glm::vec3(0.0f));
   batched.uniform("slice_dist", s_no_dist_fade ? 0.0f : _cull_distance); // dynamic doodads slice like the loop
+  _pib_scratch_slice = s_no_dist_fade ? 0.0f : _cull_distance;   // VK reads this back for its own slice
   batched.uniform("masked_additive", 0);
   batched.uniform("detail_doodad", -1);
   batched.uniform("foliage_aa", 0); // A2C reverted (black-canopy/black-world regression)
@@ -1653,14 +2279,18 @@ void WorldRender::drawDynamicBatched(tsl::robin_map<Model*, std::vector<glm::mat
       if (want_cull) gl.enable(GL_CULL_FACE); else gl.disable(GL_CULL_FACE);
       last_cull = want_cull;
     }
-    if (static_cast<int>(gr.key.blend_mode) != last_blend)
+    int const cur_blend = static_cast<int>(gr.key.blend_mode) | (gr.key.classic_alpha ? 0x100 : 0);
+    if (cur_blend != last_blend)
     {
+      batched.uniform("alpha_key_classic", gr.key.classic_alpha ? 1 : 0);
       switch (static_cast<M2Blend>(gr.key.blend_mode))
       {
         default:
         case M2Blend::Opaque:
-        case M2Blend::Alpha_Key:
           gl.disable(GL_BLEND);
+          break;
+        case M2Blend::Alpha_Key:
+          gl.disable(GL_BLEND); // alpha-key never blends (opaque cloaks; see m2_frag)
           break;
         case M2Blend::Alpha:
           gl.enable(GL_BLEND);
@@ -1673,7 +2303,7 @@ void WorldRender::drawDynamicBatched(tsl::robin_map<Model*, std::vector<glm::mat
           break;
       }
       batched.uniform("blend_mode", static_cast<int>(gr.key.blend_mode));
-      last_blend = static_cast<int>(gr.key.blend_mode);
+      last_blend = cur_blend;
     }
     if (static_cast<int>(gr.key.unfogged) != last_unfogged)
     { batched.uniform("unfogged", static_cast<int>(gr.key.unfogged)); last_unfogged = static_cast<int>(gr.key.unfogged); }
@@ -1694,9 +2324,14 @@ void WorldRender::drawDynamicBatched(tsl::robin_map<Model*, std::vector<glm::mat
     if (gr.key.tex_array1 && gr.key.tex_array1 != last_a1)
     { gl.activeTexture(static_cast<GLenum>(GL_TEXTURE0 + 2)); gl.bindTexture(GL_TEXTURE_2D_ARRAY, gr.key.tex_array1); last_a1 = gr.key.tex_array1; }
 
+    // [phase I] VK owns the M2 batches: skip GL's MDI draw but keep everything above it, because the
+    // VK feed is built out of this same grouping. Gating only the CLASSIC per-bucket path left these
+    // five batched draws still submitting the models Vulkan had already drawn.
+    if (!vk_owns_m2)
     gl.multiDrawElementsIndirect(GL_TRIANGLES, GL_UNSIGNED_SHORT,
         reinterpret_cast<void*>(static_cast<std::size_t>(gr.first_cmd) * sizeof(OpenGL::DrawElementsIndirectCommand)),
         static_cast<GLsizei>(gr.cmd_count), 0);
+    _pib_scratch_issued += gr.cmd_count;   // [VK-DIFF] what GL really drew
   }
 
   gl.bindVertexArray(0);
@@ -1728,6 +2363,12 @@ void WorldRender::drawCreaturesBatched(
   ensurePibMdi();
 
   _pib_scratch_tf.clear();
+  _pib_scratch_blp_idx.clear();   // [VULKAN phase C] stays in lockstep with _pib_scratch_tf
+  _pib_scratch_state.clear();
+  _pib_scratch_src = 3;   // [VK-DIFF] provenance of the arrays VK feeds from
+  _pib_scratch_groups.clear();
+  _pib_scratch_issued = 0;
+  _pib_batch_blps.clear();
   _pib_scratch_interior.clear();
   _pib_scratch_tex.clear();
   _pib_scratch_cmds.clear();
@@ -1850,6 +2491,8 @@ void WorldRender::drawCreaturesBatched(
         _pib_scratch_tf.push_back(transforms[i]);
         _pib_scratch_interior.push_back(inter[i]);
         _pib_scratch_tex.push_back(tex);
+        _pib_scratch_blp_idx.push_back(batchBlpPairIndex(key.blp0, key.blp1));
+        _pib_scratch_state.push_back(batchStateVec(key));
       }
     }
     out_batched.insert(entry.first);
@@ -1887,33 +2530,48 @@ void WorldRender::drawCreaturesBatched(
       _pib_scratch_cmds.insert(_pib_scratch_cmds.end(), kv.second.begin(), kv.second.end());
       dg.cmd_count = static_cast<std::uint32_t>(kv.second.size());
       draw_groups.push_back(dg);
+      // [VULKAN] y carries cull in bit0 and CLASSIC ALPHA-KEY in bit1: a v256 alpha-key pass blends
+      // with SRC_ALPHA in GL (doc 40 two-era law), so the VK pipeline must pick the blending variant
+      // for it. Keying the variant on blend_mode alone drew every classic leaf/blade cutout opaque.
+      _pib_scratch_groups.emplace_back(static_cast<int>(dg.key.blend_mode),
+                                       (dg.key.backface_cull ? 1 : 0) | (dg.key.classic_alpha ? 2 : 0),
+                                       static_cast<int>(dg.first_cmd),
+                                       static_cast<int>(dg.cmd_count));
     }
   }
 
-  // Upload (bufferData orphaning -> safe to reuse the pib buffers; the later pib pass re-orphans them).
-  gl.bindBuffer(GL_ARRAY_BUFFER, _pib_buffers[0]);
-  gl.bufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(_pib_scratch_tf.size() * sizeof(glm::mat4x4)), _pib_scratch_tf.data(), GL_STREAM_DRAW);
-  gl.bindBuffer(GL_ARRAY_BUFFER, _pib_buffers[1]);
-  gl.bufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(_pib_scratch_interior.size() * sizeof(glm::vec4)), _pib_scratch_interior.data(), GL_STREAM_DRAW);
-  gl.bindBuffer(GL_ARRAY_BUFFER, _pib_buffers[2]);
-  gl.bufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(_pib_scratch_tex.size() * sizeof(glm::ivec4)), _pib_scratch_tex.data(), GL_STREAM_DRAW);
-  gl.bindBuffer(GL_ARRAY_BUFFER, 0);
-  gl.bindBuffer(GL_DRAW_INDIRECT_BUFFER, _pib_buffers[3]);
-  gl.bufferData(GL_DRAW_INDIRECT_BUFFER, static_cast<GLsizeiptr>(_pib_scratch_cmds.size() * sizeof(OpenGL::DrawElementsIndirectCommand)), _pib_scratch_cmds.data(), GL_STREAM_DRAW);
-
-  constexpr GLenum SSBO_TARGET = 0x90D2;
-  if (!_pib_scratch_bones.empty())
+  // [phase J] VK owns these batches, so GL's copies of the instance / interior / tex /
+  // indirect / bone streams are pure waste -- the draw that would read them is gated. The
+  // SCRATCH arrays above are still built, because the VK feed is made out of them; only the
+  // GL uploads are skipped. Measured: the M2 section was 4.13 of the 4.84 ms GL still cost.
+  if (!vk_owns_m2)
   {
-    GLsizeiptr const bone_bytes = static_cast<GLsizeiptr>(_pib_scratch_bones.size() * sizeof(glm::mat4x4));
-    gl.bindBuffer(SSBO_TARGET, _pib_buffers[4]);
-    gl.bufferData(SSBO_TARGET, bone_bytes, _pib_scratch_bones.data(), GL_STREAM_DRAW);
-    gl.bindBuffer(SSBO_TARGET, 0);
-    gl.bindBufferRange(SSBO_TARGET, 0, _pib_buffers[4], 0, bone_bytes);
+    // Upload (bufferData orphaning -> safe to reuse the pib buffers; the later pib pass re-orphans them).
+    gl.bindBuffer(GL_ARRAY_BUFFER, _pib_buffers[0]);
+    gl.bufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(_pib_scratch_tf.size() * sizeof(glm::mat4x4)), _pib_scratch_tf.data(), GL_STREAM_DRAW);
+    gl.bindBuffer(GL_ARRAY_BUFFER, _pib_buffers[1]);
+    gl.bufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(_pib_scratch_interior.size() * sizeof(glm::vec4)), _pib_scratch_interior.data(), GL_STREAM_DRAW);
+    gl.bindBuffer(GL_ARRAY_BUFFER, _pib_buffers[2]);
+    gl.bufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(_pib_scratch_tex.size() * sizeof(glm::ivec4)), _pib_scratch_tex.data(), GL_STREAM_DRAW);
+    gl.bindBuffer(GL_ARRAY_BUFFER, 0);
+    gl.bindBuffer(GL_DRAW_INDIRECT_BUFFER, _pib_buffers[3]);
+    gl.bufferData(GL_DRAW_INDIRECT_BUFFER, static_cast<GLsizeiptr>(_pib_scratch_cmds.size() * sizeof(OpenGL::DrawElementsIndirectCommand)), _pib_scratch_cmds.data(), GL_STREAM_DRAW);
+
+    constexpr GLenum SSBO_TARGET = 0x90D2;
+    if (!_pib_scratch_bones.empty())
+    {
+      GLsizeiptr const bone_bytes = static_cast<GLsizeiptr>(_pib_scratch_bones.size() * sizeof(glm::mat4x4));
+      gl.bindBuffer(SSBO_TARGET, _pib_buffers[4]);
+      gl.bufferData(SSBO_TARGET, bone_bytes, _pib_scratch_bones.data(), GL_STREAM_DRAW);
+      gl.bindBuffer(SSBO_TARGET, 0);
+      gl.bindBufferRange(SSBO_TARGET, 0, _pib_buffers[4], 0, bone_bytes);
+    }
   }
 
   OpenGL::Scoped::use_program batched {*_m2_batched_program.get()};
   batched.uniform("model_origin", glm::vec3(0.0f));
   batched.uniform("slice_dist", 0.0f); // creatures fade by OPACITY, never pixel-slice (mirror the classic loop)
+  _pib_scratch_slice = 0.0f;   // VK reads this back for its own slice
   batched.uniform("masked_additive", 0);
   batched.uniform("detail_doodad", -1);
   batched.uniform("foliage_aa", 0);
@@ -1942,14 +2600,18 @@ void WorldRender::drawCreaturesBatched(
       if (want_cull) gl.enable(GL_CULL_FACE); else gl.disable(GL_CULL_FACE);
       last_cull = want_cull;
     }
-    if (static_cast<int>(gr.key.blend_mode) != last_blend)
+    int const cur_blend = static_cast<int>(gr.key.blend_mode) | (gr.key.classic_alpha ? 0x100 : 0);
+    if (cur_blend != last_blend)
     {
+      batched.uniform("alpha_key_classic", gr.key.classic_alpha ? 1 : 0);
       switch (static_cast<M2Blend>(gr.key.blend_mode))
       {
         default:
         case M2Blend::Opaque:
-        case M2Blend::Alpha_Key:
           gl.disable(GL_BLEND);
+          break;
+        case M2Blend::Alpha_Key:
+          gl.disable(GL_BLEND); // alpha-key never blends (opaque cloaks; see m2_frag)
           break;
         case M2Blend::Alpha:
           gl.enable(GL_BLEND);
@@ -1962,7 +2624,7 @@ void WorldRender::drawCreaturesBatched(
           break;
       }
       batched.uniform("blend_mode", static_cast<int>(gr.key.blend_mode));
-      last_blend = static_cast<int>(gr.key.blend_mode);
+      last_blend = cur_blend;
     }
     if (static_cast<int>(gr.key.unfogged) != last_unfogged)
     { batched.uniform("unfogged", static_cast<int>(gr.key.unfogged)); last_unfogged = static_cast<int>(gr.key.unfogged); }
@@ -1983,9 +2645,14 @@ void WorldRender::drawCreaturesBatched(
     if (gr.key.tex_array1 && gr.key.tex_array1 != last_a1)
     { gl.activeTexture(static_cast<GLenum>(GL_TEXTURE0 + 2)); gl.bindTexture(GL_TEXTURE_2D_ARRAY, gr.key.tex_array1); last_a1 = gr.key.tex_array1; }
 
+    // [phase I] VK owns the M2 batches: skip GL's MDI draw but keep everything above it, because the
+    // VK feed is built out of this same grouping. Gating only the CLASSIC per-bucket path left these
+    // five batched draws still submitting the models Vulkan had already drawn.
+    if (!vk_owns_m2)
     gl.multiDrawElementsIndirect(GL_TRIANGLES, GL_UNSIGNED_SHORT,
         reinterpret_cast<void*>(static_cast<std::size_t>(gr.first_cmd) * sizeof(OpenGL::DrawElementsIndirectCommand)),
         static_cast<GLsizei>(gr.cmd_count), 0);
+    _pib_scratch_issued += gr.cmd_count;   // [VK-DIFF] what GL really drew
   }
 
   gl.bindVertexArray(0);
@@ -2087,6 +2754,12 @@ void WorldRender::drawCreatureBodiesBatched(
     grouped[std::make_pair(batchable[i].m, batchable[i].display_id)].push_back(i);
 
   _pib_scratch_tf.clear();
+  _pib_scratch_blp_idx.clear();   // [VULKAN phase C] stays in lockstep with _pib_scratch_tf
+  _pib_scratch_state.clear();
+  _pib_scratch_src = 4;   // [VK-DIFF] provenance of the arrays VK feeds from
+  _pib_scratch_groups.clear();
+  _pib_scratch_issued = 0;
+  _pib_batch_blps.clear();
   _pib_scratch_interior.clear();
   _pib_scratch_tex.clear();
   _pib_scratch_cmds.clear();
@@ -2168,6 +2841,8 @@ void WorldRender::drawCreatureBodiesBatched(
       for (std::size_t gi = 0; gi < idxs.size(); ++gi)
       {
         _pib_scratch_tf.push_back(batchable[idxs[gi]].inst->transformMatrix());
+        _pib_scratch_blp_idx.push_back(batchBlpPairIndex(key.blp0, key.blp1));
+        _pib_scratch_state.push_back(batchStateVec(key));
         _pib_scratch_interior.push_back(inter[gi]);
         _pib_scratch_tex.push_back(glm::ivec4(key.layer0, key.layer1,
             static_cast<int>(group_bone_base + static_cast<std::uint32_t>(gi) * bone_count),
@@ -2215,6 +2890,13 @@ void WorldRender::drawCreatureBodiesBatched(
       _pib_scratch_cmds.insert(_pib_scratch_cmds.end(), kv.second.begin(), kv.second.end());
       dg.cmd_count = static_cast<std::uint32_t>(kv.second.size());
       draw_groups.push_back(dg);
+      // [VULKAN] y carries cull in bit0 and CLASSIC ALPHA-KEY in bit1: a v256 alpha-key pass blends
+      // with SRC_ALPHA in GL (doc 40 two-era law), so the VK pipeline must pick the blending variant
+      // for it. Keying the variant on blend_mode alone drew every classic leaf/blade cutout opaque.
+      _pib_scratch_groups.emplace_back(static_cast<int>(dg.key.blend_mode),
+                                       (dg.key.backface_cull ? 1 : 0) | (dg.key.classic_alpha ? 2 : 0),
+                                       static_cast<int>(dg.first_cmd),
+                                       static_cast<int>(dg.cmd_count));
     }
   }
 
@@ -2241,6 +2923,7 @@ void WorldRender::drawCreatureBodiesBatched(
   OpenGL::Scoped::use_program batched {*_m2_batched_program.get()};
   batched.uniform("model_origin", glm::vec3(0.0f));
   batched.uniform("slice_dist", 0.0f); // creatures fade by OPACITY, never pixel-slice
+  _pib_scratch_slice = 0.0f;   // VK reads this back for its own slice
   batched.uniform("masked_additive", 0);
   batched.uniform("detail_doodad", -1);
   batched.uniform("foliage_aa", 0);
@@ -2268,14 +2951,18 @@ void WorldRender::drawCreatureBodiesBatched(
       if (want_cull) gl.enable(GL_CULL_FACE); else gl.disable(GL_CULL_FACE);
       last_cull = want_cull;
     }
-    if (static_cast<int>(gr.key.blend_mode) != last_blend)
+    int const cur_blend = static_cast<int>(gr.key.blend_mode) | (gr.key.classic_alpha ? 0x100 : 0);
+    if (cur_blend != last_blend)
     {
+      batched.uniform("alpha_key_classic", gr.key.classic_alpha ? 1 : 0);
       switch (static_cast<M2Blend>(gr.key.blend_mode))
       {
         default:
         case M2Blend::Opaque:
-        case M2Blend::Alpha_Key:
           gl.disable(GL_BLEND);
+          break;
+        case M2Blend::Alpha_Key:
+          gl.disable(GL_BLEND); // alpha-key never blends (opaque cloaks; see m2_frag)
           break;
         case M2Blend::Alpha:
           gl.enable(GL_BLEND);
@@ -2288,7 +2975,7 @@ void WorldRender::drawCreatureBodiesBatched(
           break;
       }
       batched.uniform("blend_mode", static_cast<int>(gr.key.blend_mode));
-      last_blend = static_cast<int>(gr.key.blend_mode);
+      last_blend = cur_blend;
     }
     if (static_cast<int>(gr.key.unfogged) != last_unfogged)
     { batched.uniform("unfogged", static_cast<int>(gr.key.unfogged)); last_unfogged = static_cast<int>(gr.key.unfogged); }
@@ -2309,9 +2996,14 @@ void WorldRender::drawCreatureBodiesBatched(
     if (gr.key.tex_array1 && gr.key.tex_array1 != last_a1)
     { gl.activeTexture(static_cast<GLenum>(GL_TEXTURE0 + 2)); gl.bindTexture(GL_TEXTURE_2D_ARRAY, gr.key.tex_array1); last_a1 = gr.key.tex_array1; }
 
+    // [phase I] VK owns the M2 batches: skip GL's MDI draw but keep everything above it, because the
+    // VK feed is built out of this same grouping. Gating only the CLASSIC per-bucket path left these
+    // five batched draws still submitting the models Vulkan had already drawn.
+    if (!vk_owns_m2)
     gl.multiDrawElementsIndirect(GL_TRIANGLES, GL_UNSIGNED_SHORT,
         reinterpret_cast<void*>(static_cast<std::size_t>(gr.first_cmd) * sizeof(OpenGL::DrawElementsIndirectCommand)),
         static_cast<GLsizei>(gr.cmd_count), 0);
+    _pib_scratch_issued += gr.cmd_count;   // [VK-DIFF] what GL really drew
   }
 
   gl.bindVertexArray(0);
@@ -2467,9 +3159,12 @@ void WorldRender::draw (glm::mat4x4 const& model_view
   // pass only runs on an actual change.
   {
     float const af = QSettings().value("render/anisotropic_filtering", 16.0f).toFloat();
-    if (af != _last_anisotropy)
+    // [VULKAN parity diagnostic] NOGGIT_PARITY_NO_AF isolates anisotropic-filtering implementation
+    // differences between GL and VK by turning AF off on BOTH sides for a harness run.
+    float const af_eff = std::getenv("NOGGIT_PARITY_NO_AF") ? 1.0f : af;
+    if (af_eff != _last_anisotropy)
     {
-      _last_anisotropy = af;
+      _last_anisotropy = af_eff;
       TextureManager::reapply_anisotropy();
       _liquid_texture_manager.reapply_anisotropy();
     }
@@ -2477,6 +3172,16 @@ void WorldRender::draw (glm::mat4x4 const& model_view
 
   glm::mat4x4 const mvp(projection * model_view);
   math::frustum const frustum (mvp);
+
+  // [PIPELINE step 1] Context the deferred GL replay needs, stashed once per frame. The replay runs
+  // on the render thread AFTER this walk returns, so it cannot read these locals.
+  _vk_gl_deferred.clear();
+  _vk_gl_deferred_pi.clear();
+  _vk_def_model_view = model_view;
+  _vk_def_mvp = mvp;
+  _vk_def_camera_pos = camera_pos;
+  _vk_def_display = display;
+  _vk_def_boxes = draw_models_with_box;
 
   // Camera-relative view-projection (rotation only) for the shaders that take a single combined MVP
   // uniform (particles, ribbons): they subtract camera_pos in the shader, same jitter fix as the
@@ -2555,7 +3260,12 @@ void WorldRender::draw (glm::mat4x4 const& model_view
   // "LOWEST" = baked terrain + BLOB unit shadows (the 1.12 look). >=1 renders the dynamic unit shadow
   // map at end-of-frame (sampled NEXT frame via the lighting UBO ShadowMatrix). Read per-frame like
   // the msaa setting so the Graphics dropdown applies live.
-  _shadow_quality = minimap_render ? 0 : QSettings().value("graphics/shadow_quality", 3).toInt();
+  // [VULKAN parity harness] the VK terrain has no dynamic shadow map yet, so an off-screen parity run
+  // disables the GL one too -- otherwise the comparison measures a KNOWN missing feature instead of the
+  // ported shading. Only ever true inside --vk-parity runs; the user's saved setting is untouched.
+  extern bool g_noggit_harness_silent; // MapView.cpp (set by MapView::muteAudioForHarness)
+  _shadow_quality = (minimap_render || g_noggit_harness_silent)
+                      ? 0 : QSettings().value("graphics/shadow_quality", 3).toInt();
   if (_shadow_quality < 0 || _shadow_quality > 5) { _shadow_quality = 3; }
   // Hardware gate: the shadow sampler lives on texture unit 16, which only exists when the driver
   // exposes >16 fragment texture units. On a 16-unit driver the sampler uniform is rejected and
@@ -2611,8 +3321,25 @@ void WorldRender::draw (glm::mat4x4 const& model_view
   // Force it back on first. (With bloom the composite blits the scene colour ignoring depth, which is why
   // only the non-bloom path showed the black sky.)
   gl.depthMask(GL_TRUE);
-  gl.clearColor(0.f, 0.f, 0.f, 1.f);
+  // [2026-08-27 underwater horizon stripe, round 57] UNDERWATER the client shows FOG ONLY -- no
+  // sky dome, no celestials (the CLEAR_WATER param's bright sky bands are tint sources, not a
+  // dome to draw; our dome rendered them as an unfogged bright-blue horizon ring). The dome is
+  // skipped below, so the background must BE the fog colour here. Alpha 0.0, NOT 1.0: the
+  // framebuffer alpha is the bloom emissive mask (>0.88 re-brightens after fog) and a teal
+  // background at alpha 1 would bloom the whole screen.
+  if (_camera_underwater)
+  {
+    glm::vec3 const uw_fog = _skies->color_set[FOG_COLOR];
+    gl.clearColor(uw_fog.x, uw_fog.y, uw_fog.z, 0.f);
+  }
+  else
+  {
+    gl.clearColor(0.f, 0.f, 0.f, 1.f);
+  }
   gl.clear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+  // ([VULKAN] the compose hook runs at the TERRAIN pass slot below, not here: the sky dome is drawn
+  // after this clear without a depth test and would paint over anything composed this early.)
 
   // setup render settings for minimap
   if (minimap_render)
@@ -2798,9 +3525,20 @@ void WorldRender::draw (glm::mat4x4 const& model_view
       }
     }
 
-    if (!hadSky)
+    // [round 57] !_camera_underwater: no sky dome, sun/moon disc, or skybox from below the
+    // surface -- the whole view is water fog (the clear colour above). The round-56 water
+    // emissive cap was correct but the STRIPE was the dome itself: the CLEAR_WATER param's
+    // bright sky band drawn unfogged behind the fogged terrain.
+    // [VULKAN] the celestial list is filled by the sky pass just below. It MUST be cleared here and
+    // not with the other per-frame VK arrays further down -- those clears run AFTER this point in the
+    // frame and wiped the list before MapView ever saw it (the same trap the WMO liquid feed hit).
+    _vk_celestials.clear();
+
+    if (!hadSky && !_camera_underwater)
     {
-      _skies->draw( model_view
+      // no cloud deck INTO the water (its texture keeps ticking on the air density -- Sky.cpp)
+    _skies->set_cloud_draw_suppressed(_camera_underwater);
+    _skies->draw( model_view
           , projection
           , camera_pos
           , m2_shader
@@ -2809,6 +3547,24 @@ void WorldRender::draw (glm::mat4x4 const& model_view
           , _world->animtime
           , _outdoor_light_stats
       );
+
+      // [VULKAN phase G] the SKYBOX and STARS are ordinary M2 instances -- hand them to the same VK
+      // M2 feed every other doodad uses instead of inventing a second path for them. Skies has no
+      // WorldRender pointer, so it records what it drew and we feed it here.
+      for (ModelInstance* sky_m2 : { _skies->vkSkyboxInstance(), _skies->vkStarsInstance() })
+      {
+        if (!sky_m2)
+          continue;
+        std::vector<glm::mat4x4> const one{ sky_m2->transformMatrix() };
+        std::vector<glm::vec4> const one_int{ glm::vec4(0.f) };
+        vkFeedClassicBucket(sky_m2->model.get(), one, &one_int);
+        static bool s_sky_m2_log = false;
+        if (!s_sky_m2_log)
+        {
+          s_sky_m2_log = true;
+          LogError << "[VK] sky M2 fed: " << sky_m2->model->file_key().stringRepr() << std::endl;
+        }
+      }
 
       // THE SUN (1.12 sky): a bright disc billboard at the sun direction, drawn into the scene so
       // the existing FFXGlow hazes it (the halo you see in-game). Only outdoors (no global-WMO/
@@ -2908,9 +3664,36 @@ void WorldRender::draw (glm::mat4x4 const& model_view
         auto draw_celestial = [&](scoped_blp_texture_reference& tex, glm::vec3 const& dir,
                                   float half_frac, glm::vec3 const& color, float opacity, bool additive)
         {
+          {
+            static std::set<std::string> s_cel_tex_seen;
+            std::string const key = (tex->file_key().hasFilepath() ? tex->file_key().filepath() : std::string("<no path>"))
+                                  + " L" + std::to_string(tex->finishedLoading() ? 1 : 0)
+                                  + " F" + std::to_string(tex->loading_failed() ? 1 : 0);
+            if (s_cel_tex_seen.insert(key).second)
+              LogError << "[VK] celestial tex '" << key << "' loaded=" << (tex->finishedLoading() ? 1 : 0)
+                       << " failed=" << (tex->loading_failed() ? 1 : 0)
+                       << " opacity=" << opacity << std::endl;
+          }
           if (opacity <= 0.002f) return;
           if (!tex->finishedLoading() || tex->loading_failed()) return;
           glm::vec3 const center = camera_pos + dir * cel_dist;
+
+          // [VULKAN] record the billboard for the VK celestial pipeline. Camera-relative, because
+          // the VK push block has no room for both the centre and the camera (see celestial.vert).
+          {
+            VkCelestial rec;
+            rec.center_rel = dir * cel_dist;
+            rec.half_size = cel_dist * half_frac;
+            rec.right = cam_right;
+            rec.opacity = opacity;
+            rec.up = cam_up;
+            rec.color = color;
+            rec.additive = additive;
+            rec.blp = tex->file_key().hasFilepath() ? tex->file_key().filepath() : std::string();
+            _vk_celestials.push_back(rec);
+          }
+          if (_vk_owns_celestials)
+            return;   // Vulkan draws this one; GL keeps everything else in the sky pass
           OpenGL::Scoped::use_program sh{*_moon_program.get()};
           // additive = premultiplied glow added with GL_ONE (opacity is a real, unclamped multiplier);
           // else standard alpha blend for the moon discs.
@@ -2951,6 +3734,15 @@ void WorldRender::draw (glm::mat4x4 const& model_view
           auto const* p = Noggit::Project::CurrentProject::get();
           return p && p->projectVersion != Noggit::Project::ProjectVersion::CLASSIC;
         }() && _world->mapIndex._map_id == 571;
+        {
+          static int s_celgate = 0;
+          if ((s_celgate++ % 240) == 0)
+            LogError << "[VK] celestial gate: off=" << (celestial_off ? 1 : 0)
+                     << " toSun.y=" << to_sun.y << " dayFactor=" << day_factor
+                     << " drawSun=" << (_world->_settings->value("render/draw_sun", true).toBool() ? 1 : 0)
+                     << " drawMoon=" << (_world->_settings->value("render/draw_moon", true).toBool() ? 1 : 0)
+                     << " time=" << _world->time << std::endl;
+        }
         if (!celestial_off && to_sun.y > -0.05f && day_factor > 0.02f
             && _world->_settings->value("render/draw_sun", true).toBool())
         {
@@ -3067,7 +3859,14 @@ void WorldRender::draw (glm::mat4x4 const& model_view
   noggit::perf::FrameProfiler::get().add(noggit::perf::Phase::FrameSetup,
     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _setup_t0).count());
 
-  if (draw_terrain)
+  // [VULKAN phase B] when Vulkan owns the terrain pass, its colour+depth are composed HERE -- in the
+  // terrain pass slot (after the sky dome, which draws without a depth test) -- and the GL terrain pass
+  // is gated off. GL code untouched, runs as always with Graphics API = OpenGL.
+  if (draw_terrain && vk_owns_terrain && pre_scene_compose && !minimap_render && display == display_mode::in_3D)
+  {
+    pre_scene_compose();
+  }
+  if (draw_terrain && !vk_owns_terrain)
   {
     if (capture_debug_enabled())
     {
@@ -3076,6 +3875,7 @@ void WorldRender::draw (glm::mat4x4 const& model_view
 
     ZoneScopedN("World::draw() : Draw terrain");
     noggit::perf::Scoped _prof_terrain(noggit::perf::Phase::Terrain);
+    SecTimer _sec(g_vk_sec_terrain_ms);
 
     gl.disable(GL_BLEND);
     // ★★★ BLACK-WORLD FIX (2026-08-14): the detail-doodad GRASS path enables GL_SAMPLE_ALPHA_TO_COVERAGE
@@ -3143,6 +3943,17 @@ void WorldRender::draw (glm::mat4x4 const& model_view
         // chunks even directly behind the camera. Skipping off-frustum tiles cuts ~half the terrain draws
         // with zero visual change. Minimap render forces the test to 2, so it is unaffected.
         if (!minimap_render && tile->renderer()->objectsFrustumCullTest() == 0)
+          continue;
+
+        // DISTANCE CULL (user 2026-08-28: "we are under culling in big cities like stormwind -- in
+        // game the terrain for the ground and the mountain in distance cull as well"). The object
+        // gather loop below has always had this test; the TERRAIN loop never did, so every loaded
+        // tile drew all 256 chunks no matter how far away it was -- distant ground and mountains
+        // kept rasterising behind the fog wall that already hides them. The client clips terrain at
+        // the farclip plane (CVar "farclip", clamp FUN_00780770), which is what view_distance
+        // stands in for here. camDist is to the tile CENTRE, so allow one TILESIZE of slack: a tile
+        // whose centre is just past the limit can still have a near edge inside it.
+        if (!minimap_render && tile->camDist() > _terrain_cull_distance + TILESIZE)
           continue;
 
         // [perf 2026-08-06] This tile is in the frustum -> keep it loaded (MapIndex::unloadTiles won't drop it
@@ -3219,6 +4030,10 @@ void WorldRender::draw (glm::mat4x4 const& model_view
 
   // Pure-additive light effects (god rays / lighthouse beams) deferred to draw AFTER the water.
   std::vector<Model*> deferred_light_effects;
+  // Per-instance WMO-doodad light shafts (billboarded lightray cards -- the Stormwind lighthouse
+  // beam) deferred past ALL water like the bucket path: they drew in the doodad pass and the
+  // harbor water painted over the beam (user 2026-08-26: "renders underwater instead of over").
+  std::vector<ModelInstance*> deferred_pi_light_doodads;
 
   tsl::robin_map<Model*, std::vector<glm::mat4x4>> models_to_draw;
   // Models used by GAMEOBJECT spawns this frame: gameobjects are fade-mechanic objects (like
@@ -3584,12 +4399,35 @@ void WorldRender::draw (glm::mat4x4 const& model_view
   // so it's immediately visible/testable); OFF restores the old see-all _cull_distance envelope. (NB it
   // is NOT gated on game view anymore: _game_character_visible is only true in 3rd-person game view, so
   // gating on it silently disabled the cull in 1st person / the editor.)
-  bool const use_client_doodad_cull = _world->_settings->value("render/gv_doodad_cull", true).toBool();
+  // [2026-08-23 UNIFORM doodad draw distance — user decision, supersedes the Aug-16 default.] The
+  // client size-class cull (doodadCullFade, FUN_00791cb0 port) culls SMALL trees at ~200yd while big
+  // ones draw to 750 — client-accurate, but the user explicitly wants NO early differentiated cull:
+  // every doodad draws to the uniform view distance like terrain. It also only ever applied on the
+  // INDIVIDUAL path: with the perf env vars (NOGGIT_PERSISTENT_DOODADS/NOGGIT_DOODAD_MDI, armed by
+  // the launcher bat) most doodads ride the MDI/persistent paths which slice at the flat
+  // _cull_distance — so the bare release exe (no env) showed early tree culling the bat launch
+  // didn't. Uniform on every path = both launch modes render identically. The client cull remains
+  // available as an opt-IN (render/gv_doodad_cull, now default OFF).
+  bool const use_client_doodad_cull = _world->_settings->value("render/gv_doodad_cull", false).toBool();
+  // [2026-08-25 DRESSING CLASS-SPLIT — user: "grass too bright / should look brown not green".]
+  // The Un'Goro/mountain "grass" is PLACED M2 vegetation (MDDF ferns/shrubs/clumps), and the client
+  // hard-culls it by size class: class 0 (<1yd) at 30yd, class 1 (1-4yd) at 100yd. With the Aug-23
+  // uniform draw distance those props render to the horizon here, painting green over vistas the
+  // client shows as bare ground. Synthesis of both decisions: SMALL DRESSING (classes 0-1) gets the
+  // client cull by default; trees/landmarks (classes 2-4) keep the uniform distance (no early tree
+  // popping) unless the full client cull is opted in. (Ground CLUTTER is unrelated here: turtle's
+  // re-minted GroundEffectTexture orphans ~9.5M of 9.6M subcell effect ids -> the live client has
+  // essentially no clutter, and noggit resolves the same ids to the same nothing -- doc 37.)
+  bool const use_dressing_cull = _world->_settings->value("render/gv_dressing_cull", true).toBool();
   auto m2_dist_envelope = [&](ModelInstance* mi) -> float
   {
-    if (use_client_doodad_cull && display == display_mode::in_3D)
+    if ((use_client_doodad_cull || use_dressing_cull) && display == display_mode::in_3D)
     {
-      return mi->doodadCullFade(camera_pos, 1.0f); // environmentDetail default 1.0 (@0x009e1340)
+      mi->ensureExtents(); // makes _cull_class current
+      if (use_client_doodad_cull || mi->_cull_class <= 1)
+      {
+        return mi->doodadCullFade(camera_pos, 1.0f); // environmentDetail default 1.0 (@0x009e1340)
+      }
     }
 
     float const radius = mi->model->rad * mi->scale;
@@ -3709,7 +4547,7 @@ void WorldRender::draw (glm::mat4x4 const& model_view
         for (auto const& kv : b)
         {
           float fade;
-          if (use_client_doodad_cull)
+          if (use_client_doodad_cull || (use_dressing_cull && kv.second.cull_class <= 1))
           {
             // [client cull 2026-08-16] CLIENT per-class doodad cull (FUN_00791cb0 tables), byte-exact
             // distances. The persistent bucket is per-(model,tile) and dropped by TILE distance -- a
@@ -3737,12 +4575,16 @@ void WorldRender::draw (glm::mat4x4 const& model_view
             // (fade -> extra_alpha -> smooth alpha blend in the draw loop). Keep it collected until past
             // hard + a tile-edge margin (a tile is culled by its CENTRE, its near instances sit ~half a
             // diagonal closer), so it's already invisible before it drops.
-            float const weighted = std::min(1.0f, s_cull_base + kv.first->rad * s_cull_per_rad);
-            float const hard = std::min(_cull_distance, _cull_distance * weighted * 1.5f);
-            float const soft = hard * 0.9f;
+            // [2026-08-23 UNIFORM draw distance — user decision.] The old size-weighted hard cap
+            // (0.4 + rad*0.03 of the view distance) faded small-model buckets much earlier than big
+            // ones — the same differentiated early cull the user rejected on the individual path.
+            // Uniform boundary: every bucket draws to the flat _cull_distance (the shader slice
+            // handles the visual edge), dropped only past it plus the tile-edge margin.
+            float const hard = _cull_distance;
+            float const soft = hard; // no early fade band — binary like the individual path
             if (tile_dist > hard + 380.0f)
             {
-              continue; // fully faded and past the tile-edge margin -> drop
+              continue; // fully past the boundary and the tile-edge margin -> drop
             }
             fade = (hard <= soft) ? 1.0f
               : std::clamp((hard - tile_dist) / (hard - soft), 0.0f, 1.0f);
@@ -3992,7 +4834,13 @@ void WorldRender::draw (glm::mat4x4 const& model_view
 
     ZoneScopedN("World::draw() : Draw WMOs");
     _deferred_wmo_liquid.clear(); // refilled by WMORender, flushed in the water phase below
+    _vk_wmo_liquids.clear();      // [VULKAN] same lifetime, but survives the flush below
+    // [VULKAN] the particle pass runs LATER this frame, so clearing here is correct (its
+    // producers all run after this point -- unlike the celestial list, which is filled earlier).
+    Noggit::Rendering::VK::particleFeed().clear();
+
     noggit::perf::Scoped _prof_wmo(noggit::perf::Phase::WMO);
+    SecTimer _sec(g_vk_sec_wmo_ms);
     {
       OpenGL::Scoped::use_program wmo_program{*_wmo_program.get()};
 
@@ -4022,6 +4870,9 @@ void WorldRender::draw (glm::mat4x4 const& model_view
       }
 
 
+      // [VULKAN phase D] one WMO feed per frame -- reset before the loop that fills it, or the
+      // per-frame draw/transform arrays grow without bound.
+      vkResetWmoFrame();
       for (auto& instance: wmos_to_draw)
       {
         bool is_hidden = instance->wmo->is_hidden();
@@ -4089,6 +4940,10 @@ void WorldRender::draw (glm::mat4x4 const& model_view
               , draw_wmo_exterior
               , this // per-room (MOLR) point-light scoping for interior groups
           );
+          // [VULKAN phase D] feed the SAME instance to Vulkan. AFTER the GL draw on purpose:
+          // draw() is what writes portal_group_visibility, and the feed must use THIS frame's.
+          // GL's rendering above is untouched -- this only appends to the arrays MapView hands to VK.
+          vkFeedWmoInstance(instance);
         }
       }
     }
@@ -4221,6 +5076,7 @@ void WorldRender::draw (glm::mat4x4 const& model_view
 
     ZoneScopedN("World::draw() : Draw M2s");
     noggit::perf::Scoped _prof_m2(noggit::perf::Phase::M2);
+    SecTimer _sec(g_vk_sec_m2_ms);
 
     if (draw_model_animations)
     {
@@ -4241,6 +5097,7 @@ void WorldRender::draw (glm::mat4x4 const& model_view
 
       ZoneScopedN("World::draw() : Inject visible WMO doodads");
       noggit::perf::Scoped _prof_gather(noggit::perf::Phase::M2Gather); // M2 spike hunt: whole WMO-doodad gather
+    SecTimer _sec2(g_vk_sec_gather_ms);
 
       // Parallelized WMO-doodad gather (was ~35ms single-threaded per frame in Ironforge). Behaviour is
       // IDENTICAL to the old serial loop -- same instances routed the same way, same order after the merge.
@@ -4559,6 +5416,15 @@ void WorldRender::draw (glm::mat4x4 const& model_view
         if (!creature_in_range
             && (!spawn.model_instance.has_value() || spawn.model_instance->_cull_fade_phase == 0))
         {
+          // [mem 2026-08-26] EVICT far spawns' models: creation was lazy but release never
+          // happened, so every spawn ever approached kept its model+attachment instances (and
+          // their shared model/texture refs) for the whole session. 100 yd of hysteresis past
+          // the draw distance so the boundary never thrashes create/evict.
+          if (spawn.model_instance.has_value()
+              && creature_distance > creature_spawn_model_distance + 100.0f)
+          {
+            _world->releaseCreatureSpawnModel(spawn);
+          }
           trace_creature_spawn("skip-distance", spawn, creature_distance, "draw distance");
           continue;
         }
@@ -4885,6 +5751,7 @@ void WorldRender::draw (glm::mat4x4 const& model_view
       if (draw_ground_clutter && clutter_density > 0.0f && draw_models && !minimap_render)
       {
         noggit::perf::Scoped _prof_clutter(noggit::perf::Phase::Clutter); // M2 spike hunt: ground-clutter inject
+    SecTimer _sec2(g_vk_sec_clutter_ms);
         // Density-parity diagnostics (Westfall tile 30_52 ground truth = ~426 instances/chunk,
         // simulated from the ADT+DBC): log the funnel every ~5s so instance loss is attributable.
         static int clutter_dbg_frame = 0;
@@ -4963,6 +5830,12 @@ void WorldRender::draw (glm::mat4x4 const& model_view
               // variant produced visible chunk seams or brightening lines. Blades past the distance
               // fade to alpha 0 in-shader; the chunk-centre gate above bounds the overdraw.
               std::size_t idx = 0;
+              // [finding 123] one lookup per RUN of identical models, not three per doodad
+              Model* cl_last = nullptr;
+              tsl::robin_map<Model*, std::uint32_t>* cl_counts = nullptr;
+              std::vector<glm::mat4x4>* cl_tf = nullptr;
+              std::vector<float>* cl_fade = nullptr;
+              std::vector<glm::vec4>* cl_int = nullptr;
               for (auto const& dd : doodads)
               {
                 if (clutter_density < 1.0f)
@@ -4997,17 +5870,80 @@ void WorldRender::draw (glm::mat4x4 const& model_view
                   m->_force_unlit = true;
                   dd.cached_model = m; // loaded -> cache so this doodad never string-hashes again
                 }
-                models_to_draw[m].push_back(dd.transform);
-                models_to_draw_fades[m].push_back(1.0f); // fade is per-vertex in the shader (client c9 ramp)
+                if (m != cl_last)
+                {
+                  cl_last = m;
+                  cl_tf   = &models_to_draw[m];
+                  cl_fade = &models_to_draw_fades[m];
+                  cl_int  = &models_to_draw_interior[m];
+                  // [finding 127] models_to_draw* are per-frame LOCALS, so every frame these
+                  // vectors grow from zero capacity to ~132k entries -- geometric reallocation
+                  // moving roughly twice the final bytes, on top of the copy itself. Reserve
+                  // from last frame's count; the clutter set barely changes frame to frame.
+                  static tsl::robin_map<Model*, std::uint32_t> s_last_clutter_count;
+                  // Reserve whenever capacity is short of last frame's total for this model --
+                  // NOT only when the vector is empty. The tile-doodad and WMO-doodad producers
+                  // run BEFORE clutter, so a model they also use would already be non-empty here
+                  // and would have missed the reserve entirely, leaving the 132k-entry growth in
+                  // place for exactly the models most likely to be shared.
+                  {
+                    auto const lc = s_last_clutter_count.find(m);
+                    if (lc != s_last_clutter_count.end() && lc->second > cl_tf->capacity())
+                    {
+                      cl_tf->reserve(lc->second);
+                      cl_fade->reserve(lc->second);
+                      cl_int->reserve(lc->second);
+                    }
+                  }
+                  cl_counts = &s_last_clutter_count;
+                }
+                if (cl_counts) { (*cl_counts)[m] = static_cast<std::uint32_t>(cl_tf->size() + 1u); }
+                cl_tf->push_back(dd.transform);
+                cl_fade->push_back(1.0f); // fade is per-vertex in the shader (client c9 ramp)
                 // For the detail_doodad shader path this attribute carries the PACKED per-blade bake
                 // (MapChunk::computeDetailDoodads): x = mccv_r*256+g, y = b*2+shadowBit+1024 (marker),
                 // z/w = ground-normal x/z. Only the detail branch decodes it; clutter never takes the
                 // interior branch.
-                models_to_draw_interior[m].push_back(dd.tint);
+                cl_int->push_back(dd.tint);
                 ++dbg_submitted;
               }
             }
           }
+        }
+        // DIAGNOSTIC (grass saga, one-shot, always-on): the first frame that actually SUBMITS
+        // clutter prints totals + species to LogError, so a normal user run answers "is the green
+        // stuff clutter at all, and which models" straight from log.txt (LogDebug is env-gated off).
+        static bool s_clutter_diag_done = false;
+        if (!s_clutter_diag_done && dbg_submitted > 0)
+        {
+          s_clutter_diag_done = true;
+          LogError << "GRASS-DIAG clutter first-submit: chunks=" << dbg_chunks
+                   << " placed=" << dbg_placed << " submitted=" << dbg_submitted << std::endl;
+          int diag_species = 0;
+          for (auto const& mp : _detail_doodad_models)
+          {
+            Model* m = mp.second.get();
+            auto it = models_to_draw.find(m);
+            if (it != models_to_draw.end() && !it->second.empty() && diag_species < 8)
+            {
+              ++diag_species;
+              LogError << "GRASS-DIAG species " << mp.first << " x" << it->second.size() << std::endl;
+            }
+          }
+        }
+        // [GRASS-LOSS 2026-08-28] "grass in ascension goes patchy/missing after travelling a bit".
+        // The funnel below already counts every way a blade can be dropped, but it only went to
+        // LogDebug (env-gated off), so a normal run says nothing. Report it at LogError whenever
+        // clutter is actually being LOST -- chunks whose first-time compute was deferred past the
+        // per-frame budget, or doodad models that are not loaded -- throttled to the same ~5s tick
+        // so it cannot spam. A healthy frame prints nothing.
+        if (clutter_dbg && (dbg_deferred > 0 || dbg_notloaded > 0))
+        {
+          LogError << "GRASS-LOSS chunks=" << dbg_chunks << " deferred=" << dbg_deferred
+                   << " notloaded=" << dbg_notloaded << " placed=" << dbg_placed
+                   << " submitted=" << dbg_submitted << " far=" << dbg_far
+                   << " species=" << _detail_doodad_models.size()
+                   << " dist=" << clutter_dist << " density=" << clutter_density << std::endl;
         }
         if (clutter_dbg)
         {
@@ -5047,6 +5983,7 @@ void WorldRender::draw (glm::mat4x4 const& model_view
         if (s_doodad_mdi && s_persistent_doodads && !minimap_render && draw_models)
         {
           noggit::perf::Scoped _prof_mdi(noggit::perf::Phase::SubmitInst);
+    SecTimer _sec2(g_vk_sec_submit_ms);
           // [perf 2026-08-07] GPU-driven P1: collect ALL LOADED tiles' doodads (camera-independent) so the batch
           // caches across camera movement and rebuilds ONLY on tile load/unload -- killing the per-frame assembly
           // that made the old visible-set MDI net-flat. Draw all -> the idle GPU frustum-clips the off-screen
@@ -5057,8 +5994,24 @@ void WorldRender::draw (glm::mat4x4 const& model_view
             if (!t)
               continue;
             auto const& b = t->renderer()->doodadInstanceBuffers();
+            float const t_dist = t->camDist();
             for (auto const& kv : b)
+            {
+              // [2026-08-25 dressing class-split] the MDI batch bypassed every distance rule, so
+              // small vegetation drew to the horizon even with the cull on. Same conservative
+              // bucket test as the persistent path (tile centre - half diagonal vs client cull_far):
+              // a dropped bucket is one whose EVERY instance is past the client's hard cull.
+              if (use_client_doodad_cull || (use_dressing_cull && kv.second.cull_class <= 1))
+              {
+                float cull_far, band;
+                ModelInstance::doodadCullParams(kv.second.cull_class, 1.0f, cull_far, band);
+                if (t_dist - 377.0f > cull_far)
+                {
+                  continue;
+                }
+              }
               _mdi_all_loaded.emplace_back(kv.first, &kv.second);
+            }
           }
           drawDoodadsBatched(_mdi_all_loaded, model_view, draw_hidden_models, frustum, _world->model_animtime);
         }
@@ -5081,11 +6034,13 @@ void WorldRender::draw (glm::mat4x4 const& model_view
         // [FALLS-DIAG 2026-08-08] NOGGIT_NO_DYN_MDI=1 skips the dyn batch entirely -> every bucket
         // draws via the instanced fallback (prepareDraw path). Path-isolation bisect switch.
         static bool const s_no_dyn_mdi = std::getenv("NOGGIT_NO_DYN_MDI") != nullptr;
+        vkM2SnapshotClear();   // [VULKAN] one snapshot per frame, appended by every producer below
         if (!s_no_dyn_mdi)
         {
           drawDynamicBatched(models_to_draw, models_to_draw_interior, models_to_draw_fades,
                              go_bucket_models, model_view, static_cast<int>(_world->model_animtime),
                              draw_hidden_models);
+          vkM2SnapshotAppend();
         }
 
         // [creature MDI 2026-08-18] PHASE A: batch the far/simple creature groups here too, BEFORE the
@@ -5154,9 +6109,36 @@ void WorldRender::draw (glm::mat4x4 const& model_view
         // CLIENT clutter fade distance (m2_vert c9-equivalent view-depth ramp over the last 15% of
         // groundEffectDist). Only the detail_doodad frag path reads the resulting fade.
         m2_shader.uniform("detail_dist", clutter_detail_dist);
+        _vk_clutter_detail_dist = clutter_detail_dist;   // [VULKAN] same ramp in the VK M2 shader
 
         {
+        // [GL-COST HUNT] report, once every 300 frames, how much of the M2 load GL is STILL
+        // carrying in VK mode. The GL scene pass costs 5.15 ms/frame of which only 0.14 ms builds
+        // VK's feeds; if these counts are non-zero the rest is GL drawing what VK would not take.
+        {
+          static int s_glm2_frames = 0;
+          static std::size_t s_still = 0, s_fed = 0, s_pass = 0, s_arena = 0, s_empty = 0, s_hidden = 0;
+          s_still += _vk_gl_still_drew; s_fed += _vk_classic_fed;
+          s_pass += _vk_fb_pass; s_arena += _vk_fb_arena; s_empty += _vk_fb_empty;
+          s_hidden += _vk_fb_hidden;
+          if (++s_glm2_frames >= 300)
+          {
+            LogError << "[VK] GL-M2/frame: stillDrewByGL=" << (s_still / 300)
+                     << " fedToVK=" << (s_fed / 300)
+                     << " | reject pass=" << (s_pass / 300)
+                     << " arena=" << (s_arena / 300)
+                     << " empty=" << (s_empty / 300)
+                     << " allHidden=" << (s_hidden / 300) << std::endl;
+            s_glm2_frames = 0; s_still = s_fed = s_pass = s_arena = s_empty = s_hidden = 0;
+          }
+        }
+        _vk_gl_still_drew = 0;
+        _classic_issued = 0;   // [VK-DIFF] per-FRAME count of the GL-only classic doodad path
+        _vk_classic_fed = 0;
+        _vk_fb_pass = _vk_fb_arena = _vk_fb_empty = _vk_fb_hidden = 0;
+        _vk_fb_names.clear();
         noggit::perf::Scoped _prof_ddraw(noggit::perf::Phase::DoodadDraw); // M2 spike hunt: instanced doodad buckets only
+    SecTimer _sec2(g_vk_sec_ddraw_ms);
         for (auto& pair : models_to_draw)
         {
           bool is_inclusion_filtered = false;
@@ -5286,6 +6268,28 @@ void WorldRender::draw (glm::mat4x4 const& model_view
 
             {
               noggit::perf::Scoped _prof_submit(noggit::perf::Phase::SubmitInst);
+              _classic_issued += pair.second.size();   // [VK-DIFF] GL-only classic doodad path
+              // [VULKAN phase C] hand the SAME bucket to Vulkan (GL's own draw below is untouched)
+              bool const vk_took_bucket = vkFeedClassicBucket(pair.first, pair.second, &bucket_interior);
+              // GL skips ONLY the buckets Vulkan actually took; a rejected bucket still needs GL or
+              // the model would simply vanish.
+              // [GL-COST HUNT] instances GL still draws while VK owns M2 -- every one of these is a
+              // bucket Vulkan refused, and GL doing the scene twice is exactly what we are paying for.
+              if (vk_owns_m2 && !vk_took_bucket)
+              {
+                // [PIPELINE step 1] Defer to the render thread instead of drawing here, so this walk
+                // can eventually leave that thread. Same instances, same transforms, replayed below.
+                _vk_gl_still_drew += pair.second.size();
+                VkGlDeferredBucket d;
+                d.model = pair.first;
+                d.transforms = pair.second;
+                d.interiors = bucket_interior;
+                d.fades = bucket_fades;
+                d.slice_dist = (s_no_dist_fade || go_bucket_models.count(pair.first)) ? 0.0f
+                                                                                      : _cull_distance;
+                _vk_gl_deferred.push_back(std::move(d));
+              }
+              if (!vk_owns_m2)
               pair.first->renderer()->draw( model_view
                 , pair.second
                 , m2_shader
@@ -5351,6 +6355,10 @@ void WorldRender::draw (glm::mat4x4 const& model_view
             {
               continue;
             }
+            // [phase J] PERSISTENT doodads are the third M2 path, and VK feeds all three. When VK
+            // owns M2 this draw is redundant -- the models are already in the VK frame. Verified by
+            // the bench screenshot diff, since parity mode cannot cover a gated path.
+            if (!vk_owns_m2)
             m->renderer()->drawPersistent(model_view, pd.second->transform_vbo, pd.second->interior_vbo,
                                           static_cast<int>(pd.second->count), m2_shader, model_render_state,
                                           _world->model_animtime, pd_fade);
@@ -5363,6 +6371,14 @@ void WorldRender::draw (glm::mat4x4 const& model_view
         // billboard doodads, mounts, attachments, gameobjects) -- the suspected CPU-bound draw-submission
         // storm. IndivDraw times it as one bucket; the nested M2Creatures/M2Particles split it further.
         noggit::perf::Scoped _prof_indiv(noggit::perf::Phase::IndivDraw);
+        // [finding 96] IndivDraw is the largest child of M2 and the hash-lookup theory was wrong
+        // (finding 95). Split it: the head (state + creature groups), the per-doodad bucket loop,
+        // and the flush that feeds VK. Reported every 300 frames.
+        static double s_id_head = 0.0, s_id_loop = 0.0, s_id_flush = 0.0;
+        static unsigned s_id_frames = 0;
+        auto const _id_t0 = std::chrono::steady_clock::now();
+        auto _id_t1 = _id_t0, _id_t2 = _id_t0;
+    SecTimer _sec2(g_vk_sec_indiv_ms);
 
         // A grass bucket may have left alpha-to-coverage enabled; clear it before the rest of the
         // draws so it can't affect creatures / other passes.
@@ -5449,6 +6465,23 @@ void WorldRender::draw (glm::mat4x4 const& model_view
         // GL_INVALID_OPERATION remains (a benign RACE the per-call check masks; no visual corruption) -- watch it.
         // Opt OUT with NOGGIT_NO_INSTANCED_DOODADS=1 if a scene ever blacks.
         static bool const s_inst_doodads = std::getenv("NOGGIT_NO_INSTANCED_DOODADS") == nullptr;
+        // Partition pure-additive light shafts OUT of both per-instance paths and defer them past
+        // the water (see deferred_pi_light_doodads): the lighthouse beam etc. must composite over
+        // the harbor surface exactly like the bucketed god-rays at the models_to_draw deferral.
+        if (!per_instance_wmo_doodads.empty())
+        {
+          auto const mid = std::stable_partition(
+            per_instance_wmo_doodads.begin(), per_instance_wmo_doodads.end(),
+            [](ModelInstance* mi)
+            {
+              Model* m = mi ? mi->model.get() : nullptr;
+              return !(m && m->finishedLoading()
+                       && is_pure_additive_light_effect(m)
+                       && m->_particles.empty() && m->_ribbons.empty());
+            });
+          deferred_pi_light_doodads.assign(mid, per_instance_wmo_doodads.end());
+          per_instance_wmo_doodads.erase(mid, per_instance_wmo_doodads.end());
+        }
         if (!per_instance_wmo_doodads.empty() && !s_inst_doodads)
         {
           OpenGL::Scoped::use_program doodad_shader {*_m2_program.get()};
@@ -5475,10 +6508,39 @@ void WorldRender::draw (glm::mat4x4 const& model_view
           // uniform churn in the SubmitIndiv wall. Group by model (same model == same materials/passes).
           // Cheap (model.get() is a plain pointer read); the earlier "3000ms" from this was the fog bug,
           // not the sort. NOT batching -- still one draw per doodad, like the client's individual path.
-          std::sort(per_instance_wmo_doodads.begin(), per_instance_wmo_doodads.end(),
-            [](ModelInstance* a, ModelInstance* b) { return a->model.get() < b->model.get(); });
+          // [phase L] That material sort exists ONLY so GL's M2RenderState cache hits on consecutive
+          // individual draws. Vulkan is bindless and buckets per model, so draw order buys it nothing --
+          // and in VK mode the draws this sort was ordering are gated off anyway. Skip it. (Anything VK
+          // rejects still falls back to a GL draw; those are rare, and an unsorted handful is far cheaper
+          // than sorting the whole list every frame.)
+          if (!vk_owns_m2)
+          {
+            std::sort(per_instance_wmo_doodads.begin(), per_instance_wmo_doodads.end(),
+              [](ModelInstance* a, ModelInstance* b) { return a->model.get() < b->model.get(); });
+          }
 
-          std::unordered_set<std::uint64_t> seen_doodad_keys;
+          // reused across frames: a fresh unordered_set here allocated and rehashed every frame
+          static std::unordered_set<std::uint64_t> seen_doodad_keys;
+          seen_doodad_keys.clear();
+          // [GL-COST] Vulkan was fed ONE BUCKET PER DOODAD from this loop -- a 1-element vector per
+          // per-instance WMO doodad, so N doodads became N buckets and N VK draws. Group them by
+          // model and feed one bucket each after the loop: same instances, same relative order within
+          // a model, a fraction of the calls on both sides. Pure-GL frames (vk_feeding false) keep the
+          // original inline draw untouched.
+          // [finding 95] ONE map, one hash per doodad. These were three maps keyed by the same
+          // Model*, so each doodad hashed the same pointer three times to append three values.
+          struct PiBucket
+          {
+            std::vector<glm::mat4x4> tf;
+            std::vector<glm::vec4> intr;
+            std::vector<ModelInstance*> inst;
+          };
+          static std::unordered_map<Model*, PiBucket> pi;
+          if (vk_feeding)
+          {
+            for (auto& e : pi) { e.second.tf.clear(); e.second.intr.clear(); e.second.inst.clear(); }
+          }
+          _id_t1 = std::chrono::steady_clock::now();
           for (ModelInstance* _dptr : per_instance_wmo_doodads)
           {
             if (!_dptr) { continue; } // defensive: cache pointers are never null in practice
@@ -5500,6 +6562,18 @@ void WorldRender::draw (glm::mat4x4 const& model_view
             }
             {
               noggit::perf::Scoped _prof_submit2(noggit::perf::Phase::SubmitIndiv);
+              // [VULKAN phase D] hand this per-instance WMO doodad to Vulkan -- now accumulated into
+              // its model's bucket and fed once after the loop (see the flush below).
+              if (vk_feeding)
+              {
+                glm::mat4x4 const tf = doodad.transformMatrix();
+                PiBucket& b = pi[pmodel];   // one hash for all three appends
+                b.tf.push_back(tf);
+                // same source as before: the transform's translation, NOT get_pos()
+                b.intr.push_back(interior_light_at(glm::vec3(tf[3])));
+                b.inst.push_back(&doodad);
+              }
+              else
               pmodel->renderer()->draw(model_view
                 , doodad
                 , doodad_shader
@@ -5527,6 +6601,53 @@ void WorldRender::draw (glm::mat4x4 const& model_view
               }
               pmodel->updateParticleSystems(pdt);
               pmodel->swapInstanceEmitterState(key);
+            }
+          }
+          // one bucket per MODEL instead of one per doodad. Anything Vulkan refuses still gets its
+          // GL draw, per instance, exactly as the inline path did.
+          _id_t2 = std::chrono::steady_clock::now();
+          if (vk_feeding)
+          {
+            for (auto& e : pi)
+            {
+              if (e.second.tf.empty()) continue;
+              Model* const pm = e.first;
+              bool const took = vkFeedClassicBucket(pm, e.second.tf, &e.second.intr);
+              if (vk_owns_m2 && took) continue;
+              if (vk_owns_m2)
+              {
+                // [PIPELINE step 1] deferred to the render thread, same as the bucket path.
+                // On the slice_dist question: this section does not set it, but _m2_program's value
+                // IS set every frame by the shadow pass (L7530, slice_dist = 0), which runs before
+                // the replay -- so the inline draw and the replay see the same 0. The earlier "+30
+                // pixel regression" was inside the check's own +/-30 band (finding 57).
+                for (ModelInstance* mi : e.second.inst)
+                  _vk_gl_deferred_pi.push_back({pm, mi, interior_light_at(mi->get_pos())});
+                continue;
+              }
+              for (ModelInstance* mi : e.second.inst)
+                pm->renderer()->draw(model_view, *mi, doodad_shader, doodad_render_state, frustum,
+                                     _cull_distance, camera_pos,
+                                     static_cast<int>(_world->model_animtime), display,
+                                     /*no_cull*/ false, /*bloom_mask_only*/ false,
+                                     interior_light_at(mi->get_pos()));
+            }
+          }
+          {
+            using ms = std::chrono::duration<double, std::milli>;
+            auto const _id_t3 = std::chrono::steady_clock::now();
+            s_id_head  += ms(_id_t1 - _id_t0).count();
+            s_id_loop  += ms(_id_t2 - _id_t1).count();
+            s_id_flush += ms(_id_t3 - _id_t2).count();
+            if (++s_id_frames >= 300u)
+            {
+              LogError << "[VK] INDIV split/frame: head=" << (s_id_head / s_id_frames)
+                       << " bucketLoop=" << (s_id_loop / s_id_frames)
+                       << " vkFlush=" << (s_id_flush / s_id_frames)
+                       << " ms  doodads=" << per_instance_wmo_doodads.size()
+                       << " models=" << pi.size() << std::endl;
+              s_id_head = s_id_loop = s_id_flush = 0.0;
+              s_id_frames = 0;
             }
           }
         }
@@ -5693,6 +6814,7 @@ void WorldRender::draw (glm::mat4x4 const& model_view
             if (!s_no_pib_mdi)
             {
               drawPibBatched(pib_groups);
+              vkM2SnapshotAppend();
             }
             for (auto& g : pib_groups)
             {
@@ -6065,6 +7187,11 @@ void WorldRender::draw (glm::mat4x4 const& model_view
               {
                 mount_model->animcalc = false;
               }
+              // GHOST PARITY (user 2026-08-25): the mount renders as part of the unit -- one
+              // translucency/tint for the whole render (body, gear, mount), so a ghost rider's
+              // mount is ghosted too instead of staying solid under a see-through rider.
+              mount.model_alpha = instance->model_alpha;
+              mount.model_tint = instance->model_tint;
               mount_model->renderer()->draw(model_view, mount, m2_shader, model_render_state, frustum,
                 _cull_distance, camera_pos, creature_animtime, display, /*no_cull*/ true, // GPU-clip, no bbox snap
                 /*bloom_mask_only*/ false, interior_light_at(mount.get_pos(), false), creature_fade);
@@ -6264,13 +7391,23 @@ void WorldRender::draw (glm::mat4x4 const& model_view
                 attachment_instance.setRenderAnchor(glm::vec3(origin_d), rel);
               }
               // Particle transform: models whose emitters ride their parent (flag 0x10) use the full
-              // animated attachment matrix; world-space emitters (aura sparkles like RibbonTrail) use
-              // the BIND-pose placement (attachment pos only, no animated bone) so live particles stay
-              // put while the body animates -- matching the live client.
-              attachment.particle_transform = attachment_instance.model->particlesRideParent()
-                ? attachment_instance.transformMatrix()
-                : instance->transformMatrix()
-                  * glm::translate(glm::mat4x4(1.0f), fixCoordSystem(attachment_def->pos));
+              // animated attachment matrix. NON-riding emitters (aura sparkles, BREATH BUBBLES) are
+              // TRUE world-space in the client: bake the emitter's current placement into each
+              // particle at SPAWN and draw with IDENTITY -- live particles stay put in the world
+              // (bubbles trail behind a swimming character) instead of riding the instance matrix.
+              if (attachment_instance.model->particlesRideParent())
+              {
+                attachment_instance.model->clearWorldSpaceParticleEmission();
+                attachment.particle_transform = attachment_instance.transformMatrix();
+              }
+              else
+              {
+                attachment_instance.model->setWorldSpaceParticleEmission(
+                  instance->transformMatrix()
+                  * glm::translate(glm::mat4x4(1.0f), fixCoordSystem(attachment_def->pos)),
+                  attachment.particle_kill_plane_y);
+                attachment.particle_transform = glm::mat4x4(1.0f);
+              }
               if (draw_model_animations)
               {
                 attachment_instance.model->animcalc = false;
@@ -6286,6 +7423,13 @@ void WorldRender::draw (glm::mat4x4 const& model_view
                          << attachment_def->pos.z << "}"
                          << std::endl;
               }
+              // GHOST PARITY (user 2026-08-25: "ghost effect on npcs not applying to equipment"):
+              // worn equipment (helm/shoulders/weapons) follows the UNIT's translucency -- copy the
+              // body's CreatureModelAlpha x aura alpha and char-proc tint onto the attachment every
+              // frame (auras/visuals can change live). Aura state-kit models stay exempt
+              // (client-verified 2026-08-22: Anomalus body alpha 200, its sparkles full-opacity).
+              attachment_instance.model_alpha = attachment.is_aura_kit ? 1.0f : instance->model_alpha;
+              attachment_instance.model_tint = attachment.is_aura_kit ? glm::vec3(1.0f) : instance->model_tint;
               attachment_instance.model->renderer()->draw(model_view
                 , attachment_instance
                 , m2_shader
@@ -7254,6 +8398,7 @@ void WorldRender::draw (glm::mat4x4 const& model_view
   {
     OpenGL::Scoped::use_program water_shader {*_liquid_program.get()};
     water_shader.uniform("camera", glm::vec3(camera_pos.x, camera_pos.y, camera_pos.z));
+    water_shader.uniform("sheen_dir", _skies->celestial_dir()); // glitter tracks the drawn sun/moon disc
     water_shader.uniform("animtime", _world->animtime);
     water_shader.uniform("draw_shadows", _terrain_params_ubo_data.draw_shadows);
 
@@ -7274,7 +8419,7 @@ void WorldRender::draw (glm::mat4x4 const& model_view
   gl.enable(GL_BLEND);
   gl.blendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ZERO, GL_ONE_MINUS_SRC_ALPHA);
 
-  if (draw_water)
+  if (draw_water && !vk_owns_water)
   {
     if (capture_debug_enabled())
     {
@@ -7314,6 +8459,7 @@ void WorldRender::draw (glm::mat4x4 const& model_view
     // Water surface specular (sun sheen): same sun-band colour as the terrain specular; toggle via
     // render/water_specular (default on, like the client's reflective water).
     water_shader.uniform ("camera", glm::vec3(camera_pos.x, camera_pos.y, camera_pos.z));
+    water_shader.uniform ("sheen_dir", _skies->celestial_dir());
     water_shader.uniform ("sun_spec_color", _skies->color_set[SUN_COLOR]);
     water_shader.uniform ("draw_water_specular"
                           , _world->_settings->value("render/water_specular", true).toBool() ? 1 : 0);
@@ -7326,6 +8472,11 @@ void WorldRender::draw (glm::mat4x4 const& model_view
         break;
 
       if (tile->renderer()->isOccluded() && !tile->Water.needsUpdate() && !tile->renderer()->isOverridingOcclusionCulling())
+        continue;
+
+      // Same distance cull as the terrain pass -- without it the far tiles' WATER would keep
+      // drawing after their ground was culled, leaving lakes/ocean floating in the fog.
+      if (!minimap_render && tile->camDist() > _terrain_cull_distance + TILESIZE)
         continue;
 
       tile->Water.renderer()->draw(
@@ -7352,11 +8503,14 @@ void WorldRender::draw (glm::mat4x4 const& model_view
   // models, so a creature standing in WMO water is blended over by the surface -- same ordering ADT
   // water already had. Inherits the water pass's blendFuncSeparate, which keeps water opacity out of
   // the bloom mask.
-  if (draw_water && !_deferred_wmo_liquid.empty() && _wmo_liquid_program)
+  if (draw_water && !vk_owns_water && !_deferred_wmo_liquid.empty() && _wmo_liquid_program)
   {
     ZoneScopedN("World::draw() : Draw deferred WMO water");
     OpenGL::Scoped::bool_setter<GL_CULL_FACE, GL_FALSE> const cull;
     OpenGL::Scoped::use_program wmo_liquid_shader{*_wmo_liquid_program.get()};
+    // User-directed sun/moon glitter on exterior WMO water (doc 37): the lobe needs the view origin.
+    wmo_liquid_shader.uniform("camera", glm::vec3(camera_pos.x, camera_pos.y, camera_pos.z));
+    wmo_liquid_shader.uniform("sheen_dir", _skies->celestial_dir());
 
     wmo_liquid_shader.uniform("water_alpha_mult",
                               _world->_settings->value("water/transparency", 1.0f).toFloat());
@@ -7393,12 +8547,72 @@ void WorldRender::draw (glm::mat4x4 const& model_view
   // Weather precipitation (rain streaks / snow flakes) around the camera -- the visible half of the
   // editor weather; the light/fog half is the STORM-param blend in Sky::colorFor. Drawn after the
   // water so drops overlay it like everything else.
-  if (_world->weather_type != 0 && _world->weather_intensity > 0.0f)
+  // INTERIOR SUPPRESSION (user 2026-08-26): no precipitation while the camera stands in a TRUE
+  // indoor WMO group -- the client kills weather rendering inside buildings. Exterior city groups
+  // and open ext-lit channels keep raining, and (client parity) rain still falls through OUTDOOR
+  // overhangs/bridges -- vanilla has no per-particle roof test.
+  if (_world->weather_type != 0 && _world->weather_intensity > 0.0f
+      && !(_camera_inside_wmo && _camera_in_indoor_group))
   {
     glm::vec3 const precip_light = _skies->color_set[LIGHT_GLOBAL_AMBIENT] * 0.75f
                                  + _skies->color_set[LIGHT_GLOBAL_DIFFUSE] * 0.45f;
+    // RAIN-DIAG (one-shot, 2026-08-27 "rain color is black"): name the light inputs feeding the
+    // precip tint so a zeroed band vs a texture/draw problem is decidable from one session.
+    {
+      static bool s_rain_diag = false;
+      if (!s_rain_diag)
+      {
+        s_rain_diag = true;
+        glm::vec3 const amb = _skies->color_set[LIGHT_GLOBAL_AMBIENT];
+        glm::vec3 const dif = _skies->color_set[LIGHT_GLOBAL_DIFFUSE];
+        LogError << "RAIN-DIAG type=" << _world->weather_type
+                 << " intensity=" << _world->weather_intensity
+                 << " amb=(" << amb.x << "," << amb.y << "," << amb.z << ")"
+                 << " dif=(" << dif.x << "," << dif.y << "," << dif.z << ")"
+                 << " precip=(" << precip_light.x << "," << precip_light.y << "," << precip_light.z << ")"
+                 << std::endl;
+      }
+    }
     _weather_effect.draw(mvp, camera_pos, _world->weather_type, _world->weather_intensity,
                          _world->animtime, precip_light, _world->_context);
+  }
+
+  // Surface splash/wake ripples (client Water0Ripple port): drain the game-tick spawn requests
+  // into the pool and draw the live rings flat on the water, additive, after the surface.
+  // RIPPLE-DIAG (one-shot): proves the DRAIN stage receives spawns.
+  {
+    static bool s_ripple_drain_diag = false;
+    if (!s_ripple_drain_diag && !_world->pending_ripples.empty())
+    {
+      s_ripple_drain_diag = true;
+      LogError << "RIPPLE-DIAG drain received " << _world->pending_ripples.size()
+               << " spawn(s) this frame" << std::endl;
+    }
+  }
+  for (auto const& spawn_request : _world->pending_ripples)
+  {
+    _water_ripples.spawn(spawn_request.pos, spawn_request.rot, spawn_request.size0,
+                         spawn_request.growth, spawn_request.lifetime_s, spawn_request.alpha_peak,
+                         spawn_request.kind);
+  }
+  _world->pending_ripples.clear();
+  _water_ripples.draw(mvp, _world->animtime, _world->_context);
+
+  // Underwater particulates -- the client's waterParticulates motes (Textures\WaterPoop02.blp).
+  // CLIENT RE 2026-08-25 (doc 37, FUN_006809c0/0066fd50/0068efe0 chain): the motes run under
+  // EVERY liquid -- the tick gate is only `liquidType != 0xf`. Per-liquid look = a FAMILY row of
+  // sheet cells (DAT_0086a0a0): water/ocean {0..7}, MAGMA {9,10,11,12}x2, SLIME {0x8}. The old
+  // "no motes under lava/slime" note was an unverified assumption (user caught it).
+  if (_camera_underwater)
+  {
+    glm::vec3 const mote_light = _skies->color_set[LIGHT_GLOBAL_AMBIENT] * 0.8f
+                               + _skies->color_set[LIGHT_GLOBAL_DIFFUSE] * 0.3f;
+    _underwater_motes.draw(mvp, camera_pos, 3, 1.0f, _world->animtime, mote_light, _world->_context,
+                           _camera_liquid_family);
+  }
+  else
+  {
+    _underwater_motes.draw(mvp, camera_pos, 0, 0.0f, _world->animtime, glm::vec3(0.0f), _world->_context);
   }
 
   // Deferred pure-additive light effects (god rays / lighthouse beams), drawn AFTER the water so
@@ -7448,6 +8662,68 @@ void WorldRender::draw (glm::mat4x4 const& model_view
     }
 
     // Restore the default opaque state for anything drawn afterwards.
+    gl.disable(GL_BLEND);
+    gl.enable(GL_CULL_FACE);
+    gl.depthMask(GL_TRUE);
+  }
+
+  // Deferred PER-INSTANCE light-shaft doodads (lighthouse beam & co): individual draws with each
+  // instance's own (billboarded) transform, after every water pass -- see the partition above the
+  // per-instance doodad paths.
+  if (!deferred_pi_light_doodads.empty())
+  {
+    OpenGL::Scoped::use_program pi_light_shader {*_m2_program.get()};
+    OpenGL::M2RenderState pi_light_state;
+    pi_light_state.tex_arrays = {0, 0};
+    pi_light_state.tex_indices = {0, 0};
+    pi_light_state.tex_unit_lookups = {0, 0};
+    gl.blendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    gl.disable(GL_BLEND);
+    gl.depthMask(GL_TRUE);
+    gl.enable(GL_CULL_FACE);
+    pi_light_shader.uniform("blend_mode", 0);
+    pi_light_shader.uniform("unfogged", static_cast<int>(pi_light_state.unfogged));
+    pi_light_shader.uniform("unlit", static_cast<int>(pi_light_state.unlit));
+    pi_light_shader.uniform("tex_unit_lookup_1", 0);
+    pi_light_shader.uniform("tex_unit_lookup_2", 0);
+    pi_light_shader.uniform("pixel_shader", 0);
+    std::unordered_set<std::uint64_t> seen_light_keys;
+    for (ModelInstance* _dptr : deferred_pi_light_doodads)
+    {
+      if (!_dptr)
+      {
+        continue;
+      }
+      ModelInstance& doodad = *_dptr;
+      Model* pmodel = doodad.model.get();
+      if (!pmodel || !pmodel->finishedLoading() || pmodel->loading_failed()
+          || (!draw_hidden_models && pmodel->is_hidden()))
+      {
+        continue;
+      }
+      if (!seen_light_keys.insert(wmo_doodad_placement_key(doodad.get_pos())).second)
+      {
+        continue; // duplicate cross-tile placement
+      }
+      if (draw_model_animations)
+      {
+        pmodel->animcalc = false;
+      }
+      pmodel->renderer()->draw(model_view
+        , doodad
+        , pi_light_shader
+        , pi_light_state
+        , frustum
+        , _cull_distance
+        , camera_pos
+        , static_cast<int>(_world->model_animtime)
+        , display
+        , /*no_cull*/ false
+        , /*bloom_mask_only*/ false
+        , interior_light_at(doodad.get_pos())
+      );
+      ++_world->_n_rendered_objects;
+    }
     gl.disable(GL_BLEND);
     gl.enable(GL_CULL_FACE);
     gl.depthMask(GL_TRUE);
@@ -7644,8 +8920,12 @@ void WorldRender::draw (glm::mat4x4 const& model_view
       {
         pmodel->swapInstanceEmitterState(draw_item.guid);
       }
+      // x draw_item.fade (user 2026-08-25): the stream-in/cull fade is ONE alpha for the whole unit
+      // -- the body mesh eases in over 2 s while its emitters popped at full opacity. Particles now
+      // carry CreatureModelAlpha AND the unit fade, like every other component.
       pmodel->renderer()->drawParticlesForInstance(
-          glm::transpose(model_view), particles_shader, instance->transformMatrix(), instance->model_alpha);
+          glm::transpose(model_view), particles_shader, instance->transformMatrix(),
+          instance->model_alpha * draw_item.fade);
       if (pmodel->hasGeometryParticles())
       {
         pmodel->appendGeometryParticleTransforms(instance->transformMatrix(), geometry_particle_draws);
@@ -7668,17 +8948,29 @@ void WorldRender::draw (glm::mat4x4 const& model_view
           if (!amodel || !amodel->finishedLoading() || amodel->loading_failed() || amodel->is_hidden())
             continue;
 
+          // Surface-bounded particle systems (breath bubbles, kill plane = the liquid surface):
+          // when the camera is ABOVE water, the client hides them behind the ~0.9-alpha surface
+          // (it draws particles BEFORE water; measured: the water base pass has ZWRITE OFF, so
+          // there is no real depth occlusion either way). noggit draws particles AFTER water (the
+          // god-ray ordering), so the equivalent is skipping the draw -- at the canal's full
+          // opacity that is visually identical, and submerged cameras still see the bubbles.
+          if (!_camera_underwater && attachment.particle_kill_plane_y < 1.0e29f)
+          {
+            continue;
+          }
+
           std::uint64_t const attachment_key = static_cast<std::uint64_t>(draw_item.guid)
             | (static_cast<std::uint64_t>(&attachment - draw_item.spawn->attachment_models.data() + 1) << 32);
           if (draw_model_animations)
           {
             amodel->swapInstanceEmitterState(attachment_key);
           }
-          // Full alpha: aura/spell effect models are separate from the creature, so CreatureModelAlpha
-          // (the body fade, e.g. Anomalus 0.784) does NOT apply to them in the client.
+          // CreatureModelAlpha does NOT apply here (aura/spell effect models are separate from the
+          // creature in the client -- Anomalus body 0.784, sparkles full), but the unit's stream-in/
+          // cull FADE is one alpha for every component: attachment emitters fade in with the body.
           amodel->renderer()->drawParticlesForInstance(
               glm::transpose(model_view), particles_shader,
-              attachment.particle_transform, 1.0f);
+              attachment.particle_transform, draw_item.fade);
           if (draw_model_animations)
           {
             amodel->swapInstanceEmitterState(attachment_key);
@@ -7719,8 +9011,11 @@ void WorldRender::draw (glm::mat4x4 const& model_view
         }
         pmodel->updateParticleSystems(pdt);
       }
+      // go_item.second = the GO's 2 s fade alpha (user 2026-08-25): the mesh eased in while the
+      // emitters (mining-vein smoke etc.) popped at full opacity the frame the GO entered range.
       pmodel->renderer()->drawParticlesForInstance(
-          glm::transpose(model_view), particles_shader, go_instance->transformMatrix());
+          glm::transpose(model_view), particles_shader, go_instance->transformMatrix(),
+          go_item.second);
       if (draw_model_animations)
       {
         pmodel->swapInstanceEmitterState(key);
@@ -8343,6 +9638,24 @@ void WorldRender::renderBloomAndComposite(GLuint target_fbo, int w, int h, glm::
     // applied HERE, exactly where the client carries it (the composite quad's vertex alpha, 0.647 in
     // the captured inn frame).
     p.uniform("intensity", glow_strength);
+    // Underwater wave warp (1.12 FFXGlowWave, RE doc 36): submerged camera -> the client's DuDv
+    // screen warp + 0.329 base blur mix engage in the composite. The CLEAR_WATER param swap
+    // (updateLightingUniformBlock) has already raised glow_strength to the water param's glow (1.0
+    // on the stock map-0 lights), so the blur^2 term is at full client strength down here too.
+    // NO TRANSITION RAMP (user 2026-08-27: "all RE from client, nothing guessed"): the warp is
+    // ON underwater and OFF above -- binary. The old 5 s ease-in was a DERIVED invention (its
+    // "5 s fade" decompile turned out to be the AUDIO ambience volume, doc 37); removed.
+    _uw_ffx_weight = _camera_underwater ? 1.0f : 0.0f;
+    p.uniform("wave_on", (_uw_ffx_weight > 0.001f) ? 1 : 0);
+    p.uniform("wave_time", static_cast<float>(_world->animtime) * 0.001f);
+    p.uniform("viewport_px", glm::vec2(static_cast<float>(w), static_cast<float>(h)));
+    // Coupled wobble lever x USER-TUNED 0.25 (2026-08-27 "just make it quarter the strength" --
+    // a DELIBERATE deviation from the client-exact 3px/0.329 pair; lever 100 = this quarter
+    // look, 400 = the traced client pair) x the ramp-in weight above.
+    p.uniform("wave_strength",
+              _uw_ffx_weight * 0.25f
+                * std::clamp(_world->_settings->value("render/underwater_wobble_strength", 100.0f)
+                               .toFloat(), 0.0f, 400.0f) / 100.0f);
     gl.drawArraysInstanced(GL_TRIANGLES, 0, 3, 1);
   }
 
@@ -8397,6 +9710,11 @@ void WorldRender::ensureShadowTarget(int size)
   alloc(_shadow_env_fbo, _shadow_env_tex);
   gl.bindFramebuffer(GL_FRAMEBUFFER, static_cast<GLuint>(prev_fbo_binding));
   gl.bindTexture(GL_TEXTURE_2D, 0);
+}
+
+glm::vec3 WorldRender::sunSpecColor() const
+{
+  return _skies ? _skies->color_set[SUN_COLOR] : glm::vec3(0.f);
 }
 
 void WorldRender::upload()
@@ -8745,15 +10063,44 @@ void WorldRender::updateLightingUniformBlock(bool draw_fog, glm::vec3 const& cam
   // editor intermittently (any map, any time the camera sits over loading liquid). Default to "not
   // underwater" on failure.
   bool underwater = false;
+  int liquid_family = -1;
   try
   {
-    underwater = _world->camera_is_underwater(camera_pos);
+    // Typed query so the submersion effects know WHICH liquid: ADT layers + WMO group liquids --
+    // Stormwind canals and MC lava are WMO liquid, invisible to the old chunk-only
+    // camera_is_underwater ("underwater has no effect" in canals). The WMO half needs the probe
+    // cache, which only game-mode tick used to build -- ensure it HERE so submersion works in
+    // editor mode too (cheap: rebuilds only on >10yd movement / every 240 frames).
+    _world->ensureProbeCache(camera_pos);
+    if (auto const lq = _world->getLiquidAt(camera_pos))
+    {
+      // EXACT point test (round 19): the 0.35yd early-engage band predated the camera water-wall;
+      // with the wall holding the camera ~0.24yd off the surface, the band made "touching the
+      // plane" flip the underwater look while still above water. The wall prevents surface
+      // clipping now, so the band is obsolete.
+      underwater = lq->first > camera_pos.y;
+      _camera_liquid_surface_y = lq->first;
+      if (underwater)
+      {
+        // family from the id: LiquidType ids follow id%4 = {1 water, 2 ocean, 3 magma, 0 slime}
+        // across both eras ({1,5,13,17}, {2,14}, {3,15,19}, {4,20}); 21 (Naxx slime) is the exception.
+        int const id = lq->second;
+        int const m = id % 4;
+        liquid_family = (id == 21) ? 3 : (m == 1) ? 0 : (m == 2) ? 1 : (m == 3) ? 2 : 3;
+      }
+    }
   }
   catch (...)
   {
     underwater = false;
+    liquid_family = -1;
   }
-  _skies->setCurrentParam(underwater ? CLEAR_WATER : CLEAR);
+  _camera_underwater = underwater; // cached for the underwater-particulates pass in draw()
+  _camera_liquid_family = liquid_family;
+  // CLEAR_WATER params are the WATER submersion set -- under MAGMA/SLIME they wrongly blued the
+  // scene ("underlava shows underwater blue"). Those liquids keep the CLEAR params and get their
+  // own dense fog override below (tint measured from the client's lava/slime textures).
+  _skies->setCurrentParam((underwater && liquid_family <= 1) ? CLEAR_WATER : CLEAR);
   // Weather: every band (fog/diffuse/ambient/sky/water) blends toward the STORM param set by the
   // editor weather intensity (Sky::colorFor / floatParamFor read it).
   Skies::set_weather_intensity(_world->weather_type != 0 ? _world->weather_intensity : 0.0f);
@@ -8967,6 +10314,26 @@ void WorldRender::updateLightingUniformBlock(bool draw_fog, glm::vec3 const& cam
   // are SPATIAL -- Light.dbc falloff radii for the zone fog, MFOG sphere falloff for WMO fog -- both
   // of which are handled at their sources, so no temporal smoothing is needed or canon.)
 
+  // SUBMERGED IN MAGMA/SLIME: dense fog in the liquid's own colour ("super foggy and red"),
+  // replacing every other fog source. Tints MEASURED from the client's liquid textures
+  // (lava.1.blp mean RGB 176,23,0; slime.1.blp mean 68,132,19); range = a short 25yd wall.
+  // Water/ocean submersion keeps the CLEAR_WATER param fog (client law); this override is only
+  // for the liquids the param system has no set for.
+  if (_camera_underwater && _camera_liquid_family >= 2)
+  {
+    fog_color = (_camera_liquid_family == 2)
+              ? glm::vec3(176.0f / 255.0f, 23.0f / 255.0f, 0.0f)
+              : glm::vec3(68.0f / 255.0f, 132.0f / 255.0f, 19.0f / 255.0f);
+    fog_start = 0.0f;   // fraction of fog_end -- dense from the camera
+    fog_end = 25.0f;
+  }
+
+  // UNDERWATER DEPTH DARKENING: REMOVED 2026-08-26 (user: "not canon -- double check"). It was
+  // an ADMITTED APPROXIMATION (the hypothesised 1-eyeZ*k law was never RE'd; neither capture has
+  // a dive, and no depth-scaled light multiplier exists in any decompiled underwater chain --
+  // the client's whole submersion look is the CLEAR_WATER param swap + its short fog). Do NOT
+  // reintroduce without trace/decomp evidence.
+
   _lighting_ubo_data.DiffuseColor_FogStart = {diffuse.x,diffuse.y,diffuse.z, fog_start};
   _lighting_ubo_data.AmbientColor_FogEnd = {ambient.x,ambient.y,ambient.z, fog_end};
   _lighting_ubo_data.FogColor_FogOn = {fog_color.x,fog_color.y,fog_color.z, static_cast<float>(draw_fog)};
@@ -9018,6 +10385,12 @@ void WorldRender::updateLightingUniformBlock(bool draw_fog, glm::vec3 const& cam
       }
       glm::vec3 mf_color;
       float mf_end = 0.0f, mf_start = 0.0f;
+      // Weather gate input (user 2026-08-26: "rain/snow showing inside buildings"): remember
+      // whether the camera's group is a TRUE interior. Exterior groups (Stormwind streets) and
+      // ext-lit open channels (canals/harbours) are NOT interiors -- they keep their rain.
+      _camera_in_indoor_group = cam_group
+        && !cam_group->group->is_exterior()
+        && !cam_group->group->is_exterior_lit();
       if (cam_group
           && cam_group->wmo->evaluate_camera_fog(*cam_group->group, cam_group->transform,
                                                  camera_pos, /*camera_inside_wmo=*/ true,
@@ -9051,6 +10424,20 @@ void WorldRender::updateLightingUniformBlock(bool draw_fog, glm::vec3 const& cam
     float const env_start_frac = env_end > 0.001f ? std::clamp(env_start_abs / env_end, -5.0f, 0.99f) : 0.25f;
     _lighting_ubo_data.EnvFogColor_On = {env_color.x, env_color.y, env_color.z, env_w};
     _lighting_ubo_data.EnvFogDist = {env_start_frac, env_end, 0.0f, 0.0f};
+
+    // SUBMERGED IN MAGMA/SLIME (round 27): the dense liquid fog must replace the ENTITY/Env fog
+    // context too. Molten Core is a WMO interior, so its models AND geometry read the Env slots --
+    // with only the zone fog overridden they kept the room's MFOG and showed as silhouettes far
+    // past the lava fog ("I shouldn't be able to see far past the fog in the lava"). Same measured
+    // liquid-texture tints and the same short 25yd wall.
+    if (_camera_underwater && _camera_liquid_family >= 2)
+    {
+      glm::vec3 const liquid_fog = (_camera_liquid_family == 2)
+        ? glm::vec3(176.0f / 255.0f, 23.0f / 255.0f, 0.0f)
+        : glm::vec3(68.0f / 255.0f, 132.0f / 255.0f, 19.0f / 255.0f);
+      _lighting_ubo_data.EnvFogColor_On = {liquid_fog.x, liquid_fog.y, liquid_fog.z, 1.0f};
+      _lighting_ubo_data.EnvFogDist = {0.0f, 25.0f, 0.0f, 0.0f};
+    }
   }
   _lighting_ubo_data.LightDir_FogRate = {_outdoor_light_stats.dayDir.x, _outdoor_light_stats.dayDir.y, _outdoor_light_stats.dayDir.z, _skies->fogRate()};
   _lighting_ubo_data.OceanColorLight = { ocean_color_light.x,ocean_color_light.y,ocean_color_light.z, _skies->ocean_shallow_alpha()};

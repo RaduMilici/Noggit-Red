@@ -97,6 +97,13 @@ namespace noggit::perf
 
     // current frame (add() writes here; end_frame() folds it into the window)
     std::array<double, static_cast<std::size_t>(Phase::COUNT)> cur{};
+    // [finding 96] time spent inside NESTED Scopes, per phase, so exclusive = sum - child_sum
+    std::array<double, static_cast<std::size_t>(Phase::COUNT)> child_sum{};
+    void add_child(Phase p, double ms)
+    {
+      if (!on) { return; }
+      child_sum[static_cast<std::size_t>(p)] += ms;
+    }
     double baseline_ms = 0.0; // EWMA of the frame period; the spike threshold rides on this
 
     // [SubmitInst breakdown 2026-08-05] accumulate the instanced-doodad draw SHAPE over the report window
@@ -212,6 +219,15 @@ namespace noggit::perf
       {
         os << "  " << phase_name(static_cast<Phase>(i)) << "=" << (sum[i] / frames);
       }
+      os << "\n  EXCLUSIVE-ms (self, children subtracted):";
+      for (std::size_t i = 0; i < static_cast<std::size_t>(Phase::COUNT); ++i)
+      {
+        double const excl = (sum[i] - child_sum[i]) / frames;
+        if (excl > 0.005)
+        {
+          os << "  " << phase_name(static_cast<Phase>(i)) << "=" << excl;
+        }
+      }
       os << "\n  worst-frame-ms (per phase):";
       for (std::size_t i = 0; i < static_cast<std::size_t>(Phase::COUNT); ++i)
       {
@@ -225,6 +241,7 @@ namespace noggit::perf
       LogError << os.str() << std::endl;
       inst_models = inst_groups = inst_drawcalls = inst_instances = 0;
       sum.fill(0.0);
+      child_sum.fill(0.0);
       mx.fill(0.0);
       frames = 0;
       spikes = 0;
@@ -239,6 +256,16 @@ namespace noggit::perf
     Phase _p;
     bool _on;
     std::chrono::steady_clock::time_point _t0;
+    Scoped* _parent = nullptr;
+
+    // per-thread innermost open scope; worker threads keep their own stack, so a phase entered on
+    // a pool thread is attributed within that thread rather than to whatever the render thread
+    // happened to have open
+    static Scoped*& current()
+    {
+      static thread_local Scoped* c = nullptr;
+      return c;
+    }
 
     explicit Scoped(Phase p)
       : _p(p)
@@ -246,6 +273,8 @@ namespace noggit::perf
     {
       if (_on)
       {
+        _parent = current();
+        current() = this;
         _t0 = std::chrono::steady_clock::now();
       }
     }
@@ -253,8 +282,11 @@ namespace noggit::perf
     {
       if (_on)
       {
-        FrameProfiler::get().add(_p,
-          std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _t0).count());
+        double const ms = std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - _t0).count();
+        FrameProfiler::get().add(_p, ms);
+        current() = _parent;
+        if (_parent) { FrameProfiler::get().add_child(_parent->_p, ms); }
       }
     }
     Scoped(Scoped const&) = delete;

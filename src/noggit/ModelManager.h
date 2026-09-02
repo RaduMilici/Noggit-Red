@@ -26,7 +26,7 @@ public:
 
 private:
   friend struct scoped_model_reference;
-  static Noggit::AsyncObjectMultimap<Model> _;
+  static Noggit::AsyncObjectMultimap<Model>& _;   // leaked on purpose, see ModelManager.cpp
 };
 
 struct scoped_model_reference

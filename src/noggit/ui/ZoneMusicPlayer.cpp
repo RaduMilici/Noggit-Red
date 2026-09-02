@@ -2,6 +2,7 @@
 
 #include <noggit/ui/ZoneMusicPlayer.hpp>
 
+#include <noggit/ui/SfxPlayer.hpp>
 #include <noggit/DBC.h>
 #include <noggit/Log.h>
 #include <noggit/application/NoggitApplication.hpp>
@@ -41,12 +42,50 @@ namespace Noggit::Ui
     layout->addWidget(_zone_label);
 
     auto* vol_layout = new QHBoxLayout();
-    vol_layout->addWidget(new QLabel(tr("Volume"), this));
+    vol_layout->addWidget(new QLabel(tr("Music"), this));
     _volume_slider = new QSlider(Qt::Horizontal, this);
     _volume_slider->setRange(0, 100);
     _volume_slider->setValue(_master_volume);
     vol_layout->addWidget(_volume_slider);
     layout->addLayout(vol_layout);
+
+    // Effects channel volume (footsteps / fidgets / event one-shots -- the client's
+    // SoundVolume CVar analogue; playback via SfxPlayer, doc 38)
+    {
+      auto* fx_layout = new QHBoxLayout();
+      fx_layout->addWidget(new QLabel(tr("Effects"), this));
+      auto* fx_slider = new QSlider(Qt::Horizontal, this);
+      fx_slider->setRange(0, 100);
+      fx_slider->setValue(Noggit::Ui::SfxPlayer::instance().volume());
+      fx_layout->addWidget(fx_slider);
+      layout->addLayout(fx_layout);
+      connect(fx_slider, &QSlider::valueChanged, [](int v)
+              {
+                Noggit::Ui::SfxPlayer::instance().set_volume(v);
+                QSettings().setValue("zone_music/effects_volume", v);
+              });
+    }
+
+    // Ambience channel volume (the client's separate AmbienceVolume CVar analogue, doc 38)
+    auto* amb_layout = new QHBoxLayout();
+    amb_layout->addWidget(new QLabel(tr("Ambience"), this));
+    _ambience_slider = new QSlider(Qt::Horizontal, this);
+    _ambience_slider->setRange(0, 100);
+    _ambience_slider->setValue(_amb_volume);
+    amb_layout->addWidget(_ambience_slider);
+    layout->addLayout(amb_layout);
+    connect(_ambience_slider, &QSlider::valueChanged, [this](int v)
+            {
+              _amb_volume = v;
+              // live-apply to the sounding deck when not mid-crossfade (the fade tick otherwise
+              // ramps toward the recomputed target on its own)
+              _amb_target_volume = std::clamp(static_cast<int>(std::lround(_amb_dbc_vol * v)), 0, 100);
+              if (!_amb_fade_timer->isActive() && _amb_decks[_amb_active])
+              {
+                _amb_decks[_amb_active]->setVolume(_amb_target_volume);
+              }
+              QSettings().setValue("zone_music/ambience_volume", v);
+            });
 
     _song_list = new QListWidget(this);
     _song_list->setSelectionMode(QListWidget::SingleSelection);
@@ -59,15 +98,18 @@ namespace Noggit::Ui
     _silence_timer = new QTimer(this);
     _silence_timer->setSingleShot(true);
 
-    _fade_timer = new QTimer(this);  // ~50ms steps -> ~1s fade
+    _fade_timer = new QTimer(this);  // music fade-out ticker (wall-clock t inside)
     connect(_fade_timer, &QTimer::timeout, [this]() { tick_fade(); });
+
+    _amb_fade_timer = new QTimer(this); // ambience 5.0 s crossfade ticker (wall-clock t inside)
+    connect(_amb_fade_timer, &QTimer::timeout, [this]() { tick_ambience_fade(); });
 
     connect(_volume_slider, &QSlider::valueChanged, [this](int v)
             {
               _master_volume = v;
               // When not mid-crossfade, apply straight to the live deck; otherwise tick_fade() ramps
               // toward the new _master_volume on its own.
-              if (!_fade_timer->isActive() && _decks[_active_deck]) { _decks[_active_deck]->setVolume(v); }
+              if (!_fade_timer->isActive() && _decks[_active_deck]) { _decks[_active_deck]->setVolume(effective_master()); }
               QSettings().setValue("zone_music/volume", v);
             });
 
@@ -93,6 +135,9 @@ namespace Noggit::Ui
       int const saved_volume = std::clamp(settings.value("zone_music/volume", _master_volume).toInt(), 0, 100);
       _master_volume = saved_volume;
       _volume_slider->setValue(saved_volume);
+      int const saved_amb = std::clamp(settings.value("zone_music/ambience_volume", _amb_volume).toInt(), 0, 100);
+      _amb_volume = saved_amb;
+      _ambience_slider->setValue(saved_amb);
       _enable_check->setChecked(settings.value("zone_music/enabled", false).toBool());
     }
 
@@ -114,6 +159,7 @@ namespace Noggit::Ui
     _enabled = false;
     if (_silence_timer) { _silence_timer->stop(); }
     if (_fade_timer) { _fade_timer->stop(); }
+    if (_amb_fade_timer) { _amb_fade_timer->stop(); }
     for (int i = 0; i < DECK_COUNT; ++i)
     {
       if (_decks[i])
@@ -122,6 +168,11 @@ namespace Noggit::Ui
         // Releasing the media unhooks the DirectShow graph and the temp-file handle, which lets the
         // backend thread finish -- a bare stop() alone can leave it running on exit.
         _decks[i]->setMedia(QMediaContent());
+      }
+      if (_amb_decks[i])
+      {
+        _amb_decks[i]->stop();
+        _amb_decks[i]->setMedia(QMediaContent());
       }
     }
   }
@@ -204,6 +255,8 @@ namespace Noggit::Ui
   {
     _silence_timer->stop();
     _fade_timer->stop();
+    // NOTE: the AMBIENCE channel is NOT stopped here -- it is independent of the music enable
+    // (its own gate is the Ambience slider; full teardown stays in shutdown_audio).
     for (int i = 0; i < DECK_COUNT; ++i)
     {
       if (_decks[i])
@@ -447,7 +500,7 @@ namespace Noggit::Ui
 
       // CLIENT-FAITHFUL: the new track HARD-STARTS at full volume -- the 1.12 client sets the stream
       // volume instantly (FSOUND_SetVolume) with NO fade-in. Only the previous deck fades out.
-      _decks[idle]->setVolume(_master_volume);
+      _decks[idle]->setVolume(effective_master());
       _decks[idle]->setMedia(QUrl::fromLocalFile(temp->fileName()));
       _decks[idle]->play();
     }
@@ -464,7 +517,7 @@ namespace Noggit::Ui
     _track_ending = false;  // fresh track -> allow the end-of-track watchdog to fire again
 
     _fade_from_volume = (_decks[1 - _active_deck] ? _decks[1 - _active_deck]->volume() : 0);
-    _fade_ticks = 0;
+    _fade_start_ms = QDateTime::currentMSecsSinceEpoch(); // wall-clock ramp (see hpp note)
     _fade_timer->start(FADE_TICK_MS); // ramps the OUTGOING deck to silence over FADE_OUT_MS
   }
 
@@ -475,14 +528,17 @@ namespace Noggit::Ui
     QMediaPlayer* const in_deck  = _decks[_active_deck];
     QMediaPlayer* const out_deck = _decks[1 - _active_deck];
 
-    if (in_deck && in_deck->volume() != _master_volume)
+    if (in_deck && in_deck->volume() != effective_master())
     {
-      in_deck->setVolume(_master_volume); // hold live deck at full (guards against slider drift)
+      in_deck->setVolume(effective_master()); // hold live deck at full (guards against slider drift)
     }
 
-    _fade_ticks++;
+    // WALL-CLOCK t (2026-08-27): counted ticks stepped AND stretched the fade whenever tile loads
+    // stalled the UI thread (exactly the zone-change moment). Real elapsed time keeps the ramp on
+    // the client's 4.0 s line no matter how late the timer fires.
     float const t = std::min(1.0f,
-                             static_cast<float>(_fade_ticks * FADE_TICK_MS) / static_cast<float>(FADE_OUT_MS));
+                             static_cast<float>(QDateTime::currentMSecsSinceEpoch() - _fade_start_ms)
+                               / static_cast<float>(FADE_OUT_MS));
     if (out_deck)
     {
       // CLIENT-EXACT curve: a LINEAR amplitude ramp. The 1.12 client fades in FMOD's 0-255 volume with
@@ -523,5 +579,202 @@ namespace Noggit::Ui
       wait_ms = dist(_rng);
     }
     _silence_timer->start(wait_ms);
+  }
+
+  // ===== ZONE AMBIENCE channel (client law RE'd 2026-08-27, doc 38) =====
+
+  void ZoneMusicPlayer::ensure_amb_deck(int deck)
+  {
+    if (deck < 0 || deck >= 2 || _amb_decks[deck])
+    {
+      return;
+    }
+    auto* p = new QMediaPlayer(this);
+    p->setVolume(0);
+    _amb_decks[deck] = p;
+    // Ambience LOOPS: the client opens the stream in loop mode; QMediaPlayer has no loop flag,
+    // so restart the same media on end (only while this deck is the live one).
+    connect(p, &QMediaPlayer::mediaStatusChanged, [this, deck](QMediaPlayer::MediaStatus s)
+            {
+              if (s == QMediaPlayer::EndOfMedia && _enabled && deck == _amb_active && _amb_decks[deck])
+              {
+                _amb_decks[deck]->setPosition(0);
+                _amb_decks[deck]->play();
+              }
+            });
+  }
+
+  int ZoneMusicPlayer::underwater_ambience_entry()
+  {
+    if (_underwater_ambience_se != -2)
+    {
+      return _underwater_ambience_se;
+    }
+    // The client selects the submerged-listener ambience BY NAME from SoundEntries
+    // (FUN_004609b0: "Underwater (DONOTRENAME)"). Resolve once, cache forever.
+    _underwater_ambience_se = 0;
+    try
+    {
+      for (DBCFile::Iterator it = gSoundEntriesDB.begin(); it != gSoundEntriesDB.end(); ++it)
+      {
+        if (std::string(it->getString(SoundEntriesDB::Name)) == "Underwater (DONOTRENAME)")
+        {
+          _underwater_ambience_se = static_cast<int>(it->getUInt(SoundEntriesDB::ID));
+          break;
+        }
+      }
+    }
+    catch (...) {}
+    return _underwater_ambience_se;
+  }
+
+  void ZoneMusicPlayer::update_ambience(int sound_ambience_id, bool is_day, bool underwater)
+  {
+    // INDEPENDENT of the music enable (user 2026-08-27 "no ambience/birds": the checkbox only
+    // covers music; the client runs ambience on its own CVar). The Ambience slider is the
+    // gate: 0 = off (fades the current loop out through the normal 5 s path).
+    if (_amb_volume <= 0)
+    {
+      if (_current_ambience_se != 0)
+      {
+        _current_ambience_se = 0;
+        start_ambience_entry(0);
+      }
+      return;
+    }
+    // Chooser (client FUN_00460bd0 priority; the ghost/forced lanes don't exist in noggit):
+    // submerged listener -> the "Underwater (DONOTRENAME)" row, else the zone SoundAmbience
+    // row's Day(+1)/Night(+2) SoundEntries (3-column table {ID, Day, Night}, dump-verified).
+    int wanted = 0;
+    if (underwater)
+    {
+      wanted = underwater_ambience_entry();
+    }
+    if (wanted == 0 && sound_ambience_id > 0)
+    {
+      try
+      {
+        if (gSoundAmbienceDB.CheckIfIdExists(sound_ambience_id))
+        {
+          auto const row = gSoundAmbienceDB.getByID(sound_ambience_id);
+          wanted = static_cast<int>(row.getUInt(is_day ? 1 : 2));
+        }
+      }
+      catch (...) {}
+    }
+    if (wanted == _current_ambience_se)
+    {
+      return; // client law: an unchanged record never restarts (FUN_00460b00 step 2)
+    }
+    _current_ambience_se = wanted;
+    start_ambience_entry(wanted);
+  }
+
+  void ZoneMusicPlayer::start_ambience_entry(int se_id)
+  {
+    // Begin the client's 5.0 s crossfade: whatever plays on the active deck becomes the
+    // fading-out deck; the new record opens at volume 0 on the idle deck and ramps up.
+    _amb_fade_start_ms = QDateTime::currentMSecsSinceEpoch();
+    _amb_fade_from = (_amb_decks[_amb_active] ? _amb_decks[_amb_active]->volume() : 0);
+    int const idle = 1 - _amb_active;
+    ensure_amb_deck(idle);
+    _amb_target_volume = 0;
+    _amb_dbc_vol = 1.0f;
+
+    if (se_id > 0)
+    {
+      try
+      {
+        auto const se = gSoundEntriesDB.getByID(se_id);
+        std::string const dir = se.getString(SoundEntriesDB::FilePath);
+        std::vector<std::string> files;
+        for (int i = 0; i < 10; ++i)
+        {
+          std::string const fn = se.getString(SoundEntriesDB::Filenames + i);
+          if (!fn.empty())
+          {
+            files.push_back(fn);
+          }
+        }
+        if (!files.empty())
+        {
+          // like the client stream open: pick one of the row's files, then LOOP it
+          int pick = 0;
+          if (files.size() > 1)
+          {
+            std::uniform_int_distribution<int> dist(0, static_cast<int>(files.size()) - 1);
+            pick = dist(_rng);
+          }
+          std::string const path = dir + "\\" + files[pick];
+          auto* client_data = Noggit::Application::NoggitApplication::instance()->clientData();
+          if (client_data && client_data->exists(path))
+          {
+            BlizzardArchive::ClientFile file(path, client_data);
+            auto* temp = new QTemporaryFile(this);
+            if (temp->open())
+            {
+              temp->write(file.getBuffer(), file.getSize());
+              temp->close();
+              temp->rename(temp->fileName() + QString::fromStdString(files[pick]));
+              if (_amb_files[idle])
+              {
+                _amb_files[idle]->deleteLater();
+              }
+              _amb_files[idle] = temp;
+              // client target volume = the SoundEntries row's authored Volume (FUN_00460b00
+              // ramps to SOUNDDEFINITION +0x78 = that field), scaled by our ambience slider
+              _amb_dbc_vol = se.getFloat(SoundEntriesDB::Volume);
+              if (!(_amb_dbc_vol > 0.0f) || _amb_dbc_vol > 4.0f)
+              {
+                _amb_dbc_vol = 1.0f; // garbage/unauthored volume -> full
+              }
+              _amb_target_volume = std::clamp(static_cast<int>(std::lround(_amb_dbc_vol * _amb_volume)), 0, 100);
+              _amb_decks[idle]->setVolume(0); // client: instant 0, then the 5 s ramp to target
+              _amb_decks[idle]->setMedia(QUrl::fromLocalFile(temp->fileName()));
+              _amb_decks[idle]->play();
+            }
+            else
+            {
+              delete temp;
+            }
+          }
+          else
+          {
+            LogError << "Ambience: file not found '" << path << "'" << std::endl;
+          }
+        }
+      }
+      catch (...) {}
+    }
+
+    _amb_active = idle;
+    _amb_fade_timer->start(FADE_TICK_MS);
+  }
+
+  void ZoneMusicPlayer::tick_ambience_fade()
+  {
+    // Wall-clock t over the client's 5.0 s (FUN_00460b00 / FUN_007a5a10(5.0) + FUN_007a57b0(5.0)):
+    // both decks ramp linearly; late timer ticks (tile-load stalls) still land ON the line.
+    float const t = std::min(1.0f,
+                             static_cast<float>(QDateTime::currentMSecsSinceEpoch() - _amb_fade_start_ms)
+                               / 5000.0f);
+    QMediaPlayer* const in_deck = _amb_decks[_amb_active];
+    QMediaPlayer* const out_deck = _amb_decks[1 - _amb_active];
+    if (in_deck)
+    {
+      in_deck->setVolume(static_cast<int>(std::lround(_amb_target_volume * t)));
+    }
+    if (out_deck)
+    {
+      out_deck->setVolume(std::max(0, static_cast<int>(std::lround(_amb_fade_from * (1.0f - t)))));
+      if (t >= 1.0f && out_deck->state() != QMediaPlayer::StoppedState)
+      {
+        out_deck->stop();
+      }
+    }
+    if (t >= 1.0f)
+    {
+      _amb_fade_timer->stop();
+    }
   }
 }

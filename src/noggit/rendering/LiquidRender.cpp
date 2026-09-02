@@ -23,7 +23,18 @@ void LiquidRender::draw(math::frustum const& frustum
     , LiquidTextureManager* tex_manager
 )
 {
-  if (!_map_tile->Water.hasData())
+  // [finding 162] PERMANENT WATER HOLES. _has_data is recomputed in exactly ONE place -- inside the
+  // `if (_need_buffer_update)` block below -- and this early return sits above it. So the moment a
+  // tile evaluates false it can never recover: the only code that could set it true again is
+  // unreachable. A tile drawn once before its water finished parsing, or one whose buffers were
+  // re-tagged by unload(), is then skipped for the rest of the session even though its water is
+  // present and loaded. The result is per-tile water holes whose pattern depends on load timing,
+  // which is what "water is patchy / has chunk holes" looks like from the editor.
+  //
+  // Letting a PENDING BUFFER UPDATE through is what makes it recoverable: the block below re-derives
+  // _has_data from the chunks. If it is still false afterwards, _render_layers stays empty and the
+  // draw below iterates nothing, so this costs a walk of the tile's chunks and draws nothing.
+  if (!_map_tile->Water.hasData() && !_need_buffer_update)
   {
     static int logged_empty_water_tiles = 0;
     if (logged_empty_water_tiles < 20)
@@ -148,14 +159,28 @@ void LiquidRender::updateLayerData(LiquidTextureManager* tex_manager)
           auto tex_profile_it = tex_frames.find(layer.liquidID());
           if (tex_profile_it == tex_frames.end())
           {
+            // [finding 163] THE CHUNK HOLES. This used to `continue`, dropping the chunk entirely --
+            // one chunk-sized hole in the water surface for every liquid whose id has no texture
+            // profile. Turtle's custom maps use liquid ids that are not in the stock liquid tables,
+            // so whole runs of chunks vanished; stock Azeroth never hits it, which is why the parity
+            // cameras never caught it. The id only selects which TEXTURE to animate -- the surface
+            // geometry, height and depth are all already built -- so an unknown id is no reason not
+            // to draw the water. Fall back to plain water (LiquidType 1), then to whatever profile
+            // exists, and only give up if the manager has nothing at all.
+            tex_profile_it = tex_frames.find(1u);
+            if (tex_profile_it == tex_frames.end() && !tex_frames.empty())
+              tex_profile_it = tex_frames.begin();
             static int logged_missing_liquid_profiles = 0;
             if (logged_missing_liquid_profiles < 40)
             {
               LogError << "Turtle water: missing liquid profile " << layer.liquidID()
-                       << ", skipping layer chunk" << std::endl;
+                       << (tex_profile_it == tex_frames.end()
+                             ? ", and no fallback profile exists -- chunk not drawn"
+                             : ", drawing with the fallback profile") << std::endl;
               logged_missing_liquid_profiles++;
             }
-            continue;
+            if (tex_profile_it == tex_frames.end())
+              continue;
           }
 
           std::tuple<GLuint, glm::vec2, int, unsigned> const& tex_profile = tex_profile_it->second;

@@ -459,6 +459,23 @@ namespace Noggit
                 });
       }
 
+      // Client DRESSING distance cull (live): ON = small vegetation props (size classes 0-1: ferns,
+      // shrubs, grass clumps under ~4yd) cull + fade at the client's 30yd/100yd like the real client --
+      // distant vistas show bare ground instead of a green prop carpet ("grass should look brown").
+      // Trees/landmarks (classes 2-4) are NOT affected -- they keep the uniform draw distance unless
+      // the full doodad cull above is enabled. Byte-exact same FUN_00791cb0 tables; read live.
+      {
+        auto* dressing_cull_cb = new QCheckBox(tr("Client dressing distance cull (small vegetation)"), this);
+        dressing_cull_cb->setObjectName("_gv_dressing_cull_checkbox");
+        dressing_cull_cb->setChecked(_settings->value("render/gv_dressing_cull", true).toBool());
+        _perf_layout->addWidget(dressing_cull_cb);
+        connect(dressing_cull_cb, &QCheckBox::toggled, [this](bool checked)
+                {
+                  _settings->setValue("render/gv_dressing_cull", checked);
+                  _settings->sync();
+                });
+      }
+
       // Client creature distance cull (live): ON = creatures/NPCs are culled + faded by the SAME client
       // size-class table (a humanoid is class 1 -> ~100y, big creatures persist farther), exactly like the
       // client. OFF = draw creatures out to the flat creature draw distance (500y). The player character is
@@ -620,6 +637,39 @@ namespace Noggit
           _settings->sync();
         });
         form->addRow(new QLabel("Anisotropic filtering"), af);
+      }
+
+      // [VULKAN 2026-08-29] Graphics API picker (user asked for a dropdown instead of launcher env vars).
+      // 0 = OpenGL (default, the shipping renderer). 1 = Vulkan preview: the VK backend renders alongside
+      // GL and is composited into the viewport (the migration lane; passes move over one by one).
+      // 2 = Vulkan full view (dev): VK fills the viewport, GL scene draw skipped -- clay world, for fps
+      // probing only. Read ONCE at map load (MapView::initializeGL) -> takes effect on the next map open.
+      {
+        auto* api = new QComboBox();
+        api->addItem("OpenGL", 0);
+        api->addItem("Vulkan", 1);
+        // (mode 2 = bare VK full view is a DEV-ONLY checkpoint: NOGGIT_VK_FULL env, never in the UI)
+        int const cur = std::min(1, _settings->value("render/graphics_api", 0).toInt());
+        api->setCurrentIndex(std::max(0, api->findData(cur)));
+        api->setToolTip("Applies when a map is (re)opened. Vulkan falls back to OpenGL if unsupported.");
+        connect(api, QOverload<int>::of(&QComboBox::currentIndexChanged), [=](int idx)
+        {
+          _settings->setValue("render/graphics_api", api->itemData(idx).toInt());
+          _settings->sync();
+        });
+        form->addRow(new QLabel("Graphics API"), api);
+
+        // Parity harness: with the Vulkan preview, compare GL vs VK pixels every ~60 frames and log
+        // "[VK-DIFF] ..." lines (+ per-camera PNGs when nrcln/bin/Release/vk_diff_cams.txt exists).
+        auto* parity_cb = new QCheckBox("Vulkan parity check (logs [VK-DIFF], writes vk_diff\\*.png)");
+        parity_cb->setChecked(_settings->value("render/vk_parity_check", false).toBool());
+        parity_cb->setToolTip("Needs Graphics API = Vulkan (preview). Applies on next map open.");
+        connect(parity_cb, &QCheckBox::toggled, [=](bool checked)
+        {
+          _settings->setValue("render/vk_parity_check", checked);
+          _settings->sync();
+        });
+        form->addRow(parity_cb);
       }
 
       // Shadow quality: the 3.3.5a client's own extShadowQuality ladder (0-5, labels from the exe --

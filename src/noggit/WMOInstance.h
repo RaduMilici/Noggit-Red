@@ -135,6 +135,9 @@ public:
             );
 
   void intersect (math::ray const&, selection_result*, bool do_exterior = true, float max_dist = 0.0f);
+  // [doc 38 footsteps] nearest ground hit: {world distance, the hit face's authored TerrainType
+  // row} via per-triangle MOPY material -> WMOMaterial.ground_type. nullopt = miss.
+  std::optional<std::pair<float, int>> groundHit(math::ray const&, float max_dist);
   // [game mode] ray-test this WMO's OWN doodads (fences, crates, rocks placed by the WMO) --
   // per-triangle via ModelInstance::intersect. Separate from intersect() so editor selection
   // behaviour (WMO doodads are not selectable) stays unchanged.
@@ -146,7 +149,7 @@ public:
                                        std::vector<wmo_doodad_instance*>& out);
   // [game mode] world-space liquid surface height at world_pos from this WMO's group liquids
   // (BRD lava, city pools); nullopt when none covers it.
-  std::optional<float> liquidHeightAt (glm::vec3 const& world_pos);
+  std::optional<float> liquidHeightAt (glm::vec3 const& world_pos, int* out_liquid_id = nullptr);
 
   // GAMEOBJECT-owned instances aren't registered with map tiles; skip the tile-visibility gate in
   // draw() (they are frustum-culled by their gather loop instead).

@@ -69,6 +69,8 @@ public:
            , bool init_empty = false, int chunk_idx = 0, bool load_textures = true);
 
   auto getHoleMask(void) const -> unsigned { return static_cast<unsigned>(holes); }
+  // [VULKAN phase B] raw MCSH shadow map (64x64, 85 = shadowed) for the VK terrain feed
+  std::uint8_t const* vkShadowMapData() const { return _shadow_map; }
 
   // Ground clutter (detail doodads): grass/flowers/pebbles the client scatters on terrain from the
   // GroundEffectTexture/Doodad DBCs. Computed lazily on first render, cached here as (model path,
@@ -92,7 +94,16 @@ public:
   std::vector<DetailDoodad> const& detailDoodads();
   bool _detail_doodads_computed = false;
   std::vector<DetailDoodad> _detail_doodads;
+
+
+
   void computeDetailDoodads();
+  // TerrainType ROW under a world position (doc 38 footsteps): most-covering texture layer ->
+  // its MCLY effectId -> GroundEffectTexture.TerrainType. -1 when this chunk's own layers
+  // declare nothing (Blizzard leaves placeholder effect rows in places, e.g. under Stormwind);
+  // out_dominant_texture then names the texture so the caller can resolve it map-wide.
+  int groundTerrainTypeRowAt(glm::vec3 const& world_pos,
+                             std::string* out_dominant_texture = nullptr);
 
   MapTile *mt;
   glm::vec3 vmin, vmax, vcenter;

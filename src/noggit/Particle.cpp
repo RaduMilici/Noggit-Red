@@ -1,5 +1,6 @@
 // This file is part of Noggit3, licensed under GNU General Public License (version 3).
 
+#include <noggit/rendering/vulkan/VkParticleFeed.hpp>
 #include <noggit/Misc.h>
 #include <noggit/Particle.h>
 #include <noggit/Log.h>
@@ -1046,6 +1047,17 @@ void ParticleSystem::update(float dt)
         //rem = 0;
         for (int i = 0; i<tospawn; ++i) {
           Particle p = emitter->newParticle(this, manim, mtime, manimtime, w, l, spd, var, spr, spr2);
+          // World-space emission: bake the emitter's CURRENT world matrix into the particle at
+          // spawn (points and vectors); the draw then uses identity, so live particles stay put
+          // in the world while the emitter moves on (client behaviour for non-riding emitters).
+          if (_world_space_emission)
+          {
+            p.pos    = glm::vec3(_emission_base * glm::vec4(p.pos, 1.0f));
+            p.origin = glm::vec3(_emission_base * glm::vec4(p.origin, 1.0f));
+            p.speed  = glm::vec3(_emission_base * glm::vec4(p.speed, 0.0f));
+            p.dir    = glm::vec3(_emission_base * glm::vec4(p.dir, 0.0f));
+            p.down   = glm::vec3(_emission_base * glm::vec4(p.down, 0.0f));
+          }
 
           // TEMP [PARTDBG]: where does Noggit actually attach/spawn each Anomalus emitter? Logs the bone's
           // world (model-local) position, the spawned particle position + emission direction, per emitter.
@@ -1110,6 +1122,13 @@ void ParticleSystem::update(float dt)
       mspeed = 1.0f;
     }
     p.pos += p.speed * mspeed * dt;
+
+    // World-space particles die at the kill plane (the liquid surface): bubbles POP there like
+    // the client's, never rising into open air above the water.
+    if (_world_space_emission && p.pos.y > _kill_plane_y)
+    {
+      p.life = p.maxlife + 1.0f;
+    }
 
     p.life += dt;
     float rlife = p.life / p.maxlife;
@@ -1703,6 +1722,63 @@ void ParticleSystem::draw( glm::mat4x4 const& model_view
     }
   }
 
+  // [VULKAN phase G] mirror this emitter draw for the VK particle pipeline. GL keeps its own
+  // upload below untouched; this only appends to the frame's feed.
+  {
+    auto& feed = Noggit::Rendering::VK::particleFeed();
+    auto const& ctx = Noggit::Rendering::VK::particleDrawContext();
+    bool const use_offsets_vk = billboard || type == 1 || type == 2;
+    if (!ctx.valid || vertices.empty() || indices.empty()
+        || colors_data.size() != vertices.size() || texcoords.size() != vertices.size()
+        || (use_offsets_vk && offsets.size() != vertices.size()))
+    {
+      ++feed.skipped;   // instanced / desynced emitter draws stay GL-only (tracked TODO)
+    }
+    else
+    {
+      glm::mat4x4 xform;
+      std::memcpy(&xform[0][0], ctx.transform, sizeof(ctx.transform));
+      // Emitter flag 0x8: particle size scales with the model scale (m2_vert scale_with_instance).
+      float const inst_scale = (flags & 0x8) ? glm::length(glm::vec3(xform[0])) : 1.0f;
+
+      Noggit::Rendering::VK::ParticleFeed::Draw d;
+      d.first_index = static_cast<std::uint32_t>(feed.indices.size());
+      d.index_count = static_cast<std::uint32_t>(indices.size());
+      d.base_vertex = static_cast<std::int32_t>(feed.vertices.size() / 9u);
+      d.blend = static_cast<int>(blend);
+      d.alpha_test = alpha_test;
+      d.alpha_mod = ctx.alpha_mod;
+      if (_texture_id < model->_textures.size())
+      {
+        auto const& t = model->_textures[_texture_id];
+        d.blp = t->file_key().hasFilepath() ? t->file_key().filepath() : std::string();
+      }
+
+      feed.vertices.reserve(feed.vertices.size() + vertices.size() * 9u);
+      for (std::size_t i = 0; i < vertices.size(); ++i)
+      {
+        glm::vec4 p = xform * glm::vec4(vertices[i], 1.f);
+        if (use_offsets_vk)
+          p += glm::vec4(offsets[i] * inst_scale, 0.f);
+        feed.vertices.push_back(p.x); feed.vertices.push_back(p.y); feed.vertices.push_back(p.z);
+        feed.vertices.push_back(texcoords[i].x); feed.vertices.push_back(texcoords[i].y);
+        feed.vertices.push_back(colors_data[i].x); feed.vertices.push_back(colors_data[i].y);
+        feed.vertices.push_back(colors_data[i].z); feed.vertices.push_back(colors_data[i].w);
+      }
+      for (std::uint16_t idx : indices)
+        feed.indices.push_back(idx);
+      feed.draws.push_back(std::move(d));
+    }
+  }
+  if (Noggit::Rendering::VK::vkOwnsParticles())
+  {
+    return;   // Vulkan draws this emitter
+  }
+
+  // [PIPELINE scope] counted AFTER the gate: this is a real GL emitter draw. Counting at
+  // ModelRender::drawParticles' entry instead reported 20-35/frame for emitters Vulkan owns and
+  // never drew -- the same call-vs-draw error as the WMO counter (finding 65).
+  { extern unsigned g_gl_draw_particles; ++g_gl_draw_particles; }
   gl.bufferData<GL_ARRAY_BUFFER, glm::vec3>(_vertices_vbo, vertices, GL_STREAM_DRAW);
   gl.bufferData<GL_ARRAY_BUFFER, glm::vec4>(_colors_vbo, colors_data, GL_STREAM_DRAW);
   gl.bufferData<GL_ARRAY_BUFFER, glm::vec2>(_texcoord_vbo, texcoords, GL_STREAM_DRAW);
@@ -2455,6 +2531,70 @@ void RibbonEmitter::draw( OpenGL::Scoped::use_program& shader
       continue;
     }
     add_quad_indices(indices, indice);
+  }
+
+  // [VULKAN phase G] mirror the trail. Ribbons are the same shape of work as particles -- world-space
+  // quads, one texture, one blend mode per pass -- so they ride the SAME feed and pipelines, flagged
+  // so the fragment stage skips the particle-only black-fringe divide.
+  {
+    auto& feed = Noggit::Rendering::VK::particleFeed();
+    auto const& rctx = Noggit::Rendering::VK::ribbonDrawContext();
+    std::size_t const inst = rctx.valid ? rctx.transforms.size() / 16u : 0u;
+    if (!inst || vertices.empty() || indices.empty() || texcoords.size() != vertices.size())
+    {
+      if (!vertices.empty() && !indices.empty())
+        ++feed.skipped;
+    }
+    else
+    {
+      std::size_t const n_passes_vk = std::max<std::size_t>(_texture_ids.size(), 1);
+      for (std::size_t inst_i = 0; inst_i < inst; ++inst_i)
+      {
+        glm::mat4x4 xform;
+        std::memcpy(&xform[0][0], rctx.transforms.data() + inst_i * 16u, 16u * sizeof(float));
+        std::int32_t const base_vertex = static_cast<std::int32_t>(feed.vertices.size() / 9u);
+        for (std::size_t i = 0; i < vertices.size(); ++i)
+        {
+          glm::vec4 const p = xform * glm::vec4(vertices[i], 1.f);
+          feed.vertices.push_back(p.x); feed.vertices.push_back(p.y); feed.vertices.push_back(p.z);
+          feed.vertices.push_back(texcoords[i].x); feed.vertices.push_back(texcoords[i].y);
+          feed.vertices.push_back(tcolor.x); feed.vertices.push_back(tcolor.y);
+          feed.vertices.push_back(tcolor.z); feed.vertices.push_back(tcolor.w);
+        }
+        std::uint32_t const first_index = static_cast<std::uint32_t>(feed.indices.size());
+        for (std::uint16_t idx : indices)
+          feed.indices.push_back(idx);
+
+        for (std::size_t pass = 0; pass < n_passes_vk; ++pass)
+        {
+          Noggit::Rendering::VK::ParticleFeed::Draw d;
+          d.first_index = first_index;
+          d.index_count = static_cast<std::uint32_t>(indices.size());
+          d.base_vertex = base_vertex;
+          d.alpha_test = 0.f;
+          d.alpha_mod = 1.f;
+          d.ribbon = true;
+          int blend_vk = 4;
+          if (!_material_ids.empty())
+          {
+            std::uint16_t const mid = _material_ids[std::min(pass, _material_ids.size() - 1)];
+            if (mid < model->_render_flags.size())
+              blend_vk = static_cast<int>(model->_render_flags[mid].blend);
+          }
+          d.blend = blend_vk;
+          if (pass < _texture_ids.size() && _texture_ids[pass] < model->_textures.size())
+          {
+            auto const& t = model->_textures[_texture_ids[pass]];
+            d.blp = t->file_key().hasFilepath() ? t->file_key().filepath() : std::string();
+          }
+          feed.draws.push_back(std::move(d));
+        }
+      }
+    }
+  }
+  if (Noggit::Rendering::VK::vkOwnsRibbons())
+  {
+    return;   // Vulkan draws this trail
   }
 
   gl.bufferData<GL_ARRAY_BUFFER, glm::vec3>(_vertices_vbo, vertices, GL_STREAM_DRAW);

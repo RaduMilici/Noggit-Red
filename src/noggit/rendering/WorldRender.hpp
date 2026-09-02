@@ -61,19 +61,172 @@ namespace Noggit::Rendering
   public:
     WorldRender(World* world);
 
+    // [VULKAN phase A, 2026-08-29] optional compose hook: called by draw() right after the scene target
+    // (MSAA/bloom FBO or the Qt framebuffer) has been cleared and BEFORE any scene geometry. MapView uses
+    // it to write the Vulkan-rendered colour + depth as the base layer so the GL passes depth-test over
+    // it (VK content sits UNDER the normal editor view). Null = no-op. Only for the main 3D viewport.
+    std::function<void()> pre_scene_compose;
+    // [VULKAN phase B] pass ownership gates. When a pass is owned by VK, draw() SKIPS the GL pass (the GL
+    // code stays intact and runs unchanged with Graphics API = OpenGL -- gate, never delete).
+    bool vk_owns_terrain = false;
+    // [phase I] VK mode was rendering the WHOLE SCENE TWICE. VK drew terrain, WMO, M2, water, sky,
+    // clouds and particles, but on the GL side only terrain/WMO/sky/clouds/particles/celestials were
+    // ever gated off -- the M2 and water passes had NO gate at all, so both APIs drew every model and
+    // every water surface every frame, with a full CPU sync in between. The parity harness could not
+    // see it: parity mode deliberately keeps the full GL scene as the reference image.
+    //
+    // These gate GL's DRAW only. The recording side effects stay, because the VK feed is built out of
+    // them -- same rule as g_vk_owns_wmo.
+    bool vk_owns_m2 = false;
+    // [phase J] The VK feeds (vkFeedClassicBucket / vkFeedWmoInstance / the terrain+water collect)
+    // ran unconditionally inside WorldRender::draw -- including in PURE GL MODE, where nothing ever
+    // consumes them. That is a per-frame tax on the GL baseline for buckets no one reads. Set true
+    // only when the VK path (or parity, which needs both) will actually consume this frame's feeds.
+    bool vk_feeding = false;
+    bool vk_owns_water = false;
+    // read-only view of the per-frame lighting/fog block so the VK backend renders with the same numbers
+    OpenGL::LightingUniformBlock const& lightingBlock() const { return _lighting_ubo_data; }
+    // [VULKAN phase B] sun band (LightIntBand 9) = the terrain specular colour GL feeds sun_spec_color
+    glm::vec3 sunSpecColor() const;
+
+    // [VULKAN phase C] CPU mirror of the MDI geometry arena + the per-frame batch streams, so the Vulkan
+    // backend can draw the SAME batches from the SAME offsets GL's indirect commands use. Filled by
+    // mdiEnsureModelInArena / drawDynamicBatched; consumed by MapView's VK block. GL is unaffected.
+    std::vector<unsigned char> const& mdiMirrorVertices() const { return _mdi_mirror_verts; }
+    std::vector<std::uint16_t> const& mdiMirrorIndices() const { return _mdi_mirror_idx; }
+    bool mdiMirrorDirty() const { return _mdi_mirror_dirty; }
+    void clearMdiMirrorDirty() { _mdi_mirror_dirty = false; }
+    // [VULKAN] per-frame SNAPSHOT of every M2 producer's output. The scratch arrays below are
+    // cleared by each producer in turn (drawPibBatched runs last and wiped the classic feed), so VK
+    // reads this accumulated copy instead.
+    void vkM2SnapshotClear();
+    void vkM2SnapshotAppend();
+    std::vector<glm::mat4x4> const& vkM2Transforms() const { return _vk_m2_tf; }
+    std::vector<glm::vec4> const& vkM2Interiors() const { return _vk_m2_interior; }
+    std::vector<glm::ivec4> const& vkM2TexInfo() const { return _vk_m2_tex; }
+    std::vector<int> const& vkM2BlpIndex() const { return _vk_m2_blp_idx; }
+    std::vector<glm::ivec4> const& vkM2State() const { return _vk_m2_state; }
+    std::vector<glm::mat4x4> const& vkM2Bones() const { return _vk_m2_bones; }
+    std::vector<OpenGL::DrawElementsIndirectCommand> const& vkM2Commands() const { return _vk_m2_cmds; }
+    std::vector<glm::ivec4> const& vkM2Groups() const { return _vk_m2_groups; }
+    LiquidTextureManager const& liquidTextureManager() const { return _liquid_texture_manager; }
+    // [VULKAN] every visible WMO liquid this frame: (groups, instance transform). VK appends
+    // these to the ADT water mesh so one pipeline draws both.
+    struct VkWmoLiquidRef { std::vector<WMOGroup*> groups; glm::mat4x4 transform; };
+    std::vector<VkWmoLiquidRef> const& vkWmoLiquids() const { return _vk_wmo_liquids; }
+
+    // [phase F] every celestial billboard this frame, in the order GL issues them. Positions are
+    // camera-relative; MapView resolves `blp` to a bindless id and hands the list to Vulkan.
+    struct VkCelestial
+    {
+      glm::vec3 center_rel;
+      float half_size;
+      glm::vec3 right;
+      float opacity;
+      glm::vec3 up;
+      glm::vec3 color;
+      bool additive;
+      std::string blp;
+    };
+    std::vector<VkCelestial> const& vkCelestials() const { return _vk_celestials; }
+    // groundEffectDist for this frame -- the client's per-vertex clutter fade ramp needs it.
+    float vkClutterDetailDist() const { return _vk_clutter_detail_dist; }
+    void setVkOwnsCelestials(bool v) { _vk_owns_celestials = v; }
+    void vkClearWmoLiquids() { _vk_wmo_liquids.clear(); }
+    // celestial disc direction -- GL feeds it to the liquid shader as `sheen_dir`
+    glm::vec3 celestialDirForVk() const { return _skies ? _skies->celestial_dir() : glm::vec3(0.f, 1.f, 0.f); }
+    std::vector<std::pair<std::string, std::string>> const& vkM2BlpPairs() const { return _vk_m2_blp_pairs; }
+    int vkM2BlpPairIndex(std::string const& a, std::string const& b);
+
+    std::vector<glm::mat4x4> const& batchInstanceTransforms() const { return _pib_scratch_tf; }
+    std::vector<glm::vec4> const& batchInstanceInteriors() const { return _pib_scratch_interior; }
+    std::vector<glm::ivec4> const& batchInstanceTexInfo() const { return _pib_scratch_tex; }
+    std::vector<glm::mat4x4> const& batchBones() const { return _pib_scratch_bones; }
+    std::vector<OpenGL::DrawElementsIndirectCommand> const& batchDrawCommands() const { return _pib_scratch_cmds; }
+    // parallel to batchInstanceTexInfo(): index into batchBlpPairs() for that instance's textures
+    std::vector<int> const& batchInstanceBlpIndex() const { return _pib_scratch_blp_idx; }
+    std::vector<glm::ivec4> const& batchInstanceState() const { return _pib_scratch_state; }
+    // per DRAW GROUP: (blend_mode, backface_cull, first_cmd, cmd_count) -- the same grouping the
+    // GL path uses to switch blend/cull state, so VK can bind one pipeline per group.
+    std::vector<glm::ivec4> const& batchDrawGroups() const { return _pib_scratch_groups; }
+    // the per-pixel object-cull distance this batch set pushed into the GL `slice_dist` uniform
+    float batchSliceDist() const { return _pib_scratch_slice; }
+    // which batch function last filled these arrays (diagnostic): 1 pib, 2 dynamic, 3 creatures,
+    // 4 creature bodies -- VK feeds from whatever ran last in the frame
+    int batchSource() const { return _pib_scratch_src; }
+    // how many draw commands that function actually ISSUED to GL (0 = built but not drawn)
+    std::size_t batchIssued() const { return _pib_scratch_issued; }
+    // the OTHER doodad path (_mdi_buffers, per-class cull): commands GL issued from it this frame.
+    // VK is fed only the _pib_* batches, so anything drawn here is GL-only geometry.
+    std::size_t mdiIssued() const { return _mdi_issued; }
+    // the CLASSIC per-model instanced loop (m2_shader) -- also GL-only, also unseen by VK
+    std::size_t classicIssued() const { return _classic_issued; }
+    // how many classic-path instances were additionally handed to VK this frame
+    std::size_t vkClassicFed() const { return _vk_classic_fed; }
+    // instances the VK feed could NOT represent this frame, by reason. Phase C is done only
+    // when these are zero -- they are the remaining GL-only geometry.
+    // ---- [VULKAN phase D] WMO feed ----
+    struct VkWmoDraw
+    {
+      std::uint32_t index_count = 0;
+      std::uint32_t first_index = 0;
+      std::int32_t  base_vertex = 0;
+      std::uint32_t xform_index = 0;   // into vkWmoTransforms()
+      std::int32_t  blend_mode = 0;
+      std::int32_t  backface_cull = 0;
+    };
+    // one record per arena batch: (blp pair index, shader, flags, alpha test mode)
+    std::vector<glm::ivec4> const& vkWmoBatches() const { return _vk_wmo_batches; }
+    std::vector<std::pair<std::string, std::string>> const& vkWmoBlpPairs() const { return _vk_wmo_blp_pairs; }
+    bool vkWmoBatchesDirty() const { return _vk_wmo_batches_dirty; }
+    void clearVkWmoBatchesDirty() { _vk_wmo_batches_dirty = false; }
+    std::vector<Noggit::Rendering::VkWmoVertex> const& vkWmoArenaVertices() const { return _vk_wmo_verts; }
+    std::vector<std::uint16_t> const& vkWmoArenaIndices() const { return _vk_wmo_idx; }
+    bool vkWmoArenaDirty() const { return _vk_wmo_arena_dirty; }
+    void clearVkWmoArenaDirty() { _vk_wmo_arena_dirty = false; }
+    std::vector<VkWmoDraw> const& vkWmoDraws() const { return _vk_wmo_draws; }
+    std::vector<glm::mat4x4> const& vkWmoTransforms() const { return _vk_wmo_xforms; }
+    // MOHD ambient per visible instance, parallel to vkWmoTransforms()
+    std::vector<glm::vec4> const& vkWmoAmbients() const { return _vk_wmo_ambients; }
+    // instances whose groups could not be represented yet (open TODO, must reach zero)
+    std::size_t vkWmoFallback() const { return _vk_wmo_fallback; }
+    // what GL issued for WMOs this frame -- the VK feed is only trustworthy while these track
+    std::size_t glWmoDrawCalls() const;
+    void vkFeedWmoInstance(WMOInstance* instance);
+    void vkResetWmoFrame();
+    // set by MapView when the VK backend has a working WMO pipeline: GL then records its runs
+    // for the feed but stops drawing them (the VK compose already supplied those pixels)
+    void setVkOwnsWmo(bool v) { _vk_owns_wmo = v; }
+
+    std::size_t vkFallbackPass() const { return _vk_fb_pass; }
+    std::size_t vkFallbackArena() const { return _vk_fb_arena; }
+    std::size_t vkFallbackEmpty() const { return _vk_fb_empty; }
+    std::vector<std::string> const& vkFallbackNames() const { return _vk_fb_names; }
+    std::vector<std::pair<std::string, std::string>> const& batchBlpPairs() const { return _pib_batch_blps; }
+
     void upload() override;
     void unload() override;
+    // Listener-submerged state for the audio layer (ambience underwater override, doc 38).
+    bool camera_underwater() const { return _camera_underwater; }
 
     // True while the camera is inside a WMO this frame (cached in draw()). Read by WMORender to route WMO
     // exterior-lit / portal-spill faces to the WMO's interior context instead of the outdoor map light.
     bool cameraInsideWmo() const { return _camera_inside_wmo; }
 
+
     // Called by WMORender instead of drawing its liquid inline -- see _deferred_wmo_liquid.
     void queueWmoLiquid(std::vector<WMOGroup*> groups, glm::mat4x4 const& transform,
                         bool interior_only, bool draw_fog)
     {
+      // [VULKAN] keep a copy for the VK water feed: _deferred_wmo_liquid is flushed and CLEARED
+      // inside the same frame's water phase, so MapView's next-frame read always saw it empty.
+      _vk_wmo_liquids.push_back({ groups, transform });
       _deferred_wmo_liquid.push_back({std::move(groups), transform, interior_only, draw_fog});
     }
+
+    // [PIPELINE step 1] Replay the buckets Vulkan refused, on the render thread, after draw().
+    // No-op when nothing was deferred (the usual case is a handful of all-hidden-geoset models).
+    void drawDeferredGlFallback();
 
     void draw (glm::mat4x4 const& model_view
         , glm::mat4x4 const& projection
@@ -377,7 +530,99 @@ namespace Noggit::Rendering
     std::unique_ptr<scoped_blp_texture_reference> _sun_glare_texture;  // textures/sunGlare.blp (sun corona/rays)
     glm::vec2 _sun_screen_uv{0.5f, 0.5f}; // sun projected to screen [0,1], for the sunshaft pass
     float _sun_shaft_strength = 0.0f;     // view-alignment-faded strength; 0 = sun off-screen/behind
-    GLuint _bloom_scene_fbo = 0, _bloom_scene_color = 0, _bloom_scene_depth = 0;
+    // [VULKAN phase C] MDI arena mirror (see mdiMirrorVertices)
+    static glm::ivec4 batchStateVec(StaticBatchKey const& k);
+    // [VULKAN phase C] append one classic-path bucket to the VK feed arrays (GL untouched)
+    // Returns TRUE when Vulkan actually took this bucket, so the caller can skip GL's draw for it.
+    // A bucket VK rejected (unresolved pass, arena failure) must still be drawn by GL.
+    bool vkFeedClassicBucket(Model* m, std::vector<glm::mat4x4> const& transforms,
+                             std::vector<glm::vec4> const* interiors);
+    int batchBlpPairIndex(std::string const& blp0, std::string const& blp1);
+    // [VULKAN phase C] per-instance BATCH STATE for the VK shader: x = blend_mode, y = flag bits
+    // (0 unlit, 1 unfogged, 2 classic_alpha era, 3 backface_cull), z = pixel_shader, w = tu lookups.
+    std::vector<glm::ivec4> _pib_scratch_state;
+    std::vector<glm::ivec4> _pib_scratch_groups;
+
+    std::vector<glm::mat4x4> _vk_m2_tf;
+    std::vector<glm::vec4> _vk_m2_interior;
+    std::vector<glm::ivec4> _vk_m2_tex;
+    std::vector<int> _vk_m2_blp_idx;
+    std::vector<glm::ivec4> _vk_m2_state;
+    std::vector<glm::mat4x4> _vk_m2_bones;
+    std::vector<OpenGL::DrawElementsIndirectCommand> _vk_m2_cmds;
+    std::vector<glm::ivec4> _vk_m2_groups;
+    std::vector<std::pair<std::string, std::string>> _vk_m2_blp_pairs;
+    // index OF the pair table -- the linear scan it replaces was O(batches x pairs) string
+    // compares every frame, and the table grows as more of the world is visited.
+    std::unordered_map<std::string, int> _vk_m2_blp_pair_index;
+    float _pib_scratch_slice = 0.f;
+    int _pib_scratch_src = 0;
+    std::size_t _pib_scratch_issued = 0;
+    std::size_t _mdi_issued = 0;
+    std::size_t _classic_issued = 0;
+    std::size_t _vk_classic_fed = 0;
+    std::size_t _vk_fb_pass = 0, _vk_fb_arena = 0, _vk_fb_empty = 0;
+    std::size_t _vk_gl_still_drew = 0;   // instances GL drew anyway while VK owned M2
+    std::size_t _vk_fb_hidden = 0;       // declined because every pass is a hidden geoset
+    bool _vk_last_feed_nothing = false;  // last feed declined AND had nothing visible to draw
+
+    // [PIPELINE step 1] Buckets Vulkan refuses are drawn by GL from INSIDE the traversal today, which
+    // is the one thing stopping the traversal from moving off the render thread (GL calls are not
+    // legal there). Collect them instead and replay them on the render thread after the walk. They
+    // cannot simply be dropped: see finding 54, that loses ~230 pixels.
+    struct VkGlDeferredBucket
+    {
+      Model* model = nullptr;
+      std::vector<glm::mat4x4> transforms;
+      std::vector<glm::vec4> interiors;
+      std::vector<float> fades;
+      // the bucket's own slice_dist -- hardcoding 0 here disables the distance slice and draws
+      // models that should have been sliced out (worth ~75 pixels, caught by the static check)
+      float slice_dist = 0.0f;
+    };
+    std::vector<VkGlDeferredBucket> _vk_gl_deferred;
+    // Per-INSTANCE doodads Vulkan refused. Separate list because these replay through the
+    // non-instanced `draw(model_view, ModelInstance&, ...)` overload under _m2_program, not the
+    // instanced one the bucket list uses.
+    struct VkGlDeferredInstance
+    {
+      Model* model = nullptr;
+      ModelInstance* instance = nullptr;
+      glm::vec4 interior{0.0f};
+    };
+    std::vector<VkGlDeferredInstance> _vk_gl_deferred_pi;
+    // traversal context the replay needs, stashed once per frame
+    glm::mat4x4 _vk_def_model_view{1.0f};
+    // the MVP the frustum is built from -- math::frustum is only forward-declared here, so store the
+    // matrix and rebuild it at replay time (that is all its constructor takes anyway)
+    glm::mat4x4 _vk_def_mvp{1.0f};
+    glm::vec3 _vk_def_camera_pos{0.0f};
+    display_mode _vk_def_display = display_mode::in_3D;
+    bool _vk_def_boxes = false;
+    std::vector<std::string> _vk_fb_names;   // this frame's GL-only models (why + path)
+
+    // [VULKAN phase D] WMO arena (append-only, keyed by wmo file + group index) and per-frame feed
+    struct VkWmoSlot { std::int32_t base_vertex = 0; std::uint32_t index_base = 0;
+                       std::uint32_t batch_base = 0; bool ok = false; };
+    std::vector<glm::ivec4> _vk_wmo_batches;
+    std::vector<std::pair<std::string, std::string>> _vk_wmo_blp_pairs;
+    bool _vk_wmo_batches_dirty = false;
+    bool _vk_owns_wmo = false;
+    int vkWmoBlpPairIndex(std::string const& a, std::string const& b);
+    std::unordered_map<std::string, VkWmoSlot> _vk_wmo_slots;
+    std::vector<Noggit::Rendering::VkWmoVertex> _vk_wmo_verts;
+    std::vector<std::uint16_t> _vk_wmo_idx;
+    bool _vk_wmo_arena_dirty = false;
+    std::vector<VkWmoDraw> _vk_wmo_draws;
+    std::vector<glm::mat4x4> _vk_wmo_xforms;
+    std::vector<glm::vec4> _vk_wmo_ambients;
+    std::size_t _vk_wmo_fallback = 0;
+    std::vector<int> _pib_scratch_blp_idx;
+    std::vector<std::pair<std::string, std::string>> _pib_batch_blps;
+        std::vector<unsigned char> _mdi_mirror_verts;
+    std::vector<std::uint16_t> _mdi_mirror_idx;
+    bool _mdi_mirror_dirty = false;
+        GLuint _bloom_scene_fbo = 0, _bloom_scene_color = 0, _bloom_scene_depth = 0;
     // MSAA: the scene renders into multisampled renderbuffers (when render/msaa > 0) and is resolved
     // into _bloom_scene_color before the bloom chain. 0 = off.
     GLuint _msaa_fbo = 0, _msaa_color_rb = 0, _msaa_depth_rb = 0;
@@ -421,6 +666,11 @@ namespace Noggit::Rendering
     Noggit::Rendering::Primitives::Circle _circle_render;
     Noggit::Rendering::Primitives::PathDecal _path_decal_render; // creature patrol routes
     Noggit::Rendering::Primitives::WeatherEffect _weather_effect; // rain / snow precipitation
+    Noggit::Rendering::Primitives::WeatherEffect _underwater_motes; // waterParticulates when submerged
+    Noggit::Rendering::Primitives::WaterRipples _water_ripples;   // surface wake/splash rings
+    bool _camera_underwater = false; // cached each frame in updateLightingUniformBlock
+    int _camera_liquid_family = -1;  // while submerged: 0 water, 1 ocean, 2 magma, 3 slime (else -1)
+    float _camera_liquid_surface_y = 0.0f; // surface height of the covering liquid while submerged
     // GEOMETRY-MODEL particle models (checklist 12.2), lazily loaded + cached by normalized path.
     std::unordered_map<std::string, scoped_model_reference> _geometry_particle_models;
 
@@ -550,6 +800,14 @@ namespace Noggit::Rendering
     PointLightRegistry _point_light_registry;
     bool _point_lights_scoped = false; // true while the UBO carries a WMO group's MOLR set
     bool _camera_inside_wmo = false;   // cached per frame; drives the WMO shader's camera_inside_wmo uniform
+    // Camera's smallest containing WMO group is a TRUE interior (MOGP indoor, not exterior-lit):
+    // suppresses precipitation (client behaviour: no rain/snow inside buildings; exterior city
+    // groups and open ext-lit channels keep raining). Valid only while _camera_inside_wmo.
+    bool _camera_in_indoor_group = false;
+    // Wobble warp+veil weight: BINARY (1 underwater, 0 above). The old ~5 s ease was a derived
+    // invention and is REMOVED (user 2026-08-27 "nothing guessed"; the decompiled "5 s fade"
+    // FUN_00460b00 is the AUDIO ambience volume -- doc 37 rounds 52/56/56b).
+    float _uw_ffx_weight = 0.0f;
     float _camera_wmo_interior_factor = 0.0f; // continuous 0..1 = depth into the WMO room over the fog falloff
                                               // band; blends the interior fog in by distance (client-spatial)
                                               // instead of the binary _camera_inside_wmo snap
@@ -581,6 +839,10 @@ namespace Noggit::Rendering
       bool draw_fog;
     };
     std::vector<DeferredWmoLiquid> _deferred_wmo_liquid;
+    std::vector<VkWmoLiquidRef> _vk_wmo_liquids;   // persists past the deferred flush, for VK
+    std::vector<VkCelestial> _vk_celestials;
+    float _vk_clutter_detail_dist = 0.f;
+    bool _vk_owns_celestials = false;
 
     bool _need_terrain_params_ubo_update = false;
   };

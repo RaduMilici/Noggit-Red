@@ -44,6 +44,7 @@ struct scoped_blp_texture_reference;
 struct blp_texture : public AsyncObject
 {
   blp_texture (BlizzardArchive::Listfile::FileKey const& filename, Noggit::NoggitRenderContext context);
+  ~blp_texture(); // releases this texture's array layer back to its class free-list (see below)
   void finishLoading() override;
   virtual void waitForChildrenLoaded() override {};
   char const* async_object_type_name() const override { return "blp_texture"; }
@@ -93,18 +94,30 @@ private:
   std::optional<GLint> _compression_format;
   int _array_index = -1;
   GLuint _texture_array = 0;
+  // [mem 2026-08-26] which (format,w,h,mips) class + flat slot this texture occupies, so the
+  // destructor / unload() can RECYCLE the layer. Layers were append-only: every unique texture
+  // ever seen kept its slot for the whole session (n_used only grew), so long sessions leaked
+  // VRAM+driver RAM monotonically -- the "noggit eats all the RAM" hog.
+  std::optional<std::tuple<GLint, int, int, int>> _array_class;
+  int _array_slot = -1;
+  void release_array_slot();
 };
 
 struct TexArrayParams
 {
   std::vector<GLuint> arrays;
   int n_used = 0;
+  // [mem 2026-08-26] recycled flat slots (array_idx * N_ARRAY_TEX + layer) released by dead
+  // textures; upload() takes from here before growing n_used. All access on the GL thread.
+  std::vector<int> free_slots;
 };
 
 class TextureManager
 {
 public:
   static void report();
+  // [VULKAN phase B] public wrapper: decode a BLP to RGBA mips for the VK texture cache (no GL upload)
+  static bool vk_load_raw(std::string const& filename, Noggit::NoggitRenderContext context, int& width, int& height, std::map<int, std::vector<uint32_t>>& data) { return load_raw_texture(filename, context, width, height, data); }
   static void unload_all(Noggit::NoggitRenderContext context);
   static void register_raw_texture(std::string const& filename, Noggit::NoggitRenderContext context, int width, int height, std::vector<uint32_t> data);
   static TexArrayParams& get_tex_array(int width, int height, int mip_level, Noggit::NoggitRenderContext context);
@@ -112,6 +125,9 @@ public:
   // Live-apply the render/anisotropic_filtering setting to every already-uploaded array (models,
   // particles, tilesets). Needs a current GL context; called from WorldRender::draw on a change.
   static void reapply_anisotropy();
+  // [mem 2026-08-26] return a dead texture's array layer to its class free-list (GL thread only).
+  static void release_layer(Noggit::NoggitRenderContext context,
+                            std::tuple<GLint, int, int, int> const& klass, int slot);
   static std::size_t loaded_count() { return _.size(); } // [mem-diag]
 
 private:
@@ -124,7 +140,7 @@ private:
     std::vector<uint32_t> data;
   };
   static bool load_raw_texture(std::string const& filename, Noggit::NoggitRenderContext context, int& width, int& height, std::map<int, std::vector<uint32_t>>& data);
-  static Noggit::AsyncObjectMultimap<blp_texture> _;
+  static Noggit::AsyncObjectMultimap<blp_texture>& _;   // leaked on purpose, see TextureManager.cpp
   static std::array<std::unordered_map<std::tuple<GLint, int, int, int>, TexArrayParams, tuple_hash>, 7> _tex_arrays;
   static std::map<std::pair<std::string, int>, raw_texture_data> _raw_textures;
   static std::mutex _raw_textures_mutex;

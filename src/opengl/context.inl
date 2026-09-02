@@ -33,6 +33,11 @@ namespace
       , _function (function)
       , _extra_info (extra_info)
     {
+      if (OpenGL::gl_call_count_on())   // finding 92; off by default
+      {
+        ++OpenGL::gl_call_count();
+        if (OpenGL::gl_call_histo_on()) { ++OpenGL::gl_call_histo()[function]; }
+      }
       if (!_current_context)
       {
         throw std::runtime_error (std::string(_function) + ": called without active OpenGL context: no context at all");

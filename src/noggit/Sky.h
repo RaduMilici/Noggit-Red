@@ -122,11 +122,16 @@ public:
 
   glm::vec3 colorFor(int r, int t) const;
   float floatParamFor(int r, int t) const;
+  // Like floatParamFor, but never the *_WATER param variant: CLEAR_WATER reads CLEAR, STORM_WATER
+  // reads STORM. Cloud coverage uses this (user 2026-08-26: submerging emptied the CLEAR_WATER
+  // cloud-density band -> the row-budgeted cloud regen wiped back in slices on surfacing).
+  float floatParamForAirVariant(int r, int t) const;
 
-private:
   // Evaluate a band on an EXPLICIT param set (nullptr falls back like an unauthored band). colorFor/
   // floatParamFor blend the current (clear) set toward the STORM set by the global weather intensity —
   // the client's rainy-weather light change (Light.dbc authors clear/storm/... param ids per light).
+  // PUBLIC: Skies::update_sky_colors also evaluates the WATER param's river-deep band with it (the
+  // exterior WMO water colour).
   glm::vec3 colorFromParam(SkyParam const* param, int r, int t) const;
   float floatFromParam(SkyParam const* param, int r, int t) const;
 
@@ -264,6 +269,13 @@ public:
   // from the editor's weather control.
   static void set_weather_intensity(float w);
   static float weather_intensity();
+
+  // The CLEAR_WATER param's RIVER_COLOR_DARK band, weighted across the active lights each frame --
+  // the flat colour the client paints exterior WMO liquid with (canal dark blue). Statics so
+  // wmo_liquid::draw can read it without threading it through the draw chain (same pattern as the
+  // weather intensity).
+  static void set_water_river_dark(glm::vec3 const& c);
+  static glm::vec3 water_river_dark();
   void setAreaLightId(int light_id);
   void update_sky_colors(glm::vec3 pos, int time);
 
@@ -319,6 +331,43 @@ public:
   // Sun (day) / moon (night) direction for the procedural cloud lighting -- fed each frame by
   // WorldRender (which owns the celestial arc); one frame of lag is irrelevant.
   void set_celestial_dir(glm::vec3 const& d) { _celestial_dir = d; }
+  glm::vec3 const& celestial_dir() const { return _celestial_dir; } // water glitter keys on the drawn disc
+
+  // [VULKAN] gradient-dome mirror. GL uploads these straight into its VBOs from locals; VK needs the
+  // same arrays to build its own buffers. Positions/indices are static (built once in upload());
+  // colours are re-derived whenever the zone light changes, which raises _vk_sky_dirty.
+  std::vector<glm::vec3> const& vkDomeVertices() const { return _vk_dome_verts; }
+  std::vector<glm::vec3> const& vkDomeColors() const { return _vk_dome_colors; }
+  std::vector<std::uint16_t> const& vkDomeIndices() const { return _vk_dome_indices; }
+  bool vkDomeDirty() const { return _vk_sky_dirty; }
+  // Set while Vulkan draws the gradient dome, so GL skips ITS dome draw (and only that -- the
+  // clouds, skybox, sun/moon and stars are still GL passes). Never set in parity mode: the
+  // reference image has to keep rendering the full GL scene.
+  void setVkOwnsDome(bool v) { _vk_owns_dome = v; }
+  // The compose needs this: when VK owns the dome, GL draws no sky, so the compose must not discard
+  // VK's far-plane pixels (the dome writes no depth and so sits at 1.0).
+  [[nodiscard]] bool vkOwnsDome() const { return _vk_owns_dome; }
+
+  // Cloud deck mirror: the cap mesh is static, the 128x128 RGBA texture is re-generated on a
+  // 0.1s timer (tick_clouds) and the opacity follows the render/cloud_density setting.
+  std::vector<float> const& vkCloudVertices() const { return _vk_cloud_verts; }
+  std::vector<std::uint16_t> const& vkCloudIndices() const { return _vk_cloud_indices; }
+  std::vector<std::uint8_t> const& vkCloudRgba() const { return _clouds.rgba; }
+  float vkCloudOpacity() const { return _vk_cloud_opacity; }
+  bool vkCloudMeshDirty() const { return _vk_cloud_mesh_dirty; }
+  void clearVkCloudMeshDirty() { _vk_cloud_mesh_dirty = false; }
+  unsigned vkCloudTexSerial() const { return _vk_cloud_tex_serial; }
+  void setVkOwnsClouds(bool v) { _vk_owns_clouds = v; }
+
+  // [VULKAN] the skybox / stars M2 this frame (null when the zone authors none / it is day).
+  // They are ordinary M2 instances, so WorldRender hands them to the normal VK M2 feed.
+  ModelInstance* vkSkyboxInstance() const { return _vk_skybox_instance; }
+  ModelInstance* vkStarsInstance() const { return _vk_stars_instance; }
+  void clearVkDomeDirty() { _vk_sky_dirty = false; }
+  // [underwater] hide the cloud LAYER while the camera is submerged (user 2026-08-26: "don't
+  // render the sky into the water") -- the texture keeps ticking on the AIR density, so
+  // surfacing shows the intact deck instantly (no row-regen banding).
+  void set_cloud_draw_suppressed(bool s) { _cloud_draw_suppressed = s; }
 
   void unload();
 
@@ -383,7 +432,21 @@ private:
   void tick_clouds(float dt_sec);
   void draw_clouds(glm::mat4x4 const& mvp, glm::vec3 const& camera_pos, int animtime);
   glm::vec3 _celestial_dir = glm::vec3(0.f, 1.f, 0.f); // sun by day / moon by night (WorldRender feeds this)
+  std::vector<glm::vec3> _vk_dome_verts;
+  std::vector<glm::vec3> _vk_dome_colors;
+  std::vector<std::uint16_t> _vk_dome_indices;
+  bool _vk_sky_dirty = true;
+  bool _vk_owns_dome = false;
+  std::vector<float> _vk_cloud_verts;
+  std::vector<std::uint16_t> _vk_cloud_indices;
+  bool _vk_cloud_mesh_dirty = false;
+  unsigned _vk_cloud_tex_serial = 0;   // bumped every tick_clouds regen
+  float _vk_cloud_opacity = 0.f;
+  bool _vk_owns_clouds = false;
+  ModelInstance* _vk_skybox_instance = nullptr;
+  ModelInstance* _vk_stars_instance = nullptr;
   float _cloud_coverage = 0.f;               // Light-DBC float band 3 (cloud density), interpolated
+  bool _cloud_draw_suppressed = false;       // see set_cloud_draw_suppressed()
   int _last_cloud_animtime = 0;
 
   Noggit::NoggitRenderContext _context;

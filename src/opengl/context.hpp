@@ -2,6 +2,9 @@
 
 #pragma once
 #include <opengl/types.hpp>
+#include <cstddef>
+#include <cstdlib>
+#include <unordered_map>
 #include <QtGui/QOpenGLFunctions_4_1_Core>
 #include <QtGui/QOpenGLFunctions_4_3_Core>  // [perf 2026-08-05] for glMultiDrawElementsIndirect (draw-call batching)
 
@@ -19,6 +22,38 @@
 
 namespace OpenGL
 {
+  // [finding 92] Counts EVERY call that goes through the gl wrapper -- incremented in the
+  // verify_context_and_check_for_gl_errors constructor, which every gl.* method builds. This is a
+  // call counter, not a draw counter: entry counters have misled this port three times because
+  // several draw functions are entered and then return before issuing anything.
+  //
+  // The question it answers: can the scene walk move off the render thread in VK mode? Only if it
+  // makes no GL call at all.
+  inline std::size_t& gl_call_count() { static std::size_t n = 0; return n; }
+
+  // NOGGIT_GL_CALL_COUNT=1 to enable. Off by default: an increment on every gl call sits in the
+  // measured path of BOTH renderers, and a benchmark should not carry its own instrumentation.
+  inline bool gl_call_count_on()
+  {
+    static bool const on = std::getenv("NOGGIT_GL_CALL_COUNT") != nullptr
+                        || std::getenv("NOGGIT_GL_CALL_HISTO") != nullptr;
+    return on;
+  }
+
+  // NOGGIT_GL_CALL_HISTO=1: also tally calls by function name, so the remaining calls can be
+  // attributed and gated out one source at a time. Off by default -- a map probe per GL call is
+  // exactly the kind of overhead that would corrupt the numbers it is meant to explain.
+  inline bool gl_call_histo_on()
+  {
+    static bool const on = std::getenv("NOGGIT_GL_CALL_HISTO") != nullptr;
+    return on;
+  }
+  inline std::unordered_map<char const*, std::size_t>& gl_call_histo()
+  {
+    static std::unordered_map<char const*, std::size_t> m;
+    return m;
+  }
+
   struct context
   {
     struct scoped_setter

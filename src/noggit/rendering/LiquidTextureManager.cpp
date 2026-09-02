@@ -16,7 +16,11 @@ using namespace Noggit::Rendering;
 
 namespace
 {
-  std::string classic_liquid_texture(unsigned liquid_type_id, int type)
+  // `type_class` MUST be the NORMALIZED class (0 water, 1 ocean, 2 magma, 3 slime) -- the switch
+  // below is written against that enum. Never pass a raw vanilla LiquidType.Type here: 1.12
+  // encodes water as 3, which this switch reads as SLIME (that mistake textured every id-1
+  // canal/lake with slime.blp, 2026-08-27). Use LiquidTypeDB::liquidClass().
+  std::string classic_liquid_texture(unsigned liquid_type_id, int type_class)
   {
     switch (liquid_type_id)
     {
@@ -31,13 +35,13 @@ namespace
         break;
     }
 
-    switch (type)
+    switch (type_class)
     {
-      case 2:
+      case 2: // magma
         return "XTextures\\lava\\lava.";
-      case 3:
+      case 3: // slime
         return "XTextures\\slime\\slime.";
-      default:
+      default: // water / ocean
         return "XTextures\\river\\lake_a.";
     }
   }
@@ -132,7 +136,11 @@ void LiquidTextureManager::upload()
     const DBCFile::Record record = gLiquidTypeDB.getRecord(i);
     size_t const field_count = gLiquidTypeDB.getFieldCount();
     unsigned liquid_type_id = record.getInt(LiquidTypeDB::ID);
-    int type = field_count > LiquidTypeDB::Type ? record.getInt(LiquidTypeDB::Type) : 0;
+    // NORMALIZED class (0 water, 1 ocean, 2 magma, 3 slime) -- version-gated in DBC.cpp, because
+    // the raw Type column differs in BOTH index and enum between 1.12 and 3.3.5a. Equivalent to
+    // the long-validated behaviour on both eras: classic id 1 -> 0 (lake_a, as before), ids
+    // 2/3/4/21 short-circuit above, and on WotLK the Type column IS this class.
+    int type = LiquidTypeDB::liquidClass(static_cast<int>(liquid_type_id));
     glm::vec2 anim = {1.f, 0.f};
 
     if (field_count > LiquidTypeDB::AnimationY)
@@ -255,6 +263,9 @@ void LiquidTextureManager::upload()
     }
 
     _texture_frames_map[liquid_type_id] = std::make_tuple(array, anim, type, n_frames);
+    // [VULKAN] keep the base name + frame count so the VK feed can resolve the animated frame to a
+    // bindless texture id (VK cannot use the GL array handle).
+    _vk_texture_names[liquid_type_id] = { filename, static_cast<unsigned>(n_frames) };
     if (liquid_debug_enabled())
     {
       LogDebug << "Loaded liquid profile id=" << liquid_type_id

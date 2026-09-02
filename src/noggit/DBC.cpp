@@ -47,6 +47,10 @@ SoundAmbienceDB gSoundAmbienceDB;
 ZoneMusicDB gZoneMusicDB;
 ZoneIntroMusicTableDB gZoneIntroMusicTableDB;
 SoundEntriesDB gSoundEntriesDB;
+CreatureSoundDataDB gCreatureSoundDataDB;
+SoundWaterTypeDB gSoundWaterTypeDB;
+FootstepTerrainLookupDB gFootstepTerrainLookupDB;
+TerrainTypeDB gTerrainTypeDB;
 CreatureDisplayInfoDB gCreatureDisplayInfoDB;
 CreatureDisplayInfoExtraDB gCreatureDisplayInfoExtraDB;
 CreatureModelDataDB gCreatureModelDataDB;
@@ -148,6 +152,10 @@ void OpenDBs(std::shared_ptr<BlizzardArchive::ClientData> clientData)
   gZoneMusicDB.open(clientData);
   gZoneIntroMusicTableDB.open(clientData);
   gSoundEntriesDB.open(clientData);
+  gCreatureSoundDataDB.open(clientData);
+  gSoundWaterTypeDB.open(clientData);
+  gFootstepTerrainLookupDB.open(clientData);
+  gTerrainTypeDB.open(clientData);
   gCreatureDisplayInfoDB.open(clientData);
   try
   {
@@ -434,13 +442,86 @@ const char * getGroundEffectDoodad(unsigned int effectID, int DoodadNum)
   }
 }
 
+// See DBC.h: the Type column moved (2 -> 3) AND its enum changed between 1.12 and 3.3.5a.
+// Gate on the loaded file's field count so a mixed/converted dataset still resolves correctly.
+size_t LiquidTypeDB::TypeField()
+{
+  return gLiquidTypeDB.getFieldCount() <= 4 ? 2 : 3;
+}
+
+int LiquidTypeDB::liquidClass(int liquid_id)
+{
+  bool const classic = gLiquidTypeDB.getFieldCount() <= 4;
+
+  if (!classic)
+  {
+    // 3.3.5a: the Type column IS the class and covers every authored id.
+    try
+    {
+      if (liquid_id >= 1 && gLiquidTypeDB.CheckIfIdExists(liquid_id))
+      {
+        int const t = static_cast<int>(gLiquidTypeDB.getByID(liquid_id).getUInt(3));
+        if (t >= 0 && t <= 3)
+        {
+          return t;
+        }
+      }
+    }
+    catch (...) {}
+    // unknown id on WotLK data: fall through to the id heuristic below
+  }
+
+  // 1.12: only ids 1,2,3,4 (+21) exist and the DBC Type cannot separate water from ocean, so
+  // the ID is the classifier. Same mapping liquid_layer::mclq_liquid_type applies.
+  switch (liquid_id)
+  {
+  case 1:  return 0; // water / river
+  case 2:  return 1; // ocean
+  case 3:  return 2; // magma
+  case 4:  return 3; // slime
+  case 21: return 3; // naxxramas slime
+  default: break;
+  }
+  if (liquid_id < 1)
+  {
+    return 0;
+  }
+  // Non-base ids group in 4s (water, ocean, magma, slime).
+  switch ((liquid_id - 1) % 4)
+  {
+  case 1:  return 1;
+  case 2:  return 2;
+  case 3:  return 3;
+  default: return 0;
+  }
+}
+
+int LiquidTypeDB::loopSound(int liquid_id)
+{
+  if (gLiquidTypeDB.getFieldCount() <= 4) // Classic has no sound column
+  {
+    return 0;
+  }
+  try
+  {
+    if (liquid_id >= 1 && gLiquidTypeDB.CheckIfIdExists(liquid_id))
+    {
+      return static_cast<int>(gLiquidTypeDB.getByID(liquid_id).getUInt(4));
+    }
+  }
+  catch (...) {}
+  return 0;
+}
+
 int LiquidTypeDB::getLiquidType(int pID)
 {
   int type = 0;
   try
   {
     LiquidTypeDB::Record rec = gLiquidTypeDB.getByID(pID);
-    type = gLiquidTypeDB.getFieldCount() > LiquidTypeDB::Type ? rec.getUInt(LiquidTypeDB::Type) : 0;
+    // version-gated column (Classic keeps Type at 2; field 3 there is SpellID -- see DBC.h)
+    type = gLiquidTypeDB.getFieldCount() > LiquidTypeDB::TypeField()
+             ? rec.getUInt(LiquidTypeDB::TypeField()) : 0;
   }
   catch (DBCFile::NotFound const&)
   {

@@ -510,6 +510,24 @@ static_assert(sizeof(ClassicModelRibbonEmitterDef) == 220,
               "Classic ribbon emitter def must be 220 bytes (verified stride); padding would misparse it");
 
 
+// Classic (v256) M2 event def: header block + a classic TRACK BASE (interp/gseq + per-sequence
+// ranges + global times, NO keys). The client fires these from the anim tick (doc 38:
+// CGUnit_C::HandleAnimEvent FUN_005ffbd0 -- $FSD footsteps, $FD1-4 fidgets, $CSD custom, ...).
+struct ClassicModelEventDef {
+  char id[4];        // FourCC ("$FSD", "$FD1", ...)
+  int32_t data;      // event payload ($CSD: the SoundEntries id)
+  uint32_t bone;
+  glm::vec3 pos;
+  int16_t type;      // track interpolation (unused for events)
+  int16_t seq;       // global sequence or -1
+  uint32_t nRanges;  // per-SEQUENCE ranges into the times array
+  uint32_t ofsRanges;
+  uint32_t nTimes;
+  uint32_t ofsTimes;
+};
+static_assert(sizeof(ClassicModelEventDef) == 44,
+              "Classic event def must be 44 bytes (id+data+bone+pos + 20-byte classic track base)");
+
 struct ModelEvents {
   char id[4];
   int32_t data;

@@ -42,6 +42,7 @@
 #include <utility>
 #include <limits>
 #include <array>
+#include <atomic> // FOOTSTEP-DIAG one-shot counter
 #include <cstdint>
 #include <optional>
 #include <cmath>
@@ -675,6 +676,9 @@ namespace
   struct CreatureAttachmentModelSpec
   {
     int attachment_id = -1;
+    // Aura state-kit effect model (chest sparkle etc.) rather than worn equipment: exempt from the
+    // unit's CreatureModelAlpha/ghost tint (client-verified: Anomalus body 200, sparkles full).
+    bool is_aura_kit = false;
     std::string model_path;
     std::vector<std::pair<std::size_t, std::string>> texture_overrides;
   };
@@ -1007,9 +1011,19 @@ namespace
                                                  std::uint32_t sex_id)
   {
     model_name = normalize_model_filename(std::move(model_name));
-    if (model_name.empty())
+    // An EMPTY DBC component name normalises to just ".m2" (the normaliser appends the extension),
+    // so the empty check below used to pass and the loader requested
+    // "item/objectcomponents/<dir>/.m2" -- a path that cannot exist, whose load failure tripped the
+    // "some models couldn't be loaded, saving will cause collision and culling issues" dialog
+    // (user 2026-08-25). Treat a missing STEM as "no model".
     {
-      return {};
+      auto const slash = model_name.find_last_of('/');
+      std::string const stem = (slash == std::string::npos) ? model_name
+                                                            : model_name.substr(slash + 1);
+      if (model_name.empty() || stem.empty() || stem == ".m2")
+      {
+        return {};
+      }
     }
 
     auto* client = Noggit::Application::NoggitApplication::instance()->clientData();
@@ -1020,11 +1034,11 @@ namespace
     }
 
     auto candidate = normalize_model_filename(std::string("item/objectcomponents/") + component_dir + "/" + model_name);
-    if (client->exists(candidate))
-    {
-      return candidate;
-    }
 
+    // [helm fit, user 2026-08-27] the RACE/GENDER variant comes FIRST: helmet meshes are authored
+    // per head shape (…_gnm/_dwf/…) and the client always fits the wearer's variant. We used to
+    // return the BASE file whenever it existed and only fall back to the variant -- a gnome got
+    // the generic (human-shaped) shell, chin and nose poking out of display 14172's diving helm.
     auto const suffix = attachment_model_variant_suffix(race_id, sex_id);
     if (!suffix.empty())
     {
@@ -1038,6 +1052,11 @@ namespace
           return variant;
         }
       }
+    }
+
+    if (client->exists(candidate))
+    {
+      return candidate;
     }
 
     return candidate;
@@ -1563,6 +1582,47 @@ namespace
           else
           {
             debug << " helmetKeepsHair=1 model='" << head_model << "' vis=" << helmet_vis;
+          }
+          // FACIAL + EAR hiding (2026-08-26, user: display 14172 diving helmet -- "the chin and
+          // nose sticks out, we only hide hair"): HelmetGeosetVisData's remaining 1.12 columns are
+          // per-RACE masks for the facial geoset families and the ears (row 248 full helm sets all
+          // five; the Defias bandana row 247 keeps hair but masks the facial rows -- it covers the
+          // mouth). Hide = force the family to its x01 "none" variant (facial 101/201/301, ears
+          // 701); geoset-0 stays reserved for the hair/body rule above.
+          if (helmet_vis != 0 && !head_model.empty() && gHelmetGeosetVisDataDB.getRecordCount() > 0)
+          {
+            try
+            {
+              auto const vis_row = gHelmetGeosetVisDataDB.getByID(helmet_vis);
+              auto const race_hides = [&](std::size_t field) -> bool
+              {
+                std::uint32_t const mask = vis_row.getUInt(field);
+                if (mask == 0)
+                {
+                  return false;
+                }
+                // per-race bit (race ids 1-based); out-of-range/unknown race falls back to "hide"
+                return (race_id == 0 || race_id > 32) ? true
+                     : ((mask >> (race_id - 1)) & 1u) != 0u;
+              };
+              if (race_hides(HelmetGeosetVisDataDB::Facial1Flags))
+              {
+                assign_geoset_selection(selection, CharacterGeosetFamily::Geoset100, 1, false);
+              }
+              if (race_hides(HelmetGeosetVisDataDB::Facial2Flags))
+              {
+                assign_geoset_selection(selection, CharacterGeosetFamily::Geoset200, 1, false);
+              }
+              if (race_hides(HelmetGeosetVisDataDB::Facial3Flags))
+              {
+                assign_geoset_selection(selection, CharacterGeosetFamily::Geoset300, 1, false);
+              }
+              if (race_hides(HelmetGeosetVisDataDB::EarsFlags))
+              {
+                assign_geoset_selection(selection, CharacterGeosetFamily::Ears, 1, false);
+              }
+            }
+            catch (DBCFile::NotFound const&) {}
           }
         });
 
@@ -3407,12 +3467,409 @@ bool World::setGameCharacterDisplayId(std::uint32_t display_id)
   _game_character.model_path = model_result.path;
   _game_character.model_scale = resolve_creature_model_scale(display_id);
   _game_character.template_scale = resolve_creature_display_scale(display_id);
+  // [game mode] swim float law (335a FUN_00730d10, all 4 constants dumped 2026-08-26): enter
+  // swim at depth > 0.75 x collisionHeight, exit under (enter - 1/36) -- PER-MODEL Turtle
+  // CreatureModelData CollisionHeight (f15) x the display scale. The old fixed 2.0894661 (a
+  // WotLK HumanMale value) sank every short race: a dwarf never broke the surface.
+  _game_char_collision_height = 2.031f;
+  try
+  {
+    auto display = gCreatureDisplayInfoDB.getByID(display_id);
+    auto model = gCreatureModelDataDB.getByID(display.getUInt(CreatureDisplayInfoDB::ModelID));
+    float const h = model.getFloat(CreatureModelDataDB::CollisionHeight);
+    if (h > 0.05f)
+    {
+      _game_char_collision_height = h * _game_character.template_scale;
+    }
+  }
+  catch (DBCFile::NotFound const&)
+  {
+  }
   _game_character.is_character_model = _game_character.model_path.rfind("character/", 0) == 0;
   bool const ok = ensureCreatureSpawnModel(_game_character);
   Log << "[game mode] character display " << display_id << " -> '" << _game_character.model_path
       << "'" << (_game_character.is_character_model ? " (character skeleton)" : "")
       << (ok ? " OK" : " FAILED") << std::endl;
   return ok;
+}
+
+int World::terrainTypeForTexture(std::string const& texture_filename)
+{
+  if (texture_filename.empty())
+  {
+    return -1;
+  }
+  // Look first; only rescan when the answer is missing.
+  {
+    auto const early = _texture_terrain_types.find(texture_filename);
+    if (early != _texture_terrain_types.end())
+    {
+      return early->second;
+    }
+  }
+  // MISS -> rescan, throttled. NOTE (2026-08-27): the previous trigger used
+  // mapIndex.getNLoadedTiles(), which counts tiles QUEUED for load (incremented at load start),
+  // so it reached its final value while the tiles were still parsing: the table was built once
+  // from barely-loaded tiles and then never rebuilt, because the count never changed again.
+  // Stormwind is exactly the case that needs the rescan -- its own tile (30_47) declares only the
+  // empty effect 7823 for the ground texture, while the neighbours that stream in a moment later
+  // (31_48 / 32_48 / 32_47) declare it Stone via effect 993.
+  float const now_ms = static_cast<float>(animtime);
+  if (!_texture_terrain_types.empty() && now_ms - _texture_terrain_last_scan_ms < 2000.0f)
+  {
+    return -1; // recently scanned and still unknown; don't rescan every footstep
+  }
+  {
+    _texture_terrain_last_scan_ms = now_ms;
+    unsigned scanned_tiles = 0;
+    _texture_terrain_types.clear();
+    for (MapTile* tile : mapIndex.loaded_tiles())
+    {
+      if (!tile)
+      {
+        continue;
+      }
+      ++scanned_tiles;
+      for (unsigned cz = 0; cz < 16; ++cz)
+      {
+        for (unsigned cx = 0; cx < 16; ++cx)
+        {
+          MapChunk* const c = tile->getChunk(cx, cz);
+          if (!c || !c->texture_set)
+          {
+            continue;
+          }
+          int const n = static_cast<int>(c->texture_set->num());
+          for (int i = 0; i < n; ++i)
+          {
+            unsigned const eff = c->texture_set->getEffectForLayer(static_cast<std::size_t>(i));
+            if (!eff)
+            {
+              continue;
+            }
+            try
+            {
+              if (!gGroundEffectTextureDB.CheckIfIdExists(eff))
+              {
+                continue;
+              }
+              auto const rec = gGroundEffectTextureDB.getByID(eff);
+              int const t = static_cast<int>(rec.getUInt(GroundEffectTextureDB::TerrainType()));
+              if (t > 0) // only rows that actually declare a type teach us about the texture
+              {
+                _texture_terrain_types.emplace(
+                  c->texture_set->filename(static_cast<std::size_t>(i)), t);
+              }
+            }
+            catch (...) {}
+          }
+        }
+      }
+    }
+    _texture_terrain_tiles_scanned = scanned_tiles;
+    LogError << "FOOTSTEP-TEXTABLE rebuilt from " << scanned_tiles << " FINISHED tiles: "
+             << _texture_terrain_types.size() << " textures with an authored terrain type"
+             << " (looking for '" << texture_filename << "')" << std::endl;
+  }
+  auto const hit = _texture_terrain_types.find(texture_filename);
+  return hit == _texture_terrain_types.end() ? -1 : hit->second;
+}
+
+int World::groundTerrainTypeAt(glm::vec3 const& pos, glm::mat4x4 const& model_view)
+{
+  // Down-ray like the game ground probe: whatever supports the character decides the family.
+  glm::vec3 const origin(pos.x, pos.y + 2.0f, pos.z);
+  math::ray const ray(origin, glm::vec3(0.f, -1.f, 0.f));
+  selection_result const results(intersectProbe(model_view, ray, 12.0f));
+
+  float best_dist = std::numeric_limits<float>::max();
+  int best_kind = -1; // 0 = terrain chunk, 1 = wmo, 2 = m2
+  WMOInstance* best_wmo = nullptr;
+  for (auto const& hit : results)
+  {
+    if (hit.first >= best_dist)
+    {
+      continue;
+    }
+    if (hit.second.index() == eEntry_MapChunk)
+    {
+      best_dist = hit.first;
+      best_kind = 0;
+    }
+    else if (hit.second.index() == eEntry_Object)
+    {
+      auto obj = std::get<selected_object_type>(hit.second);
+      best_dist = hit.first;
+      if (obj->which() == eWMO)
+      {
+        best_kind = 1;
+        best_wmo = static_cast<WMOInstance*>(obj);
+      }
+      else
+      {
+        best_kind = 2;
+      }
+    }
+  }
+
+  // FOOTSTEP-SURFACE diag (one-shot x20): which surface each step actually resolves against.
+  // Needed because Stormwind's streets/interiors are WMO geometry whose materials are almost
+  // all "None" -- this names the branch, the WMO, and its authored ground type per step.
+  {
+    static std::atomic<int> s_surf_diag_left{20};
+    if (s_surf_diag_left.load(std::memory_order_relaxed) > 0
+        && s_surf_diag_left.fetch_sub(1, std::memory_order_relaxed) > 0)
+    {
+      std::string wmo_name = "-";
+      int wmo_gt = -99;
+      if (best_kind == 1 && best_wmo)
+      {
+        wmo_name = best_wmo->wmo->file_key().stringRepr();
+        if (auto const g = best_wmo->groundHit(ray, 12.0f))
+        {
+          wmo_gt = g->second;
+        }
+      }
+      LogError << "FOOTSTEP-SURFACE kind=" << best_kind
+               << " (0=terrain 1=wmo 2=m2 -1=none)"
+               << " wmo='" << wmo_name << "' wmoGroundType=" << wmo_gt
+               << " pos=(" << pos.x << "," << pos.y << "," << pos.z << ")" << std::endl;
+    }
+  }
+
+  if (best_kind == 1 && best_wmo)
+  {
+    // WMO floor: MOMT.ground_type is a TerrainType id, but it is only AUTHORED on a handful of
+    // materials (surveyed 2026-08-27: 2090 of 2176 materials across 400 Turtle WMOs are 10 =
+    // "None"; the authored ones are 0 Dirt / 2 Stone / 4 Wood on chapels, barns, ships...).
+    // Authored wins; "None" falls through to the ground the building stands on rather than
+    // inventing a type -- that is what makes Stormwind's streets sound like their own paving
+    // instead of one flat default everywhere.
+    // A WMO floor's OWN material decides -- including TerrainType 10 "None", which is an authored
+    // value (row 10 -> SoundClass 0 -> the generic step), not a gap. Data (2026-08-27): of 8280
+    // walkable floor triangles in Stormwind.wmo, 7424 are textured and every one declares None,
+    // while inns/barns/barracks author Wood/Stone on the floor they actually mean. Falling through
+    // to the ADT terrain here was the "grass footsteps on stone streets" bug -- it read the grass
+    // buried UNDER the city. Only a face with NO material at all (gt < 0, collision-only
+    // geometry: 856 of those 8280) has nothing to say, and then the ground beneath is the best
+    // available answer.
+    if (auto const g = best_wmo->groundHit(ray, 12.0f))
+    {
+      int const gt = g->second;
+      if (gt >= 0)
+      {
+        return gt;
+      }
+    }
+  }
+  // M2 supports (crates/planks) carry no authored ground type either -> same fallback.
+  MapChunk* const chunk = getChunkAt(pos);
+  if (!chunk)
+  {
+    return -1;
+  }
+  std::string dominant_texture;
+  int row = chunk->groundTerrainTypeRowAt(pos, &dominant_texture);
+  if (row < 0 && !dominant_texture.empty())
+  {
+    // This chunk carries only placeholder effect rows. Resolve the texture map-wide: the same
+    // ground texture is declared properly in other loaded tiles (Stormwind's ground texture is
+    // Stone in 31_48/32_48 while the city sits on 30_47).
+    row = terrainTypeForTexture(dominant_texture);
+  }
+  return row;
+}
+
+std::uint32_t World::gameCharacterFootstepId()
+{
+  // client resolution (doc 38): CreatureDisplayInfo.Sound override, else the model's
+  // CreatureModelData.SoundID -> CreatureSoundData row -> column 9 = CreatureFootstepID.
+  try
+  {
+    auto const display_id = _game_character.display_id;
+    if (!display_id || !gCreatureDisplayInfoDB.CheckIfIdExists(display_id)
+        || gCreatureSoundDataDB.getRecordCount() == 0)
+    {
+      return 0;
+    }
+    auto const display = gCreatureDisplayInfoDB.getByID(display_id);
+    std::uint32_t csd_id = display.getUInt(CreatureDisplayInfoDB::Sound);
+    if (!csd_id)
+    {
+      auto const model_id = display.getUInt(CreatureDisplayInfoDB::ModelID);
+      if (model_id && gCreatureModelDataDB.CheckIfIdExists(model_id))
+      {
+        csd_id = gCreatureModelDataDB.getByID(model_id).getUInt(CreatureModelDataDB::SoundID);
+      }
+    }
+    if (!csd_id || !gCreatureSoundDataDB.CheckIfIdExists(csd_id))
+    {
+      return 0;
+    }
+    return gCreatureSoundDataDB.getByID(csd_id).getUInt(CreatureSoundDataDB::Footstep);
+  }
+  catch (...)
+  {
+    return 0;
+  }
+}
+
+std::uint32_t World::gameCharacterSoundEntry(std::size_t column)
+{
+  // Same resolution chain as gameCharacterFootstepId (doc 38): CreatureDisplayInfo.Sound override,
+  // else the model's CreatureModelData.SoundID -> the CreatureSoundData row -> the asked column.
+  try
+  {
+    auto const display_id = _game_character.display_id;
+    if (!display_id || !gCreatureDisplayInfoDB.CheckIfIdExists(display_id)
+        || gCreatureSoundDataDB.getRecordCount() == 0)
+    {
+      return 0;
+    }
+    auto const display = gCreatureDisplayInfoDB.getByID(display_id);
+    std::uint32_t csd_id = display.getUInt(CreatureDisplayInfoDB::Sound);
+    if (!csd_id)
+    {
+      auto const model_id = display.getUInt(CreatureDisplayInfoDB::ModelID);
+      if (model_id && gCreatureModelDataDB.CheckIfIdExists(model_id))
+      {
+        csd_id = gCreatureModelDataDB.getByID(model_id).getUInt(CreatureModelDataDB::SoundID);
+      }
+    }
+    if (!csd_id || !gCreatureSoundDataDB.CheckIfIdExists(csd_id))
+    {
+      return 0;
+    }
+    return gCreatureSoundDataDB.getByID(csd_id).getUInt(column);
+  }
+  catch (...)
+  {
+    return 0;
+  }
+}
+
+int World::characterSplashSoundEntry()
+{
+  // Cached scan for the SoundType 21 rows. Size classing (Small / Medium / large) is NOT RE'd --
+  // the three ids appear in no lookup table and the exe carries no immediate for them, and the
+  // game character's CreatureSoundData authors no submerge column (verified on Ascension data,
+  // 2026-08-28). MEDIUM is used for the game-view character (player-sized models); this is the
+  // one labelled assumption in this lane, and it only picks WHICH of three variants of the same
+  // sound plays, never whether it plays.
+  static int s_cached = -2;
+  if (s_cached != -2)
+  {
+    return s_cached;
+  }
+  s_cached = 0;
+  int small_id = 0, large_id = 0;
+  try
+  {
+    for (auto row = gSoundEntriesDB.begin(); row != gSoundEntriesDB.end(); ++row)
+    {
+      if (row->getUInt(SoundEntriesDB::SoundType) != 21)
+      {
+        continue;
+      }
+      std::string name = row->getString(SoundEntriesDB::Name);
+      std::transform(name.begin(), name.end(), name.begin(),
+                     [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+      if (name.find("charactersplashsound") == std::string::npos)
+      {
+        continue; // type 21 also carries PlayerDrowningLoop -- not a splash
+      }
+      int const id = static_cast<int>(row->getUInt(SoundEntriesDB::ID));
+      if (name.find("medium") != std::string::npos) { s_cached = id; }
+      else if (name.find("small") != std::string::npos) { small_id = id; }
+      else { large_id = id; }
+    }
+  }
+  catch (...) {}
+  if (!s_cached) { s_cached = small_id ? small_id : large_id; }
+  LogError << "[water] character splash SoundEntries id = " << s_cached << std::endl;
+  return s_cached;
+}
+
+int World::footstepSoundEntry(std::uint32_t footstep_id, int terrain_row, bool splash)
+{
+  if (!footstep_id)
+  {
+    return 0;
+  }
+  // CLIENT LAW (FUN_00458450 bounds check `-1 < terrain_row`): an unknown terrain type plays
+  // NO footstep at all. Only wet steps still sound, via the splash column.
+  if (terrain_row < 0 && !splash)
+  {
+    return 0;
+  }
+  if (terrain_row < 0)
+  {
+    terrain_row = 0; // wading over unauthored ground still splashes (class 0 splash row)
+  }
+  // TerrainType row -> its SoundClass (f4) = the FootstepTerrainLookup axis (doc 38;
+  // FUN_00458450: array[row.field4] inside the footstep-id object).
+  int sound_class = 0;
+  try
+  {
+    if (gTerrainTypeDB.CheckIfIdExists(terrain_row))
+    {
+      sound_class = static_cast<int>(gTerrainTypeDB.getByID(terrain_row)
+                                       .getUInt(TerrainTypeDB::SoundClass));
+    }
+  }
+  catch (...) {}
+
+  // lazy one-time bake of the 179-row lookup, mirroring the client's FUN_00457040 table:
+  // key = (footstep id, sound class) -> {normal, splash} SoundEntries.
+  static std::map<std::pair<std::uint32_t, int>, std::pair<int, int>> s_lookup;
+  static bool s_baked = false;
+  if (!s_baked)
+  {
+    s_baked = true;
+    try
+    {
+      for (auto it = gFootstepTerrainLookupDB.begin(); it != gFootstepTerrainLookupDB.end(); ++it)
+      {
+        auto const fs = it->getUInt(FootstepTerrainLookupDB::CreatureFootstepID);
+        auto const cls = static_cast<int>(it->getUInt(FootstepTerrainLookupDB::TerrainSoundID));
+        s_lookup[{fs, cls}] = { static_cast<int>(it->getUInt(FootstepTerrainLookupDB::SoundID)),
+                                static_cast<int>(it->getUInt(FootstepTerrainLookupDB::SoundIDSplash)) };
+      }
+    }
+    catch (...) {}
+  }
+  auto const hit = s_lookup.find({footstep_id, sound_class});
+  int const se = (hit == s_lookup.end()) ? 0
+                                         : (splash ? hit->second.second : hit->second.first);
+  // FOOTSTEP-DIAG (one-shot x12): the whole resolve chain in one line per step, so a wrong
+  // sound can be traced to the terrain row / sound class / lookup without another RE round.
+  {
+    static std::atomic<int> s_fs_diag_left{12};
+    if (s_fs_diag_left.load(std::memory_order_relaxed) > 0
+        && s_fs_diag_left.fetch_sub(1, std::memory_order_relaxed) > 0)
+    {
+      LogError << "FOOTSTEP-DIAG fsId=" << footstep_id
+               << " terrainRow=" << terrain_row
+               << " soundClass=" << sound_class
+               << " splash=" << (splash ? 1 : 0)
+               << " -> soundEntry=" << se << std::endl;
+    }
+  }
+  return se;
+}
+
+std::vector<int> World::gameCharacterAnimEventTimes(std::uint32_t fourcc, int anim_id)
+{
+  if (!_game_character.model_instance.has_value())
+  {
+    return {};
+  }
+  Model* const m = _game_character.model_instance->model.get();
+  if (!m || !m->finishedLoading() || m->loading_failed())
+  {
+    return {};
+  }
+  return m->animEventTimes(fourcc, static_cast<std::int16_t>(anim_id));
 }
 
 int World::gameCharacterAnimLengthMs(int anim_id)
@@ -3433,9 +3890,25 @@ int World::gameCharacterAnimLengthMs(int anim_id)
     static_cast<std::uint64_t>(_game_character.model_instance->uid), anim_id);
 }
 
-void World::setGameCharacterBubbles(bool on)
+void World::setGameCharacterBubbles(bool on, float surface_y)
 {
-  if (on == _game_character_bubbles || !_game_character.model_instance.has_value())
+  if (!_game_character.model_instance.has_value())
+  {
+    return;
+  }
+  if (on && _game_character_bubbles)
+  {
+    // already on: keep the kill plane tracking the CURRENT liquid surface
+    for (auto& a : _game_character.attachment_models)
+    {
+      if (a.attachment_id == 17)
+      {
+        a.particle_kill_plane_y = surface_y;
+      }
+    }
+    return;
+  }
+  if (on == _game_character_bubbles)
   {
     return;
   }
@@ -3455,6 +3928,7 @@ void World::setGameCharacterBubbles(bool on)
     // client-exact effect: SpellVisualEffectName 108 "HARDCODED Breath Underwater"
     CreatureSpawnOverlay::AttachmentModel bubbles;
     bubbles.attachment_id = breath_attachment;
+    bubbles.particle_kill_plane_y = surface_y; // bubbles pop at the liquid surface
     bubbles.model_instance.emplace(BlizzardArchive::Listfile::FileKey("particles/bubbles.m2"), _context);
     bubbles.model_instance->pos = _game_character.pos;
     bubbles.model_instance->dir = _game_character.model_instance->dir;
@@ -3484,14 +3958,17 @@ float World::gameCharacterAnimMoveSpeed(int anim_id)
 
 void World::updateGameCharacter(glm::vec3 const& pos, float orientation_deg, int anim_id,
                                 float lower_body_twist_rad, float anim_time_scale,
-                                float body_pitch_deg)
+                                float body_pitch_deg, bool force_anim_restart)
 {
   _game_character.pos = pos;
   _game_character.orientation = orientation_deg;
   if (_game_character.model_instance.has_value())
   {
     auto& mi = *_game_character.model_instance;
-    if (anim_id != mi.forcedAnimationId() && mi.model->finishedLoading())
+    // force_anim_restart (user 2026-08-26, held-space dolphin hops): a RE-LAUNCH of the same
+    // one-shot (JumpStart 37 -> new jump while 37 is still the chosen id) must restart it --
+    // the id-change test alone left the model frozen at JumpStart's end pose.
+    if ((anim_id != mi.forcedAnimationId() || force_anim_restart) && mi.model->finishedLoading())
     {
       // entering a one-shot (JumpStart/JumpEnd/JumpLandRun/Death): roll its variation NOW,
       // client SetAnimation-style, so this tick's length queries and the next draw's animate()
@@ -3511,6 +3988,37 @@ void World::updateGameCharacter(glm::vec3 const& pos, float orientation_deg, int
       mi.recalcExtents(); // isInFrustum in the render gather reads these
     }
   }
+}
+
+void World::releaseCreatureSpawnModel(CreatureSpawnOverlay& spawn)
+{
+  if (!spawn.model_instance.has_value())
+  {
+    return;
+  }
+  // per-instance state lives on the SHARED models keyed by guid / (guid | slot<<32) -- drop it
+  // with the instance (a stale-key drop on a model that never stored one is a harmless no-op).
+  // ModelInstance::model is a scoped_model_reference: always valid while the instance exists.
+  spawn.model_instance->model->dropInstanceEmitterState(spawn.guid);
+  spawn.model_instance->model->dropInstanceParticleColorSets(spawn.guid);
+  for (std::size_t i = 0; i < spawn.attachment_models.size(); ++i)
+  {
+    auto& att = spawn.attachment_models[i];
+    if (att.model_instance.has_value())
+    {
+      att.model_instance->model->dropInstanceEmitterState(
+        static_cast<std::uint64_t>(spawn.guid) | (static_cast<std::uint64_t>(i + 1) << 32));
+    }
+  }
+  if (spawn.mount_instance.has_value())
+  {
+    spawn.mount_instance->model->dropInstanceEmitterState(spawn.guid);
+  }
+  spawn.attachment_models.clear();
+  spawn.mount_instance.reset();
+  spawn.model_instance.reset();
+  // model_path / scales / flags stay resolved -- re-approaching the spawn rebuilds through
+  // ensureCreatureSpawnModel exactly like first sight (create budget applies).
 }
 
 bool World::ensureCreatureSpawnModel(CreatureSpawnOverlay& spawn)
@@ -3617,6 +4125,10 @@ bool World::ensureCreatureSpawnModel(CreatureSpawnOverlay& spawn)
       // Aura state-kit effect models (chest sparkles etc.) apply to EVERY creature with permanent
       // auras, not just character-skeleton models.
       auto aura_specs = resolve_creature_aura_attachment_models(spawn.auras, _spell_infos);
+      for (auto& aura_spec : aura_specs)
+      {
+        aura_spec.is_aura_kit = true; // exempt from the unit ghost alpha (see AttachmentModel::is_aura_kit)
+      }
       attachment_specs.insert(attachment_specs.end(),
                               std::make_move_iterator(aura_specs.begin()),
                               std::make_move_iterator(aura_specs.end()));
@@ -3645,6 +4157,7 @@ bool World::ensureCreatureSpawnModel(CreatureSpawnOverlay& spawn)
         {
           CreatureSpawnOverlay::AttachmentModel attachment;
           attachment.attachment_id = attachment_spec.attachment_id;
+          attachment.is_aura_kit = attachment_spec.is_aura_kit;
           attachment.model_instance.emplace(BlizzardArchive::Listfile::FileKey(attachment_spec.model_path), _context);
           attachment.model_instance->pos = spawn.pos;
           attachment.model_instance->dir = spawn.model_instance->dir;
@@ -5190,6 +5703,109 @@ std::optional<float> World::getLiquidHeightAt(glm::vec3 const& pos)
   return best;
 }
 
+std::optional<std::pair<float, int>> World::getLiquidAt(glm::vec3 const& pos)
+{
+  auto const result = for_maybe_chunk_at(pos, [&](MapChunk* chunk) -> std::optional<std::pair<float, int>>
+  {
+    ChunkWater* const cw = chunk->liquid_chunk();
+    if (!cw)
+    {
+      return std::optional<std::pair<float, int>>{};
+    }
+    std::optional<std::pair<float, int>> best;
+    for (auto& layer : *cw->getLayers())
+    {
+      if (layer.empty())
+      {
+        continue;
+      }
+      auto const& verts = layer.getVertices();
+      float const fx = (pos.x - verts[0].x) / UNITSIZE;
+      float const fz = (pos.z - verts[0].z) / UNITSIZE;
+      if (fx < 0.0f || fz < 0.0f || fx > 8.0f || fz > 8.0f)
+      {
+        continue;
+      }
+      int const cx = std::min(7, static_cast<int>(fx));
+      int const cz = std::min(7, static_cast<int>(fz));
+      if (!layer.hasSubchunk(cx, cz))
+      {
+        continue;
+      }
+      float const tx = fx - static_cast<float>(cx);
+      float const tz = fz - static_cast<float>(cz);
+      float const h =
+        glm::mix(glm::mix(verts[cz * 9 + cx].y,       verts[cz * 9 + cx + 1].y,       tx),
+                 glm::mix(verts[(cz + 1) * 9 + cx].y, verts[(cz + 1) * 9 + cx + 1].y, tx), tz);
+      if (!best || h > best->first)
+      {
+        best = std::make_pair(h, layer.liquidID());
+      }
+    }
+    return best;
+  });
+  std::optional<std::pair<float, int>> best = result ? *result : std::optional<std::pair<float, int>>{};
+
+  // WMO group liquids (canals, MC lava) via the probe cache, tile-accurate (heightAtLocal).
+  if (_probe_cache_valid)
+  {
+    for (auto* wmo_instance : _probe_cache_wmos)
+    {
+      int wmo_liquid_id = 0;
+      if (auto const h = wmo_instance->liquidHeightAt(pos, &wmo_liquid_id))
+      {
+        if (!best || *h > best->first)
+        {
+          best = std::make_pair(*h, wmo_liquid_id);
+        }
+      }
+    }
+  }
+  return best;
+}
+
+int World::liquidClassForId(int liquid_id)
+{
+  // VERSION-GATED in one place (DBC.cpp): 3.3.5a reads the DBC Type column (authoritative for
+  // every id -- an id-modulo guess mis-classifies e.g. 100 "Basic Procedural Water" = ocean and
+  // 121 "CoA Black - Magma" = magma), 1.12 classifies by id because its Type enum cannot
+  // separate water from ocean. See LiquidTypeDB::liquidClass.
+  return LiquidTypeDB::liquidClass(liquid_id);
+}
+
+void World::sampleWaterLoopSources(glm::vec3 const& center, float radius,
+                                   std::array<WaterLoopSample, 4>& out)
+{
+  for (auto& o : out) { o = WaterLoopSample{}; }
+  // Probe the listener spot plus a ring; each hit's class records its nearest distance. The
+  // client's FUN_0068b0d0 scans the liquid-tile grid for the nearest per (class,speed) vector;
+  // this is the noggit-liquid-model equivalent (class exact; speed = still, see WaterSoundPlayer).
+  auto consider = [&](glm::vec3 const& p, float d)
+  {
+    if (auto const liq = getLiquidAt(p))
+    {
+      int const cls = liquidClassForId(liq->second);
+      if (cls >= 0 && cls < 4 && (!out[cls].found || d < out[cls].distance))
+      {
+        out[cls] = WaterLoopSample{true, d, liq->second};
+      }
+    }
+  };
+  consider(center, 0.0f);
+  int const rings = 2;
+  int const spokes = 8;
+  for (int r = 1; r <= rings; ++r)
+  {
+    float const dist = radius * static_cast<float>(r) / static_cast<float>(rings);
+    for (int s = 0; s < spokes; ++s)
+    {
+      float const a = 6.2831853f * static_cast<float>(s) / static_cast<float>(spokes);
+      consider(glm::vec3(center.x + std::cos(a) * dist, center.y, center.z + std::sin(a) * dist),
+               dist);
+    }
+  }
+}
+
 void World::ensureProbeCache(glm::vec3 const& center)
 {
   float constexpr cache_radius = k_probe_cache_radius;  // covers the 25yd camera boom + corners + margin
@@ -6124,6 +6740,14 @@ int World::getZoneIntroMusic(glm::vec3 const& pos)
   // One-shot zone INTRO music: WMOAreaTable.IntroSound (col 8) then AreaTable.IntroSound (col 9).
   // City intros (Ironforge Intro, CoT intro) live here, NOT on ZoneMusic.
   return getZoneMusicField(pos, WMOAreaTableDB::ZoneIntroMusicTable, AreaDB::ZoneIntroMusicTable);
+}
+
+int World::getZoneAmbience(glm::vec3 const& pos)
+{
+  // Ambience loop (SoundAmbience.dbc {ID, DayAmbience, NightAmbience} -> SoundEntries):
+  // WMOAreaTable.SoundAmbience (col 6) then AreaTable.SoundAmbience (col 7) up the parent
+  // chain -- the same resolution walk the client's ambience channel uses (doc 38).
+  return getZoneMusicField(pos, WMOAreaTableDB::SoundAmbience, AreaDB::SoundAmbience);
 }
 
 int World::getZoneMusicField(glm::vec3 const& pos, size_t wmo_field, size_t area_field)

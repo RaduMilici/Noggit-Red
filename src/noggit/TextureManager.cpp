@@ -14,7 +14,11 @@
 #include <cctype>
 #include <glm/vec2.hpp>
 
-decltype (TextureManager::_) TextureManager::_;
+// [EXIT-CRASH FIX 2026-08-29] Intentionally LEAKED: the three object managers reference each other
+// from their element destructors (~WMO -> ModelManager::_, ~Model -> TextureManager::_), and their
+// cross-TU static destruction order is unspecified, so whichever died first left the others faulting
+// on a destroyed mutex/map during process exit. Never destroying them removes the hazard entirely.
+Noggit::AsyncObjectMultimap<blp_texture>& TextureManager::_ = *new Noggit::AsyncObjectMultimap<blp_texture>();
 decltype (TextureManager::_tex_arrays) TextureManager::_tex_arrays;
 decltype (TextureManager::_raw_textures) TextureManager::_raw_textures;
 decltype (TextureManager::_raw_textures_mutex) TextureManager::_raw_textures_mutex;
@@ -37,7 +41,11 @@ std::atomic<unsigned long long> g_texture_upload_epoch{0};
 //   * VRAM: each class pre-allocates all N layers up front (immutable array size). ~11MB per 512^2-DXT1
 //     64-layer array; worst case ~1GB of tail waste across all loaded classes -- fine on the 24GB target GPU.
 //     Watch [MEM] vram= after the bump; dial back if it pressures the eviction path we just stabilised.
-constexpr unsigned N_ARRAY_TEX = 64;
+// [mem 2026-08-26] 64 -> 32: each NEW (format,size,mips) class preallocates ALL layers up front
+// (a raw-RGBA8 1024^2 class was 341 MB the moment ONE such texture appeared). With layer
+// recycling (free_slots) a second array per class rarely materializes, so halving the block
+// halves the worst-case per-class cost with no visual change.
+constexpr unsigned N_ARRAY_TEX = 32;
 namespace
 {
   constexpr char const* fallback_texture_filename = "tileset/generic/black.blp";
@@ -62,7 +70,10 @@ namespace
       return (m >= 1.0f) ? m : 1.0f; // extension absent or query failed -> no AF
     }();
     float const requested = QSettings().value("render/anisotropic_filtering", 16.0f).toFloat();
-    return std::clamp(requested, 1.0f, hw_max);
+    // [VULKAN parity diagnostic] NOGGIT_PARITY_NO_AF isolates anisotropic-filtering implementation
+    // differences between GL and VK by turning AF off on BOTH sides for a harness run.
+    float const requested_eff = std::getenv("NOGGIT_PARITY_NO_AF") ? 1.0f : requested;
+    return std::clamp(requested_eff, 1.0f, hw_max);
   }
 
   void apply_anisotropy(GLenum target)
@@ -229,7 +240,8 @@ TexArrayParams& TextureManager::get_tex_array(int width, int height, int mip_lev
 
   int index_x = array_params.n_used / n_layers;
 
-  if (array_params.arrays.size() <= index_x)
+  // a recycled slot fits in an EXISTING array -- never grow capacity while one is available
+  if (array_params.free_slots.empty() && array_params.arrays.size() <= index_x)
   {
     GLuint array;
 
@@ -274,7 +286,8 @@ TexArrayParams& TextureManager::get_tex_array(GLint compression, int width, int 
 
   int index_x = array_params.n_used / n_layers;
 
-  if (array_params.arrays.size() <= index_x)
+  // a recycled slot fits in an EXISTING array -- never grow capacity while one is available
+  if (array_params.free_slots.empty() && array_params.arrays.size() <= index_x)
   {
     GLuint array;
 
@@ -459,11 +472,20 @@ void blp_texture::upload()
 
     auto& params = TextureManager::get_tex_array( _width, _height, static_cast<int>(_data.size()), _context);
 
-    int index_x = params.n_used / n_layers;
-    int index_y = params.n_used % n_layers;
+    // recycle a released slot before growing the class (see TexArrayParams::free_slots)
+    int slot = params.n_used;
+    if (!params.free_slots.empty())
+    {
+      slot = params.free_slots.back();
+      params.free_slots.pop_back();
+    }
+    int index_x = slot / n_layers;
+    int index_y = slot % n_layers;
 
     _texture_array = params.arrays[index_x];
     _array_index = index_y;
+    _array_class = std::make_tuple(static_cast<GLint>(-1), _width, _height, static_cast<int>(_data.size()));
+    _array_slot = slot;
 
     for (int i = 0; i < _data.size(); ++i)
     {
@@ -473,7 +495,10 @@ void blp_texture::upload()
       height = std::max(height >> 1, 1);
     }
 
-    params.n_used++;
+    if (slot == params.n_used)
+    {
+      params.n_used++;
+    }
 
     {
       static bool const s_texup_log = std::getenv("NOGGIT_TEXUP_LOG") != nullptr;
@@ -499,11 +524,20 @@ void blp_texture::upload()
 
     auto& params = TextureManager::get_tex_array(_compression_format.value(), _width, _height, static_cast<int>(_compressed_data.size()), _compressed_data, _context);
 
-    int index_x = params.n_used / n_layers;
-    int index_y = params.n_used % n_layers;
+    // recycle a released slot before growing the class (see TexArrayParams::free_slots)
+    int slot = params.n_used;
+    if (!params.free_slots.empty())
+    {
+      slot = params.free_slots.back();
+      params.free_slots.pop_back();
+    }
+    int index_x = slot / n_layers;
+    int index_y = slot % n_layers;
 
     _texture_array = params.arrays[index_x];
     _array_index = index_y;
+    _array_class = std::make_tuple(_compression_format.value(), _width, _height, static_cast<int>(_compressed_data.size()));
+    _array_slot = slot;
 
     for (int i = 0; i < _compressed_data.size(); ++i)
     {
@@ -513,7 +547,10 @@ void blp_texture::upload()
       height = std::max(height >> 1, 1);
     }
 
-    params.n_used++;
+    if (slot == params.n_used)
+    {
+      params.n_used++;
+    }
 
     // [FALLS-DIAG 2026-08-08] NOGGIT_TEXUP_LOG=1: name every array upload (file -> array/layer) so a
     // layer collision or unexpected writer in a class is visible from one run. Diagnostic only.
@@ -536,8 +573,55 @@ void blp_texture::upload()
   g_texture_upload_epoch.fetch_add(1, std::memory_order_relaxed); // MDI batcher cache-invalidation signal
 }
 
+// [mem 2026-08-26] layer recycling: without this, array layers were append-only -- every unique
+// texture ever seen held its slot for the whole session (the refcounted blp_texture freed, its
+// LAYER did not), so long fly-around sessions grew VRAM/driver RAM monotonically until the
+// machine paged itself to death. All calls happen on the GL/main thread (same thread that
+// uploads), matching the existing unsynchronized _tex_arrays access.
+void blp_texture::release_array_slot()
+{
+  if (_array_slot < 0 || !_array_class)
+  {
+    return;
+  }
+  TextureManager::release_layer(_context, *_array_class, _array_slot);
+  _array_slot = -1;
+  _array_class.reset();
+  _texture_array = 0;
+  _array_index = -1;
+}
+
+blp_texture::~blp_texture()
+{
+  release_array_slot();
+}
+
+void TextureManager::release_layer(Noggit::NoggitRenderContext context,
+                                   std::tuple<GLint, int, int, int> const& klass, int slot)
+{
+  // [2026-08-27 SHIRT BUG] slot REUSE is opt-in (NOGGIT_TEX_RECYCLE=1) until the pre-existing
+  // refcount imbalance is fixed: AsyncObjectMultimap::erase's own comment documents tolerated
+  // DOUBLE-RELEASES -- a texture can be destroyed while a live instance still draws its layer.
+  // Append-only layers made that invisible (dead layers kept their pixels); reuse made every
+  // such dangling holder show the slot's NEW occupant (several displays all wearing the same
+  // white shirt). With the flag off free_slots stays empty, so upload() never recycles and
+  // get_tex_array's growth guard is inert -- exact pre-round-54 layer behaviour.
+  static bool const s_recycle = std::getenv("NOGGIT_TEX_RECYCLE") != nullptr;
+  if (!s_recycle)
+  {
+    return;
+  }
+  auto& per_context = _tex_arrays[static_cast<std::size_t>(context)];
+  auto const it = per_context.find(klass);
+  if (it != per_context.end())
+  {
+    it->second.free_slots.push_back(slot);
+  }
+}
+
 void blp_texture::unload()
 {
+  release_array_slot(); // the re-upload takes a (possibly different) recycled slot
   _uploaded = false;
 
   // load data back from file. pretty sad. maybe keep it after loading?

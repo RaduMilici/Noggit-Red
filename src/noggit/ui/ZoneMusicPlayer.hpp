@@ -41,6 +41,30 @@ namespace Noggit::Ui
     // current track when both are 0.
     void update_zone(int zone_music_id, int intro_music_id, bool is_day);
 
+    // ===== ZONE AMBIENCE channel (client law RE'd, doc 38) =====
+    // A looping SoundEntries stream from the zone's SoundAmbience row (Day/Night column), with
+    // the client's "Underwater (DONOTRENAME)" SoundEntries override while the LISTENER is
+    // submerged. Every record change is a genuine 5.0 s CROSSFADE (FUN_00460b00: the old stream
+    // fades to silence over 5 s AND the new one ramps 0 -> its authored SoundEntries Volume
+    // over 5 s) -- unlike music (4 s out + hard start). Call each frame like update_zone.
+    void update_ambience(int sound_ambience_id, bool is_day, bool underwater);
+    // The live Ambience slider value (0..100) -- the water-loop engine shares this channel.
+    int ambience_volume() const { return _amb_volume; }
+
+    // Submerged-listener MUSIC duck (doc 38): the client's underwater SoundProviderPreferences
+    // row (EAX roomHF -10000 mB) muffles everything; EAX is unreproducible on QMediaPlayer, so
+    // the music decks approximate it (labeled) with a 0.5 volume duck. The ambience channel is
+    // EXEMPT -- underwater it already plays the dedicated underwater record.
+    void set_submerged(bool s)
+    {
+      if (_submerged == s) { return; }
+      _submerged = s;
+      if (!_fade_timer->isActive() && _decks[_active_deck])
+      {
+        _decks[_active_deck]->setVolume(effective_master());
+      }
+    }
+
   private:
     void ensure_deck(int deck);   // lazily create one of the two QMediaPlayer "decks"
     void rebuild_playlist();      // (re)load _files/_dir from _current_zone_music_id + _is_day
@@ -52,6 +76,12 @@ namespace Noggit::Ui
     void stop_playback();
     void shutdown_audio();        // release the media backend fully (stop + clear media) for a clean exit
     bool intro_off_cooldown(int intro_id) const; // ZoneIntroMusicTable MinDelayMinutes gate
+
+    // ambience channel internals (see update_ambience)
+    void ensure_amb_deck(int deck);
+    void start_ambience_entry(int se_id); // begin the 5 s crossfade to this SoundEntries id (0 = to silence)
+    void tick_ambience_fade();            // wall-clock 5.0 s ramp, both decks
+    int underwater_ambience_entry();      // "Underwater (DONOTRENAME)" SoundEntries id (cached name scan)
 
     // CLIENT-FAITHFUL transition (RE'd from wow.exe, see RE_notes/ghidra/out/MUSIC_ENGINE_RE.md):
     // the 1.12 client does NOT crossfade -- a new track HARD-STARTS at full volume (instant
@@ -68,9 +98,18 @@ namespace Noggit::Ui
     QTimer* _silence_timer;
     QTimer* _fade_timer;          // drives the fade-out of the previous deck
     int _master_volume = 70;      // user's target volume (slider); the live deck plays AT this
+    bool _submerged = false;      // see set_submerged()
+    int effective_master() const
+    {
+      return _submerged ? (_master_volume + 1) / 2 : _master_volume;
+    }
     bool _track_ending = false;   // guards against scheduling the next track more than once per track
     int _fade_from_volume = 0;    // outgoing deck's volume when the fade-out started
-    int _fade_ticks = 0;          // elapsed fade-out ticks (FADE_TICK_MS each)
+    // WALL-CLOCK fade anchor (2026-08-27, user: fade "goes lower, pause, lower, pause"): the fade
+    // ran on COUNTED ticks, but zone changes stall the UI thread with tile loads, so the QTimer
+    // fired in late bursts -- chunked volume drops AND a stretched fade. Elapsed real time puts
+    // every (late) tick at the right point on the client's 4.0 s linear ramp.
+    qint64 _fade_start_ms = 0;
     std::mt19937 _rng;
 
     bool _enabled = false;
@@ -100,5 +139,19 @@ namespace Noggit::Ui
     QLabel* _zone_label;
     QSlider* _volume_slider;
     QListWidget* _song_list;
+
+    // ===== ambience channel state =====
+    QMediaPlayer* _amb_decks[2] = {nullptr, nullptr};
+    QTemporaryFile* _amb_files[2] = {nullptr, nullptr};
+    int _amb_active = 0;
+    QTimer* _amb_fade_timer = nullptr;
+    qint64 _amb_fade_start_ms = 0;   // wall-clock crossfade anchor (5000 ms, both directions)
+    int _amb_fade_from = 0;          // outgoing deck volume at fade start
+    int _amb_target_volume = 0;      // incoming deck target = SoundEntries Volume x slider
+    float _amb_dbc_vol = 1.0f;       // the playing row's authored Volume (for live slider apply)
+    int _amb_volume = 70;            // ambience slider (client AmbienceVolume analogue)
+    int _current_ambience_se = 0;    // SoundEntries id currently sounding (0 = silence)
+    int _underwater_ambience_se = -2; // -2 = not yet resolved by the name scan
+    QSlider* _ambience_slider = nullptr;
   };
 }

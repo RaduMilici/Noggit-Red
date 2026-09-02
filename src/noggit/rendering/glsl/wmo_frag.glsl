@@ -70,6 +70,15 @@ float dyn_shadow_sample(sampler2DShadow smap, mat4 smatrix, vec4 center_range, v
   float fade = clamp((fade_r - 0.65) / 0.35, 0.0, 1.0);
   return mix(mix(ShadowParams.y, 1.0, s / 9.0), 1.0, fade);
 }
+// UNIT-ONLY shadow (no ENVIRONMENTAL map). Interior faces are lit by their baked MOCV, which
+// ALREADY contains the building's own self-shadowing -- multiplying the env map in on top of that
+// repaints the interior (user 2026-08-27: it changed Timbermaw's interior lighting). Creature and
+// player shadows come from the UNIT map only, which is what the missing-shadow report was about.
+float dyn_unit_shadow_factor(vec3 world_pos)
+{
+  if (ShadowParams.x < 0.5) { return 1.0; }
+  return dyn_shadow_sample(shadow_map, ShadowMatrix, ShadowCenterRange, world_pos);
+}
 float dyn_shadow_factor(vec3 world_pos)
 {
   if (ShadowParams.x < 0.5) { return 1.0; }
@@ -276,6 +285,15 @@ vec3 apply_lighting(vec3 material)
   vec3 vertex_color = bool(flags & eWMOBatch_HasMOCV) ? f_vertex_color.rgb : vec3(0.);
 
   vec3 light_color;
+  // UNIT SHADOW COVERAGE (user 2026-08-27: "shadow doesn't render on WMO surfaces"). The dynamic
+  // shadow was only ever multiplied into the EXTERIOR branch's directional term, so every
+  // MOCV-lit interior face -- building floors, and the city surfaces that light from their bake --
+  // received no shadow at all, while terrain and M2 (which both call dyn_shadow_factor) did. The
+  // client's unit shadow is a PROJECTED MULTIPLY pass: it lands on whatever surface is under the
+  // unit regardless of how that surface is lit. Track whether the branch already applied it and
+  // multiply the finished interior light below -- with the UNIT map ONLY (dyn_unit_shadow_factor),
+  // never the environmental map, so baked interior lighting is left exactly as authored.
+  bool shadow_applied = false;
 
   if (bool(flags & eWMOBatch_Unlit))
   {
@@ -322,6 +340,7 @@ vec3 apply_lighting(vec3 material)
     // read too bright and warm vs in-game.)
     // Dynamic shadow (extShadowQuality-style): occludes the directional sun term only.
     nDotL *= dyn_shadow_factor(f_position);
+    shadow_applied = true;
     light_color = clamp(lit_diffuse * nDotL, 0.0, 1.0)
                 + lit_ambient;
     // UNIFIED PATH (MOHD 0x2) EXTERIOR: the MapObjU shaders ADD the baked MOCV on exterior batches
@@ -415,6 +434,14 @@ vec3 apply_lighting(vec3 material)
     {
       light_color = ambient_color + (bool(flags & eWMOBatch_HasMOCV) ? mocv_light : vec3(0.0));
     }
+  }
+
+  // Interior / unified / no-MOCV faces: the branch above computed a baked or ambient light with no
+  // directional term to occlude, so the projected unit shadow multiplies the FINISHED light here.
+  // Self-illuminated (F_UNLIT) faces are emissive and stay unshadowed, like the client.
+  if (!shadow_applied && !bool(flags & eWMOBatch_Unlit))
+  {
+    light_color *= dyn_unit_shadow_factor(f_position);
   }
 
   light_color += point_lights(f_position, normalize(f_normal));

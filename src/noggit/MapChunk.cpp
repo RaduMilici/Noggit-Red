@@ -1,5 +1,10 @@
 // This file is part of Noggit3, licensed under GNU General Public License (version 3).
 #include <math/frustum.hpp>
+#include <atomic> // GRASS-DIAG one-shot counter
+#include <array>   // footstep terrain-type layer weights
+#include <sstream> // FOOTSTEP-LAYER diagnostic
+#include <mutex>   // per-tile texture->terrain table
+#include <string>
 #include <noggit/Brush.h>
 #include <noggit/TileWater.hpp>
 #include <noggit/ChunkWater.hpp>
@@ -2077,6 +2082,236 @@ void MapChunk::registerChunkUpdate(unsigned flags)
   mt->registerChunkUpdate(flags);
 }
 
+namespace
+{
+  // ===== PER-TEXTURE terrain types, built from the tile's own authoring (doc 38, 2026-08-27).
+  // WHY: the same ground texture is declared inconsistently across chunks. Under Stormwind,
+  // elwynnrockbasetest2 carries effect 7823 -- a FULLY EMPTY GroundEffectTexture row (no
+  // doodads, amount 0, type 0) -- while the very same texture carries effect 993 (an empty row
+  // that still declares TerrainType 2 = STONE) in most other chunks of the tile. A per-chunk
+  // reading therefore reports "nothing" exactly where the city is. The client resolves the
+  // terrain type per TEXTURE (its chunk layers hold a per-texture handle, and its unit-side type
+  // survives chunk-to-chunk moves), so mirror that: scan the whole tile ONCE and let a texture's
+  // authored type apply wherever that texture is used.
+  std::map<std::pair<int, int>, std::map<std::string, int>> g_tile_texture_terrain;
+  std::mutex g_tile_texture_terrain_mutex;
+
+  // Rich row = it authors doodads or a density, so its TerrainType 0 genuinely means Dirt.
+  // Fully empty row with type 0 = unauthored placeholder, NOT Dirt.
+  bool ground_effect_row_is_rich(DBCFile::Record const& rec)
+  {
+    for (int i = 0; i < 4; ++i)
+    {
+      unsigned const dd = rec.getUInt(GroundEffectTextureDB::Doodads + i);
+      if (dd && dd != 0xFFFFFFFFu)
+      {
+        return true;
+      }
+    }
+    return rec.getUInt(GroundEffectTextureDB::Amount()) != 0;
+  }
+
+  std::map<std::string, int> const& tile_texture_terrain(MapTile* mt)
+  {
+    std::pair<int, int> const key{static_cast<int>(mt->index.x), static_cast<int>(mt->index.z)};
+    std::lock_guard<std::mutex> const lock(g_tile_texture_terrain_mutex);
+    auto const it = g_tile_texture_terrain.find(key);
+    if (it != g_tile_texture_terrain.end())
+    {
+      return it->second;
+    }
+    auto& table = g_tile_texture_terrain[key];
+    for (unsigned cz = 0; cz < 16; ++cz)
+    {
+      for (unsigned cx = 0; cx < 16; ++cx)
+      {
+        MapChunk* const c = mt->getChunk(cx, cz);
+        if (!c || !c->texture_set)
+        {
+          continue;
+        }
+        int const n = static_cast<int>(c->texture_set->num());
+        for (int i = 0; i < n; ++i)
+        {
+          unsigned const eff = c->texture_set->getEffectForLayer(static_cast<std::size_t>(i));
+          if (!eff)
+          {
+            continue;
+          }
+          try
+          {
+            if (!gGroundEffectTextureDB.CheckIfIdExists(eff))
+            {
+              continue;
+            }
+            auto const rec = gGroundEffectTextureDB.getByID(eff);
+            int const t = static_cast<int>(rec.getUInt(GroundEffectTextureDB::TerrainType()));
+            // a declared type (or a rich row's explicit Dirt) becomes this texture's type
+            if (t > 0 || ground_effect_row_is_rich(rec))
+            {
+              table.emplace(c->texture_set->filename(static_cast<std::size_t>(i)), t);
+            }
+          }
+          catch (...) {}
+        }
+      }
+    }
+    return table;
+  }
+}
+
+int MapChunk::groundTerrainTypeRowAt(glm::vec3 const& world_pos,
+                                     std::string* out_dominant_texture)
+{
+  // TERRAIN footstep type (doc 38, corrected 2026-08-27 after the "grass on Stormwind stone"
+  // report). The terrain type is a property of the TEXTURE UNDER THE FOOT: the layer's MCLY
+  // effectId -> GroundEffectTexture -> TerrainType. Data proof that this is the general
+  // mechanism (not just a grass-scatter thing): GroundEffectTexture rows exist with ALL FOUR
+  // doodad slots empty (0xFFFFFFFF) purely to declare a type, and the Turtle table authors 628
+  // Stone / 148 Sand / 143 Soggy / 6 Wood rows.
+  //
+  // The layer is picked by ALPHA DOMINANCE at the position -- NOT by the MCNK doodadMapping,
+  // which is the ground-effect SCATTER table (it points at whichever layer may sprout grass and
+  // is commonly 0, which is what made every surface report the base layer's type).
+  if (!texture_set)
+  {
+    return -1;
+  }
+  int const n_tex = static_cast<int>(texture_set->num());
+  if (n_tex <= 0)
+  {
+    return -1;
+  }
+
+  // texel in the chunk's 64x64 alpha grid (index convention x + 64*z, as texture_set uses)
+  float const u = (world_pos.x - mVertices[0].x) / CHUNKSIZE;
+  float const v = (world_pos.z - mVertices[0].z) / CHUNKSIZE;
+  int const tx = std::clamp(static_cast<int>(u * 64.0f), 0, 63);
+  int const tz = std::clamp(static_cast<int>(v * 64.0f), 0, 63);
+  std::size_t const offset = static_cast<std::size_t>(tx) + 64u * static_cast<std::size_t>(tz);
+
+  // per-layer coverage: layers 1..n-1 come from the alphamaps, layer 0 is the remainder
+  std::array<int, 4> weight{{0, 0, 0, 0}};
+  auto* amaps = texture_set->getAlphamaps();
+  int overlaid = 0;
+  for (int i = 1; i < n_tex && i < 4; ++i)
+  {
+    int a = 0;
+    if (amaps && (*amaps)[i - 1].has_value())
+    {
+      a = static_cast<int>((*amaps)[i - 1]->getAlpha(offset));
+    }
+    weight[i] = a;
+    overlaid += a;
+  }
+  weight[0] = std::max(0, 255 - overlaid);
+
+  // most-covering layer first; the first layer that actually authors a ground effect wins (a
+  // decorative overlay without one must not silence the base texture underneath it)
+  std::array<int, 4> order{{0, 1, 2, 3}};
+  std::sort(order.begin(), order.begin() + n_tex,
+            [&weight](int a, int b) { return weight[a] > weight[b]; });
+
+  int chosen = -1;
+  int chosen_layer = -1;
+  unsigned chosen_effect = 0;
+  char const* chosen_via = "none";
+
+  // 1) most-covering layer whose OWN effect row actually declares something (a non-zero type,
+  //    or an explicit Dirt on a row that authors doodads/density).
+  for (int k = 0; k < n_tex && chosen < 0; ++k)
+  {
+    unsigned const effect_id = texture_set->getEffectForLayer(static_cast<std::size_t>(order[k]));
+    if (!effect_id)
+    {
+      continue;
+    }
+    try
+    {
+      if (!gGroundEffectTextureDB.CheckIfIdExists(effect_id))
+      {
+        continue;
+      }
+      auto const rec = gGroundEffectTextureDB.getByID(effect_id);
+      int const t = static_cast<int>(rec.getUInt(GroundEffectTextureDB::TerrainType()));
+      if (t > 0 || ground_effect_row_is_rich(rec))
+      {
+        chosen = t;
+        chosen_layer = order[k];
+        chosen_effect = effect_id;
+        chosen_via = "layer";
+      }
+    }
+    catch (...) {}
+  }
+
+  // 2) placeholder row here (e.g. Stormwind's ground uses the empty effect 7823): fall back to
+  //    what this TEXTURE is declared as elsewhere in the same tile (see tile_texture_terrain).
+  if (chosen < 0 && mt)
+  {
+    auto const& table = tile_texture_terrain(mt);
+    for (int k = 0; k < n_tex && chosen < 0; ++k)
+    {
+      auto const hit = table.find(texture_set->filename(static_cast<std::size_t>(order[k])));
+      if (hit != table.end())
+      {
+        chosen = hit->second;
+        chosen_layer = order[k];
+        chosen_via = "texture-tile";
+      }
+    }
+  }
+
+  // 3) still nothing: hand the caller the dominant texture so it can resolve the type from the
+  //    WHOLE loaded map (the declaring chunks are often in a neighbouring tile -- Stormwind's
+  //    ground texture is declared Stone in 31_48/32_48 while the city itself sits on 30_47).
+  if (out_dominant_texture && n_tex > 0)
+  {
+    *out_dominant_texture = texture_set->filename(static_cast<std::size_t>(order[0]));
+  }
+
+  // FOOTSTEP-LAYER diag (one-shot x20): every layer's coverage + what it declares, so a wrong
+  // terrain type can be traced to the layer pick or to the map data itself in one session.
+  {
+    static std::atomic<int> s_layer_diag_left{20};
+    if (s_layer_diag_left.load(std::memory_order_relaxed) > 0
+        && s_layer_diag_left.fetch_sub(1, std::memory_order_relaxed) > 0)
+    {
+      std::ostringstream layers;
+      for (int i = 0; i < n_tex; ++i)
+      {
+        unsigned const eff = texture_set->getEffectForLayer(static_cast<std::size_t>(i));
+        int tt = -1;
+        try
+        {
+          if (eff && gGroundEffectTextureDB.CheckIfIdExists(eff))
+          {
+            tt = static_cast<int>(gGroundEffectTextureDB.getByID(eff)
+                                    .getUInt(GroundEffectTextureDB::TerrainType()));
+          }
+        }
+        catch (...) {}
+        layers << " L" << i << "{w=" << weight[i] << " eff=" << eff << " T=" << tt << "}";
+      }
+      LogError << "FOOTSTEP-LAYER chunk=" << px << "," << py
+               << " texel=" << tx << "," << tz
+               << " nTex=" << n_tex << layers.str()
+               << " tex0='" << texture_set->filename(0) << "'"
+               << " -> via=" << chosen_via << " layer=" << chosen_layer
+               << " eff=" << chosen_effect << " row=" << chosen << std::endl;
+    }
+  }
+
+  if (chosen >= 0)
+  {
+    return chosen;
+  }
+  // Nothing authored here. The client leaves its cached terrain type at -1 in that case
+  // (FUN_005fa730/FUN_006706d0) and the footstep resolve then plays NOTHING -- silence is a
+  // real client state, so do not invent a Dirt step.
+  return -1;
+}
+
 std::vector<MapChunk::DetailDoodad> const& MapChunk::detailDoodads()
 {
   if (!_detail_doodads_computed)
@@ -2149,6 +2384,10 @@ void MapChunk::computeDetailDoodads()
     return glm::mix(top, bot, v);
   };
 
+  // CLIENT slot-offset state (FUN_006bfc10 local_8): the species round-robin offset is the
+  // chunk's RUNNING VISIT ordinal, incremented once per subcell visit -- see the placement loop.
+  unsigned visit_counter = 0;
+
   for (int sy = 0; sy < 8; ++sy)
   {
     for (int sx = 0; sx < 8; ++sx)
@@ -2213,6 +2452,40 @@ void MapChunk::computeDetailDoodads()
       {
         continue;
       }
+      // DIAGNOSTIC (grass saga): sample the first resolution attempts once per session -- names the
+      // effect ids this map actually feeds in and whether the loaded DBC resolves them (the census
+      // says they should nearly all be dead; if blades appear anyway, these lines name the source).
+      {
+        static std::atomic<int> s_grass_diag_left{12};
+        if (s_grass_diag_left.load(std::memory_order_relaxed) > 0
+            && s_grass_diag_left.fetch_sub(1, std::memory_order_relaxed) > 0)
+        {
+          bool resolved = false;
+          std::string first_doodad;
+          try
+          {
+            DBCFile::Record r = gGroundEffectTextureDB.getByID(effect_id);
+            resolved = true;
+            for (int di = 0; di < 4 && first_doodad.empty(); ++di)
+            {
+              unsigned const dd = r.getUInt(GroundEffectTextureDB::Doodads + di);
+              if (dd && dd != 0xFFFFFFFFu)
+              {
+                try
+                {
+                  first_doodad = gGroundEffectDoodadDB.getByID(dd).getString(GroundEffectDoodadDB::Filename());
+                }
+                catch (...) {}
+              }
+            }
+          }
+          catch (...) {}
+          LogError << "GRASS-DIAG resolve effect_id=" << effect_id
+                   << " resolved=" << (resolved ? 1 : 0)
+                   << " doodad='" << first_doodad << "'"
+                   << " chunk=" << px << "," << py << std::endl;
+        }
+      }
 
       // Doodad table: the RAW 4 slots (client keeps empties in place -- the round-robin below
       // indexes the raw array so an empty slot simply places nothing, which is how the client
@@ -2247,12 +2520,27 @@ void MapChunk::computeDetailDoodads()
         continue;
       }
 
-      unsigned const subcell = static_cast<unsigned>(sy * 8 + sx);
-      for (unsigned d = 0; d < amount; ++d)
+      // CLIENT-EXACT species pick (FUN_006bfc10 line ~208): slot = doodad[(d + VISIT ordinal) & 3]
+      // -- the offset is the chunk's running subcell-visit counter (client local_8), NOT the
+      // subcell index. On low-density rows (mountain dressing authors 1-4 per visit) not every
+      // slot cycles, so the offset decides WHICH species appear: the old (d + subcell)&3 law
+      // systematically picked a different subset than the client on sparse rows (user 2026-08-26:
+      // "wrong grass choice, wrong grass at hills and mountains"). Our folded amount
+      // (= density x frill/64) is split back into client-shaped visits: frill >= 64 -> multiple
+      // visits of the authored density; frill < 64 -> one visit of the scaled amount.
+      unsigned const n_visits = std::max(1u, static_cast<unsigned>(frill_scale + 0.5f));
+      unsigned const per_visit = std::max(1u, (amount + n_visits - 1u) / n_visits);
+      unsigned placed = 0;
+      for (unsigned v = 0; v < n_visits; ++v, ++visit_counter)
+      for (unsigned d = 0; d < per_visit; ++d)
       {
-        // client-exact species pick (FUN_006bfc10): raw-slot round-robin doodad[(d + subcell) & 3].
+        if (placed >= amount)
+        {
+          break;
+        }
+        ++placed;
         // An empty slot -> no doodad this iteration (species weighting + natural gaps).
-        unsigned const doodad_id = slot_ids[(d + subcell) & 3u];
+        unsigned const doodad_id = slot_ids[(d + visit_counter) & 3u];
         if (!doodad_id)
         {
           continue;
@@ -2340,6 +2628,7 @@ void MapChunk::computeDetailDoodads()
         transform = glm::rotate(transform, yaw, glm::vec3(0.0f, 1.0f, 0.0f));
         transform = glm::scale(transform, glm::vec3(scale));
 
+
         // Per-blade packed attribute -- CLIENT-EXACT bake (placement FUN_007d3390 + DetailDoodad.bls
         // vs_2_0/ps_2_0 extracted from patch.MPQ, RE 2026-08-20):
         //   vertColor.rgb = the RAW interpolated MCCV bytes (neutral painted MCCV 0x7F ~= HALF
@@ -2376,5 +2665,16 @@ void MapChunk::computeDetailDoodads()
       }
     }
   }
+
+  // [finding 138] Group the doodads by model with a STABLE sort. This is order-preserving for the
+  // renderer: models_to_draw[m] only ever receives model m's doodads, and a stable sort keeps their
+  // relative order, so every per-model instance array comes out bit-identical. (Finding 135 wrongly
+  // assumed grouping would reorder instances and need the parity images re-blessed -- it does not.)
+  //
+  // Why it matters: measured run length was 1.05 (finding 135), i.e. the models are interleaved, so
+  // every per-run optimisation in the clutter loop was operating on runs of one.
+  std::stable_sort(_detail_doodads.begin(), _detail_doodads.end(),
+                   [](DetailDoodad const& a, DetailDoodad const& b)
+                   { return a.model_path < b.model_path; });
 }
 

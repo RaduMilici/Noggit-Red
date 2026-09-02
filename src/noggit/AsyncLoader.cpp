@@ -1,5 +1,6 @@
 // This file is part of Noggit3, licensed under GNU General Public License (version 3).
 
+#include <atomic>
 #include <noggit/AsyncLoader.h>
 #include <noggit/errorHandling.h>
 #include <Exception.hpp>
@@ -224,6 +225,10 @@ void AsyncLoader::process()
       if (object->is_required_when_saving())
       {
         _important_object_failed_loading = true;
+        // Name the culprit: the save dialog ("some models couldn't be loaded") only reports THAT
+        // something failed; without this line there is no way to know WHICH object tripped it.
+        LogError << "SAVE-BLOCKING load failure: key='" << async_object_key(object)
+                 << "' type=" << object->async_object_type_name() << std::endl;
       }
 
       _currently_loading.remove(object);
@@ -242,6 +247,10 @@ void AsyncLoader::process()
       if (object->is_required_when_saving())
       {
         _important_object_failed_loading = true;
+        // Name the culprit: the save dialog ("some models couldn't be loaded") only reports THAT
+        // something failed; without this line there is no way to know WHICH object tripped it.
+        LogError << "SAVE-BLOCKING load failure: key='" << async_object_key(object)
+                 << "' type=" << object->async_object_type_name() << std::endl;
       }
 
       _currently_loading.remove(object);
@@ -259,6 +268,10 @@ void AsyncLoader::process()
       if (object->is_required_when_saving())
       {
         _important_object_failed_loading = true;
+        // Name the culprit: the save dialog ("some models couldn't be loaded") only reports THAT
+        // something failed; without this line there is no way to know WHICH object tripped it.
+        LogError << "SAVE-BLOCKING load failure: key='" << async_object_key(object)
+                 << "' type=" << object->async_object_type_name() << std::endl;
       }
 
       _currently_loading.remove(object);
@@ -267,8 +280,18 @@ void AsyncLoader::process()
   }
 }
 
+// [EXIT-CRASH FIX 2026-08-29] AsyncLoader is a function-local static, so it is destroyed during
+// process exit while other statics -- notably the object map owning WMOs, whose doodad
+// ModelInstances release model references in their destructors -- are still being torn down. Those
+// destructors called into the DEAD loader and faulted on its mutex/condvar. This flag has constant
+// initialisation and no destructor, so it remains readable for the whole of exit.
+std::atomic<bool> g_async_loader_alive{false};
+
 void AsyncLoader::queue_for_load (AsyncObject* object)
 {
+  if (!g_async_loader_alive.load(std::memory_order_acquire))
+    return;   // shutting down: nothing left to load, and the queues are gone
+
   std::lock_guard<std::mutex> const lock (_guard);
   _to_load[(size_t)object->loading_priority()].push_back (object);
   _state_changed.notify_one();
@@ -276,6 +299,12 @@ void AsyncLoader::queue_for_load (AsyncObject* object)
 
 void AsyncLoader::ensure_deletable (AsyncObject* object)
 {
+  // Destroyed loader (process exit): the worker threads were already stopped and joined by
+  // ~AsyncLoader, so nothing can still be loading this object and there is nothing to wait for.
+  // Touching _guard/_state_changed here is what crashed WMO teardown.
+  if (!g_async_loader_alive.load(std::memory_order_acquire))
+    return;
+
   std::unique_lock<std::mutex> lock (_guard);
   _state_changed.wait
   ( lock
@@ -309,10 +338,14 @@ AsyncLoader::AsyncLoader(int numThreads)
   {
     _threads.emplace_back (&AsyncLoader::process, this);
   }
+  g_async_loader_alive.store(true, std::memory_order_release);
 }
 
 AsyncLoader::~AsyncLoader()
 {
+  // Mark dead FIRST: destructors running later in the exit sequence must take the early-out above
+  // rather than reach into members that are about to be destroyed.
+  g_async_loader_alive.store(false, std::memory_order_release);
   _stop = true;
   _state_changed.notify_all();
 

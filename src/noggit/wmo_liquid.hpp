@@ -115,32 +115,57 @@ public:
              bool is_ocean,
              std::string const& wmo_path,
              bool interior_material_color = false,
-             glm::vec3 const& material_color = glm::vec3(0.0f));
+             glm::vec3 const& material_color = glm::vec3(0.0f),
+             bool indoor_channel = false,
+             std::vector<glm::vec3> const* group_vertices = nullptr);
   wmo_liquid(wmo_liquid const& other);
 
   // [game mode] local-space surface height when local_pos lies within this liquid's XZ extent
   // (WMO pools are flat-ish: the max vertex height). nullopt outside.
+  // TILE-ACCURATE submersion probe (FLOATLIQ, 2026-08-24). The old version returned the MAX height
+  // of every rendered vertex over the whole pool's XZ AABB -- on multi-level liquid (MC lava spans
+  // -110..-20) that flooded every room below the pool's HIGHEST ledge ("starts swimming in a lot of
+  // sections"), and phantom Z~0 sheets extended the AABB. Correct = find the tile under the point,
+  // require it RENDERED (hidden bit 0x8 respected, exactly like the render path), and bilinear the
+  // 4 corner heights of THAT tile -- the 1.12 client's per-tile behaviour.
   std::optional<float> heightAtLocal(glm::vec3 const& local_pos) const
   {
-    if (vertices.empty())
+    if (_tile_rendered.empty() || _grid_heights.empty())
     {
       return std::nullopt;
     }
-    float minx = vertices[0].x, maxx = minx;
-    float minz = vertices[0].z, maxz = minz;
-    float maxh = vertices[0].y;
-    for (auto const& v : vertices)
-    {
-      minx = std::min(minx, v.x); maxx = std::max(maxx, v.x);
-      minz = std::min(minz, v.z); maxz = std::max(maxz, v.z);
-      maxh = std::max(maxh, v.y);
-    }
-    if (local_pos.x < minx || local_pos.x > maxx || local_pos.z < minz || local_pos.z > maxz)
+    float const fx = (local_pos.x - pos.x) / 4.1666666f;
+    float const fz = (pos.z - local_pos.z) / 4.1666666f;
+    if (fx < 0.0f || fz < 0.0f || fx >= static_cast<float>(xtiles) || fz >= static_cast<float>(ytiles))
     {
       return std::nullopt;
     }
-    return maxh;
+    int const i = static_cast<int>(fx);
+    int const j = static_cast<int>(fz);
+    if (!_tile_rendered[j * xtiles + i])
+    {
+      return std::nullopt;
+    }
+    float const tx = fx - static_cast<float>(i);
+    float const tz = fz - static_cast<float>(j);
+    int const stride = xtiles + 1;
+    float const h =
+      (_grid_heights[j * stride + i] * (1.0f - tx) + _grid_heights[j * stride + i + 1] * tx) * (1.0f - tz)
+      + (_grid_heights[(j + 1) * stride + i] * (1.0f - tx) + _grid_heights[(j + 1) * stride + i + 1] * tx) * tz;
+    return h;
   }
+
+  int liquid_id() const { return _liquid_id; }
+  // [VULKAN] geometry mirror captured in initGeometry (the GL path discards its locals).
+  // 6 floats per vertex: pos xyz | depth | uv xy.
+  std::vector<float> const& vkVertices() const { return _vk_verts; }
+  std::vector<std::uint16_t> const& vkIndices() const { return _vk_indices; }
+  glm::vec3 const& materialColor() const { return _material_color; }
+  bool vkUseMaterialColor() const { return _use_material_color; }
+  bool vkIndoorChannel() const { return _indoor_channel; }
+  // LiquidTextureManager profile key -- WMO liquid ids are remapped before the lookup, so VK must
+  // use the SAME mapping GL's draw() does or it picks the wrong texture/anim/type.
+  static unsigned vkTextureProfileId(int liquid_id);
 
   void upload(OpenGL::Scoped::use_program& water_shader);
   void draw(glm::mat4x4 const& transform,
@@ -161,11 +186,27 @@ private:
   // instead of the zone water light. Resolved in WMO.cpp from the group EXTERIOR/exterior-lit flags.
   bool _use_material_color = false;
   glm::vec3 _material_color = glm::vec3(0.0f);
+  // City water CHANNELS (Stormwind canals/harbor, Booty Bay): MOGP indoor flag 0x2000 + exterior_lit
+  // -- the ocean-dark opaque look. Open-air WMO pools (Northshire abbeygate stream) lack indoor and
+  // blend with the river instead.
+  bool _indoor_channel = false;
 
+  std::vector<float> _vk_verts;
+  std::vector<std::uint16_t> _vk_indices;
   std::vector<float> depths;
   std::vector<glm::vec2> tex_coords;
   std::vector<glm::vec3> vertices;
   std::vector<std::uint16_t> indices;
+
+  // Per-tile probe data (heightAtLocal): rendered flag per tile (hidden bit 0x8 clear) + the FULL
+  // (xtiles+1)*(ytiles+1) vertex height grid in group-local space. Filled in initGeometry.
+  std::vector<std::uint8_t> _tile_rendered;
+  std::vector<float> _grid_heights;
+  // FLOATLIQ geometric clip (port of twmoa_toolkit wmo_liquid_geometric_clip.py, the fix that
+  // hides Turtle's flat phantom sheets in the 3.3.5a data): 1 = tile hidden because the flat
+  // sheet hovers over open air there (no group mesh vertex at/below water level in its cell).
+  // Empty when the clip doesn't apply (non-flat pool / mostly-submerged pool / no mesh).
+  std::vector<std::uint8_t> _clip_hidden;
 
   int _indices_count;
 

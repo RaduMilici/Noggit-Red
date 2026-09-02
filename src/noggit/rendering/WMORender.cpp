@@ -256,6 +256,8 @@ void WMORender::unload()
   }
 }
 
+int g_wmo_interior_mod2x = 1;   // mirrored from the GL uniform for the VK WMO shader
+
 void WMORender::draw(OpenGL::Scoped::use_program& wmo_shader
     , OpenGL::program* wmo_liquid_program
     , LiquidTextureManager* liquid_texture_manager
@@ -287,12 +289,20 @@ void WMORender::draw(OpenGL::Scoped::use_program& wmo_shader
     return;
   }
 
+  _vk_fog = VkFogContext{};   // zone fog unless an MFOG sphere applies below
+  // [finding 100] VK owns the WMO pass: these uniforms feed a GL shader that issues no draws
+  // this frame. The VK feed is built from _vk_fog and the batch table, not from GL uniform state,
+  // so skipping them changes nothing that is drawn.
+  extern bool g_vk_owns_wmo;   // WMOGroupRender.cpp
+  bool const vk_skip_gl_uniforms = g_vk_owns_wmo;
+  if (!vk_skip_gl_uniforms)
   wmo_shader.uniform("ambient_color",glm::vec3(_wmo->ambient_light_color));
 
   // UNIFIED RENDER PATH (MOHD flag 0x2): the client hard-branches on this flag to the additive
   // MapObjU shaders (interior = MOHD ambient + baked MOCV). Set per-WMO from its own flag so stock
   // WMOs (flags 0x0) get 0 and the shader's interior branch stays byte-identical; only the retail
   // ports and stock Stormwind carry the flag. See noggit-wmo-unified-render-path.
+  if (!vk_skip_gl_uniforms)
   wmo_shader.uniform("wmo_unified", _wmo->flags.use_unified_render_path ? 1 : 0);
 
   // While the camera is inside a WMO, its exterior-lit + portal-spill faces are lit from THIS WMO's own
@@ -300,6 +310,7 @@ void WMORender::draw(OpenGL::Scoped::use_program& wmo_shader
   // positioned inside a city WMO, so the outdoor fallback was flooding Ironforge's building fronts and the
   // gryphon-flight tunnels with Dun Morogh daylight. Viewed from outside (in the world) they keep outdoor
   // lighting. world_renderer is null in the asset-preview, where the camera is never "inside" a WMO.
+  if (!vk_skip_gl_uniforms)
   wmo_shader.uniform("camera_inside_wmo",
       (world_renderer && world_renderer->cameraInsideWmo()) ? 1 : 0);
 
@@ -308,6 +319,7 @@ void WMORender::draw(OpenGL::Scoped::use_program& wmo_shader
   // dimmed when the camera is NOT detected inside the WMO). =1 shows raw MOCV (magenta=no MOCV). 0/unset off.
   static int const s_debug_mocv =
       std::getenv("NOGGIT_WMO_DEBUG_MOCV") ? std::atoi(std::getenv("NOGGIT_WMO_DEBUG_MOCV")) : 0;
+  if (!vk_skip_gl_uniforms)
   wmo_shader.uniform("debug_mocv", s_debug_mocv);
 
   // 3.3.5a interior mod2x (tex*MOCV*2). Gated to non-CLASSIC projects behind NOGGIT_335A_WMO_MOD2X, matching
@@ -318,7 +330,9 @@ void WMORender::draw(OpenGL::Scoped::use_program& wmo_shader
       (std::getenv("NOGGIT_NO_335A_WMO_MOD2X") == nullptr
        && Noggit::Project::CurrentProject::get() != nullptr
        && Noggit::Project::CurrentProject::get()->projectVersion != Noggit::Project::ProjectVersion::CLASSIC) ? 1 : 0;
+  if (!vk_skip_gl_uniforms)
   wmo_shader.uniform("wmo_interior_mod2x", s_wmo_interior_mod2x);
+  g_wmo_interior_mod2x = s_wmo_interior_mod2x;   // [VULKAN phase D] mirror it to the VK pass
 
   // [GREENDBG 2026-07-30] temporary: NOGGIT_WMO_DEBUG=1..6 isolates one shading term (see wmo_frag.glsl).
   {
@@ -327,6 +341,7 @@ void WMORender::draw(OpenGL::Scoped::use_program& wmo_shader
       char const* v = std::getenv("NOGGIT_WMO_DEBUG");
       return (v && *v) ? std::atoi(v) : 0;
     }();
+    if (!vk_skip_gl_uniforms)
     wmo_shader.uniform("wmo_debug_mode", s_wmo_debug_mode);
   }
 
@@ -335,9 +350,11 @@ void WMORender::draw(OpenGL::Scoped::use_program& wmo_shader
   // Defaults target the client's ~0.5 interior-floor brightness (Goldshire apitrace: floor ~120-150/255).
   static float const s_wmo_interior_floor =
       std::getenv("NOGGIT_335A_INTERIOR_FLOOR") ? static_cast<float>(std::atof(std::getenv("NOGGIT_335A_INTERIOR_FLOOR"))) : 0.10f;
+  if (!vk_skip_gl_uniforms)
   wmo_shader.uniform("wmo_interior_floor", s_wmo_interior_floor);
   static float const s_wmo_interior_gain =
       std::getenv("NOGGIT_335A_INTERIOR_GAIN") ? static_cast<float>(std::atof(std::getenv("NOGGIT_335A_INTERIOR_GAIN"))) : 1.30f;
+  if (!vk_skip_gl_uniforms)
   wmo_shader.uniform("wmo_interior_gain", s_wmo_interior_gain);
 
   // (Removed the "wmo_open" outdoor-spill heuristic: it lifted EVERY interior group toward the outdoor
@@ -447,11 +464,21 @@ void WMORender::draw(OpenGL::Scoped::use_program& wmo_shader
       // default fog the live client never shows. Ironforge "interior too near" + Icecrown "too foggy" are
       // ZONE-fog problems (light-zone selection / fog-end), fixed in the lighting path, not here.
 
+      float const wmo_fog_start_frac =
+          fog_end > 0.001f ? std::clamp(fog_start_abs / fog_end, -5.0f, 0.99f) : 0.25f;
+      if (!vk_skip_gl_uniforms)
       wmo_shader.uniform("use_wmo_fog", 1);
+      if (!vk_skip_gl_uniforms)
       wmo_shader.uniform("wmo_fog_color", fog_color);
+      if (!vk_skip_gl_uniforms)
       wmo_shader.uniform("wmo_fog_end", fog_end);
-      wmo_shader.uniform("wmo_fog_start",
-                         fog_end > 0.001f ? std::clamp(fog_start_abs / fog_end, -5.0f, 0.99f) : 0.25f);
+      if (!vk_skip_gl_uniforms)
+      wmo_shader.uniform("wmo_fog_start", wmo_fog_start_frac);
+      // [VULKAN phase D] hand the SAME context to the VK feed (read right after this draw)
+      _vk_fog.use_wmo_fog = true;
+      _vk_fog.color = fog_color;
+      _vk_fog.end = fog_end;
+      _vk_fog.start_frac = wmo_fog_start_frac;
     }
 
     if (world_renderer)
