@@ -4103,8 +4103,21 @@ namespace Noggit::Rendering::VK
         VkDescriptorSet m2_sets[2] = { _dset, _tt_dset };
         vkCmdBindDescriptorSets(rec, VK_PIPELINE_BIND_POINT_GRAPHICS, _m2_layout, 0, 2, m2_sets, 0, nullptr);
         push[18] = _m2_slice_dist;   // m2.frag: per-pixel object-cull slice
+        // [2026-09-01 DITHER FIX] m2.vert now builds a CAMERA-RELATIVE clip position (see the note
+        // there), so this pass needs mvp * translate(camera) rather than the absolute mvp -- the same
+        // matrix the celestial pass already builds. Written into a copy so the passes after M2 keep
+        // the absolute mvp they expect.
+        float m2_push[20];
+        std::memcpy(m2_push, push, sizeof(push));
+        for (int r = 0; r < 4; ++r)
+        {
+          m2_push[12 + r] = mvp16[0 + r] * _sky_camera[0]
+                          + mvp16[4 + r] * _sky_camera[1]
+                          + mvp16[8 + r] * _sky_camera[2]
+                          + mvp16[12 + r];
+        }
         vkCmdPushConstants(rec, _m2_layout,
-                           VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), push);
+                           VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(m2_push), m2_push);
         VkBuffer m2_vbs[5] = { _m2_vbo, _m2_inst_tf, _m2_inst_in, _m2_inst_tx, _m2_inst_st };
         VkDeviceSize m2_offs[5] = { 0, 0, 0, 0, 0 };
         vkCmdBindVertexBuffers(rec, 0, 5, m2_vbs, m2_offs);

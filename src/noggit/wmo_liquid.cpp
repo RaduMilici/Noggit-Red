@@ -198,12 +198,35 @@ wmo_liquid::wmo_liquid(BlizzardArchive::ClientFile* f,
           fl = std::min(fl, v.y);
         }
       }
-      if (below <= group_vertices->size() / 2) // genuinely-submerged pools are left alone
+      // [2026-09-01 DISABLED] This clip is OFF. Measured on kl_grandmoocanyon (Windhorn Canyon) it
+      // hid 30-57% of every pool's liquid tiles -- 611/1925, 375/660, 539/1155, 633/1375 -- which is
+      // the "water in chunks, missing chunks" the user reported. A canyon WMO is mostly WALL, so it
+      // trips the "mostly above water" test, and then every cell whose measured floor sits above the
+      // waterline is discarded -- which in a canyon is most of the map. The rule only holds for a
+      // small pool sitting in a basin, not for a liquid sheet spanning terrain-scale geometry.
+      //
+      // It was added 2026-08-25 for phantom liquid at Northshire's abbeygate waterfall and, per the
+      // user, never fixed that either. Re-enabling it needs a test that cannot delete real water:
+      // clip against the group's floor UNDER each cell (raycast/nearest-triangle), not "is there a
+      // mesh vertex in this 4.17-unit cell", and only for sheets whose footprint is comparable to
+      // the pool rather than the whole group.
+      if (false)
       {
         _clip_hidden.assign(static_cast<std::size_t>(xtiles) * ytiles, 0);
         for (std::size_t k = 0; k < _clip_hidden.size(); ++k)
         {
-          if (cell_floor[k] > wl + 0.5f)
+          // [2026-09-01 HOLE FIX] cell_floor starts at FLT_MAX and is only lowered for cells that
+          // CONTAIN a group mesh vertex. A cell with no vertex therefore kept FLT_MAX and satisfied
+          // `> wl + 0.5`, so it was hidden -- even though nothing had been measured there. Liquid
+          // tiles are 4.17 units; a low-poly group has vertices in only some of them, so most tiles
+          // were clipped away and the surface broke into a regular grid of holes (user report:
+          // Windhorn Canyon water "in chunks, missing chunks", same pattern in GL and VK because
+          // both consume this same clip mask).
+          //
+          // Absence of a vertex is not evidence that the floor is above the water. Only hide a cell
+          // that was actually measured and measured as dry -- which is what the phantom-sheet fix
+          // was after in the first place.
+          if (cell_floor[k] != std::numeric_limits<float>::max() && cell_floor[k] > wl + 0.5f)
           {
             _clip_hidden[k] = 1;
           }
@@ -471,6 +494,69 @@ int wmo_liquid::initGeometry(BlizzardArchive::ClientFile* f, std::string const& 
 
         index += 4;
       }
+    }
+  }
+
+  // [2026-09-01 STAIRCASE FIX] WMO liquid depth is the authored `water_vertex.flow1 / 255`, and the
+  // open-air-pool path now mixes the shallow->deep colour by it (the round-11 change that stopped
+  // flat river-deep pools standing out against the ADT river beside them). That mix is only
+  // meaningful if the WMO actually authored a depth GRADIENT. Turtle's WMOs frequently author flow1
+  // as one or two values, so the mix snapped between two colours along the 4.17-unit liquid tile
+  // grid -- a hard staircase of two shades across a pool with no real deep part (user report,
+  // Windhorn Canyon). Pre-round-11 this could not happen because the pool was drawn flat.
+  //
+  // So: use the gradient only when there IS one. With fewer than three distinct authored values
+  // there is nothing to interpolate, and every vertex takes the mean -- one flat colour, which is
+  // what the pool looked like before the depth mix existed. Depth also drives ALPHA, so the mean
+  // (rather than 0 or 1) keeps the opacity where the artist put it.
+  if (!depths.empty())
+  {
+    float dmin = depths[0], dmax = depths[0], dsum = 0.0f;
+    std::vector<float> distinct;
+    for (float d : depths)
+    {
+      dmin = std::min(dmin, d);
+      dmax = std::max(dmax, d);
+      dsum += d;
+      if (distinct.size() < 3
+          && std::find_if(distinct.begin(), distinct.end(),
+                          [d](float e) { return std::abs(e - d) < 1.0f / 255.0f; }) == distinct.end())
+      {
+        distinct.push_back(d);
+      }
+    }
+    // Measured on this map: depthMin=0 depthMax=1 with the values sitting AT the extremes -- a
+    // bimodal mask, not a gradient. The distinct-value test below missed it because a handful of
+    // intermediate values exist. Treat "almost everything is at 0 or 1" as no gradient too.
+    std::size_t extremes = 0;
+    for (float d : depths)
+    {
+      if (d <= 2.0f / 255.0f || d >= 253.0f / 255.0f) ++extremes;
+    }
+    bool const bimodal = extremes * 10 >= depths.size() * 9;   // >=90% at an extreme
+    if (bimodal || distinct.size() < 3 || (dmax - dmin) < 4.0f / 255.0f)
+    {
+      float const mean = dsum / static_cast<float>(depths.size());
+      std::fill(depths.begin(), depths.end(), mean);
+    }
+  }
+
+  {
+    static int wdiag = 0;
+    if (wdiag < 25)
+    {
+      float dmn = 1e9f, dmx = -1e9f;
+      for (float d : depths) { dmn = std::min(dmn, d); dmx = std::max(dmx, d); }
+      std::size_t hidden = 0;
+      for (std::uint8_t h : _clip_hidden) { if (h) ++hidden; }
+      LogError << "[WATERDIAG-WMO] " << wmo_path
+               << " tiles=" << xtiles << "x" << ytiles
+               << " verts=" << vertices.size()
+               << " depthMin=" << (depths.empty() ? -1.f : dmn)
+               << " depthMax=" << (depths.empty() ? -1.f : dmx)
+               << " clipHidden=" << hidden << "/" << _clip_hidden.size()
+               << std::endl;
+      wdiag++;
     }
   }
 

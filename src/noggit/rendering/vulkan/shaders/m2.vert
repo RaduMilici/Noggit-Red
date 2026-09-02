@@ -104,7 +104,21 @@ void main()
   }
 
   mat4 modelMatrix = inst_transform * boneTransformMat;
-  vec4 world = modelMatrix * vec4(in_pos, 1.0);
+  // [2026-09-01 DITHER FIX] Port of the GL fix in m2_vert.glsl (2026-08-20, "instanced-path dither").
+  // VK formed the FULL world position (~17000 on a real map) and multiplied it by the mvp in float:
+  //   1) mvp * worldpos at that magnitude cancels catastrophically -> vertices swim as the camera moves;
+  //   2) building worldpos = transform * bone * pos at ~17000 quantizes the small per-vertex ANIMATION
+  //      onto the ~0.002 float grid there -> animated models dither/shake in place.
+  // Never form the big world position for the clip path. Keep the animated part model-local (small),
+  // rotate/scale it (still small), and add the instance-minus-camera offset -- big minus big, exact
+  // near the camera. pc.mvp is the CAMERA-RELATIVE matrix (mvp * translate(camera)) for this pass, so
+  // everything the clip position touches stays small. The absolute world position is rebuilt after,
+  // for fog/lighting, where precision does not matter.
+  vec3 local_pos = (boneTransformMat * vec4(in_pos, 1.0)).xyz;   // animated, model-local (small)
+  vec3 rot_pos = mat3(inst_transform) * local_pos;               // rotated/scaled (small)
+  vec3 inst_rel = inst_transform[3].xyz - Camera_Pad.xyz;        // instance-minus-camera (exact)
+  vec3 world_rel = rot_pos + inst_rel;                           // small, precise
+  vec4 world = vec4(world_rel + Camera_Pad.xyz, 1.0);            // absolute, for lighting/fog only
 
   v_world = world.xyz;
   v_normal = mat3(modelMatrix) * in_normal;
@@ -117,7 +131,7 @@ void main()
     int tu1 = (inst_state.w >> 8) & 0xFF;
     if (tu0 == 0 || tu1 == 0)
     {
-      vec3 wr = world.xyz - Camera_Pad.xyz;
+      vec3 wr = world_rel;   // == world - camera, but without re-forming the big value
       vec3 vert_view = vec3(dot(wr, CamRight_Pad.xyz), dot(wr, CamUp_Pad.xyz),
                             -dot(wr, CamFwd_DetailDist.xyz));
       vec3 n = normalize(v_normal);
@@ -133,7 +147,7 @@ void main()
   v_state = inst_state;
 
   // GL clip -> VK clip (z in [0, w]); y stays (VK y-down + un-flipped GL blit cancel)
-  vec4 clip = pc.mvp * world;
+  vec4 clip = pc.mvp * vec4(world_rel, 1.0);   // pc.mvp is camera-relative for the M2 pass
   clip.z = (clip.z + clip.w) * 0.5;
   gl_Position = clip;
 }

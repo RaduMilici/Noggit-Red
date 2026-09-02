@@ -56,10 +56,6 @@ public:
 
   std::array<glm::vec3, 9 * 9>& getVertices() { return _vertices; };
   std::array<float, 9 * 9>& getDepth() { return _depth; };
-  // True when _depth came from the FILE (MCLQ depth bytes, or an MH2O depth array): those are the
-  // client's authoritative shallow->deep color factor. False for editor-created layers and MH2O
-  // blocks without a depth array, where _depth is just the 1.0 default.
-  bool hasAuthoredDepth() const { return _has_authored_depth; }
   std::array<glm::vec2, 9 * 9>& getTexCoords() { return _tex_coords; };
 
   float min() const { return _minimum; }
@@ -107,7 +103,6 @@ private:
   std::uint64_t _subchunks;
   std::array<glm::vec3, 9 * 9> _vertices;
   std::array<float, 9 * 9> _depth;
-  bool _has_authored_depth = false;
   std::array<glm::vec2, 9 * 9> _tex_coords;
 
   std::map<int, std::vector<std::uint16_t>> _indices_by_lod;

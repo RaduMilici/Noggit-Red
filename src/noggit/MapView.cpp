@@ -15084,9 +15084,12 @@ void main()
                       // Same world-unit depth GL derives in LiquidRender: the authored byte scaled so
                       // 255 saturates this type's colour ramp, raised to the physical terrain thinness
                       // where the heightmap is available (continuous across tiles, unlike the raw byte).
-                      float const authored_deep_units = lay.hasAuthoredDepth()
-                        ? ((liquid_cat == 1) ? (1.0f / 0.012f) : (1.0f / 0.05f))
-                        : 8.0f;
+                      // [BISECT 2026-09-01] Reverted to the pre-3f05f266 depth model. That commit
+                      // scaled the authored byte by 20x (river) / 83x (ocean) when hasAuthoredDepth()
+                      // and fell back otherwise, so neighbouring chunks landed on wildly different
+                      // opacities -- dense where a depth byte was authored, near-transparent where
+                      // not. On a custom map that reads as patchy water with chunk-shaped holes.
+                      float const authored_deep_units = 100.0f;
                       MapChunk* const terrain_chunk = t->getChunk(static_cast<unsigned>(wx), static_cast<unsigned>(wz));
                       glm::vec3 const* const heightmap = terrain_chunk ? terrain_chunk->getHeightmap() : nullptr;
                       for (int k = 0; k < 4; ++k)
@@ -15099,7 +15102,7 @@ void main()
                         if (heightmap)
                         {
                           float const diff = p.y - heightmap[17 * vz + vxi].y;
-                          render_depth = std::max(std::max(0.f, diff), raw * authored_deep_units);
+                          render_depth = std::max(0.f, diff);
                         }
                         glm::vec2 const uv = ci < static_cast<int>(ltex.size()) ? ltex[ci] : glm::vec2(0.f);
                         vk_wverts.push_back(p.x); vk_wverts.push_back(p.y); vk_wverts.push_back(p.z);
@@ -15170,11 +15173,23 @@ void main()
               for (auto it = s_water_spans.begin(); it != s_water_spans.end(); )
               {
                 MapTile* const t = it->first;
-                std::uint32_t const slot = (static_cast<std::uint32_t>(t->index.x) & 7u) * 8u
-                                         + (static_cast<std::uint32_t>(t->index.z) & 7u);
-                bool const same_tile = it->second.tile_x == t->index.x
-                                    && it->second.tile_z == t->index.z;
-                if (slot_owned_by(slot, t) && same_tile) { ++it; continue; }   // still its slot: keep
+                // [2026-09-01] USE-AFTER-FREE. s_water_spans is keyed by MapTile*, tiles unload
+                // constantly while flying, and this loop dereferenced the key (t->index) to decide
+                // whether the key was still valid -- i.e. it read a freed MapTile. Two captured crash
+                // stacks landed on exactly this line, on the MAIN thread, and it is also a good
+                // candidate for water flashing/appearing where it should not: the keep-vs-evict
+                // decision is made on garbage, so spans are wrongly retained or wrongly recycled and
+                // their vertex/index ranges get handed to other geometry.
+                //
+                // Finding 117 already established the rule for the geometry slots ("the pointer alone
+                // does not prove identity: a freed MapTile can be reused"), and WaterSpan records
+                // tile_x/tile_z precisely so this loop never has to touch t. Take the identity from
+                // the span and compare only the POINTER, which never loads through it.
+                std::uint32_t const slot = (static_cast<std::uint32_t>(it->second.tile_x) & 7u) * 8u
+                                         + (static_cast<std::uint32_t>(it->second.tile_z) & 7u);
+                bool const same_tile = s_slot_ix[slot] == it->second.tile_x
+                                    && s_slot_iz[slot] == it->second.tile_z;
+                if (s_slot_owner[slot] == t && same_tile) { ++it; continue; }   // still its slot: keep
                 if (it->second.vlen) s_free_v.push_back({ it->second.voff, it->second.vlen });
                 if (it->second.ilen) s_free_i.push_back({ it->second.ioff, it->second.ilen });
                 s_water_packs.erase(t);

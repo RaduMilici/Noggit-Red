@@ -1,6 +1,8 @@
 // This file is part of Noggit3, licensed under GNU General Public License (version 3).
 
 #include <noggit/DBC.h>
+#include <algorithm>
+#include <cctype>
 #include <noggit/Log.h>
 #include <noggit/Misc.h>
 #include <noggit/project/CurrentProject.hpp>
@@ -99,14 +101,114 @@ size_t CreatureDisplayInfoDB::ParticleColorID() { return wotlkDbcLayout() ? 12 :
 // GroundEffectTexture.dbc grew a 4-column weight array in WotLK (7 columns -> 11), pushing the
 // density and terrain-type columns back by 4. Reading the 1.12 index on WotLK data lands on
 // Weights[0], which is 1 almost everywhere -- grass came out ~8x too sparse. See DBC.h.
-size_t GroundEffectTextureDB::Weights()     { return wotlkDbcLayout() ? 5 : 0; }
-size_t GroundEffectTextureDB::Amount()      { return wotlkDbcLayout() ? 9 : 5; }
-size_t GroundEffectTextureDB::TerrainType() { return wotlkDbcLayout() ? 10 : 6; }
+// [2026-09-02 TURTLE FIX] These three used wotlkDbcLayout(), i.e. the project's DECLARED client
+// version. That is not a reliable statement about the DATA: Turtle is 1.12 content ported onto a
+// 3.3.5a client, so the project is declared WotLK while the shipped GroundEffectTexture.dbc can
+// still carry the 1.12 SEVEN-column row. Reading WotLK indices against it puts Weights[0] on the
+// real Amount, reads Amount past the end of the row and makes TerrainType garbage -- every species
+// and density decision downstream is then wrong, which is exactly the "wrong bushes, wrong count"
+// on Turtle maps.
+//
+// The row layouts differ in WIDTH (1.12 = 7 columns, WotLK = 11), so ask the LOADED FILE instead.
+// Falls back to the project version only while the DBC has not been opened yet (field count 0).
+namespace
+{
+  bool groundEffectTextureIsWotlk()
+  {
+    std::size_t const n = gGroundEffectTextureDB.getFieldCount();
+    if (n == 0) { return wotlkDbcLayout(); }   // not loaded yet -- no data to judge by
+    static int cached = -1;
+    if (cached < 0)
+    {
+      cached = (n >= 11) ? 1 : 0;
+      LogError << "[DBC] GroundEffectTexture.dbc has " << n << " columns -> using the "
+               << (cached ? "3.3.5a (weighted)" : "1.12 (no weights)") << " layout"
+               << " (project declares " << (wotlkDbcLayout() ? "WotLK" : "Classic") << ")" << std::endl;
+    }
+    return cached == 1;
+  }
+}
+size_t GroundEffectTextureDB::Weights()     { return groundEffectTextureIsWotlk() ? 5 : 0; }
+size_t GroundEffectTextureDB::Amount()      { return groundEffectTextureIsWotlk() ? 9 : 5; }
+size_t GroundEffectTextureDB::TerrainType() { return groundEffectTextureIsWotlk() ? 10 : 6; }
 
 // GroundEffectDoodad.dbc keeps 3 columns but swaps the last two between versions, so the 1.12 index
 // resolves every WotLK doodad to the empty string and no detail model loads. See DBC.h.
-size_t GroundEffectDoodadDB::Filename() { return wotlkDbcLayout() ? 1 : 2; }
-size_t GroundEffectDoodadDB::Flags()    { return wotlkDbcLayout() ? 2 : 1; }
+// Same problem, but both versions have THREE columns so width cannot separate them, and the
+// "field 2 is zero on WotLK" heuristic is WRONG on Turtle -- its rows carry non-zero flags there
+// (measured: f1 nonzero=31, f2 nonzero=32), so that test picked the 1.12 column and read the FLAGS
+// as a string offset, resolving every detail model to garbage.
+//
+// Decide by what the column actually CONTAINS. The filename column holds paths like
+// model paths under world/nodxt/detail; the flags column resolves to junk or nothing. Score both
+// the winner -- this needs no assumption about version, vendor or which fields happen to be zero.
+namespace
+{
+  int scoreFilenameColumn(std::size_t col)
+  {
+    int score = 0, sampled = 0;
+    for (DBCFile::Iterator i = gGroundEffectDoodadDB.begin();
+         i != gGroundEffectDoodadDB.end() && sampled < 64; ++i, ++sampled)
+    {
+      char const* raw = nullptr;
+      try { raw = i->getString(col); } catch (...) { continue; }
+      if (!raw || !*raw) { continue; }
+      std::string v(raw);
+      std::transform(v.begin(), v.end(), v.begin(),
+                     [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+      // Score = total LENGTH of strings that look like a model name. Turtle stores BARE filenames
+      // ("ElwFlo01.mdl"), so requiring a directory separator scored 0 on BOTH columns and decided
+      // nothing. 1.12's field 1 is a sequential INDEX that lands MID-string, so its hits are short
+      // tails ("wFlo01.mdl", "lwFlo01.mdl") while the real column yields the whole name -- summing
+      // length separates them decisively without assuming the value is a full path.
+      bool const has_ext = v.size() > 4
+                        && (v.find(".mdl") != std::string::npos || v.find(".m2") != std::string::npos);
+      if (has_ext)
+      {
+        score += static_cast<int>(v.size());
+        if (v.find("detail") != std::string::npos) { score += 8; }
+      }
+    }
+    return score;
+  }
+
+  // The two ground-effect DBCs ship as a MATCHED SET from one client version, and
+  // GroundEffectTexture's field count is exact: 7 on 1.12, 11 on 3.3.5a (the four Weights columns).
+  // Derive the doodad layout from that rather than from the strings.
+  //
+  // Scoring the strings got this wrong four times, because 1.12's field 1 is a dense 0..N-1 index
+  // whose values, read as string-block offsets, land MID-STRING and come back as entirely plausible
+  // truncated model names ("lwFlo01.mdl", "wFlo01.mdl") -- every heuristic that asked "does this
+  // column look like filenames?" answered yes for both columns. The field count cannot be fooled.
+  bool groundEffectDoodadIsWotlk()
+  {
+    if (gGroundEffectDoodadDB.getRecordCount() == 0) { return wotlkDbcLayout(); }
+    static int cached = -1;
+    if (cached < 0)
+    {
+      if (gGroundEffectTextureDB.getRecordCount() != 0)
+      {
+        cached = groundEffectTextureIsWotlk() ? 1 : 0;
+      }
+      else
+      {
+        // No matched texture table to key off -- fall back to inspecting the strings.
+        int const s1 = scoreFilenameColumn(1);
+        int const s2 = scoreFilenameColumn(2);
+        cached = (s1 >= s2 && s1 > 0) ? 1 : 0;
+        LogError << "[DBC] GroundEffectTexture.dbc unavailable; fell back to string scoring for"
+                    " GroundEffectDoodad.dbc: col1=" << s1 << " col2=" << s2
+                 << " -> filename column " << (cached ? 1 : 2) << std::endl;
+      }
+    }
+    return cached == 1;
+  }
+}
+size_t GroundEffectDoodadDB::Filename()  { return groundEffectDoodadIsWotlk() ? 1 : 2; }
+// 1.12 has no flags column -- its field 1 is the lookup key (see DBC.h).
+size_t GroundEffectDoodadDB::Flags()     { return groundEffectDoodadIsWotlk() ? 2 : NoColumn; }
+// 3.3.5a is keyed by record id (field 0); 1.12 by field 1.
+size_t GroundEffectDoodadDB::LookupKey() { return groundEffectDoodadIsWotlk() ? 0 : 1; }
 
 // CharSections.dbc reordered Type (VariationIndex) / Color (ColorIndex) behind the texture names + flags
 // in WotLK (see DBC.h for the empirically-verified layouts).
@@ -433,7 +535,8 @@ const char * getGroundEffectDoodad(unsigned int effectID, int DoodadNum)
   try
   {
     unsigned int doodadId = gGroundEffectTextureDB.getByID(effectID).getUInt(GroundEffectTextureDB::Doodads + DoodadNum);
-    return gGroundEffectDoodadDB.getByID(doodadId).getString(GroundEffectDoodadDB::Filename());
+    return gGroundEffectDoodadDB.getByID(doodadId, GroundEffectDoodadDB::LookupKey())
+             .getString(GroundEffectDoodadDB::Filename());
   }
   catch (DBCFile::NotFound)
   {

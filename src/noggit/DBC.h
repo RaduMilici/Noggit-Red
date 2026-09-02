@@ -181,9 +181,22 @@ public:
     DBCFile("DBFilesClient\\GroundEffectDoodad.dbc")
   { }
 
-  /// VERSION-GATED. Both versions have 3 columns but the last two are SWAPPED:
-  ///   1.12   : ID(0) Flags(1)    Filename(2)
-  ///   3.3.5a : ID(0) Filename(1) Flags(2)
+  /// VERSION-GATED. Both versions have 3 columns, but they are NOT the same three:
+  ///   1.12   : Id(0) LookupKey(1) Filename(2)   -- no flags column at all
+  ///   3.3.5a : Id(0) Filename(1)  Flags(2)
+  ///
+  /// [2026-09-02] The 1.12 middle column is the LOOKUP KEY, not flags. Decompiled from WoW.exe:
+  /// FUN_0057a880 reads three fields into a 12-byte record (+0, +4, string pointer at +8), and
+  /// FUN_006b1a90 then builds the runtime table as  table[ *(int*)(rec+4) ] = *(char**)(rec+8)
+  /// -- keyed on FIELD 1. GroundEffectTexture.Doodads[] holds those keys, NOT record ids.
+  /// Turtle's file has field 0 = 1..655 (sparse ids) and field 1 = 0..524 (a dense index), so a
+  /// lookup by id resolves every doodad ONE ROW EARLY: effect 4052 came out as
+  /// ApkBus01/ApkBus03/AtcBus01/ApkFlo03 -- note the stray Atc, the shift crosses a zone boundary
+  /// in the id space -- where the client renders ApkBus02/ApkBus04/ApkBus01/ApkGra01. Keying on
+  /// field 1 reproduces the 3.3.5a-by-id result on 95.1% of shared rows, the rest being genuine
+  /// Turtle custom content. This is the "wrong grass in the wrong place, and different in 335a vs
+  /// Turtle" report: 3.3.5a has no such column, so only Turtle was ever affected.
+  static constexpr size_t NoColumn = static_cast<size_t>(-1);
   /// Verified against the shipped DBCs. In 1.12, field 1 is a sequential index that happens to land
   /// mid-string when read as an offset ("lwFlo01.mdl", "wFlo01.mdl") -- the truncated garbage that
   /// originally hid the grass. In 3.3.5a it is the other way round: field 1 holds the real offsets
@@ -192,7 +205,8 @@ public:
   /// loads at all -- that is the "no grass".
   static const size_t ID = 0;         // uint
   static size_t Filename();           // string  (world\nodxt\detail\*.mdl)
-  static size_t Flags();              // uint
+  static size_t Flags();              // uint, or NoColumn on 1.12 (no such column)
+  static size_t LookupKey();          // the column GroundEffectTexture.Doodads[] refers to
 };
 
 class LiquidTypeDB : public DBCFile

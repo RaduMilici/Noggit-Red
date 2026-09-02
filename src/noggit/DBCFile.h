@@ -216,7 +216,27 @@ public:
     }
     _id_index_built = true;
   }
-  void invalidate_id_index() { _id_index_built = false; }
+  void invalidate_id_index() { _id_index_built = false; _key_index_built = false; }
+
+  // Secondary lazy index for a NON-primary key column, same O(1) contract as _id_index above.
+  // 1.12's GroundEffectDoodad.dbc is keyed on field 1, not field 0: the client builds its lookup
+  // table as table[rec.field1] = filename (WoW.exe FUN_006b1a90, stride 0xc, key at +4, string at
+  // +8). That lookup runs once per scattered doodad in the grass path, so the linear scan below
+  // would cost ~1e6 comparisons per chunk. Only one column is cached at a time -- callers alternate
+  // rarely, and a field change simply rebuilds.
+  void build_key_index(size_t field)
+  {
+    _key_index.clear();
+    _key_index.reserve(recordCount);
+    for (std::uint32_t r = 0; r < recordCount; ++r)
+    {
+      unsigned int const k = *reinterpret_cast<unsigned int const*>(
+          data.data() + static_cast<size_t>(r) * recordSize + field * 4u);
+      _key_index.emplace(k, r);
+    }
+    _key_index_field = field;
+    _key_index_built = true;
+  }
 
   inline Record getByID(unsigned int id, size_t field = 0)
   {
@@ -228,11 +248,10 @@ public:
         return Record(*this, data.data() + static_cast<size_t>(it->second) * recordSize);
       throw NotFound();
     }
-    for (Iterator i = begin(); i != end(); ++i)
-    {
-      if (i->getUInt(field) == id)
-        return (*i);
-    }
+    if (!_key_index_built || _key_index_field != field) { build_key_index(field); }
+    auto const kit = _key_index.find(id);
+    if (kit != _key_index.end())
+      return Record(*this, data.data() + static_cast<size_t>(kit->second) * recordSize);
     throw NotFound();
   }
   inline bool CheckIfIdExists(unsigned int id, size_t field = 0)
@@ -242,12 +261,8 @@ public:
         if (!_id_index_built) { build_id_index(); }
         return _id_index.find(id) != _id_index.end();
       }
-      for (Iterator i = begin(); i != end(); ++i)
-      {
-          if (i->getUInt(field) == id)
-              return (true);
-      }
-      return (false);
+      if (!_key_index_built || _key_index_field != field) { build_key_index(field); }
+      return _key_index.find(id) != _key_index.end();
   }
   inline int getRecordRowId(unsigned int id, size_t field = 0)
   {
@@ -287,4 +302,8 @@ private:
   // Lazy id (field 0) -> row index for O(1) getByID. Rebuilt on demand; invalidated on record add/remove.
   std::unordered_map<unsigned int, std::uint32_t> _id_index;
   bool _id_index_built = false;
+  // secondary index, keyed on _key_index_field (see build_key_index)
+  std::unordered_map<unsigned int, std::uint32_t> _key_index;
+  size_t _key_index_field = 0;
+  bool _key_index_built = false;
 };

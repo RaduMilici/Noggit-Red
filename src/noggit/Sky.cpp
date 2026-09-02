@@ -455,6 +455,36 @@ SkyParam::SkyParam(int paramId, Noggit::NoggitRenderContext context)
         _ocean_shallow_alpha = light_param.getFloat(ocean_shallow_field);
         _ocean_deep_alpha = light_param.getFloat(ocean_deep_field);
 
+        // [2026-09-01] A LightParams row that carries ZERO in the water-alpha columns is not
+        // authoring "invisible water" -- it means those columns were never filled, which is normal
+        // for custom/ported zones. The shader computes opacity as mix(shallow_a, deep_a, depth),
+        // so shallow_a = 0 makes every physically-shallow liquid cell fully transparent while the
+        // deeper cells stay solid: the water breaks up into a depth-following checkerboard of
+        // holes. Keep the sane defaults when the row is unauthored (BOTH ends zero -- a genuine
+        // 0 -> 1 ramp is a legitimate authored shore fade and is left alone).
+        if (_river_shallow_alpha <= 0.0f && _river_deep_alpha <= 0.0f)
+        {
+          _river_shallow_alpha = 0.6f;
+          _river_deep_alpha = 1.0f;
+        }
+        if (_ocean_shallow_alpha <= 0.0f && _ocean_deep_alpha <= 0.0f)
+        {
+          _ocean_shallow_alpha = 0.75f;
+          _ocean_deep_alpha = 1.0f;
+        }
+        {
+          static int logged_water_alpha = 0;
+          if (logged_water_alpha < 12)
+          {
+            LogError << "[WATER-ALPHA] lightParam=" << paramId
+                     << " riverShallow=" << _river_shallow_alpha
+                     << " riverDeep=" << _river_deep_alpha
+                     << " oceanShallow=" << _ocean_shallow_alpha
+                     << " oceanDeep=" << _ocean_deep_alpha << std::endl;
+            logged_water_alpha++;
+          }
+        }
+
         if (skybox_id)
         {
             skybox.emplace(gLightSkyboxDB.getByID(skybox_id).getString(LightSkyboxDB::filename), _context);

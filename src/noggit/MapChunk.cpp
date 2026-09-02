@@ -1,6 +1,6 @@
 // This file is part of Noggit3, licensed under GNU General Public License (version 3).
 #include <math/frustum.hpp>
-#include <atomic> // GRASS-DIAG one-shot counter
+#include <atomic>
 #include <array>   // footstep terrain-type layer weights
 #include <sstream> // FOOTSTEP-LAYER diagnostic
 #include <mutex>   // per-tile texture->terrain table
@@ -2388,10 +2388,39 @@ void MapChunk::computeDetailDoodads()
   // chunk's RUNNING VISIT ordinal, incremented once per subcell visit -- see the placement loop.
   unsigned visit_counter = 0;
 
-  for (int sy = 0; sy < 8; ++sy)
+  // Replay the client's draw loop (FUN_007d3390) to get the visited-subcell set: `frill` draws of a
+  // random subcell, duplicates discarded. Same deterministic per-chunk RNG, so it is stable.
+  // [2026-09-02 CLIENT-EXACT DRAW LIST, WoW.exe FUN_006bfc10 / Wow335.exe FUN_007d3390]
+  // The client records (sx,sy) for EVERY draw -- into a 256-entry pair of arrays, which is exactly
+  // the frillDensity ceiling -- and its placement loop then runs over all `frillDensity` draws.
+  // The visited bitmap it also maintains guards only the per-cell triangle-plane setup; it does NOT
+  // gate placement. So a subcell drawn three times receives three clusters, and the species offset
+  // is the DRAW ordinal, not the distinct-cell ordinal.
+  std::array<std::uint8_t, 256> draw_sx{};
+  std::array<std::uint8_t, 256> draw_sy{};
+  unsigned const draws = std::min(256u, static_cast<unsigned>(frill + 0.5f));
+  for (unsigned dcount = 0; dcount < draws; ++dcount)
   {
-    for (int sx = 0; sx < 8; ++sx)
+    draw_sx[dcount] = static_cast<std::uint8_t>(static_cast<unsigned>(next01() * 8.0f) & 7u);
+    draw_sy[dcount] = static_cast<std::uint8_t>(static_cast<unsigned>(next01() * 8.0f) & 7u);
+  }
+
+  for (unsigned draw = 0; draw < draws; ++draw)
+  {
     {
+      int const sx = static_cast<int>(draw_sx[draw]);
+      int const sy = static_cast<int>(draw_sy[draw]);
+      // [2026-09-02 CLIENT-EXACT DENSITY, read from Wow335.exe FUN_007d3390]
+      //   do { sx = rand()&7; sy = rand()&7;
+      //        if ((1<<sx & visited[sy]) == 0) { visited[sy] |= 1<<sx; place(sx,sy); }
+      //   } while (++i < groundEffectDensity);
+      // groundEffectDensity is the number of random DRAWS, and a draw that lands on an
+      // already-visited subcell does NOTHING -- there is no else branch. So density controls HOW MANY
+      // DISTINCT subcells receive clutter (coupon-collector: 64*(1-(63/64)^N)), and each chosen
+      // subcell is filled EXACTLY ONCE with the row's authored Amount.
+      // At N=256 that is ~63 of 64 cells x Amount (~5) = ~315 blades/chunk. The previous code gave a
+      // cell `visits` fills and multiplied Amount by it -> 1280/chunk, 4x the client. That was the
+      // "too much lush grass".
       // Stencil bit set on this subcell -> no clutter here (barren patch).
       if ((stencil[sy] >> sx) & 1u)
       {
@@ -2452,44 +2481,24 @@ void MapChunk::computeDetailDoodads()
       {
         continue;
       }
-      // DIAGNOSTIC (grass saga): sample the first resolution attempts once per session -- names the
-      // effect ids this map actually feeds in and whether the loaded DBC resolves them (the census
-      // says they should nearly all be dead; if blades appear anyway, these lines name the source).
-      {
-        static std::atomic<int> s_grass_diag_left{12};
-        if (s_grass_diag_left.load(std::memory_order_relaxed) > 0
-            && s_grass_diag_left.fetch_sub(1, std::memory_order_relaxed) > 0)
-        {
-          bool resolved = false;
-          std::string first_doodad;
-          try
-          {
-            DBCFile::Record r = gGroundEffectTextureDB.getByID(effect_id);
-            resolved = true;
-            for (int di = 0; di < 4 && first_doodad.empty(); ++di)
-            {
-              unsigned const dd = r.getUInt(GroundEffectTextureDB::Doodads + di);
-              if (dd && dd != 0xFFFFFFFFu)
-              {
-                try
-                {
-                  first_doodad = gGroundEffectDoodadDB.getByID(dd).getString(GroundEffectDoodadDB::Filename());
-                }
-                catch (...) {}
-              }
-            }
-          }
-          catch (...) {}
-          LogError << "GRASS-DIAG resolve effect_id=" << effect_id
-                   << " resolved=" << (resolved ? 1 : 0)
-                   << " doodad='" << first_doodad << "'"
-                   << " chunk=" << px << "," << py << std::endl;
-        }
-      }
-
-      // Doodad table: the RAW 4 slots (client keeps empties in place -- the round-robin below
-      // indexes the raw array so an empty slot simply places nothing, which is how the client
-      // weights species and leaves gaps).
+      // [2026-09-02 CLIENT-EXACT SPECIES PICK, decompiled from Wow335.exe FUN_007d3390]
+      //   bag[16]; scatter = 0; total = 0;
+      //   for (i = 0..3) { w = Weight[i]; if (w) { total += w;
+      //                    while (w--) { bag[scatter & 0xF] = Doodad[i]; scatter += 13; } } }
+      //   for (; total < 16; ++total) { bag[scatter & 0xF] = Doodad[total & 3]; scatter += 13; }
+      //   ... pick = bag[(d + visitOrdinal) & 0xF];  0 => place nothing
+      // A 16-slot WEIGHTED BAG, filled weight-many times per species with a stride-13 scatter (13 is
+      // coprime with 16, so it spreads rather than clumps), remainder padded round-robin.
+      //
+      // noggit indexed the RAW 4 slots with (d + visit) & 3 -- i.e. every species equally likely,
+      // weights ignored entirely. A mountain row weighted {12,2,1,1} shows its first doodad 12/16 of
+      // the time in the client but 1/4 here, so the lush bush turned up four times too often and the
+      // twigs almost never. That is the wrong-species report.
+      //
+      // VERSION-GATED: Weights[4] exists only on 3.3.5a (Weights() returns 0 on 1.12, whose row is
+      // ID/Doodads[4]/Amount/TerrainType). With no weight column every species weighs 1, which makes
+      // the pad loop fill the whole bag round-robin -- the 1.12 behaviour, reproduced by the same code.
+      std::array<unsigned, 16> doodad_bag{};
       std::array<unsigned, 4> slot_ids{ 0, 0, 0, 0 };
       unsigned filled = 0;
       unsigned amount = 8;
@@ -2505,11 +2514,35 @@ void MapChunk::computeDetailDoodads()
             ++filled;
           }
         }
+        // Build the client's 16-slot bag from the weights. 3.3.5a ONLY: the 1.12 client has no
+        // weight column and builds no bag at all -- it indexes the raw slots (see the pick below).
+        if (GroundEffectTextureDB::Weights())
+        {
+          std::size_t const w_base = GroundEffectTextureDB::Weights();
+          unsigned scatter = 0, total_w = 0;
+          for (int i = 0; i < 4; ++i)
+          {
+            unsigned w = tex_rec.getUInt(w_base + i);
+            if (!w) { continue; }
+            total_w += w;
+            while (w--)
+            {
+              doodad_bag[scatter & 0xFu] = slot_ids[i];
+              scatter += 13u;
+            }
+          }
+          for (unsigned n = total_w; n < 16u; ++n)
+          {
+            doodad_bag[scatter & 0xFu] = slot_ids[n & 3u];
+            scatter += 13u;
+          }
+        }
         // client (wow.exe FUN_006bfc10): N = density field, default 8 when 0, NO clamp -- dense
         // grass rows (e.g. Westfall) author 16-24 per subcell and the client places them all;
         // multiplied by the frillDensity visit ratio (see above)
         unsigned const a = tex_rec.getUInt(GroundEffectTextureDB::Amount());
-        amount = std::max(1u, static_cast<unsigned>(static_cast<float>(a ? a : 8u) * frill_scale + 0.5f));
+        // Client: the chosen subcell is filled ONCE with the authored Amount (default 8 when 0).
+        amount = (a ? a : 8u);
       }
       catch (...)
       {
@@ -2528,7 +2561,7 @@ void MapChunk::computeDetailDoodads()
       // "wrong grass choice, wrong grass at hills and mountains"). Our folded amount
       // (= density x frill/64) is split back into client-shaped visits: frill >= 64 -> multiple
       // visits of the authored density; frill < 64 -> one visit of the scaled amount.
-      unsigned const n_visits = std::max(1u, static_cast<unsigned>(frill_scale + 0.5f));
+      unsigned const n_visits = 1u;   // one cluster per DRAW (the client places per draw)
       unsigned const per_visit = std::max(1u, (amount + n_visits - 1u) / n_visits);
       unsigned placed = 0;
       for (unsigned v = 0; v < n_visits; ++v, ++visit_counter)
@@ -2540,7 +2573,24 @@ void MapChunk::computeDetailDoodads()
         }
         ++placed;
         // An empty slot -> no doodad this iteration (species weighting + natural gaps).
-        unsigned const doodad_id = slot_ids[(d + visit_counter) & 3u];
+        //
+        // [2026-09-02] The two clients pick DIFFERENTLY. Verified by decompiling both binaries:
+        //   1.12   WoW.exe FUN_006bfc10:
+        //            amount = rec[0x14] (field 5); if (amount == 0) amount = 8;
+        //            id = *(int*)(rec + 4 + ((k + drawOrdinal) & 3) * 4);   // Doodads[0..3]
+        //            if (id != -1) place();
+        //          i.e. ROUND-ROBIN over the RAW four slots. An empty slot consumes its turn and
+        //          places nothing -- it does NOT fall through to the next species.
+        //   3.3.5a Wow335.exe FUN_007d3390: the 16-slot stride-13 weighted bag built above.
+        //
+        // Running the bag on 1.12 data (weights forced to 1) is NOT equivalent: stride 13 scatters
+        // the four species, so eight consecutive picks are an uneven multiset rather than exactly
+        // two of each -- the repeated lush bush. And because the bag skips empty slots instead of
+        // letting them consume a turn, rows that author 1-2 species (Badlands, mountain dressing)
+        // came out filled solid where the client leaves them nearly bare.
+        unsigned const doodad_id = GroundEffectTextureDB::Weights()
+                                 ? doodad_bag[(d + draw) & 0xFu]
+                                 : slot_ids[(d + draw) & 3u];
         if (!doodad_id)
         {
           continue;
@@ -2550,9 +2600,16 @@ void MapChunk::computeDetailDoodads()
         unsigned doodad_flags = 0;
         try
         {
-          DBCFile::Record dd_rec = gGroundEffectDoodadDB.getByID(doodad_id);
+          // GroundEffectTexture.Doodads[] holds the client's LOOKUP KEY, which is the record id
+          // on 3.3.5a but FIELD 1 on 1.12 (WoW.exe FUN_006b1a90 builds table[rec.field1]). Looking
+          // it up by id on Turtle data lands one row early -- the wrong-grass report. See DBC.h.
+          DBCFile::Record dd_rec = gGroundEffectDoodadDB.getByID(doodad_id,
+                                                                GroundEffectDoodadDB::LookupKey());
           filename = dd_rec.getString(GroundEffectDoodadDB::Filename());
-          doodad_flags = dd_rec.getUInt(GroundEffectDoodadDB::Flags());
+          std::size_t const flags_col = GroundEffectDoodadDB::Flags();
+          doodad_flags = (flags_col == GroundEffectDoodadDB::NoColumn)
+                       ? 0u                       // 1.12 has no flags column
+                       : dd_rec.getUInt(flags_col);
         }
         catch (...)
         {

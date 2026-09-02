@@ -4419,14 +4419,30 @@ void WorldRender::draw (glm::mat4x4 const& model_view
   // re-minted GroundEffectTexture orphans ~9.5M of 9.6M subcell effect ids -> the live client has
   // essentially no clutter, and noggit resolves the same ids to the same nothing -- doc 37.)
   bool const use_dressing_cull = _world->_settings->value("render/gv_dressing_cull", true).toBool();
+  // [DOODADDIAG 2026-09-02] Which mechanism actually drops a doodad, and at what distance. Counts
+  // per frame, printed every 120 frames. classN = dropped by the CLASS cull at its class distance;
+  // distN = dropped by the object render distance; the histogram is the cull class of everything
+  // considered, so a tree showing up as class 1 is a MISCLASSIFICATION, not a distance problem.
+  static int dd_tick = 0;
+  static int dd_class_drop = 0, dd_dist_drop = 0, dd_kept = 0, dd_hist[5] = {0,0,0,0,0};
   auto m2_dist_envelope = [&](ModelInstance* mi) -> float
   {
     if ((use_client_doodad_cull || use_dressing_cull) && display == display_mode::in_3D)
     {
       mi->ensureExtents(); // makes _cull_class current
-      if (use_client_doodad_cull || mi->_cull_class <= 1)
+      // [2026-09-02] Was `_cull_class <= 1`, which class-culled everything under 4 YARDS at 100yd.
+      // The class comes from the largest axis of the transformed render box vs {1,4,15,100}, so a
+      // smaller tree lands in class 1 and died at 100yd while a bigger one (class 2) drew to the
+      // horizon -- "half our trees cull, half don't". Size alone cannot separate a small tree from a
+      // fence, so the class cull is now limited to class 0 (UNDER 1 YARD: ferns, clumps, pebbles,
+      // fence posts), which no tree can ever be. Everything >= 1 yard rides the object render
+      // distance, which is the knob that should govern trees.
+      if (mi->_cull_class >= 0 && mi->_cull_class <= 4) { ++dd_hist[mi->_cull_class]; }
+      if (use_client_doodad_cull || mi->_cull_class < 1)
       {
-        return mi->doodadCullFade(camera_pos, 1.0f); // environmentDetail default 1.0 (@0x009e1340)
+        float const f = mi->doodadCullFade(camera_pos, 1.0f); // environmentDetail default 1.0
+        if (f <= 0.0f) { ++dd_class_drop; }
+        return f;
       }
     }
 
@@ -4435,10 +4451,43 @@ void WorldRender::draw (glm::mat4x4 const& model_view
                         ? glm::distance(camera_pos, mi->pos)
                         : std::abs(mi->pos.y - camera_pos.y)) - radius;
     float const limit = _cull_distance;
-    // Binary: the per-pixel slice in the shader (slice_dist) handles the visual boundary exactly
-    // like terrain's far plane; the model is gathered while ANY of it is inside the boundary.
-    return dist <= limit ? 1.0f : 0.0f;
+    // [2026-09-02] Was BINARY -- a doodad appeared/vanished the instant it crossed the object render
+    // distance, which is the snapping the user reported. The client fades its doodads over a band
+    // before the cut (fadeBand @DAT_00adf38c), so do the same here: fade over the last 8% of the
+    // draw distance (floor 10yd so a short view distance still fades) and only hard-drop at the
+    // limit. The fragment slice still trims the exact boundary; by the time a model reaches it the
+    // opacity is already ~0, so the cut is invisible instead of a pop.
+    float const band = std::max(10.0f, limit * 0.08f);
+    float const fade_start = limit - band;
+    if (dist <= fade_start) { ++dd_kept; return 1.0f; }
+    if (dist >= limit)
+    {
+      ++dd_dist_drop;
+      if ((dd_tick % 120) == 0 && dd_dist_drop == 1)
+      {
+        LogError << "[DOODADDIAG] cullDist=" << limit
+                 << " objRenderDist=" << _world->_settings->value("object_render_distance", 925.0f).toFloat()
+                 << " viewDist=" << _view_distance
+                 << " clientCull=" << (use_client_doodad_cull ? 1 : 0)
+                 << " dressingCull=" << (use_dressing_cull ? 1 : 0) << std::endl;
+      }
+      return 0.0f;
+    }
+    float const a_fade = 1.0f - (dist - fade_start) / band;
+    if (a_fade < 0.01f) { ++dd_dist_drop; return 0.0f; }
+    ++dd_kept;
+    return a_fade;
   };
+
+  if ((dd_tick++ % 120) == 0)
+  {
+    LogError << "[DOODADDIAG] kept=" << dd_kept << " classDrop=" << dd_class_drop
+             << " distDrop=" << dd_dist_drop
+             << " | classHist 0=" << dd_hist[0] << " 1=" << dd_hist[1] << " 2=" << dd_hist[2]
+             << " 3=" << dd_hist[3] << " 4=" << dd_hist[4] << std::endl;
+    dd_kept = dd_class_drop = dd_dist_drop = 0;
+    for (int k = 0; k < 5; ++k) { dd_hist[k] = 0; }
+  }
 
   // frame counter loop. pretty hacky but works
   // this is used to make sure no object is processed more than once within a frame
@@ -5762,6 +5811,7 @@ void WorldRender::draw (glm::mat4x4 const& model_view
         // visible hitch. Budget it: at most a few NEW chunks per frame, so clutter fades in over a handful
         // of frames instead of stalling. Already-computed chunks are free (cached).
         int clutter_compute_budget = 6;
+
         for (auto& tile_pair : _world->_loaded_tiles_buffer)
         {
           MapTile* tile = tile_pair.second;
@@ -6056,6 +6106,13 @@ void WorldRender::draw (glm::mat4x4 const& model_view
                                [&](glm::vec3 const& p) { return interior_light_at(p, false); },
                                model_view, static_cast<int>(_world->model_animtime), draw_hidden_models,
                                _creature_batched);
+          // [2026-09-01] Hand this producer's instances to VK. Every batched producer fills the
+          // _pib_scratch_* arrays and MUST append them, or the batch is drawn by NOBODY once VK owns
+          // M2: GL is gated off by vk_owns_m2 and VK never received it. drawDynamicBatched and
+          // drawPibBatched appended; the two CREATURE producers did not -- so a creature vanished the
+          // instant it finished fading in and crossed into the batch (fade >= 0.999, see
+          // drawCreatureBodiesBatched), while its equipment kept drawing from the individual path.
+          vkM2SnapshotAppend();
         }
 
         // [creature body MDI 2026-08-18] PHASE A (real): batch the INDIVIDUAL creature BODY draws with
@@ -6084,6 +6141,7 @@ void WorldRender::draw (glm::mat4x4 const& model_view
                                     [&](glm::vec3 const& p) { return interior_light_at(p, false); },
                                     model_view, static_cast<int>(_world->model_animtime), draw_hidden_models,
                                     _creature_body_batched);
+          vkM2SnapshotAppend();   // [2026-09-01] see the note on drawCreaturesBatched above
         }
 
         OpenGL::Scoped::use_program m2_shader {*_m2_instanced_program.get()};

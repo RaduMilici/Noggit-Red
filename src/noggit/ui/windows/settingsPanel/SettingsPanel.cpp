@@ -450,7 +450,11 @@ namespace Noggit
       {
         auto* doodad_cull_cb = new QCheckBox(tr("Client doodad distance cull (size-class)"), this);
         doodad_cull_cb->setObjectName("_gv_doodad_cull_checkbox");
-        doodad_cull_cb->setChecked(_settings->value("render/gv_doodad_cull", true).toBool());
+        // [2026-09-01] Default must match WorldRender, which reads this as FALSE (it is opt-IN since
+        // it was made a toggle). The panel defaulting to true showed the box CHECKED while the
+        // renderer was not culling -- and any build predating the opt-in change writes true here,
+        // silently turning the cull on for everyone sharing these QSettings.
+        doodad_cull_cb->setChecked(_settings->value("render/gv_doodad_cull", false).toBool());
         _perf_layout->addWidget(doodad_cull_cb);
         connect(doodad_cull_cb, &QCheckBox::toggled, [this](bool checked)
                 {

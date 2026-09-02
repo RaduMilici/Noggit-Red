@@ -1,4 +1,5 @@
 // This file is part of Noggit3, licensed under GNU General Public License (version 3).
+
 #include "LiquidRender.hpp"
 #include <noggit/Log.h>
 #include <noggit/MapTile.h>
@@ -23,18 +24,7 @@ void LiquidRender::draw(math::frustum const& frustum
     , LiquidTextureManager* tex_manager
 )
 {
-  // [finding 162] PERMANENT WATER HOLES. _has_data is recomputed in exactly ONE place -- inside the
-  // `if (_need_buffer_update)` block below -- and this early return sits above it. So the moment a
-  // tile evaluates false it can never recover: the only code that could set it true again is
-  // unreachable. A tile drawn once before its water finished parsing, or one whose buffers were
-  // re-tagged by unload(), is then skipped for the rest of the session even though its water is
-  // present and loaded. The result is per-tile water holes whose pattern depends on load timing,
-  // which is what "water is patchy / has chunk holes" looks like from the editor.
-  //
-  // Letting a PENDING BUFFER UPDATE through is what makes it recoverable: the block below re-derives
-  // _has_data from the chunks. If it is still false afterwards, _render_layers stays empty and the
-  // draw below iterates nothing, so this costs a walk of the tile's chunks and draws nothing.
-  if (!_map_tile->Water.hasData() && !_need_buffer_update)
+  if (!_map_tile->Water.hasData())
   {
     static int logged_empty_water_tiles = 0;
     if (logged_empty_water_tiles < 20)
@@ -159,28 +149,14 @@ void LiquidRender::updateLayerData(LiquidTextureManager* tex_manager)
           auto tex_profile_it = tex_frames.find(layer.liquidID());
           if (tex_profile_it == tex_frames.end())
           {
-            // [finding 163] THE CHUNK HOLES. This used to `continue`, dropping the chunk entirely --
-            // one chunk-sized hole in the water surface for every liquid whose id has no texture
-            // profile. Turtle's custom maps use liquid ids that are not in the stock liquid tables,
-            // so whole runs of chunks vanished; stock Azeroth never hits it, which is why the parity
-            // cameras never caught it. The id only selects which TEXTURE to animate -- the surface
-            // geometry, height and depth are all already built -- so an unknown id is no reason not
-            // to draw the water. Fall back to plain water (LiquidType 1), then to whatever profile
-            // exists, and only give up if the manager has nothing at all.
-            tex_profile_it = tex_frames.find(1u);
-            if (tex_profile_it == tex_frames.end() && !tex_frames.empty())
-              tex_profile_it = tex_frames.begin();
             static int logged_missing_liquid_profiles = 0;
             if (logged_missing_liquid_profiles < 40)
             {
               LogError << "Turtle water: missing liquid profile " << layer.liquidID()
-                       << (tex_profile_it == tex_frames.end()
-                             ? ", and no fallback profile exists -- chunk not drawn"
-                             : ", drawing with the fallback profile") << std::endl;
+                       << ", skipping layer chunk" << std::endl;
               logged_missing_liquid_profiles++;
             }
-            if (tex_profile_it == tex_frames.end())
-              continue;
+            continue;
           }
 
           std::tuple<GLuint, glm::vec2, int, unsigned> const& tex_profile = tex_profile_it->second;
@@ -257,42 +233,18 @@ void LiquidRender::updateLayerData(LiquidTextureManager* tex_manager)
           MapChunk* terrain = _map_tile->getChunk(static_cast<unsigned>(x), static_cast<unsigned>(z));
           glm::vec3 const* heightmap = terrain ? terrain->getHeightmap() : nullptr;
 
-          // [2026-08-21 WPL "too bright" fix] The client's water color factor is the AUTHORED
-          // Water depth for the colour/alpha ramps = the MAX of the physical terrain thinness and the
-          // AUTHORED MCLQ/MH2O depth byte. [2026-08-23: RESTORED the authored term after a wrong detour.]
-          // The client bakes the water colour/alpha from the AUTHORED depth (the artist-painted 0..255
-          // shallow->deep gradient, verified: Azeroth_36_29 MCLQ carries a real 0..244 spread), NOT the
-          // physical terrain. Using terrain-only broke Caer Darrow (a STEEP crater lake): the terrain
-          // drops away everywhere so terrain-diff read uniformly DEEP -> the whole lake snapped to one
-          // dark colour with no coast gradient (user report). The authored byte preserves the real
-          // shallow-edge -> deep-centre gradient and is streaming-STABLE. authored_deep_units scales the
-          // normalized byte so 255 saturates this liquid type's colour ramp (river 0.05/u, ocean 0.012/u).
-          int const liquid_cat = layer.mclq_liquid_type(); // 0 water, 1 ocean, 2 magma, 3 slime
-          float const authored_deep_units = layer.hasAuthoredDepth()
-            ? ((liquid_cat == 1) ? (1.0f / 0.012f) : (1.0f / 0.05f))
-            : 0.0f;
-
           for (int z_v = 0; z_v < 9; ++z_v)
           {
             for (int x_v = 0; x_v < 9; ++x_v)
             {
               const unsigned v_index = z_v * 9 + x_v;
               glm::vec2& tex_coord = tex_coords[v_index];
-              // Depth = MAX(physical terrain thinness, authored byte x ramp scale). [2026-08-23 final,
-              // after two wrong detours the same day:] the authored MCLQ byte is a LINEAR depth
-              // measure, not a full-ramp saturator — ordinary rivers author TINY bytes (Elwynn
-              // 31_49/32_49: max 6-55, mean 0-9) so authored-ONLY collapsed every river to the flat
-              // shallow colour (user: "one flat color, no coast gradient"); their gradient comes from
-              // TERRAIN. WPL's murk pools author high bytes (~255 -> saturate the ramp) so max() still
-              // gives them the deep murk colour over physically-shallow beds (the 08-21 intent). The
-              // earlier Caer Darrow "whole lake snaps dark" was the STREAMING FALLBACK (byte*100 while
-              // the terrain heightmap loads), not max() — keep that fallback on the same authored
-              // scale instead so un-streamed tiles look like their streamed selves.
-              float render_depth = depth[v_index] * (layer.hasAuthoredDepth() ? authored_deep_units : 8.f);
+              // Fallback (no terrain): scale the normalized file depth into rough world units.
+              float render_depth = depth[v_index] * 100.f;
               if (heightmap)
               {
                 float const diff = vertices[v_index].y - heightmap[17 * z_v + x_v].y;
-                render_depth = std::max(std::max(0.f, diff), depth[v_index] * authored_deep_units);
+                render_depth = std::max(0.f, diff);
               }
               layer_params.vertex_data[n_chunks][v_index] = glm::vec4(vertices[v_index].y, render_depth, tex_coord.x, tex_coord.y);
             }
@@ -328,9 +280,25 @@ void LiquidRender::updateLayerData(LiquidTextureManager* tex_manager)
         static int logged_render_layers = 0;
         if (logged_render_layers < 40)
         {
-          LogError << "Turtle water: render layer " << layer_counter << " tile "
-                   << _map_tile->index.x << "," << _map_tile->index.z
-                   << " chunks " << n_chunks
+          std::size_t chunks_with_layer = 0, chunks_with_any = 0, subcells = 0;
+          for (std::size_t z2 = 0; z2 < 16; ++z2)
+            for (std::size_t x2 = 0; x2 < 16; ++x2)
+            {
+              ChunkWater* c2 = _map_tile->Water.chunks[z2][x2].get();
+              if (!c2) continue;
+              if (!c2->getLayers()->empty()) ++chunks_with_any;
+              if (layer_counter < c2->getLayers()->size())
+              {
+                ++chunks_with_layer;
+                subcells += static_cast<std::size_t>(__popcnt64((*c2->getLayers())[layer_counter].getSubchunks()));
+              }
+            }
+          LogError << "[WATERDIAG-ADT] tile " << _map_tile->index.x << "," << _map_tile->index.z
+                   << " layer " << layer_counter
+                   << " chunksWithAnyWater=" << chunks_with_any
+                   << " chunksWithThisLayer=" << chunks_with_layer
+                   << " subcellsSet=" << subcells
+                   << " -> emitted " << n_chunks
                    << " samplers " << layer_params.texture_samplers.size() << std::endl;
           logged_render_layers++;
         }

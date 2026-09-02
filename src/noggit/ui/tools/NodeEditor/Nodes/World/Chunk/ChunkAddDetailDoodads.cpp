@@ -328,7 +328,7 @@ void ChunkAddDetailDoodads::compute()
       std::for_each(meta.begin(), meta.end(), std::bind(DetailDoodadMgr::genCoord
       , std::ref(randomizer), std::placeholders::_1));
       QString filename{("world/nodxt/detail/"
-      + std::string{gGroundEffectDoodadDB.getByID(curDoodadId)
+      + std::string{gGroundEffectDoodadDB.getByID(curDoodadId, GroundEffectDoodadDB::LookupKey())
       .getString(GroundEffectDoodadDB::Filename())}).c_str()};
       filename = filename.replace(".mdx", ".m2", Qt::CaseInsensitive);
 
