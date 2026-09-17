@@ -73,9 +73,12 @@ namespace Noggit
 
       T* const obj ( [&]
                      {
+                       // the object is built from the FULL key: a fileDataID out of MDDF / MODF / MODI /
+                       // SFID (modern CASC clients) is authoritative and must not be re-derived from the
+                       // path through the listfile
                        return &_elements.emplace ( std::piecewise_construct
                                                  , std::forward_as_tuple (pair)
-                                                 , std::forward_as_tuple (async_object_filename(file_key), context, args...)
+                                                 , std::forward_as_tuple (file_key, context, args...)
                                                  ).first->second;
                      }()
                    );

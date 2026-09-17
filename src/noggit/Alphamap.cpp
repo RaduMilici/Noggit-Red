@@ -17,18 +17,20 @@ Alphamap::Alphamap(BlizzardArchive::ClientFile *f, unsigned int flags, bool use_
 {
   createNew();
 
-  if (use_big_alphamaps)
+  // The layer's own flag decides first. MCLY 0x200 (alpha_map_compressed) is an RLE-coded 64x64 map
+  // whatever the WDT says; in WotLK data it only ever appeared together with MPHD 0x4 (big alpha), so
+  // this used to be tested inside the big-alpha branch. Modern maps break that pairing: Scarlet Enclave
+  // (Classic Era 1.15.9, map 2856) sets 0x200 on 1400+ of its layers with a WDT of 0x3ca (no 0x4), and
+  // reading those RLE streams as 4-bit 2048-byte maps was the "broken texture blending"
+  // (docs/client_re/42 sec 12). Uncompressed layers keep the WDT rule: 0x4 = 4096 bytes, else 2048 4-bit.
+  if (flags & 0x200)
   {
-    // can only compress big alpha
-    if (flags & 0x200)
-    {
-      readCompressed(f);
-    }
-    else
-    {
-      readBigAlpha(f);
-    }    
-  }    
+    readCompressed(f);
+  }
+  else if (use_big_alphamaps)
+  {
+    readBigAlpha(f);
+  }
   else
   {
     readNotCompressed(f, do_not_fix_alpha_map);

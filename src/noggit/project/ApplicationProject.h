@@ -8,6 +8,8 @@
 #include <blizzard-archive-library/include/Exception.hpp>
 #include <blizzard-database-library/include/BlizzardDatabase.h>
 #include <noggit/application/Configuration/NoggitApplicationConfiguration.hpp>
+#include <noggit/casc/BuildInfo.hpp>
+#include <noggit/db2/ModernDBC.hpp>
 #include <noggit/Log.h>
 #include <noggit/ui/windows/downloadFileDialog/DownloadFileDialog.h>
 #include <QJsonDocument>
@@ -45,8 +47,27 @@ namespace Noggit::Project
     WOD,
     LEGION,
     BFA,
-    SL
+    SL,
+    // CASC "classic re-release" clients sharing the modern file formats (WDT MAID + split ADT, MD21,
+    // GFID WMO, WDC5 DB2). The product code (NoggitProject::ClientProduct) selects the build inside the
+    // shared store. See docs/client_re/41_modern_casc_client_support_research.md.
+    CLASSIC_ERA,   // wow_classic_era (1.15.x)
+    ANNIVERSARY    // wow_anniversary (2.5.x)
   };
+
+  // CASC-backed clients: files are addressed by fileDataID and the modern file formats apply.
+  inline bool isModernCascVersion(ProjectVersion version)
+  {
+    return version == ProjectVersion::SL || version == ProjectVersion::CLASSIC_ERA || version == ProjectVersion::ANNIVERSARY;
+  }
+
+  // Versions whose DB2 tables are served through the fixed-column DBCFile API (gMapDB, gLightDB, ...)
+  // by re-emitting them in the WotLK layout (noggit/db2/ModernDBC). Shadowlands keeps the older
+  // DatabaseLib route; there is no DB2 writer for either yet.
+  inline bool usesSynthesizedDbc(ProjectVersion version)
+  {
+    return version == ProjectVersion::CLASSIC_ERA || version == ProjectVersion::ANNIVERSARY;
+  }
 
   struct ClientVersionFactory
   {
@@ -58,8 +79,13 @@ namespace Noggit::Project
         return ProjectVersion::WOTLK;
       if (projectVersion == "Shadowlands")
         return ProjectVersion::SL;
+      if (projectVersion == "Classic Era")
+        return ProjectVersion::CLASSIC_ERA;
+      if (projectVersion == "Anniversary")
+        return ProjectVersion::ANNIVERSARY;
 
       assert(false);
+      return ProjectVersion::WOTLK;
     }
 
     static std::string MapToStringVersion(ProjectVersion const& projectVersion)
@@ -70,8 +96,23 @@ namespace Noggit::Project
         return std::string("Wrath Of The Lich King");
       if (projectVersion == ProjectVersion::SL)
         return std::string("Shadowlands");
+      if (projectVersion == ProjectVersion::CLASSIC_ERA)
+        return std::string("Classic Era");
+      if (projectVersion == ProjectVersion::ANNIVERSARY)
+        return std::string("Anniversary");
 
       assert(false);
+      return std::string("Wrath Of The Lich King");
+    }
+
+    // Default .build.info product code for a CASC version (used when a project file predates the field).
+    static std::string defaultProduct(ProjectVersion const& projectVersion)
+    {
+      if (projectVersion == ProjectVersion::CLASSIC_ERA)
+        return std::string("wow_classic_era");
+      if (projectVersion == ProjectVersion::ANNIVERSARY)
+        return std::string("wow_anniversary");
+      return std::string("wow");
     }
   };
 
@@ -116,6 +157,9 @@ namespace Noggit::Project
     std::string ProjectPath;
     std::string ProjectName;
     std::string ClientPath;
+    // CASC clients only: the .build.info "Product" code (wow_classic_era, wow_anniversary, wow, ...)
+    // that selects the build inside a shared store. Empty = ClientVersionFactory::defaultProduct().
+    std::string ClientProduct;
     // Archive basenames this project must NOT mount (json "IgnoredArchives"). For clients that
     // gate content archives at runtime (Ascension HD models in patch-CHA.MPQ: mounted by the game
     // only with the HD toggle on) -- noggit otherwise mounts everything and renders models the
@@ -241,7 +285,8 @@ namespace Noggit::Project
     }
 
     void createProject(std::filesystem::path const& project_path, std::filesystem::path const& client_path,
-                       std::string const& client_version, std::string const& project_name)
+                       std::string const& client_version, std::string const& project_name,
+                       std::string const& client_product = std::string())
     {
       if (!std::filesystem::exists(project_path))
         std::filesystem::create_directory(project_path);
@@ -250,6 +295,7 @@ namespace Noggit::Project
       project.ProjectName = project_name;
       project.projectVersion = ClientVersionFactory::mapToEnumVersion(client_version);
       project.ClientPath = client_path.generic_string();
+      project.ClientProduct = client_product;
       project.ProjectPath = project_path.generic_string();
 
       auto project_writer = ApplicationProjectWriter();
@@ -300,6 +346,40 @@ namespace Noggit::Project
         client_archive_locale = BlizzardArchive::Locale::AUTO;
       }
 
+      // Modern CASC clients: the product picks the build inside the shared store, the build string comes
+      // from the store's own .build.info (so a client patch does not need a noggit change), and the DB2
+      // tables are re-emitted as WotLK DBCs (noggit/db2/ModernDBC) -- the DBD build is used there as the
+      // fallback when a table's layout hash is unknown to the definitions.
+      std::string client_build_string;
+      if (usesSynthesizedDbc(project->projectVersion))
+      {
+        client_archive_version = project->projectVersion == ProjectVersion::CLASSIC_ERA
+                               ? BlizzardArchive::ClientVersion::CLASSIC_ERA
+                               : BlizzardArchive::ClientVersion::ANNIVERSARY;
+        if (project->ClientProduct.empty())
+          project->ClientProduct = ClientVersionFactory::defaultProduct(project->projectVersion);
+
+        std::string const storage_root = Noggit::Casc::findStorageRoot(project->ClientPath);
+        if (!storage_root.empty() && storage_root != project->ClientPath)
+        {
+          LogDebug << "ApplicationProject::loadProject: client path '" << project->ClientPath
+                   << "' resolved to the CASC storage root '" << storage_root << "'" << std::endl;
+          project->ClientPath = storage_root;
+        }
+
+        client_build_string = Noggit::Casc::productVersion(project->ClientPath, project->ClientProduct);
+        if (client_build_string.empty())
+        {
+          client_build_string = project->projectVersion == ProjectVersion::CLASSIC_ERA ? "1.15.9.69722" : "2.5.6.69795";
+          LogError << "ApplicationProject::loadProject: product '" << project->ClientProduct << "' not found in "
+                   << project->ClientPath << "/.build.info; assuming build " << client_build_string << std::endl;
+        }
+        client_build = BlizzardDatabaseLib::Structures::Build(client_build_string);
+        client_archive_locale = BlizzardArchive::Locale::enUS;
+        Noggit::DB2::reset();
+        Noggit::DB2::setClientBuild(client_build_string);
+      }
+
       project->ClientDatabase = std::make_shared<BlizzardDatabaseLib::BlizzardDatabase>(dbd_file_directory, client_build);
 
       // Project-level archive exclusion (json "IgnoredArchives") -> handed to ClientData through
@@ -319,10 +399,27 @@ namespace Noggit::Project
           LogDebug << "Project ignores archives: " << joined << std::endl;
       }
 
+      // CASC listfile: <project>/listfile.csv wins (ClientData), then the Settings > Paths choice, then the
+      // application default next to the executable.
+      std::string listfile_path = QSettings().value("casc/listfile_path").toString().toStdString();
+      if (listfile_path.empty())
+        listfile_path = _configuration->ApplicationListFilePath;
+
+      // Texture fidelity (Settings > Paths > "Prefer HD texture variants"): the WoW Classic Forever 1.60.1
+      // beta root lists 95,774 textures twice, content flag 0x1 marking the 4x-resolution variant
+      // (512x1024 vs 128x256 for the same file id). Only records present in the local store are ever
+      // used; the choice is resolved once when the storage opens, so it takes effect on project open.
+      // docs/client_re/42 sec 18.
+      {
+        bool const prefer_hd = QSettings().value("casc/prefer_hd_textures", true).toBool();
+        BlizzardArchive::Archive::CASCArchive::setPreferredContentFlags(0x1u, prefer_hd ? 0x1u : 0x0u);
+      }
+
       try
       {
         project->ClientData = std::make_shared<BlizzardArchive::ClientData>(
-            project->ClientPath, client_archive_version, client_archive_locale, project_path.generic_string());
+            project->ClientPath, client_archive_version, client_archive_locale, project_path.generic_string()
+            , project->ClientProduct, listfile_path);
 
         LogDebug << "ApplicationProject::loadProject project_path='" << project->ProjectPath
                  << "' client_path='" << project->ClientPath

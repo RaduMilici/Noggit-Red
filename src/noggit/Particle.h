@@ -9,6 +9,7 @@
 #include <opengl/shader.fwd.hpp>
 
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <list>
 #include <deque>
@@ -128,6 +129,12 @@ private:
   // and scales size by lerp(scaleMin,scaleMax,t). 1.0/1.0 min==max and speed 0 percent>=1 = inert.
   float _twinkle_speed = 0.0f;
   float _twinkle_percent = 1.0f;
+  // MD21 EXP2 (wowdev M2#EXP2): colorMult scales the diffuse colour, alphaMult the opacity. 1.0 = absent.
+  float _color_mult = 1.0f;
+  float _alpha_mult = 1.0f;
+  // Modern files: the record's zSource slot is a 255.0 placeholder; EXP2 (or 0) replaces it (docs 42 sec 10).
+  float _z_source_override = 0.0f;
+  bool _has_z_source_override = false;
   float _twinkle_scale_min = 1.0f;
   float _twinkle_scale_max = 1.0f;
   // SPIN sign (§2): when emitter flag 0x8000 is set the client alternates the sprite spin direction by
@@ -217,6 +224,14 @@ public:
   ParticleSystem& operator= (ParticleSystem&&) = delete;
 
   void update(float dt);
+  // MD21 EXP2 (docs/client_re/42 sec 4): colorMult / alphaMult of this emitter, applied in update()
+  void setExtendedParticle(float color_mult, float alpha_mult, float z_source)
+  {
+    _color_mult = std::isfinite(color_mult) ? color_mult : 1.0f;
+    _alpha_mult = std::isfinite(alpha_mult) ? alpha_mult : 1.0f;
+    _z_source_override = std::isfinite(z_source) ? z_source : 0.0f;
+    _has_z_source_override = true;
+  }
 
   void setup(int anim, int time, int animtime);
   void draw( glm::mat4x4 const& model_view

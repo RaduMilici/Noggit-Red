@@ -9,6 +9,7 @@
 #include <opengl/shader.fwd.hpp>
 
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -63,6 +64,7 @@ public:
     // (Aurora, DeathKnightFireSkyBox). NOTE the checklist row 8.6 had these backwards ("0x2 =
     // full-day"); 0x1 is full-day.
     int skybox_flags = 0;
+    int skybox_id = 0; // LightSkybox.dbc id: the client merges the SAME skybox reached through several lights
     int Id;
 
     SkyParam() = default;
@@ -139,6 +141,13 @@ public:
 
   float weight;
   bool global;
+
+  // [client RE 2026-09-09, wow335a.exe] weight from the client's hardcoded ZONE-LIGHT POLYGON table
+  // (FUN_0077eed0 -> FUN_007ed150 -> FUN_007ee6b0): 1 deep inside the zone's polygon, fading to 0 fifty
+  // yards outside its edge, and blended BEFORE every positional (r1/r2) light. zone_order is the table row,
+  // i.e. the blend order among zone lights. Set by Skies::findSkyWeights, independent of `weight`.
+  float zone_weight = 0.f;
+  int zone_order = -1;
 
   bool is_new_record = false;
 
@@ -250,12 +259,29 @@ private:
   float _fog_multiplier = 0.25f;
   int _area_light_id = 0;
 
+  // [client RE 2026-09-09] the zone-light polygons of this map (ZONE_LIGHT_POLYGON_DEFS in Sky.cpp), already
+  // mapped into world space with the client's constants; the box is padded by the 50-yard fade band.
+  struct ZoneLightPolygon
+  {
+    int light_id;
+    std::vector<glm::vec2> points; // (world x, world z)
+    float min_x, min_z, max_x, max_z;
+  };
+  std::vector<ZoneLightPolygon> _zone_polygons;
+  void build_zone_polygons(unsigned int mapid);
+  // the client's per-frame test at a world position: (light id, weight) per hit polygon, table order
+  void zone_polygon_weights(glm::vec3 const& pos, std::vector<std::pair<int, float>>& out) const;
+  void apply_zone_polygon_weights(glm::vec3 const& pos);
+  // every light with a weight in the client's blend order: zone-polygon lights first (table order), then
+  // the positional lights farthest-first (`skies` is sorted that way by findSkyWeights)
+  std::vector<std::pair<Sky*, float>> weighted_lights();
+
 public:
   std::vector<Sky> skies;
   std::vector<glm::vec3> color_set = std::vector<glm::vec3>(NUM_SkyColorNames);
 
   explicit Skies(unsigned int mapid, Noggit::NoggitRenderContext context);
-  unsigned int _map_id = 0; // continent id (571 = Northrend); gates the gloomy Northrend sky-dome override
+  unsigned int _map_id = 0; // continent id
 
   Sky* findSkyWeights(glm::vec3 pos);
 
@@ -361,7 +387,12 @@ public:
 
   // [VULKAN] the skybox / stars M2 this frame (null when the zone authors none / it is day).
   // They are ordinary M2 instances, so WorldRender hands them to the normal VK M2 feed.
-  ModelInstance* vkSkyboxInstance() const { return _vk_skybox_instance; }
+  std::vector<ModelInstance*> const& vkSkyboxInstances() const { return _vk_skybox_instances; }
+  // [client RE 2026-09-09] the strongest listed skybox weight (wow335a.exe FUN_007ef6e0 scales the
+  // sun/moon by 1 - this) and whether a full-weight non-overlay skybox replaces the dome, the cloud
+  // deck, the stars and the celestials this frame (FUN_007f09b0). See Skies::draw.
+  float skyboxCover() const { return _skybox_cover; }
+  bool skyboxCovers() const { return _skybox_covers; }
   ModelInstance* vkStarsInstance() const { return _vk_stars_instance; }
   void clearVkDomeDirty() { _vk_sky_dirty = false; }
   // [underwater] hide the cloud LAYER while the camera is submerged (user 2026-08-26: "don't
@@ -430,7 +461,7 @@ private:
   int _cloud_indices_count = 0;
   void init_cloud_gen();
   void tick_clouds(float dt_sec);
-  void draw_clouds(glm::mat4x4 const& mvp, glm::vec3 const& camera_pos, int animtime);
+  void draw_clouds(glm::mat4x4 const& mvp, glm::vec3 const& camera_pos, int animtime, bool covered = false);
   glm::vec3 _celestial_dir = glm::vec3(0.f, 1.f, 0.f); // sun by day / moon by night (WorldRender feeds this)
   std::vector<glm::vec3> _vk_dome_verts;
   std::vector<glm::vec3> _vk_dome_colors;
@@ -443,7 +474,13 @@ private:
   unsigned _vk_cloud_tex_serial = 0;   // bumped every tick_clouds regen
   float _vk_cloud_opacity = 0.f;
   bool _vk_owns_clouds = false;
-  ModelInstance* _vk_skybox_instance = nullptr;
+  // [client RE 2026-09-09] the frame's skybox list in draw order (FUN_007f3230's slot walk).
+  struct SkyboxEntry { ModelInstance* model; SkyParam* param; float weight; bool overlay; };
+  std::vector<SkyboxEntry> _skybox_list;
+  float _skybox_cover = 0.f;
+  bool _skybox_covers = false;
+  std::optional<glm::vec3> _flat_dome_color; // set while a full skybox replaces the dome (the fog colour)
+  std::vector<ModelInstance*> _vk_skybox_instances;
   ModelInstance* _vk_stars_instance = nullptr;
   float _cloud_coverage = 0.f;               // Light-DBC float band 3 (cloud density), interpolated
   bool _cloud_draw_suppressed = false;       // see set_cloud_draw_suppressed()

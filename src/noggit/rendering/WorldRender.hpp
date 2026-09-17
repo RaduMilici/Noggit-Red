@@ -40,6 +40,7 @@ namespace math { class frustum; } // referenced by the animated-MDI batching (dr
 
 class World;
 class WMO;
+struct WMOLight;
 class WMOGroup;
 struct MinimapRenderSettings;
 
@@ -66,6 +67,11 @@ namespace Noggit::Rendering
     // it to write the Vulkan-rendered colour + depth as the base layer so the GL passes depth-test over
     // it (VK content sits UNDER the normal editor view). Null = no-op. Only for the main 3D viewport.
     std::function<void()> pre_scene_compose;
+    // [2026-09-08 WDL HORIZON] when VK owns the terrain, draw() hands the per-frame low-res horizon
+    // (built by map_horizon::render::build_frame: client tile selection + MAHO split) to the Vulkan
+    // backend through this hook instead of drawing it with GL. A null render = nothing this frame.
+    // Third argument = the low-detail projection * model_view (the client's own horizon projection).
+    std::function<void(Noggit::map_horizon::render const*, glm::vec3 const&, glm::mat4x4 const&)> vk_horizon_feed;
     // [VULKAN phase B] pass ownership gates. When a pass is owned by VK, draw() SKIPS the GL pass (the GL
     // code stays intact and runs unchanged with Graphics API = OpenGL -- gate, never delete).
     bool vk_owns_terrain = false;
@@ -84,6 +90,45 @@ namespace Noggit::Rendering
     // only when the VK path (or parity, which needs both) will actually consume this frame's feeds.
     bool vk_feeding = false;
     bool vk_owns_water = false;
+    // [VULKAN NATIVE PRESENT, 2026-09-03] Vulkan presents directly to the window: nothing GL draws
+    // in the viewport is visible. The walk still runs as the culler + feed builder, but the pure-GL
+    // fallback DRAWS (the deferred replay of buckets VK refused) are skipped. The refusal counters
+    // and the GL-M2 report stay live -- they are the native port's remaining work list.
+    bool vk_native = false;
+
+    // ---- [VULKAN CLUTTER PERSISTENT, 2026-09-03] ------------------------------------------------
+    // Chunks whose clutter lives in a per-chunk VK buffer this frame: the clutter block skips their
+    // per-blade re-collection entirely. MapView owns the registry and REBUILDS this set every frame
+    // (so a density override / mode change falls back seamlessly). Pointers are only ever compared
+    // against live chunks inside the walk -- never dereferenced from here.
+    std::unordered_set<MapChunk const*> vk_clutter_chunks;
+    // Registered animated clutter species -> stable header slot (0..63) in the bone stream.
+    std::unordered_map<Model*, int> vk_clutter_species;
+    // Build one chunk's registration payload: instance streams + per-(species,pass) draw templates
+    // addressing the shared M2 arena. tex.x/y are left as -1 with the BLP names reported per draw;
+    // the caller (MapView) resolves them to bindless ids and back-fills before registering.
+    // false = not registrable yet (model streaming / arena slot missing) -- retry later.
+    struct VkClutterOut
+    {
+      std::vector<glm::mat4x4> tf;
+      std::vector<glm::vec4> interior;
+      std::vector<glm::ivec4> tex;
+      std::vector<glm::ivec4> state;
+      struct Draw
+      {
+        std::uint32_t index_count = 0, first_index = 0;
+        std::int32_t base_vertex = 0;
+        std::uint32_t first_instance = 0, instance_count = 0;
+        std::int32_t state_key = 0;          // blend | cull<<4 | classic_alpha<<5
+        std::string blp0, blp1;
+        std::size_t tex_from = 0, tex_count = 0;   // instances whose tex.x/y take these BLPs
+      };
+      std::vector<Draw> draws;
+    };
+    bool vkClutterBuildChunk(MapChunk* chunk, VkClutterOut& out);
+    // Per frame (before the M2 feed is consumed): write each registered species' header slot and
+    // append its CURRENT bone matrices to the snapshot bone stream -- the sway stays live.
+    void vkClutterAppendBones(glm::mat4x4 const& model_view, int animtime);
     // read-only view of the per-frame lighting/fog block so the VK backend renders with the same numbers
     OpenGL::LightingUniformBlock const& lightingBlock() const { return _lighting_ubo_data; }
     // [VULKAN phase B] sun band (LightIntBand 9) = the terrain specular colour GL feeds sun_spec_color
@@ -286,8 +331,11 @@ namespace Noggit::Rendering
     // MOLT lights its MOLR chunk references. Called by WMORender between group draws to swap the
     // point-light region of the lighting UBO to the group's authored set; restore returns to the
     // frame's global nearest-16 pool (kept in _lighting_ubo_data) before non-WMO passes.
-    void setWmoGroupPointLights(WMO const* wmo, std::vector<int16_t> const& light_refs,
-                                glm::mat4x4 const& transform, glm::vec3 const& camera_pos);
+    // `lights` is the WMO's MOLT list with MOLR refs, or its MNLD list with MNLR refs (modern groups);
+    // `doodad_set` is the instance's set: an MNLD light applies only for set 0 or its own set.
+    void setWmoGroupPointLights(WMO const* wmo, std::vector<WMOLight> const& lights,
+                                std::vector<int16_t> const& light_refs,
+                                glm::mat4x4 const& transform, glm::vec3 const& camera_pos, uint16_t doodad_set);
     void restoreGlobalPointLights();
 
     // The zone fog currently in the lighting UBO (always the OUTDOOR values -- per-WMO MFOG is
@@ -389,6 +437,9 @@ namespace Noggit::Rendering
     OpenGL::Scoped::deferred_upload_vertex_arrays<1> _mdi_vao_arr;
     bool _mdi_ready = false;
     GLsizeiptr _mdi_arena_vbo_cap = 0, _mdi_arena_ibo_cap = 0;
+    // [2026-09-05 DIAG] models the walk fed this frame, and how many were still loading
+    std::size_t _vk_dbg_models_seen = 0;
+    std::size_t _vk_dbg_models_unloaded = 0;
     GLsizei _mdi_arena_vtx = 0, _mdi_arena_idx = 0;
     GLsizeiptr _mdi_inst_cap = 0, _mdi_indirect_cap = 0;          // current instance/indirect buffer byte capacities
     std::vector<std::pair<Model*, TileRender::DoodadInstanceBuffer const*>> _mdi_all_loaded; // GPU-driven P1: ALL loaded tiles' doodads (camera-independent) -> batch rebuilds only on tile load/unload
@@ -699,6 +750,7 @@ namespace Noggit::Rendering
     // Per-frame budget for cold-cache interior-light computes, so a WMO streaming in spreads its doodads'
     // interior sampling over frames instead of one hitch. Reset each frame in updateLightingUniformBlock.
     int _interior_miss_budget = 0;
+    int _interior_deferred_this_frame = 0; // samples the budget pushed to the next frame (see interior_light_at)
     // The client's unit shadow decal texture (Textures\ShadowBlob.blp), lazily acquired on first
     // blob-shadow draw. 32x32 grayscale oval, drawn modulate (see blob_shadow_frag).
     std::unique_ptr<scoped_blp_texture_reference> _shadow_blob_texture;

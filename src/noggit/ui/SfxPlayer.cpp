@@ -12,6 +12,57 @@
 #include <QtCore/QCoreApplication>
 #include <QtCore/QSettings>
 #include <QtCore/QTemporaryFile>
+#include <noggit/audio/QtMediaTemp.hpp>
+
+// stb_vorbis, compiled once here (see QtMediaTemp.hpp)
+#define STB_VORBIS_NO_STDIO
+#define STB_VORBIS_NO_PUSHDATA_API
+#include "../../external/stb/stb_vorbis.c" // src/noggit/ui -> src/external/stb
+#include <cstdlib>
+#include <cstring>
+
+namespace Noggit::Audio
+{
+  std::vector<char> decodeForQtMedia(char const* data, std::size_t size, std::string& name)
+  {
+    if (!data || size < 4 || std::memcmp(data, "OggS", 4) != 0)
+    {
+      return std::vector<char>(data, data + size);
+    }
+    int channels = 0;
+    int sample_rate = 0;
+    short* pcm = nullptr;
+    int const frames = stb_vorbis_decode_memory(reinterpret_cast<unsigned char const*>(data), static_cast<int>(size),
+                                                &channels, &sample_rate, &pcm);
+    if (frames <= 0 || !pcm || channels <= 0 || sample_rate <= 0)
+    {
+      if (pcm) std::free(pcm);
+      LogError << "Audio: Ogg Vorbis decode failed for '" << name << "' (" << size << " bytes)" << std::endl;
+      return std::vector<char>(data, data + size);
+    }
+    std::uint32_t const data_bytes = static_cast<std::uint32_t>(frames) * static_cast<std::uint32_t>(channels) * 2u;
+    std::vector<char> wav(44 + data_bytes);
+    auto const put32 = [&](std::size_t at, std::uint32_t v) { std::memcpy(wav.data() + at, &v, 4); };
+    auto const put16 = [&](std::size_t at, std::uint16_t v) { std::memcpy(wav.data() + at, &v, 2); };
+    std::memcpy(wav.data(), "RIFF", 4);
+    put32(4, 36 + data_bytes);
+    std::memcpy(wav.data() + 8, "WAVE", 4);
+    std::memcpy(wav.data() + 12, "fmt ", 4);
+    put32(16, 16);
+    put16(20, 1); // PCM
+    put16(22, static_cast<std::uint16_t>(channels));
+    put32(24, static_cast<std::uint32_t>(sample_rate));
+    put32(28, static_cast<std::uint32_t>(sample_rate) * static_cast<std::uint32_t>(channels) * 2u);
+    put16(32, static_cast<std::uint16_t>(channels * 2));
+    put16(34, 16);
+    std::memcpy(wav.data() + 36, "data", 4);
+    put32(40, data_bytes);
+    std::memcpy(wav.data() + 44, pcm, data_bytes);
+    std::free(pcm);
+    name += ".wav";
+    return wav;
+  }
+}
 #include <QtCore/QUrl>
 #include <QtMultimedia/QMediaPlayer>
 
@@ -131,9 +182,11 @@ namespace Noggit::Ui
             auto* temp = new QTemporaryFile(this);
             if (temp->open())
             {
-              temp->write(file.getBuffer(), file.getSize());
+              std::string media_name = fn;
+              auto const bytes = Noggit::Audio::decodeForQtMedia(file.getBuffer(), file.getSize(), media_name);
+              temp->write(bytes.data(), static_cast<qint64>(bytes.size()));
               temp->close();
-              temp->rename(temp->fileName() + QString::fromStdString(fn));
+              temp->rename(temp->fileName() + QString::fromStdString(media_name));
               path_out = temp->fileName();
             }
             else

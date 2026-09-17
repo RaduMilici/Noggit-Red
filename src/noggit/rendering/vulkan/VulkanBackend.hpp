@@ -21,6 +21,7 @@
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan.h>
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <vector>
@@ -36,7 +37,10 @@ namespace Noggit::Rendering::VK
   public:
     // Loads vulkan-1.dll + creates instance/device/pool and the exportable image/semaphores.
     // Returns false (and stays inert) on ANY failure -- callers fall back to pure GL silently.
-    bool init(std::uint32_t width, std::uint32_t height);
+    // [MSAA 2026-09-03] msaa_samples: 1/2/4/8, clamped to the device; when > 1 the scene renders
+    // into multisampled colour+z+depth and the render pass RESOLVES into the exportable images,
+    // so present/readback/parity all stay single-sample. Pass 1 in parity/compose mode.
+    bool init(std::uint32_t width, std::uint32_t height, std::uint32_t msaa_samples = 1);
     void shutdown();
     [[nodiscard]] bool ready() const { return _ready; }
 
@@ -45,6 +49,32 @@ namespace Noggit::Rendering::VK
     // conventions -- the vertex shader converts). With a terrain mesh uploaded this draws the REAL terrain
     // (depth-tested); before any mesh it draws the ring-pattern skeleton test. False on submit failure.
     bool renderFrame(float time_seconds, bool wait_gl_done, float const* mvp16);
+
+    // ---- [VULKAN NATIVE PRESENT, 2026-09-03] ----------------------------------------------------
+    // Direct-to-window presentation: the backend owns a VkSurfaceKHR + VkSwapchainKHR on a native
+    // child window. When active, renderFrame() acquires a swapchain image, records a blit of the
+    // offscreen frame into it (Y-FLIPPED: our image is GL-oriented, row 0 = bottom row) inside the
+    // same command buffer, and the submit path presents. GL never touches the frame. Fail-soft:
+    // errors log, present stays off, and callers keep the GL-import compose exactly as before.
+    [[nodiscard]] bool presentCapable() const { return _present_capable; }
+    bool initPresent(void* hwnd);                 // create surface + swapchain on this window
+    void notifyPresentResize() { _sc_needs_recreate = true; }
+    [[nodiscard]] bool presentActive() const { return _present_active; }
+    // In native mode nobody outside waits the frame semaphore (GL does in compose mode); the
+    // present consumes it instead, and on frames that cannot present it must not be signalled at
+    // all (a binary semaphore must not be signalled twice). Default true = compose behaviour.
+    void setFrameSemExternallyWaited(bool v) { _frame_sem_external_wait = v; }
+    // Copies the rendered offscreen image (RGBA8, row 0 = BOTTOM row -- the same orientation
+    // glReadPixels yields, so vk_diff::savePng handles both identically). Blocks on the GPU.
+    bool readbackImage(std::vector<std::uint8_t>& out_rgba);
+    // [NATIVE PRESENT DIAG] read back the ACTUAL last-presented swapchain image (what the window
+    // shows), not the offscreen render target -- the offscreen readback cannot prove the present
+    // path. Output is RGBA8 bottom-up (same convention as readbackImage / glReadPixels), swizzled
+    // from the swapchain's BGRA. Returns false if the swapchain lacks TRANSFER_SRC.
+    bool readbackPresented(std::vector<std::uint8_t>& out_rgba);
+    [[nodiscard]] bool presentedReadbackAvailable() const { return _sc_transfer_src && _sc_presented_once; }
+    [[nodiscard]] std::uint32_t presentWidth() const { return _sc_extent.width; }
+    [[nodiscard]] std::uint32_t presentHeight() const { return _sc_extent.height; }
 
     // [VK-1] upload/replace the terrain mesh. Vertices are INTERLEAVED pos.xyz + smooth normal.xyz +
     // MCCV colour.rgb (9 floats / 36 bytes each); uint32 indices. Host-visible one-shot upload; called from
@@ -79,6 +109,17 @@ namespace Noggit::Rendering::VK
     bool setSkyDome(float const* positions_xyz, float const* colors_rgb, std::size_t vertex_count,
                     std::uint16_t const* indices, std::size_t index_count);
     bool skyDomeReady() const { return _skydome_pipeline && _skydome_index_count; }
+
+    // [2026-09-08 WDL HORIZON] the low-res distant terrain (client CMapLowDetail). `xyz` is the whole
+    // map's WDL mesh, re-uploaded only when `vertex_generation` changes; the two index ranges are
+    // rebuilt per frame by map_horizon::render::build_frame (client tile selection + MAHO split).
+    // Solid cells draw with depth writes, hole cells without. `mvp16` = the client's own low-detail
+    // projection (near = far clip - 50, far = 4 x farclip) * model_view, GL clip conventions like
+    // the terrain push. Null / empty = draw nothing.
+    bool setHorizon(float const* xyz, std::size_t vertex_count, std::uint32_t vertex_generation,
+                    std::uint32_t const* solid, std::size_t solid_count,
+                    std::uint32_t const* holes, std::size_t hole_count, float const* rgb,
+                    float const* mvp16);
 
     // [phase F] the cloud deck: the client's cloud cap mesh (pos | uv | row alpha) plus the
     // bindless index of the CPU-ticked cloud texture and the live opacity.
@@ -122,26 +163,26 @@ namespace Noggit::Rendering::VK
                       ParticleDraw const* draws, std::size_t draw_count);
     bool particlesReady() const { return _particle_pipelines[0] != VK_NULL_HANDLE; }
 
-    // [overnight stage 4] instanced M2 doodads (clay). Geometry = concatenated per-model pos+normal verts +
-    // uint32 indices; instances = one mat4 (16 floats) per instance, all models' instances in one stream;
-    // draws = per-model ranges into all three. Replaced wholesale on neighbourhood change.
-    struct DoodadDraw
-    {
-      std::uint32_t first_index = 0;
-      std::uint32_t index_count = 0;
-      std::int32_t base_vertex = 0;
-      std::uint32_t first_instance = 0;
-      std::uint32_t instance_count = 0;
-    };
-    bool setDoodads(float const* pn_verts, std::size_t vertex_count,
-                    std::uint32_t const* indices, std::size_t index_count,
-                    float const* instance_mat4s, std::size_t instance_count,
-                    DoodadDraw const* draws, std::size_t draw_count);
+    // [2026-09-03] the clay doodad path (untextured stage-4 scaffolding) is fully removed: the M2
+    // batches carry every doodad now, nothing fed or recorded it any more.
 
     // [overnight 04:11, DORMANT until called] replace the sampled ground texture with caller-provided RGBA8
     // pixels (e.g. a decoded BLP). Creates a fresh image via the same staging path, repoints the descriptor,
     // destroys the old image after a queue idle. Daylight BLP wiring becomes one call.
     bool setGroundTexture(std::uint32_t const* rgba, std::uint32_t width, std::uint32_t height);
+
+    // ---- [2026-09-04] EDITOR UI COMPOSITE ----
+    // The swapchain lives in a native child window that composites above every Qt sibling, so the
+    // tool palette was invisible; making the widgets native instead blacked out the viewport. So Qt
+    // renders the overlay to an RGBA image and VULKAN draws it last, inside the frame. Pass the
+    // premultiplied-by-nothing (straight alpha) top-down image; alpha 0 leaves the scene untouched.
+    // Call with nullptr/0 to hide the overlay. Cheap when the size is unchanged (in-place re-upload).
+    bool setUiOverlay(void const* rgba, std::uint32_t width, std::uint32_t height);
+    void clearUiOverlay() { _ui_visible = false; }
+    // [2026-09-06 DIAG] Force m2.frag's FOOTPRINT probe (term bit 6: every rasterised M2 fragment
+    // painted magenta, no discards) for the frames it is armed. Lets a snapped frame from the user's
+    // session prove whether tree fragments rasterise at all, with no env var on their side.
+    void setM2FootprintProbe(bool on) { _m2_footprint_probe = on; }
 
     // ---- [VULKAN phase B, 2026-08-29] TEXTURED TERRAIN (the first pass VK owns) ----
     // Bindless tileset textures: RGBA8 level-0 pixels, mips generated here; returns the index into the
@@ -224,12 +265,47 @@ namespace Noggit::Rendering::VK
                     std::size_t instance_count,
                     float const* bone_mat4s, std::size_t bone_count,
                     M2Draw const* draws, std::size_t draw_count);
+    // ---- [VULKAN CLUTTER PERSISTENT, 2026-09-03] ------------------------------------------------
+    // Ground clutter is STATIC per chunk, yet it was re-collected, re-copied and re-uploaded every
+    // frame (~132k instances in a heavy Elwynn view). Each computed chunk now registers ONCE: its
+    // instance streams live in a small per-chunk GPU buffer (one allocation, four sections laid out
+    // tf | interior | tex | state, matching the m2 pipeline's instance bindings), and per frame the
+    // caller hands over just the VISIBLE chunks' draw records -- a few KB of indirect commands.
+    // Geometry stays in the shared M2 arena (the draws address it by slot offsets, append-only).
+    struct ClutterDraw
+    {
+      std::uint32_t index_count = 0;
+      std::uint32_t first_index = 0;
+      std::int32_t  base_vertex = 0;
+      std::uint32_t first_instance = 0;   // within the chunk's own buffer
+      std::uint32_t instance_count = 0;
+      std::int32_t  chunk_slot = -1;      // from clutterRegisterChunk
+      std::int32_t  state_key = 0;        // blend | cull<<4 | classic_alpha<<5 (pipeline pick)
+    };
+    // Registers one chunk's instances (tight arrays, counts equal). Returns the slot, or -1.
+    std::int32_t clutterRegisterChunk(float const* tf_mat4s, float const* interior_vec4s,
+                                      std::int32_t const* tex_ivec4s, std::int32_t const* state_ivec4s,
+                                      std::size_t instance_count);
+    void clutterReleaseChunk(std::int32_t slot);   // safe on -1; buffer retire-freed
+    // This frame's visible clutter draws, SORTED by (state_key, chunk_slot). Empty = draw nothing.
+    bool setClutterFrame(ClutterDraw const* draws, std::size_t count);
+
     [[nodiscard]] bool m2Ready() const { return _m2_pipeline != VK_NULL_HANDLE && _m2_draw_count > 0; }
     [[nodiscard]] bool m2Available() const { return _m2_pipeline != VK_NULL_HANDLE; }
     // [finding 161] The water equivalent of m2Ready(). VK draws water only when BOTH of these hold
     // (see the draw: `_water_pipeline && _water_index_count`), so anything less means VK renders no
     // water at all -- and GL must not be gated off in that case.
     [[nodiscard]] bool waterReady() const { return _water_pipeline != VK_NULL_HANDLE && _water_index_count != 0; }
+    // [2026-09-02] Same contract as waterReady(), for the same reason (finding 161). Mirrors what
+    // the terrain draw actually consumes: the indirect path needs visible chunks, the non-indirect
+    // fallback needs an index count. terrainTexturedAvailable() is NOT a substitute -- it only says
+    // the pipeline and descriptor set exist, so it stays 1 on frames that draw nothing, and GL was
+    // gated off against it. That is the blue-flash / missing-doodads report.
+    [[nodiscard]] bool terrainReady() const
+    {
+      return _terrain_pipeline != VK_NULL_HANDLE
+          && (_terrain_visible_chunks != 0u || _terrain_index_count != 0u);
+    }
     [[nodiscard]] bool terrainTexturedAvailable() const { return _tt_pipeline != VK_NULL_HANDLE && _tt_dset != VK_NULL_HANDLE; }
     // Per-frame lighting/fog block (byte copy of OpenGL::LightingUniformBlock) followed by 3 extra vec4s
     // the shader appends: camera xyz, sun-spec rgb + spec-on flag, toggles (draw_shadows, draw_fog).
@@ -331,6 +407,29 @@ namespace Noggit::Rendering::VK
     // its own frame work and only pay the wait at the point it actually needs the rendered images
     // (waitFrameComplete, called immediately before the compose). The queue is single-slot: this
     // renderer submits exactly one command buffer per frame.
+    // [NATIVE PRESENT] surface/swapchain state. VkSurfaceKHR/VkSwapchainKHR handle types are core
+    // (vulkan_core.h); only the Win32 CREATE call needs vulkan_win32.h, so that PFN is type-erased.
+    bool _present_capable = false;   // instance + device extensions and entry points all present
+    bool _present_active = false;    // swapchain live; renderFrame records the present blit
+    bool _frame_sem_external_wait = true; // compose mode: GL waits _vk_done every frame
+    VkSurfaceKHR _surface = VK_NULL_HANDLE;
+    VkSwapchainKHR _swapchain = VK_NULL_HANDLE;
+    std::vector<VkImage> _sc_images;
+    VkFormat _sc_format = VK_FORMAT_B8G8R8A8_UNORM;
+    VkExtent2D _sc_extent{};
+    VkSemaphore _sc_acquire = VK_NULL_HANDLE; // acquire -> the frame submit waits on it (TRANSFER)
+    std::uint32_t _sc_index = 0;              // image index acquired for the frame being recorded
+    bool _sc_acquired = false;                // an acquired image awaits present after the submit
+    std::atomic<bool> _sc_needs_recreate{false};
+    bool _sc_transfer_src = false;   // [DIAG] swapchain created with TRANSFER_SRC (present readback)
+    bool _sc_presented_once = false; // a real frame has been presented (readback is meaningful)
+    void* _present_hwnd = nullptr;
+    bool createSwapchainInternal();
+    void presentAcquiredImage();              // vkQueuePresentKHR right after the queue submit
+    // per-frame handoff to the submit thread (set under _submit_mutex in submitFrameAsync)
+    bool _submit_wait_acquire = false;        // wait _sc_acquire at TRANSFER before the blit
+    bool _submit_signal_sem = true;           // signal _vk_done (someone -- GL or present -- waits)
+
     std::thread _submit_thread;
     std::mutex _submit_mutex;
     std::condition_variable _submit_cv;
@@ -360,6 +459,16 @@ namespace Noggit::Rendering::VK
     VkFence _fence = VK_NULL_HANDLE;
 
     std::uint32_t _width = 0, _height = 0;
+    // [MSAA] scene sample count (1 = original single-sample layout). When > 1, these hold the
+    // multisampled colour and depth-as-colour targets; the exportable images become the RESOLVE
+    // destinations and everything downstream (blit, present, readback, GL import) is unchanged.
+    VkSampleCountFlagBits _samples = VK_SAMPLE_COUNT_1_BIT;
+    VkImage _ms_color_image = VK_NULL_HANDLE;
+    VkDeviceMemory _ms_color_mem = VK_NULL_HANDLE;
+    VkImageView _ms_color_view = VK_NULL_HANDLE;
+    VkImage _ms_z_image = VK_NULL_HANDLE;
+    VkDeviceMemory _ms_z_mem = VK_NULL_HANDLE;
+    VkImageView _ms_z_view = VK_NULL_HANDLE;
     VkImage _image = VK_NULL_HANDLE;
     VkDeviceMemory _image_mem = VK_NULL_HANDLE;
     std::uint64_t _image_mem_size = 0;
@@ -401,6 +510,23 @@ namespace Noggit::Rendering::VK
     // update IN PLACE rather than reallocate (see setSkyDome)
     std::size_t _skydome_vbo_cap = 0;
     std::size_t _skydome_ibo_cap = 0;
+    // [2026-09-08 WDL HORIZON] low-res distant terrain: push-only layout (mvp + flat colour), one
+    // pipeline that writes depth (solid cells) and one that does not (MAHO hole cells), grow-only
+    // host buffers (the index list changes every frame, the vertices only with the WDL).
+    VkPipeline _horizon_pipeline = VK_NULL_HANDLE;
+    VkPipeline _horizon_pipeline_nowrite = VK_NULL_HANDLE;
+    VkPipelineLayout _horizon_layout = VK_NULL_HANDLE;
+    VkBuffer _horizon_vbo = VK_NULL_HANDLE;
+    VkDeviceMemory _horizon_vbo_mem = VK_NULL_HANDLE;
+    VkBuffer _horizon_ibo = VK_NULL_HANDLE;
+    VkDeviceMemory _horizon_ibo_mem = VK_NULL_HANDLE;
+    std::size_t _horizon_vbo_cap = 0;
+    std::size_t _horizon_ibo_cap = 0;
+    std::uint32_t _horizon_vertex_generation = 0;
+    std::uint32_t _horizon_solid_count = 0;
+    std::uint32_t _horizon_hole_count = 0;
+    float _horizon_color[3] = { 0.f, 0.f, 0.f };
+    float _horizon_mvp[16] = { 1.f, 0.f, 0.f, 0.f,  0.f, 1.f, 0.f, 0.f,  0.f, 0.f, 1.f, 0.f,  0.f, 0.f, 0.f, 1.f };
     // what the WMO descriptor set currently points at, so it is only rewritten when it changes
     VkBuffer _wmo_xforms_bound = VK_NULL_HANDLE;
     VkBuffer _wmo_amb_bound = VK_NULL_HANDLE;
@@ -422,6 +548,15 @@ namespace Noggit::Rendering::VK
     std::size_t _texup_staging_cap = 0;
     std::uint32_t _skydome_index_count = 0;
     float _sky_camera[3] = { 0.f, 0.f, 0.f };   // cached from the lighting extra, for the dome push
+    // [2026-09-04] editor-UI overlay: one persistent bindless slot re-uploaded in place, drawn as a
+    // fullscreen blended triangle after every other pass (see ui.vert/ui.frag).
+    VkPipeline _ui_pipeline = VK_NULL_HANDLE;
+    std::atomic<bool> _m2_footprint_probe{false};
+    std::int32_t _ui_tex = -1;
+    std::uint32_t _ui_w = 0, _ui_h = 0;
+    bool _ui_visible = false;
+    bool createUiPipeline();
+
     VkPipeline _cloud_pipeline = VK_NULL_HANDLE;
     VkPipelineLayout _cloud_layout = VK_NULL_HANDLE;
     VkBuffer _cloud_vbo = VK_NULL_HANDLE;
@@ -554,6 +689,21 @@ namespace Noggit::Rendering::VK
     // only changes on a growth frame -- rewriting the descriptor otherwise cost a full stall.
     VkBuffer _m2_bones_bound = VK_NULL_HANDLE;    VkDeviceMemory _m2_bones_mem = VK_NULL_HANDLE;   std::size_t _m2_bones_cap = 0;
     VkBuffer _m2_indirect = VK_NULL_HANDLE; VkDeviceMemory _m2_indirect_mem = VK_NULL_HANDLE; std::size_t _m2_indirect_cap = 0;
+    // [CLUTTER PERSISTENT] per-chunk instance buffers + this frame's draw list
+    struct ClutterChunkBuf
+    {
+      VkBuffer buf = VK_NULL_HANDLE;
+      VkDeviceMemory mem = VK_NULL_HANDLE;
+      std::uint32_t count = 0;
+      VkDeviceSize off_in = 0, off_tx = 0, off_st = 0;
+      bool used = false;
+    };
+    std::vector<ClutterChunkBuf> _clutter_chunks;
+    std::vector<ClutterDraw> _clutter_draws;
+    VkBuffer _clutter_indirect = VK_NULL_HANDLE;
+    VkDeviceMemory _clutter_indirect_mem = VK_NULL_HANDLE;
+    std::size_t _clutter_indirect_cap = 0;
+
     VkPipelineLayout _m2_layout = VK_NULL_HANDLE;
     VkPipeline _m2_pipeline = VK_NULL_HANDLE;   // == _m2_pipelines[0] (opaque, no cull)
     // [blend class][cull]: class 0 = no blend, 1 = SRC_ALPHA/1-SRC_ALPHA, 2 = ONE/ONE
@@ -629,20 +779,6 @@ namespace Noggit::Rendering::VK
     bool _tt_ready = false;
     std::uint32_t _tt_atlas_w = 0, _tt_atlas_h = 0, _tt_chunk_count = 0;
     float _tt_params[4] = { 0.f, 0.f, 0.f, 0.f }; // x = draw_shadows, y = draw_fog
-
-    // [overnight stage 4] doodads: instanced pipeline + geometry/instance buffers + per-model draw ranges
-    bool createDoodadPipeline();
-    VkPipeline _doodad_pipeline = VK_NULL_HANDLE;
-    VkBuffer _doodad_vbo = VK_NULL_HANDLE;
-    VkDeviceMemory _doodad_vbo_mem = VK_NULL_HANDLE;
-    VkBuffer _doodad_ibo = VK_NULL_HANDLE;
-    VkDeviceMemory _doodad_ibo_mem = VK_NULL_HANDLE;
-    VkBuffer _doodad_inst = VK_NULL_HANDLE;
-    VkDeviceMemory _doodad_inst_mem = VK_NULL_HANDLE;
-    // finding 104: persistent doodad buffers -- no destroy/create, no queue drain per rebuild
-    std::size_t _doodad_vbo_cap = 0, _doodad_ibo_cap = 0, _doodad_inst_cap = 0;
-    std::size_t _doodad_vbo_written = 0, _doodad_ibo_written = 0;
-    std::vector<DoodadDraw> _doodad_draws;
 
     // [overnight stage 3] water: terrain-pipeline clone with blending on / depth-write off + its own mesh
     VkPipeline _water_pipeline = VK_NULL_HANDLE;
@@ -780,6 +916,21 @@ namespace Noggit::Rendering::VK
     PFN_vkUpdateDescriptorSets vkUpdateDescriptorSets = nullptr;
     PFN_vkCmdBindDescriptorSets vkCmdBindDescriptorSets = nullptr;
     PFN_vkCmdCopyBufferToImage vkCmdCopyBufferToImage = nullptr;
+    // [NATIVE PRESENT] surface/swapchain entry points (+ blit/readback)
+    PFN_vkVoidFunction _pfn_vkCreateWin32SurfaceKHR = nullptr; // win32 struct -- cast in the .cpp
+    PFN_vkDestroySurfaceKHR vkDestroySurfaceKHR = nullptr;
+    PFN_vkGetPhysicalDeviceSurfaceSupportKHR vkGetPhysicalDeviceSurfaceSupportKHR = nullptr;
+    PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR vkGetPhysicalDeviceSurfaceCapabilitiesKHR = nullptr;
+    PFN_vkGetPhysicalDeviceSurfaceFormatsKHR vkGetPhysicalDeviceSurfaceFormatsKHR = nullptr;
+    PFN_vkGetPhysicalDeviceSurfacePresentModesKHR vkGetPhysicalDeviceSurfacePresentModesKHR = nullptr;
+    PFN_vkCreateSwapchainKHR vkCreateSwapchainKHR = nullptr;
+    PFN_vkDestroySwapchainKHR vkDestroySwapchainKHR = nullptr;
+    PFN_vkGetSwapchainImagesKHR vkGetSwapchainImagesKHR = nullptr;
+    PFN_vkAcquireNextImageKHR vkAcquireNextImageKHR = nullptr;
+    PFN_vkQueuePresentKHR vkQueuePresentKHR = nullptr;
+    PFN_vkCmdBlitImage vkCmdBlitImage = nullptr;
+    PFN_vkCmdCopyImageToBuffer vkCmdCopyImageToBuffer = nullptr;
+    PFN_vkFreeCommandBuffers vkFreeCommandBuffers = nullptr;
   };
 }
 

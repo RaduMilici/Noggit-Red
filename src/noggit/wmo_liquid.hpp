@@ -117,6 +117,7 @@ public:
              bool interior_material_color = false,
              glm::vec3 const& material_color = glm::vec3(0.0f),
              bool indoor_channel = false,
+             bool dbc_exterior = false,
              std::vector<glm::vec3> const* group_vertices = nullptr);
   wmo_liquid(wmo_liquid const& other);
 
@@ -163,6 +164,10 @@ public:
   glm::vec3 const& materialColor() const { return _material_color; }
   bool vkUseMaterialColor() const { return _use_material_color; }
   bool vkIndoorChannel() const { return _indoor_channel; }
+  bool vkDbcExterior() const { return _dbc_exterior; }
+  // exterior water colour law: 0 = legacy open-air pool (user-tuned river blend), 1 = city channel
+  // (indoor+exterior-lit, user-tuned navy), 2 = DBC-path exterior water = the client's flat river-deep
+  int waterMode() const { return _indoor_channel ? 1 : (_dbc_exterior ? 2 : 0); }
   // LiquidTextureManager profile key -- WMO liquid ids are remapped before the lookup, so VK must
   // use the SAME mapping GL's draw() does or it picks the wrong texture/anim/type.
   static unsigned vkTextureProfileId(int liquid_id);
@@ -190,6 +195,12 @@ private:
   // -- the ocean-dark opaque look. Open-air WMO pools (Northshire abbeygate stream) lack indoor and
   // blend with the river instead.
   bool _indoor_channel = false;
+  // [2026-09-09] EXTERIOR water on the LiquidType.dbc path (MOHD 0x4 set, e.g. stock 3.3.5a
+  // Stormwind: canal groups flagged EXTERIOR, groupLiquid 5 "Slow Water"). Those groups have neither
+  // the indoor flag (the Turtle/vanilla canal encoding) nor a legacy id, so they fell into the
+  // open-air-pool river blend and came out olive green. The client draws every exterior WMO water
+  // with ONE flat zone colour, Light band 17 = river deep (FUN_006b6630); this mode uses exactly that.
+  bool _dbc_exterior = false;
 
   std::vector<float> _vk_verts;
   std::vector<std::uint16_t> _vk_indices;

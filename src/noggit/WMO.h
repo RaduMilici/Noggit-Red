@@ -15,6 +15,7 @@
 #include <ClientFile.hpp>
 #include <external/glm/gtc/type_precision.hpp> // glm::u8vec3 (_ground_colors)
 #include <optional>
+#include <limits>
 
 #include <map>
 #include <set>
@@ -49,6 +50,17 @@ struct wmo_batch
 
   uint8_t flags;
   uint8_t texture;
+};
+
+// [client RE 2026-09-09, FUN_007c2a70 / FUN_007c1dc0] result of the 3.3.5a client's ground-type
+// cast: TWO nearest faces tracked independently along the down ray (see WMOGroup::groundQuery).
+struct wmo_ground_query
+{
+  float support_t = std::numeric_limits<float>::max(); // record A: the face the character stands on
+  float typed_t = std::numeric_limits<float>::max();   // record B: the visible face naming the type
+  int typed_ground_type = -1;                          // MOMT.ground_type of that face (TerrainType id)
+  bool has_support() const { return support_t != std::numeric_limits<float>::max(); }
+  bool has_typed() const { return typed_t != std::numeric_limits<float>::max(); }
 };
 
 union wmo_mopy_flags
@@ -192,10 +204,15 @@ public:
 
   void intersect (math::ray const&, std::vector<float>* results, float max_dist = 0.0f) const;
 
-  // [doc 38 footsteps] nearest COLLIDABLE hit of a (model-space) ray with its face's authored
-  // ground type: {distance, materials[MOPY tri material].ground_type} (0 for collision-only
-  // faces, which carry no material). nullopt = no hit within max_dist.
-  std::optional<std::pair<float, int>> groundHit(math::ray const&, float max_dist) const;
+  // [client RE 2026-09-09] the CWorld GROUND-TYPE cast's per-face rule (FUN_007c6600, MOPY skip
+  // mask 0x82), run over EVERY face of the group: the client walks the MOBN/MOBR BSP, which
+  // references all faces, not the MOBA render batches. Accumulates two independent nearest hits:
+  //   support (record A): nearest COLLISION-only face (0x08 without 0x20) or RENDER face (0x20);
+  //   typed   (record B): nearest RENDER face (0x20) or DETAIL-only face (0x04, no 0x08/0x20),
+  //                       whose MOPY material -> MOMT.ground_type is the TerrainType id.
+  // Group gating as FUN_007c25d0: flags 0x80/0x10000/0x400000 never answer; an interior group
+  // only answers when the ray ORIGIN is inside its box. Model-space ray; reach = its length.
+  void groundQuery(math::ray const&, float reach, wmo_ground_query& io) const;
 
   // [game mode] local-space liquid surface height at p when THIS group's room contains p and has
   // liquid covering that spot (upper-floor pools must not read as covering someone below them).
@@ -216,6 +233,7 @@ public:
   // MOLR: indices into the root WMO's MOLT light list that illuminate this group (per-room lighting).
   [[nodiscard]]
   std::vector<int16_t> const& light_refs() const { return _light_refs; }
+  std::vector<int16_t> const& new_light_refs() const { return _new_light_refs; }
 
   glm::vec3 BoundingBoxMin;
   glm::vec3 BoundingBoxMax;
@@ -280,6 +298,12 @@ public:
   // out_floor_y (optional): the GROUP-LOCAL y of the hit floor face (the highest floor within the
   // client's [pos.y-12, pos.y+1] down-ray). Lets the caller reject an outdoor object sitting on the
   // terrain above an underground WMO whose floor is far below it (terrain-separation test).
+  // Diagnostics for the interior-light probe (NOGGIT_LIGHT_DEBUG): what the floor sampler has to work with.
+  [[nodiscard]] std::size_t ground_color_count() const { return _ground_colors.size(); }
+  [[nodiscard]] std::size_t vertex_count() const { return _vertices.size(); }
+  [[nodiscard]] std::size_t index_count() const { return _indices.size(); }
+  [[nodiscard]] std::size_t material_info_count() const { return _material_infos.size(); }
+  [[nodiscard]] float collision_grid_cell() const { return _collision_grid_cell; }
   bool sample_ground_color(glm::vec3 const& local_pos, glm::vec3* out, float* out_alpha = nullptr,
                            float* out_floor_y = nullptr) const;
 
@@ -309,6 +333,7 @@ private:
   int32_t fog;
   std::vector<uint16_t> _doodad_ref;
   std::vector<int16_t> _light_refs; // MOLR
+  std::vector<int16_t> _new_light_refs; // MNLR: indices into WMO::new_lights (modern groups)
   std::unique_ptr<wmo_liquid> lq;
 
   std::vector <wmo_triangle_material_info> _material_infos;
@@ -380,6 +405,14 @@ struct WMOLight {
   float r;
 
   glm::vec4 fcolor;
+
+  // MNLD (Shadowlands+) extras -- docs/client_re/42 sec 15. A modern light applies only when its doodad set
+  // is the global set 0 or the instance's set; light_type 0 point, 1 spot (drawn as a point light at its
+  // position); modern marks an MNLD entry (fcolor holds the raw colour, intensity is applied once by the
+  // renderer, and the cull radius is attenEnd without the 6-unit floor of the WotLK MOLT rule).
+  uint32_t doodad_set = 0;
+  uint32_t light_type = 0;
+  bool modern = false;
 
   void init(BlizzardArchive::ClientFile* f);
   void setup(GLint light);
@@ -453,10 +486,8 @@ public:
   [[nodiscard]]
   std::vector<float> intersect (math::ray const&, bool do_exterior = true, float max_dist = 0.0f) const;
 
-  // [doc 38 footsteps] nearest ground hit over ALL groups (physics counts interior AND
-  // exterior faces) with the face material's ground_type. Model-space ray.
-  [[nodiscard]]
-  std::optional<std::pair<float, int>> groundHit(math::ray const&, float max_dist) const;
+  // [client RE 2026-09-09] the ground-type cast over all groups (see WMOGroup::groundQuery).
+  void groundQuery(math::ray const&, float reach, wmo_ground_query& io) const;
 
   void finishLoading() override;
 
@@ -475,6 +506,8 @@ public:
   std::vector<scoped_blp_texture_reference> textures;
   std::vector<std::string> models;
   std::vector<wmo_doodad_instance> modelis;
+  // Modern (CASC) roots: GFID lists the group files by fileDataID (no "<name>_000.wmo" naming)
+  std::vector<std::uint32_t> _group_file_ids;
   std::vector<glm::vec3> model_nearest_light_vector;
 
   // Portal graph for interior visibility culling (MOPV/MOPT/MOPR). _portal_vertices = all portal polygon
@@ -486,6 +519,7 @@ public:
   std::vector<WMOPR> _portal_refs;
 
   std::vector<WMOLight> lights;
+  std::vector<WMOLight> new_lights; // MNLD: what modern groups reference through MNLR (docs/client_re/42 sec 15)
   glm::vec4 ambient_light_color;
 
   uint32_t WmoId;

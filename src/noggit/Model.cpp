@@ -1,5 +1,7 @@
 // This file is part of Noggit3, licensed under GNU General Public License (version 3).
 
+#include <cmath>
+#include <set>
 #include <math/bounding_box.hpp>
 #include <noggit/AsyncLoader.h>
 #include <noggit/Log.h>
@@ -588,8 +590,8 @@ namespace
   }
 }
 
-Model::Model(const std::string& filename, Noggit::NoggitRenderContext context)
-  : AsyncObject(filename)
+Model::Model(BlizzardArchive::Listfile::FileKey const& file_key, Noggit::NoggitRenderContext context)
+  : AsyncObject(file_key)
   , _context(context)
   , _renderer(this)
 {
@@ -597,15 +599,335 @@ Model::Model(const std::string& filename, Noggit::NoggitRenderContext context)
 
   // Fishing-pool water-surface effect (see Model::_water_surface_effect). Keyed on the model path;
   // all are World\SkillActivated\TradeskillEnablers\Tradeskill_FishSchool_*.
-  std::string lowered = filename;
+  std::string lowered = file_key.hasFilepath() ? file_key.filepath() : std::string();
   std::transform(lowered.begin(), lowered.end(), lowered.begin(),
                  [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
   _water_surface_effect = lowered.find("fishschool") != std::string::npos;
 }
 
+// MD21-chunked M2 (Legion+, every modern CASC client): the file is a chunk stream whose MD21 payload IS a
+// v27x MD20 header + data with PAYLOAD-relative offsets. Sibling chunks name the external parts by
+// fileDataID: SFID (skin profiles, then lod skins), TXID (one per texture, 0 = composed at runtime),
+// AFID ({animId, subAnimId, fdid} for sequences without flag 0x20). TXAC / LDV1 / EXP2 / PGD1 / BFID /
+// SKID and the rest are not needed to draw. The v274 header is byte-identical to v264 for the 304 bytes
+// noggit parses; only the particle-emitter record grew (492 B). Measured on 1.15.9 / 2.5.6 files --
+// docs/client_re/41 section 7. Rebases the ClientFile onto the payload so the MD20 parser below runs unchanged.
+bool Model::unwrapMD21(BlizzardArchive::ClientFile& f)
+{
+  char const* buffer = f.getBuffer();
+  std::size_t const size = f.getSize();
+  std::size_t payload_offset = 0;
+  std::size_t payload_size = 0;
+
+  _skin_file_ids.clear();
+  _texture_file_ids.clear();
+  _anim_file_ids.clear();
+  _extended_particles.clear();
+
+  std::size_t pos = 0;
+  while (pos + 8 <= size)
+  {
+    std::uint32_t chunk_size;
+    std::memcpy(&chunk_size, buffer + pos + 4, 4);
+    if (pos + 8 + static_cast<std::size_t>(chunk_size) > size)
+    {
+      break;
+    }
+    char const* tag = buffer + pos;
+    char const* data = buffer + pos + 8;
+
+    if (std::memcmp(tag, "MD21", 4) == 0)
+    {
+      payload_offset = pos + 8;
+      payload_size = chunk_size;
+    }
+    else if (std::memcmp(tag, "SFID", 4) == 0)
+    {
+      for (std::uint32_t k = 0; k < chunk_size / 4; ++k)
+      {
+        std::uint32_t id;
+        std::memcpy(&id, data + k * 4, 4);
+        _skin_file_ids.push_back(id);
+      }
+    }
+    else if (std::memcmp(tag, "SKID", 4) == 0 && chunk_size >= 4)
+    {
+      std::memcpy(&_skeleton_file_id, data, 4);
+    }
+    else if (std::memcmp(tag, "TXID", 4) == 0)
+    {
+      for (std::uint32_t k = 0; k < chunk_size / 4; ++k)
+      {
+        std::uint32_t id;
+        std::memcpy(&id, data + k * 4, 4);
+        _texture_file_ids.push_back(id);
+      }
+    }
+    else if (std::memcmp(tag, "AFID", 4) == 0)
+    {
+      for (std::uint32_t k = 0; k < chunk_size / 8; ++k)
+      {
+        std::uint16_t anim_id, sub_anim_id;
+        std::uint32_t id;
+        std::memcpy(&anim_id, data + k * 8, 2);
+        std::memcpy(&sub_anim_id, data + k * 8 + 2, 2);
+        std::memcpy(&id, data + k * 8 + 4, 4);
+        if (id)
+        {
+          _anim_file_ids[{anim_id, sub_anim_id}] = id;
+        }
+      }
+    }
+    else if (std::memcmp(tag, "EXP2", 4) == 0)
+    {
+      // M2InitExtendedParticleArray { M2Array<M2ExtendedParticle> content; } -- every offset inside the chunk
+      // is relative to the CHUNK DATA (wowdev M2#EXP2). Record (28 B): float zSource, float colorMult,
+      // float alphaMult, M2PartTrack<fixed16> alphaCutoff {nTimes, ofsTimes, nKeys, ofsKeys}. Classic Era
+      // 1.15.9: 9 of the 172 Northshire models carry it, all {0, 1, 1, no keys} (docs/client_re/42 sec 4).
+      std::uint32_t count = 0, offset = 0;
+      if (chunk_size >= 8)
+      {
+        std::memcpy(&count, data, 4);
+        std::memcpy(&offset, data + 4, 4);
+      }
+      for (std::uint32_t k = 0; k < count; ++k)
+      {
+        std::size_t const rec = static_cast<std::size_t>(offset) + static_cast<std::size_t>(k) * 28;
+        if (rec + 28 > chunk_size)
+        {
+          break;
+        }
+        ExtendedParticle ext;
+        std::uint32_t n_times, ofs_times, n_keys, ofs_keys;
+        std::memcpy(&ext.z_source, data + rec, 4);
+        std::memcpy(&ext.color_mult, data + rec + 4, 4);
+        std::memcpy(&ext.alpha_mult, data + rec + 8, 4);
+        std::memcpy(&n_times, data + rec + 12, 4);
+        std::memcpy(&ofs_times, data + rec + 16, 4);
+        std::memcpy(&n_keys, data + rec + 20, 4);
+        std::memcpy(&ofs_keys, data + rec + 24, 4);
+        std::uint32_t const n = std::min(n_times, n_keys);
+        if (n && static_cast<std::size_t>(ofs_times) + n * 2 <= chunk_size && static_cast<std::size_t>(ofs_keys) + n * 2 <= chunk_size)
+        {
+          for (std::uint32_t q = 0; q < n; ++q)
+          {
+            std::uint16_t time, value;
+            std::memcpy(&time, data + ofs_times + q * 2, 2);
+            std::memcpy(&value, data + ofs_keys + q * 2, 2);
+            ext.alpha_cutoff_times.push_back(time);
+            ext.alpha_cutoff_values.push_back(static_cast<float>(value) / 32767.f);
+          }
+        }
+        _extended_particles.push_back(std::move(ext));
+      }
+    }
+
+    pos += 8 + static_cast<std::size_t>(chunk_size);
+  }
+
+  if (!payload_offset || payload_size < sizeof(ModelHeader) || std::memcmp(buffer + payload_offset, "MD20", 4) != 0)
+  {
+    return false;
+  }
+
+  std::vector<char> payload(buffer + payload_offset, buffer + payload_offset + payload_size);
+  if (_skeleton_file_id)
+  {
+    graftSkeleton(payload);
+  }
+  f.setBuffer(std::move(payload));
+  _modern_md21 = true;
+  return true;
+}
+
+// SKID (7.3+): the model's bones, sequences and attachments live in a .skel file and the MD21 header's own
+// arrays are EMPTY (the Forever Beta's HD blood elves: `bloodelffemale_hd.m2` = 0 bones, 0 sequences, SKID
+// 1838505; noggit drew them in bind pose, the "T-pose"). The .skel is a chunk stream: SKL1 (flags, name),
+// SKS1 {global loops, sequences, sequence lookup}, SKB1 {bones, key bone lookup}, SKA1 {attachments,
+// attachment lookup}, AFID / BFID like the M2's, every M2Array offset relative to ITS chunk's data start
+// (verified on 1838505: 386 sequences, 245 bones, 43 attachments, the stand's 272 tracks all plausible
+// read that way). The MD20 parser reads payload-relative offsets, so append the three chunk payloads to the
+// MD21 payload, add each chunk's base to every array it holds (bones and attachments carry M2Track arrays
+// of per-sequence arrays), point the header at them and merge the skeleton's AFID. SKPD (a parent
+// skeleton) is not shipped by these files and is logged when met. docs/client_re/42 sec 27.
+bool Model::graftSkeleton(std::vector<char>& payload)
+{
+  if (payload.size() < sizeof(ModelHeader))
+  {
+    return false;
+  }
+  ModelHeader header;
+  std::memcpy(&header, payload.data(), sizeof(ModelHeader));
+  if (header.nBones != 0)
+  {
+    return false; // the model carries its own skeleton; SKID is informational then
+  }
+
+  BlizzardArchive::ClientFile skel(BlizzardArchive::Listfile::FileKey(_skeleton_file_id),
+                                   Noggit::Application::NoggitApplication::instance()->clientData());
+  if (skel.isEof() || skel.getSize() < 8)
+  {
+    LogError << "MD21 model '" << _file_key.stringRepr() << "': SKID " << _skeleton_file_id
+             << " (.skel) cannot be read; the model stays in bind pose" << std::endl;
+    return false;
+  }
+
+  char const* sb = skel.getBuffer();
+  std::size_t const ssize = skel.getSize();
+  struct Chunk { std::size_t offset = 0; std::size_t size = 0; };
+  Chunk sks1, skb1, ska1, afid, skpd;
+  for (std::size_t pos = 0; pos + 8 <= ssize;)
+  {
+    std::uint32_t chunk_size;
+    std::memcpy(&chunk_size, sb + pos + 4, 4);
+    if (pos + 8 + static_cast<std::size_t>(chunk_size) > ssize)
+    {
+      break;
+    }
+    char const* tag = sb + pos;
+    Chunk const c{pos + 8, chunk_size};
+    if (std::memcmp(tag, "SKS1", 4) == 0) sks1 = c;
+    else if (std::memcmp(tag, "SKB1", 4) == 0) skb1 = c;
+    else if (std::memcmp(tag, "SKA1", 4) == 0) ska1 = c;
+    else if (std::memcmp(tag, "AFID", 4) == 0) afid = c;
+    else if (std::memcmp(tag, "SKPD", 4) == 0) skpd = c;
+    pos += 8 + static_cast<std::size_t>(chunk_size);
+  }
+  if (skpd.size)
+  {
+    LogError << "MD21 model '" << _file_key.stringRepr() << "': SKID " << _skeleton_file_id
+             << " has a parent skeleton (SKPD), not supported yet" << std::endl;
+  }
+  if (!skb1.size || skb1.size < 16 || !sks1.size || sks1.size < 24)
+  {
+    LogError << "MD21 model '" << _file_key.stringRepr() << "': SKID " << _skeleton_file_id
+             << " lacks SKB1/SKS1; the model stays in bind pose" << std::endl;
+    return false;
+  }
+
+  auto const read_u32 = [&](std::size_t at) { std::uint32_t v = 0; if (at + 4 <= payload.size()) std::memcpy(&v, payload.data() + at, 4); return v; };
+  auto const write_u32 = [&](std::size_t at, std::uint32_t v) { if (at + 4 <= payload.size()) std::memcpy(payload.data() + at, &v, 4); };
+  // M2Array {n, ofs} at `at`: make ofs payload-absolute; returns {n, absolute ofs}
+  auto const rebase_array = [&](std::size_t at, std::size_t base) -> std::pair<std::uint32_t, std::size_t>
+  {
+    std::uint32_t const n = read_u32(at);
+    std::uint32_t const ofs = read_u32(at + 4);
+    std::size_t const abs = base + ofs;
+    if (n && abs + n > payload.size())
+    {
+      write_u32(at, 0); // out of range: empty it rather than read garbage
+      return {0u, abs};
+    }
+    write_u32(at + 4, static_cast<std::uint32_t>(abs));
+    return {n, abs};
+  };
+  // M2Track at `at` (interp u16, gseq i16, timestamps M2Array<M2Array>, values M2Array<M2Array>)
+  auto const rebase_track = [&](std::size_t at, std::size_t base)
+  {
+    for (std::size_t arr : {at + 4, at + 12})
+    {
+      auto const [n, abs] = rebase_array(arr, base);
+      for (std::uint32_t j = 0; j < n; ++j)
+      {
+        rebase_array(abs + static_cast<std::size_t>(j) * 8, base);
+      }
+    }
+  };
+  auto const append = [&](Chunk const& c) -> std::size_t
+  {
+    std::size_t const base = payload.size();
+    payload.insert(payload.end(), sb + c.offset, sb + c.offset + c.size);
+    return base;
+  };
+
+  // SKS1: {global loops, sequences, sequence lookup}
+  {
+    std::size_t const base = append(sks1);
+    auto const loops = rebase_array(base, base);
+    auto const seqs = rebase_array(base + 8, base);
+    auto const lookup = rebase_array(base + 16, base);
+    header.nGlobalSequences = loops.first;   header.ofsGlobalSequences = static_cast<std::uint32_t>(loops.second);
+    header.nAnimations = seqs.first;         header.ofsAnimations = static_cast<std::uint32_t>(seqs.second);
+    header.nAnimationLookup = lookup.first;  header.ofsAnimationLookup = static_cast<std::uint32_t>(lookup.second);
+  }
+  // SKB1: {bones, key bone lookup}; each bone (88 B) carries three tracks at +16 / +36 / +56
+  {
+    std::size_t const base = append(skb1);
+    auto const bones = rebase_array(base, base);
+    auto const keys = rebase_array(base + 8, base);
+    for (std::uint32_t i = 0; i < bones.first; ++i)
+    {
+      std::size_t const bone = bones.second + static_cast<std::size_t>(i) * 88;
+      rebase_track(bone + 16, base);
+      rebase_track(bone + 36, base);
+      rebase_track(bone + 56, base);
+    }
+    header.nBones = bones.first;          header.ofsBones = static_cast<std::uint32_t>(bones.second);
+    header.nKeyBoneLookup = keys.first;   header.ofsKeyBoneLookup = static_cast<std::uint32_t>(keys.second);
+  }
+  // SKA1: {attachments, attachment lookup}; each attachment (40 B) carries one track at +20
+  if (ska1.size >= 16)
+  {
+    std::size_t const base = append(ska1);
+    auto const atts = rebase_array(base, base);
+    auto const lookup = rebase_array(base + 8, base);
+    for (std::uint32_t i = 0; i < atts.first; ++i)
+    {
+      rebase_track(atts.second + static_cast<std::size_t>(i) * 40 + 20, base);
+    }
+    header.nAttachments = atts.first;    header.ofsAttachments = static_cast<std::uint32_t>(atts.second);
+    header.nAttachLookup = lookup.first; header.ofsAttachLookup = static_cast<std::uint32_t>(lookup.second);
+  }
+  // AFID of the skeleton: the external .anim files of its sequences
+  std::size_t merged_anims = 0;
+  for (std::size_t k = 0; k + 8 <= afid.size; k += 8)
+  {
+    std::uint16_t anim_id, sub_anim_id;
+    std::uint32_t id;
+    std::memcpy(&anim_id, sb + afid.offset + k, 2);
+    std::memcpy(&sub_anim_id, sb + afid.offset + k + 2, 2);
+    std::memcpy(&id, sb + afid.offset + k + 4, 4);
+    if (id && _anim_file_ids.emplace(std::make_pair(anim_id, sub_anim_id), id).second)
+    {
+      ++merged_anims;
+    }
+  }
+  std::memcpy(payload.data(), &header, sizeof(ModelHeader));
+  LogDebug << "MD21 model '" << _file_key.stringRepr() << "': skeleton " << _skeleton_file_id << " grafted: "
+           << header.nBones << " bones, " << header.nAnimations << " sequences, " << header.nAttachments
+           << " attachments, " << merged_anims << " anim files" << std::endl;
+  return true;
+}
+
+BlizzardArchive::Listfile::FileKey Model::modelSkinKey(std::size_t skin_index) const
+{
+  if (_modern_md21 && skin_index < _skin_file_ids.size() && _skin_file_ids[skin_index])
+  {
+    BlizzardArchive::Listfile::FileKey key(_skin_file_ids[skin_index]);
+    key.deduceOtherComponent(Noggit::Application::NoggitApplication::instance()->clientData()->listfile());
+    return key;
+  }
+  std::string lodname = modelPath();
+  if (lodname.size() > 3)
+  {
+    lodname = lodname.substr(0, lodname.length() - 3);
+  }
+  lodname.append(skin_index < 10 ? "0" : "");
+  lodname.append(std::to_string(skin_index));
+  lodname.append(".skin");
+  return BlizzardArchive::Listfile::FileKey(lodname);
+}
+
 void Model::finishLoading()
 {
-  BlizzardArchive::ClientFile f(_file_key.filepath(), Noggit::Application::NoggitApplication::instance()->clientData());
+  BlizzardArchive::ClientFile f(_file_key, Noggit::Application::NoggitApplication::instance()->clientData());
+
+  if (!f.isEof() && f.getSize() >= 8 && std::memcmp(f.getBuffer(), "MD21", 4) == 0 && !unwrapMD21(f))
+  {
+    LogError << "Error loading file \"" << _file_key.stringRepr() << "\". Malformed MD21 chunk table." << std::endl;
+    finished = true;
+    return;
+  }
 
   if (f.isEof() || f.getSize() < sizeof(ModelHeader))
   {
@@ -1190,6 +1512,21 @@ void Model::initCommon(const BlizzardArchive::ClientFile& f)
     {
       _specialTextures[i] = -1;
 
+      if (_modern_md21)
+      {
+        // MD21: texture names are empty, the id sits in TXID (0 = a slot the runtime composes; keep black)
+        std::uint32_t const fdid = i < _texture_file_ids.size() ? _texture_file_ids[i] : 0u;
+        if (!fdid)
+        {
+          _textureFilenames[i] = "tileset/generic/black.blp";
+          continue;
+        }
+        std::string const path = Noggit::Application::NoggitApplication::instance()->clientData()->listfile()->getPath(fdid);
+        _textureFilenames[i] = path.empty() ? "fdid:" + std::to_string(fdid)
+                                            : BlizzardArchive::ClientData::normalizeFilenameInternal(path);
+        continue;
+      }
+
       if (texdef[i].nameLen == 0)
       {
         _textureFilenames[i] = "tileset/generic/black.blp";
@@ -1308,7 +1645,7 @@ void Model::initCommon(const BlizzardArchive::ClientFile& f)
   if (_uses_classic_layout
       && classic_m2_debug_enabled()
       && _file_key.hasFilepath()
-      && _file_key.filepath().starts_with("character/"))
+      && modelPath().starts_with("character/"))
   {
     std::ostringstream attachment_log;
     attachment_log << "Classic attachment dump model='" << _file_key.stringRepr() << "'"
@@ -1473,9 +1810,9 @@ void Model::initCommon(const BlizzardArchive::ClientFile& f)
     else
     {
       // indices - allocate space, too
-      std::string lodname = _file_key.filepath().substr(0, _file_key.filepath().length() - 3);
-      lodname.append("00.skin");
-      skin_file = std::make_unique<BlizzardArchive::ClientFile>(lodname, Noggit::Application::NoggitApplication::instance()->clientData());
+      BlizzardArchive::Listfile::FileKey const skin_key = modelSkinKey(0); // "<model>00.skin" or SFID[0] (MD21)
+      std::string const lodname = skin_key.stringRepr();
+      skin_file = std::make_unique<BlizzardArchive::ClientFile>(skin_key, Noggit::Application::NoggitApplication::instance()->clientData());
       if (skin_file->isEof()) {
         LogError << "loading skinfile " << lodname << std::endl;
         skin_file->close();
@@ -1569,7 +1906,10 @@ void Model::initCommon(const BlizzardArchive::ClientFile& f)
         for (size_t geoset_index = 0; geoset_index < view->n_submesh; ++geoset_index)
         {
           auto const& geoset = model_geosets[geoset_index];
-          size_t const vertex_end = std::min<size_t>(view->n_index, static_cast<size_t>(geoset.vstart) + geoset.vcount);
+          // Level (d2) is the high word of vstart once the skin's vertex list outgrows a uint16 (see
+          // ModelRender::initRenderPasses).
+          size_t const geoset_vstart = static_cast<size_t>(geoset.vstart) | (view->n_index > 0xFFFFu ? (static_cast<size_t>(geoset.d2) << 16) : 0u);
+          size_t const vertex_end = std::min<size_t>(view->n_index, geoset_vstart + geoset.vcount);
           uint16_t const influences = std::min<uint16_t>(4, geoset.d5);
           std::size_t vertices_with_weights = 0;
           std::size_t vertices_with_zero_weights = 0;
@@ -1583,7 +1923,7 @@ void Model::initCommon(const BlizzardArchive::ClientFile& f)
                              << " samples=";
           }
 
-          for (size_t vertex = geoset.vstart; vertex < vertex_end; ++vertex)
+          for (size_t vertex = geoset_vstart; vertex < vertex_end; ++vertex)
           {
             auto const original_vertex = _vertices[vertex];
             bool const has_weight = _vertices[vertex].weights[0] || _vertices[vertex].weights[1]
@@ -1973,8 +2313,9 @@ void Model::initAnimated(const BlizzardArchive::ClientFile& f)
       //    ClientFile::get() is unchecked pointer arithmetic. Size it to nAnimations and assign BY INDEX,
       //    leaving nullptr wherever the data is inline (Animated.h then falls back to the M2).
       animation_files.resize(header.nAnimations);
+      int modern_anim_misses = 0; // MD21 sequences flagged external whose AFID entry is missing or unshipped
 
-      std::string const lodname = _file_key.filepath().substr(0, _file_key.filepath().length() - 3);
+      std::string const lodname = modelPath().size() > 3 ? modelPath().substr(0, modelPath().length() - 3) : std::string();
       auto* const client_data = Noggit::Application::NoggitApplication::instance()->clientData();
 
       for (std::size_t seq_index = 0; seq_index < animations.size(); ++seq_index)
@@ -2012,13 +2353,131 @@ void Model::initAnimated(const BlizzardArchive::ClientFile& f)
         // 3.3.5a client's patch-3.MPQ HumanMale.m2: seq69 (anim 97) real flags=0x0 but @16=0x7FFF.
         if (!(anim.loopType & 0x20))
         {
-          std::stringstream tempname;
-          tempname << lodname << std::setfill('0') << std::setw(4) << anim.animID << "-"
-                   << std::setw(2) << anim.subAnimID << ".anim";
-          if (client_data->exists(tempname.str()))
+          if (_modern_md21)
           {
-            animation_files[seq_index] = std::make_unique<BlizzardArchive::ClientFile>(tempname.str(), client_data);
+            // MD21: the .anim files are named by fileDataID in AFID
+            auto const it = _anim_file_ids.find({static_cast<std::uint16_t>(anim.animID), static_cast<std::uint16_t>(anim.subAnimID)});
+            if (it != _anim_file_ids.end() && it->second)
+            {
+              BlizzardArchive::Listfile::FileKey const anim_key(it->second);
+              if (client_data->exists(anim_key))
+              {
+                animation_files[seq_index] = std::make_unique<BlizzardArchive::ClientFile>(anim_key, client_data);
+                // Legion+ (header flag 0x2000, set on 171 of 172 Northshire models): the .anim is a chunk
+                // stream -- AFM2 (the track data, offsets relative to the chunk payload), AFSA / AFSB
+                // (skeleton attachment / bone data). Rebase onto the AFM2 payload so the WotLK track
+                // reader sees the same bytes it always did (wowdev M2/.anim, docs/client_re/42 sec 10).
+                auto& file = *animation_files[seq_index];
+                if (file.getSize() >= 8 && std::memcmp(file.getBuffer(), "AFM2", 4) == 0)
+                {
+                  char const* buf = file.getBuffer();
+                  std::size_t const total = file.getSize();
+                  std::size_t pos = 0;
+                  while (pos + 8 <= total)
+                  {
+                    std::uint32_t chunk_size;
+                    std::memcpy(&chunk_size, buf + pos + 4, 4);
+                    if (pos + 8 + static_cast<std::size_t>(chunk_size) > total)
+                    {
+                      break;
+                    }
+                    if (std::memcmp(buf + pos, "AFM2", 4) == 0)
+                    {
+                      std::vector<char> payload(buf + pos + 8, buf + pos + 8 + chunk_size);
+                      file.setBuffer(std::move(payload));
+                      break;
+                    }
+                    pos += 8 + static_cast<std::size_t>(chunk_size);
+                  }
+                }
+              }
+              else
+              {
+                ++modern_anim_misses;
+              }
+            }
+            else
+            {
+              ++modern_anim_misses;
+            }
           }
+          else if (!lodname.empty())
+          {
+            std::stringstream tempname;
+            tempname << lodname << std::setfill('0') << std::setw(4) << anim.animID << "-"
+                     << std::setw(2) << anim.subAnimID << ".anim";
+            if (client_data->exists(tempname.str()))
+            {
+              animation_files[seq_index] = std::make_unique<BlizzardArchive::ClientFile>(tempname.str(), client_data);
+            }
+          }
+        }
+      }
+
+      if (modern_anim_misses)
+      {
+        LogError << "MD21 model '" << _file_key.stringRepr() << "': " << modern_anim_misses
+                 << " external sequence(s) without a loadable AFID .anim (tracks left empty)" << std::endl;
+      }
+
+      // [2026-09-09 FOOTSTEPS] Animation EVENTS were only parsed on the classic (v256) branch above, so
+      // every 3.3.5-format model -- including the stock character models the Game View walks with
+      // (BloodElfFemale.m2: one $FSD event, walk keys 67/534 ms, run 100/433 ms, all inline) -- had no
+      // event keys at all and never fired a footstep; the DBC resolve chain was never reached
+      // (FS-STATE events=0). v264 M2Event = {id, data, bone, pos, M2TrackBase enabled}: per-SEQUENCE
+      // timestamp arrays in sequence-relative ms, inline for flag-0x20 ("primary") sequences and in
+      // that sequence's .anim file otherwise (same rule and file table as the bone tracks).
+      if (header.nEvents && header.ofsEvents
+          && static_cast<std::size_t>(header.ofsEvents)
+             + static_cast<std::size_t>(header.nEvents) * sizeof(ModelEvents) <= f.getSize())
+      {
+        auto const* event_defs = reinterpret_cast<ModelEvents const*>(f.getBuffer() + header.ofsEvents);
+        _anim_events.clear();
+        _anim_events.reserve(header.nEvents);
+        for (std::uint32_t ev_i = 0; ev_i < header.nEvents; ++ev_i)
+        {
+          auto const& def = event_defs[ev_i];
+          ModelAnimEvent ev;
+          std::memcpy(&ev.fourcc, def.id, 4);
+          ev.data = def.data;
+          std::uint32_t const n_tracks = std::min<std::uint32_t>(def.nTimes, header.nAnimations);
+          if (def.ofsTimes && n_tracks
+              && static_cast<std::size_t>(def.ofsTimes)
+                 + static_cast<std::size_t>(n_tracks) * sizeof(AnimationBlockHeader) <= f.getSize())
+          {
+            auto const* track_headers =
+              reinterpret_cast<AnimationBlockHeader const*>(f.getBuffer() + def.ofsTimes);
+            for (std::uint32_t j = 0; j < n_tracks; ++j)
+            {
+              auto const& th = track_headers[j];
+              if (!th.nEntries)
+              {
+                continue;
+              }
+              bool const inline_seq = (animations[j].loopType & 0x20) != 0; // real flags live in loopType
+              BlizzardArchive::ClientFile const* ext =
+                (!inline_seq && j < animation_files.size()) ? animation_files[j].get() : nullptr;
+              if (!inline_seq && !ext)
+              {
+                continue; // keys live in a .anim this client does not have
+              }
+              char const* base = ext ? ext->getBuffer() : f.getBuffer();
+              std::size_t const limit = ext ? ext->getSize() : f.getSize();
+              std::size_t const end = static_cast<std::size_t>(th.ofsEntries)
+                                    + static_cast<std::size_t>(th.nEntries) * sizeof(std::uint32_t);
+              if (end > limit)
+              {
+                continue;
+              }
+              auto const* times = reinterpret_cast<std::uint32_t const*>(base + th.ofsEntries);
+              auto& list = ev.times_per_anim[static_cast<std::int16_t>(animations[j].animID)];
+              for (std::uint32_t k = 0; k < th.nEntries; ++k)
+              {
+                list.push_back(static_cast<int>(times[k]));
+              }
+            }
+          }
+          _anim_events.push_back(std::move(ev));
         }
       }
     }
@@ -2224,7 +2683,7 @@ void Model::initAnimated(const BlizzardArchive::ClientFile& f)
         -> std::optional<std::uint16_t>
       {
         auto* client_data = Noggit::Application::NoggitApplication::instance()->clientData();
-        auto const model_path = _file_key.hasFilepath() ? _file_key.filepath() : std::string();
+        auto const model_path = modelPath();
 
         for (auto const& raw_filename : {
                read_embedded_model_string(f, emitter.ofsParticleFileName, emitter.nParticleFileName),
@@ -2370,12 +2829,58 @@ void Model::initAnimated(const BlizzardArchive::ClientFile& f)
   if (!_uses_classic_layout && header.nParticleEmitters)
   {
     _particles.reserve(header.nParticleEmitters);
-    ModelParticleEmitterDef const* pdefs = reinterpret_cast<ModelParticleEmitterDef const*>(f.getBuffer() + header.ofsParticleEmitters);
-    for (size_t i = 0; i<header.nParticleEmitters; ++i) 
+    // v27x emitter records are 492 bytes (476 + 16 bytes of multi-texture params). The header flag 0x200
+    // ("new particle record") is NOT a reliable tell: Classic Era re-exports carry 492-byte records with
+    // the flag clear (generaltorch01 / azr_tree01 / bfd_walllight03, 2026-09-15). Read with the wrong
+    // stride, the second emitter's track headers are garbage (type 1, seq 0, thousands of keys) and the
+    // global-sequence deref segfaulted in ParticleSystem::update. Decide from the data: the first stride
+    // whose track headers look sane wins.
+    auto const emitter_tracks_sane = [&](std::size_t stride) -> bool
     {
+      if (static_cast<std::size_t>(header.ofsParticleEmitters) + header.nParticleEmitters * stride > f.getSize())
+      {
+        return false;
+      }
+      for (std::size_t i = 0; i < header.nParticleEmitters; ++i)
+      {
+        char const* rec = f.getBuffer() + header.ofsParticleEmitters + i * stride;
+        // EmissionSpeed .. Lifespan: six consecutive AnimationBlocks at +0x34
+        for (std::size_t k = 0; k < 6; ++k)
+        {
+          AnimationBlock const* block = reinterpret_cast<AnimationBlock const*>(rec + 0x34 + k * sizeof(AnimationBlock));
+          if (block->type < 0 || block->type > 3) return false;
+          if (block->seq != -1 && (block->seq < 0 || static_cast<std::size_t>(block->seq) >= _global_sequences.size())) return false;
+          if (block->nTimes != block->nKeys) return false;
+          if (block->nTimes && static_cast<std::size_t>(block->ofsTimes) + static_cast<std::size_t>(block->nTimes) * sizeof(AnimationBlockHeader) > f.getSize()) return false;
+        }
+      }
+      return true;
+    };
+    std::size_t emitter_stride = sizeof(ModelParticleEmitterDef);
+    if (_modern_md21)
+    {
+      emitter_stride = emitter_tracks_sane(492) ? 492 : (emitter_tracks_sane(476) ? 476 : 492);
+    }
+    char const* pdefs_base = f.getBuffer() + header.ofsParticleEmitters;
+    for (size_t i = 0; i<header.nParticleEmitters; ++i)
+    {
+      if (static_cast<std::size_t>(header.ofsParticleEmitters) + (i + 1) * emitter_stride > f.getSize())
+      {
+        break;
+      }
+      ModelParticleEmitterDef const& pdef = *reinterpret_cast<ModelParticleEmitterDef const*>(pdefs_base + i * emitter_stride);
       try
       {
-        _particles.emplace_back(this, f, pdefs[i], _global_sequences.data(), _context);
+        _particles.emplace_back(this, f, pdef, _global_sequences.data(), _context);
+        if (_modern_md21)
+        {
+          // Modern records carry 255.0 in the legacy zSource track slot (every emitter of every 1.15.9
+          // file compared against its 3.3.5a twin: portal, torch, campfire, fountain, smoke, waterfall);
+          // the live value is EXP2.zSource (0 in all of them), which WoWViewerCpp applies over the record.
+          // noggit consumes that slot as the particle deceleration, so 255 sent everything shooting.
+          ExtendedParticle const* ext = extendedParticle(i);
+          _particles.back().setExtendedParticle(ext ? ext->color_mult : 1.f, ext ? ext->alpha_mult : 1.f, ext ? ext->z_source : 0.f);
+        }
       }
       catch (std::logic_error error)
       {
@@ -2536,7 +3041,7 @@ void Model::calcBones(glm::mat4x4 const& model_view
   for (size_t i = 0; i<header.nBones; ++i)
   {
     if (capture_m2_animation_debug_enabled()
-        && _file_key.filepath().find("gnomemachine") != std::string::npos)
+        && modelPath().find("gnomemachine") != std::string::npos)
     {
       LogDebug << "Model::calcBones bone begin model='" << _file_key.stringRepr()
                << "' bone=" << i
@@ -2551,11 +3056,41 @@ void Model::calcBones(glm::mat4x4 const& model_view
                         blend_anim, blend_time, blend_w);
 
     if (capture_m2_animation_debug_enabled()
-        && _file_key.filepath().find("gnomemachine") != std::string::npos)
+        && modelPath().find("gnomemachine") != std::string::npos)
     {
       LogDebug << "Model::calcBones bone end model='" << _file_key.stringRepr()
                << "' bone=" << i
                << std::endl;
+    }
+  }
+
+  // Diagnostic (NOGGIT_M2_DEBUG_BONES=<substring of the model path>): once per model, every bone's posed
+  // matrix -- determinant, translation, NaN -- and its track use in the current sequence. Written for the
+  // Forever Beta HD characters (docs/client_re/42 sec 25): torso and head exploded while arms held.
+  {
+    static char const* const debug_bones = std::getenv("NOGGIT_M2_DEBUG_BONES");
+    if (debug_bones && *debug_bones && modelPath().find(debug_bones) != std::string::npos)
+    {
+      static std::set<std::string> reported;
+      if (reported.insert(modelPath()).second)
+      {
+        LogError << "[BONE-DEBUG] model=" << modelPath() << " bones=" << header.nBones << " anim=" << _anim
+                 << " time=" << time << " animtime=" << animation_time << std::endl;
+        for (size_t i = 0; i < header.nBones; ++i)
+        {
+          glm::mat4x4 const& m = bones[i].mat;
+          float const det = glm::determinant(glm::mat3(m));
+          glm::vec3 const t(m[3]);
+          bool nan = false;
+          for (int c = 0; c < 4; ++c)
+            for (int r = 0; r < 4; ++r)
+              if (std::isnan(m[c][r]) || std::isinf(m[c][r])) nan = true;
+          LogError << "[BONE-DEBUG] bone=" << i << " parent=" << bones[i].parent
+                   << " pivot=(" << bones[i].pivot.x << "," << bones[i].pivot.y << "," << bones[i].pivot.z << ")"
+                   << " transformed=" << bones[i].flags.transformed << " billboard=" << bones[i].flags.billboard
+                   << " det=" << det << " t=(" << t.x << "," << t.y << "," << t.z << ")" << (nan ? " NAN" : "") << std::endl;
+        }
+      }
     }
   }
 
@@ -2940,7 +3475,7 @@ void Model::animate(glm::mat4x4 const& model_view, int anim_id, int anim_time, b
   {
     static int tmaxdbg = 0;
     if (tmaxdbg < 1 && _file_key.hasFilepath()
-        && _file_key.filepath().find("anomalus") != std::string::npos)
+        && modelPath().find("anomalus") != std::string::npos)
     {
       ++tmaxdbg;
       LogDebug << "[TMAXDBG] anomalus anim_id=" << anim_id << " tmax=" << tmax
@@ -3237,7 +3772,7 @@ void Model::animate(glm::mat4x4 const& model_view, int anim_id, int anim_time, b
   if (animGeometry || animBones)
   {
     if (capture_m2_animation_debug_enabled()
-        && _file_key.filepath().find("gnomemachine") != std::string::npos)
+        && modelPath().find("gnomemachine") != std::string::npos)
     {
       LogDebug << "Model::animate bone matrix copy begin model='" << _file_key.stringRepr()
                << "' bones=" << bones.size()
@@ -3253,7 +3788,7 @@ void Model::animate(glm::mat4x4 const& model_view, int anim_id, int anim_time, b
     }
 
     if (capture_m2_animation_debug_enabled()
-        && _file_key.filepath().find("gnomemachine") != std::string::npos)
+        && modelPath().find("gnomemachine") != std::string::npos)
     {
       LogDebug << "Model::animate bone matrix copy end model='" << _file_key.stringRepr()
                << "' copied=" << bone_counter
@@ -3265,7 +3800,7 @@ void Model::animate(glm::mat4x4 const& model_view, int anim_id, int anim_time, b
     if (upload_bones) { _renderer.updateBoneMatrices(); } // GL: main-thread only (see upload_bones doc)
 
     if (capture_m2_animation_debug_enabled()
-        && _file_key.filepath().find("gnomemachine") != std::string::npos)
+        && modelPath().find("gnomemachine") != std::string::npos)
     {
       LogDebug << "Model::animate bone matrix upload end model='" << _file_key.stringRepr()
                << "'" << std::endl;

@@ -25,6 +25,7 @@
 #include <QtCore/QElapsedTimer>
 #include <QtCore/QSettings>
 #include <QtCore/QTimer>
+#include <QtGui/QImage>   // [2026-09-04] _vk_ui_image: the editor overlay handed to Vulkan
 #include <QtWidgets/QDockWidget>
 #include <QtWidgets/QDoubleSpinBox>
 #include <QtWidgets/QLabel>
@@ -53,6 +54,7 @@ class QGroupBox;
 class QListWidget;
 class QVBoxLayout;
 class QMenu;
+class QWindow;
 class QToolButton;
 class QToolBar;
 class QListWidgetItem;
@@ -327,6 +329,7 @@ public:
   QDockWidget* _game_mode_speed_dock = nullptr;
   Noggit::BoolToggleProperty _draw_lights_zones = { false };
   Noggit::BoolToggleProperty _draw_creature_spawns = { false };
+  bool _creature_spawns_user_click = false;   // set by the View-menu action; only then is the toggle persisted
   Noggit::BoolToggleProperty _show_detail_info_window = { false };
   Noggit::BoolToggleProperty _show_minimap_window = { false };
   // [game mode] entry snap used by the Game View toolbar toggle: place the camera on the nearest
@@ -810,6 +813,26 @@ private:
   bool _destroying = false;
   bool _needs_redraw = false;
   bool _capture_probe = false;
+
+  // [VULKAN NATIVE PRESENT, 2026-09-03] native child window the VK swapchain presents into.
+  // Created on demand via a QUEUED call (never inside paintGL); input-transparent (WM_NCHITTEST ->
+  // HTTRANSPARENT + WA_TransparentForMouseEvents on the container) so every event still lands on
+  // this widget. GL mode never creates it -- gate, never delete.
+  QWindow* _vk_present_window = nullptr;
+  QWidget* _vk_present_container = nullptr;
+  bool _vk_present_requested = false;
+  void ensureVkPresentSurface();
+  // [2026-09-04 NATIVE UI COMPOSITE] The overlay image handed to Vulkan each time it changes.
+  // Grabbed on a TIMER, never inside paintGL: QWidget::render() re-enters Qt's painting machinery,
+  // and one of the overlay widgets calls QMainWindow::statusBar(), which lazily CONSTRUCTS a
+  // QStatusBar -> QWidget::setParent -> reparentFocusWidgets -> throw, inside the paint. That
+  // crashed the app within 60 frames. Grab outside the paint, upload inside it.
+  QImage _vk_ui_image;
+  bool _vk_ui_image_dirty = false;
+  QTimer _vk_ui_timer;
+  void grabVkUiOverlay();
+  // Promote viewport overlay widgets above the native present surface (see the .cpp note).
+  void raiseViewportOverlayWidgets();
 
   bool _mod_z_down = false;
   bool _mod_x_down = false;

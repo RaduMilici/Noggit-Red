@@ -98,12 +98,11 @@ public:
 
 
   void computeDetailDoodads();
-  // TerrainType ROW under a world position (doc 38 footsteps): most-covering texture layer ->
-  // its MCLY effectId -> GroundEffectTexture.TerrainType. -1 when this chunk's own layers
-  // declare nothing (Blizzard leaves placeholder effect rows in places, e.g. under Stormwind);
-  // out_dominant_texture then names the texture so the caller can resolve it map-wide.
-  int groundTerrainTypeRowAt(glm::vec3 const& world_pos,
-                             std::string* out_dominant_texture = nullptr);
+  // TerrainType ROW under a world position, the 3.3.5a client's chunk rule (FUN_007a0530, RE'd
+  // 2026-09-09): the 8x8 sub-cell (4.1667 yd) under the position -> hole bit test -> the MCNK
+  // doodadMapping's 2-bit layer index for that sub-cell -> that layer's MCLY effectId ->
+  // GroundEffectTexture.TerrainType. -1 = hole / no layer / no effect row (unknown).
+  int groundTerrainTypeRowAt(glm::vec3 const& world_pos);
 
   MapTile *mt;
   glm::vec3 vmin, vmax, vcenter;

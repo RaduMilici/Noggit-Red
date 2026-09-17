@@ -25,8 +25,8 @@ struct LiquidChunkInstanceDataUniformBlock
   uint _pad3;
   uint _pad4;
   uint _pad5;
-  uint _pad6;
-  uint _pad7;
+  uint row_color_light;   // 0x80RRGGBB when the liquid row carries its own colours (PBR water)
+  uint row_color_dark;
 };
 
 layout (std140) uniform matrices
@@ -57,6 +57,8 @@ flat out uint type;
 flat out vec2 anim_uv;
 flat out int tex_frame;
 flat out uint shadow_chunk_index;
+flat out uint row_color_light_v;
+flat out uint row_color_dark_v;
 out vec2 shadow_uv;
 out vec3 world_pos_; // for the water surface specular (sun sheen) in the fragment shader
 
@@ -108,6 +110,8 @@ void main()
   tex_frame = get_texture_frame(int(params.n_tex_frames));
   anim_uv = vec2(params.anim_u, params.anim_v);
   shadow_chunk_index = params.shadow_chunk_index;
+  row_color_light_v = params.row_color_light;
+  row_color_dark_v = params.row_color_dark;
   shadow_uv = vec2(position.x / CHUNKSIZE, position.y / CHUNKSIZE);
 
   // Camera-relative (see terrain_vert.glsl) so water surfaces don't jitter against the terrain/models.

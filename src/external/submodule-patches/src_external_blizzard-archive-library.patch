@@ -1,0 +1,560 @@
+diff --git a/include/CASCArchive.hpp b/include/CASCArchive.hpp
+index 17bdddc..304f7bb 100644
+--- a/include/CASCArchive.hpp
++++ b/include/CASCArchive.hpp
+@@ -3,6 +3,8 @@
+ 
+ #include <BaseArchive.hpp>
+ 
++#include <cstdint>
++
+ namespace BlizzardArchive::Listfile
+ {
+   class Listfile;
+@@ -14,9 +16,17 @@ namespace BlizzardArchive::Archive
+   class CASCArchive : public BaseArchive
+   {
+   public:
+-    CASCArchive(std::string const& path, std::string const& cache_path, Locale locale, OpenMode open_mode, Listfile::Listfile* listfile);
++    // product: the .build.info "Product" code selecting the build inside a multi-product store
++    // ("wow", "wow_classic_era", "wow_anniversary", ...). CascLib needs it verbatim.
++    CASCArchive(std::string const& path, std::string const& cache_path, std::string const& product, Locale locale, OpenMode open_mode, Listfile::Listfile* listfile);
+     ~CASCArchive() override;
+ 
++    // Which duplicate root record wins for a FileDataId whose content is local under more than one
++    // record: the one whose content flags equal `value` under `mask` (mask 0 = first record, as upstream
++    // CascLib). Must be called BEFORE the storage is opened; the root manifest is resolved once then.
++    // Modern WoW roots use bit 0x1 for the high-resolution texture variant (docs/client_re/42 sec 18).
++    static void setPreferredContentFlags(std::uint32_t mask, std::uint32_t value);
++
+     [[nodiscard]]
+     bool openFile(Listfile::FileKey const& file_key, Locale locale, HANDLE* file_handle) const override;
+ 
+@@ -31,6 +41,7 @@ namespace BlizzardArchive::Archive
+ 
+   private:
+     HANDLE _handle = nullptr;
++    std::string _product; // kept alive for CascOpenStorageEx (szCodeName points into it)
+   };
+ 
+ }
+diff --git a/include/ClientData.hpp b/include/ClientData.hpp
+index 93c0c12..4500e98 100644
+--- a/include/ClientData.hpp
++++ b/include/ClientData.hpp
+@@ -26,6 +26,10 @@ namespace BlizzardArchive
+     CLASSIC = 0,
+     WOTLK = 1,
+     SL = 2,
++    // CASC-backed "modern" clients (root manifest v2; split ADT + MAID, MD21, GFID WMO, WDC5 DB2).
++    // Anything >= SL is served from a CASC store, see _storage_type below.
++    CLASSIC_ERA = 3,   // wow_classic_era (1.15.x)
++    ANNIVERSARY = 4,   // wow_anniversary (2.5.x)
+   };
+ 
+   enum class StorageType : char
+@@ -65,16 +69,23 @@ namespace BlizzardArchive
+     * locale - prefered locale of the client. Wotlk supports automatic detection, for that use Locale::AUTO
+     * local_path - project directory, should also contain listfile.csv for CASC-based projects.
+     */
++    // casc_product - product code of a multi-product CASC store (.build.info "Product" column, e.g.
++    //                "wow_classic_era"); ignored for MPQ clients.
++    // listfile_path - fallback listfile (id;path csv) used when <local_path>/listfile.csv does not exist.
+     explicit ClientData(std::string const& path
+       , ClientVersion version
+       , Locale locale
+-      , std::string const& local_path);
++      , std::string const& local_path
++      , std::string const& casc_product = "wow"
++      , std::string const& listfile_path = "");
+ 
+     explicit ClientData(std::string const& path
+         , std::string const& cdn_cache_path
+         , ClientVersion version
+         , Locale locale
+-        , std::string const& local_path);
++        , std::string const& local_path
++        , std::string const& casc_product = "wow"
++        , std::string const& listfile_path = "");
+ 
+     ~ClientData();
+ 
+@@ -84,6 +95,12 @@ namespace BlizzardArchive
+     [[nodiscard]]
+     StorageType storageType() const { return _storage_type; }
+ 
++    [[nodiscard]]
++    bool isCASC() const { return _storage_type == StorageType::CASC; }
++
++    [[nodiscard]]
++    std::string const& cascProduct() const { return _casc_product; }
++
+     [[nodiscard]]
+     OpenMode openMode() const { return _open_mode; }
+ 
+@@ -206,6 +223,8 @@ namespace BlizzardArchive
+     std::string _path;
+     std::string _local_path;
+     std::optional<std::string> _cdn_cache_path;
++    std::string _casc_product;
++    std::string _listfile_path;
+ 
+     // A sorted list of loaded archives. The last one is the most up-to-date one.
+     std::vector<Archive::BaseArchive*> _archives;
+diff --git a/include/ClientFile.hpp b/include/ClientFile.hpp
+index fbce0db..284d713 100644
+--- a/include/ClientFile.hpp
++++ b/include/ClientFile.hpp
+@@ -62,7 +62,11 @@ namespace BlizzardArchive
+       return reinterpret_cast<T const*>(_buffer.data() + offset);
+     }
+ 
+-    void setBuffer(std::vector<char> const& vec) { _buffer = vec; }
++    // Replaces the contents and rewinds; the stream is readable again (a NEW_FILE starts at eof).
++    // Used to feed synthesized streams (modern split-ADT tiles rebuilt as one WotLK-shaped MCNK stream,
++    // an MD21 payload unwrapped from its chunk) to loaders written for the monolithic formats.
++    void setBuffer(std::vector<char> const& vec) { _buffer = vec; _pointer = 0; _eof = _buffer.empty(); }
++    void setBuffer(std::vector<char>&& vec) { _buffer = std::move(vec); _pointer = 0; _eof = _buffer.empty(); }
+ 
+     void save();
+ 
+diff --git a/include/Listfile.hpp b/include/Listfile.hpp
+index c1ae74f..8671061 100644
+--- a/include/Listfile.hpp
++++ b/include/Listfile.hpp
+@@ -21,13 +21,17 @@ namespace BlizzardArchive::Listfile
+ 
+     std::uint32_t getFileDataID(std::string const& filename) const;
+     std::string getPath(std::uint32_t file_data_id) const;
++    // Gives an unnamed fileDataID a synthetic path (e.g. "fdid/108286.wmo") so path-keyed code can open it.
++    // A real listfile name for the id is never overwritten.
++    // const: ClientData hands out a const Listfile; the maps are mutable because this only adds names.
++    void registerPath(std::uint32_t file_data_id, std::string const& path) const;
+ 
+     std::unordered_map<std::string, std::uint32_t> const& pathToFileDataIDMap() const { return _path_to_fdid; };
+     std::unordered_map<std::uint32_t, std::string> const& fileDataIDToPathMap() const { return _fdid_to_path; };
+ 
+   private:
+-    std::unordered_map<std::string, std::uint32_t> _path_to_fdid;
+-    std::unordered_map<std::uint32_t, std::string> _fdid_to_path;
++    mutable std::unordered_map<std::string, std::uint32_t> _path_to_fdid;
++    mutable std::unordered_map<std::uint32_t, std::string> _fdid_to_path;
+   };
+ 
+   class FileKey
+diff --git a/src/CASCArchive.cpp b/src/CASCArchive.cpp
+index 056ec23..b276b1a 100644
+--- a/src/CASCArchive.cpp
++++ b/src/CASCArchive.cpp
+@@ -3,68 +3,104 @@
+ #include <Exception.hpp>
+ #include <CascLib.h>
+ 
++#include <noggit/Log.h>
++
++#include <atomic>
++#include <cstring>
++
+ 
+ using namespace BlizzardArchive::Archive;
+ 
++// src/external/casclib-patch/FileTree.cpp (local CascLib patch, copied over the fetched upstream tree)
++extern "C" void CascSetPreferredContentFlags(DWORD dwMask, DWORD dwValue);
++
++void CASCArchive::setPreferredContentFlags(std::uint32_t mask, std::uint32_t value)
++{
++  CascSetPreferredContentFlags(static_cast<DWORD>(mask), static_cast<DWORD>(value));
++}
++
++namespace
++{
++  DWORD casc_locale_mask(BlizzardArchive::Locale locale)
++  {
++    switch (locale)
++    {
++      case BlizzardArchive::Locale::enUS: return CASC_LOCALE_ENUS;
++      case BlizzardArchive::Locale::enGB: return CASC_LOCALE_ENGB;
++      case BlizzardArchive::Locale::deDE: return CASC_LOCALE_DEDE;
++      case BlizzardArchive::Locale::koKR: return CASC_LOCALE_KOKR;
++      case BlizzardArchive::Locale::frFR: return CASC_LOCALE_FRFR;
++      case BlizzardArchive::Locale::zhCN: return CASC_LOCALE_ZHCN;
++      case BlizzardArchive::Locale::zhTW: return CASC_LOCALE_ZHTW;
++      case BlizzardArchive::Locale::esES: return CASC_LOCALE_ESES;
++      case BlizzardArchive::Locale::esMX: return CASC_LOCALE_ESMX;
++      case BlizzardArchive::Locale::ruRU: return CASC_LOCALE_RURU;
++      default: return 0; // CascLib falls back to the storage's default locale
++    }
++  }
++}
++
+ CASCArchive::CASCArchive(std::string const& path
+                          , std::string const& cache_path
++                         , std::string const& product
+                          , Locale locale
+                          , OpenMode open_mode
+                          , Listfile::Listfile* listfile)
+   : BaseArchive(path, locale, listfile)
++  , _product(product.empty() ? std::string("wow") : product)
+ {
++  // 2026-09-15: the product code used to be hardcoded to "wow" (retail). A shared install carries several
++  // products in ONE store (.build.info rows: wow_classic_era, wow_anniversary, ...) and the code name picks
++  // the build config -> encoding -> root manifest; the data archives are common. Requires CascLib >= 3.0
++  // (root manifest v2), see cmake/FindCascLib.cmake and docs/client_re/41.
++  CASC_OPEN_STORAGE_ARGS args;
++  std::memset(&args, 0, sizeof(args));
++  args.Size = sizeof(CASC_OPEN_STORAGE_ARGS);
++  args.szCodeName = _product.c_str();
++  args.szRegion = "us";
++  args.dwLocaleMask = casc_locale_mask(locale);
++
++  bool online = false;
+   switch (open_mode)
+   {
+     case OpenMode::REMOTE:
+-    {
+-      CASC_OPEN_STORAGE_ARGS args;
+-      args.Size = sizeof(CASC_OPEN_STORAGE_ARGS);
+       args.szLocalPath = cache_path.c_str();
+-      args.szCodeName = "wow";
+-      args.szRegion = "us";
+-      args.PfnProgressCallback = nullptr;
+-      args.PtrProgressParam = nullptr;
+-      args.PfnProductCallback = nullptr;
+-      args.PtrProductParam = nullptr;
+-      args.dwLocaleMask = 0;  // TODO: pass locale
+-      args.szBuildKey = nullptr;
+       args.szCdnHostUrl = path.c_str();
+-
+-
+-      if (!CascOpenStorageEx(nullptr, &args, true, &_handle))
+-      {
+-        throw Exceptions::Archive::ArchiveOpenError("Error opening CASC archive: " + path
+-                                                    + ". Error code: " + std::to_string(GetCascError()));
+-      }
+-
++      online = true;
+       break;
+-    }
+     case OpenMode::LOCAL:
+-    {
+-      CASC_OPEN_STORAGE_ARGS args;
+-      args.Size = sizeof(CASC_OPEN_STORAGE_ARGS);
+       args.szLocalPath = path.c_str();
+-      args.szCodeName = "wow";
+-      args.szRegion = "us";
+-      args.PfnProgressCallback = nullptr;
+-      args.PtrProgressParam = nullptr;
+-      args.PfnProductCallback = nullptr;
+-      args.PtrProductParam = nullptr;
+-      args.dwLocaleMask = 0;  // TODO: pass locale
+-      args.szBuildKey = nullptr;
+-      args.szCdnHostUrl = nullptr;
+-
+-
+-      if (!CascOpenStorageEx(nullptr, &args, false, &_handle))
+-      {
+-        throw Exceptions::Archive::ArchiveOpenError("Error opening CASC archive: " + path
+-                                                    + ". Error code: " + std::to_string(GetCascError()));
+-      }
+-
+       break;
+-    }
+   }
+ 
++  if (!CascOpenStorageEx(nullptr, &args, online, &_handle))
++  {
++    throw Exceptions::Archive::ArchiveOpenError("Error opening CASC archive: " + path
++                                                + " (product '" + _product + "'). Error code: " + std::to_string(GetCascError()));
++  }
++
++  CASC_STORAGE_PRODUCT storage_product;
++  std::memset(&storage_product, 0, sizeof(storage_product));
++  DWORD features = 0;
++  DWORD file_count = 0;
++  size_t length_needed = 0;
++  CascGetStorageInfo(_handle, CascStorageProduct, &storage_product, sizeof(storage_product), &length_needed);
++  CascGetStorageInfo(_handle, CascStorageFeatures, &features, sizeof(features), &length_needed);
++  CascGetStorageInfo(_handle, CascStorageTotalFileCount, &file_count, sizeof(file_count), &length_needed);
++  LogDebug << "CASCArchive: opened '" << path << "' product='" << storage_product.szCodeName
++           << "' build=" << storage_product.BuildNumber << " features=0x" << std::hex << features << std::dec
++           << " files=" << file_count << std::endl;
++
++  if (!(features & CASC_FEATURE_FILE_DATA_IDS))
++  {
++    // The root manifest was not understood (the pre-3.0 CascLib on a v2 root behaves exactly like this):
++    // every open-by-fileDataID would fail. Fail loudly instead of rendering nothing.
++    CascCloseStorage(_handle);
++    _handle = nullptr;
++    throw Exceptions::Archive::ArchiveOpenError("CASC archive '" + path + "' (product '" + _product
++                                                + "'): the linked CascLib does not expose fileDataIDs for this root manifest"
++                                                  " (features=0x" + std::to_string(features) + ").");
++  }
+ }
+ 
+ bool CASCArchive::openFile(Listfile::FileKey const& file_key, Locale locale, HANDLE* file_handle) const
+@@ -84,8 +120,31 @@ bool CASCArchive::openFile(Listfile::FileKey const& file_key, Locale locale, HAN
+     file_data_id = _listfile->getFileDataID(file_key.filepath());
+   }
+ 
++  // Name the first failures: a 0 here means the listfile does not know the path, a CascOpenFile
++  // failure means the id is not in this product's root (or the storage rejected it).
++  static std::atomic<int> logged_failures{0};
++  if (!file_data_id)
++  {
++    // The community listfile names ~160k of the 213k files; every Classic root block carries the Jenkins
++    // name hash of its entries (421 of 421 blocks, 2026-09-16), so a path the listfile lacks (1210 map
++    // folders, e.g. world/maps/mauradon/mauradon.wdt) still opens by NAME -- CascLib hashes the
++    // normalised path and looks it up in the root.
++    if (file_key.hasFilepath() && CascOpenFile(_handle, file_key.filepath().c_str(), 0, CASC_OPEN_BY_NAME, file_handle))
++    {
++      return true;
++    }
++    if (logged_failures++ < 64)
++      LogError << "CASCArchive::openFile: listfile has no fileDataID for '" << file_key.stringRepr() << "' and the root has no name hash for it" << std::endl;
++    return false;
++  }
+ 
+-  return CascOpenFile(_handle, CASC_FILE_DATA_ID(file_data_id), 0, 3, file_handle);
++  bool const ok = CascOpenFile(_handle, CASC_FILE_DATA_ID(file_data_id), 0, CASC_OPEN_BY_FILEID, file_handle);
++  if (!ok && logged_failures++ < 64)
++  {
++    LogError << "CASCArchive::openFile: CascOpenFile(" << file_data_id << ") failed, error " << GetCascError()
++             << " for '" << file_key.stringRepr() << "'" << std::endl;
++  }
++  return ok;
+ }
+ 
+ bool CASCArchive::readFile(HANDLE file_handle, char* buffer, std::size_t buf_size) const
+@@ -103,9 +162,15 @@ bool CASCArchive::closeFile(HANDLE file_handle) const
+ std::uint64_t CASCArchive::getFileSize(HANDLE file_handle) const
+ {
+   assert(file_handle);
+-  unsigned long long size;
++  unsigned long long size = 0;
+ 
+-  CascGetFileSize64(file_handle, static_cast<PULONGLONG>(&size));
++  // A file whose data is not in the local storage (partial Battle.net install of the Forever Beta) or
++  // that needs a missing TACT key opens but has no size: report 0 so readFile treats it as missing
++  // (docs/client_re/42 sec 17.1) instead of resizing the buffer to an uninitialised value.
++  if (!CascGetFileSize64(file_handle, static_cast<PULONGLONG>(&size)))
++  {
++    return 0;
++  }
+ 
+   return size;
+ }
+@@ -129,8 +194,36 @@ bool CASCArchive::exists(Listfile::FileKey const& file_key, Locale locale) const
+   }
+ 
+ 
+-  bool status = CascOpenFile(_handle, CASC_FILE_DATA_ID(file_data_id), 0, 3, &file_handle);
+-  CascCloseFile(file_handle);
++  bool status = false;
++  if (file_data_id)
++  {
++    status = CascOpenFile(_handle, CASC_FILE_DATA_ID(file_data_id), 0, CASC_OPEN_BY_FILEID, &file_handle);
++  }
++  else if (file_key.hasFilepath())
++  {
++    status = CascOpenFile(_handle, file_key.filepath().c_str(), 0, CASC_OPEN_BY_NAME, &file_handle); // root name hash, see openFile
++  }
++  if (status)
++  {
++    // A file the root lists but the local storage cannot decode -- a Forever Beta (1.60.1) entry behind a
++    // TACT key CascLib does not have (ERROR_FILE_ENCRYPTED 1005) -- opens fine and fails on the first read.
++    // Report it as missing so callers take their fallbacks instead of reading an empty buffer
++    // (docs/client_re/42 sec 17.1).
++    char probe = 0;
++    DWORD read = 0;
++    if (!CascReadFile(file_handle, &probe, 1, &read) || read != 1)
++    {
++      static std::atomic<int> logged_unreadable{0};
++      if (logged_unreadable++ < 32)
++      {
++        DWORD const err = GetCascError();
++        LogError << "CASCArchive::exists: '" << file_key.stringRepr() << "' opens but cannot be read (CascLib error "
++                 << err << (err == 1005 ? ", encrypted: no TACT key" : "") << "); treating it as missing" << std::endl;
++      }
++      status = false;
++    }
++    CascCloseFile(file_handle);
++  }
+   return status;
+ 
+ }
+diff --git a/src/ClientData.cpp b/src/ClientData.cpp
+index c395f74..7cb92c5 100644
+--- a/src/ClientData.cpp
++++ b/src/ClientData.cpp
+@@ -7,6 +7,7 @@
+ #include <noggit/Log.h>
+ 
+ #include <filesystem>
++#include <atomic>
+ #include <cassert>
+ #include <regex>
+ #include <set>
+@@ -29,13 +30,16 @@ bool has_classic_mpq_layout(fs::path const& client_path)
+ }
+ }
+ 
+-ClientData::ClientData(std::string const& path, ClientVersion version, Locale locale, std::string const& local_path)
++ClientData::ClientData(std::string const& path, ClientVersion version, Locale locale, std::string const& local_path
++                       , std::string const& casc_product, std::string const& listfile_path)
+   : _version(version)
+   , _open_mode(OpenMode::LOCAL)
+   , _storage_type((version >= ClientVersion::SL) ? StorageType::CASC : StorageType::MPQ)
+   , _locale_mode(locale)
+   , _path(path)
+   , _local_path(ClientData::normalizeFilenameUnix(local_path))
++  , _casc_product(casc_product.empty() ? std::string("wow") : casc_product)
++  , _listfile_path(listfile_path)
+ {
+ 
+   validateLocale();
+@@ -51,7 +55,8 @@ ClientData::ClientData(std::string const& path, ClientVersion version, Locale lo
+   }
+ }
+ 
+-ClientData::ClientData(std::string const& path, std::string const& cdn_cache_path, ClientVersion version, Locale locale, std::string const& local_path)
++ClientData::ClientData(std::string const& path, std::string const& cdn_cache_path, ClientVersion version, Locale locale, std::string const& local_path
++                       , std::string const& casc_product, std::string const& listfile_path)
+     : _version(version)
+     , _open_mode(OpenMode::REMOTE)
+   , _storage_type((version >= ClientVersion::SL) ? StorageType::CASC : StorageType::MPQ)
+@@ -59,6 +64,8 @@ ClientData::ClientData(std::string const& path, std::string const& cdn_cache_pat
+     , _path(path)
+     , _local_path(ClientData::normalizeFilenameUnix(local_path))
+     , _cdn_cache_path(cdn_cache_path)
++    , _casc_product(casc_product.empty() ? std::string("wow") : casc_product)
++    , _listfile_path(listfile_path)
+ {
+ 
+   validateLocale();
+@@ -266,19 +273,29 @@ void ClientData::initializeMPQStorage()
+ 
+ void ClientData::initializeCASCStorage()
+ {
+-  _listfile.initFromCSV((fs::path(_local_path) / "listfile.csv").string());
++  // A project-local listfile wins; otherwise the application-wide one (Settings > Paths > CASC listfile).
++  // Modern clients address everything by fileDataID, the listfile is only needed for the few files
++  // noggit opens by NAME (DB2 tables, the map WDT, the stars model) and for showing names in the UI.
++  std::string listfile = (fs::path(_local_path) / "listfile.csv").string();
++  if (!fs::exists(listfile) && !_listfile_path.empty())
++  {
++    listfile = _listfile_path;
++  }
++  LogDebug << "ClientData: CASC product '" << _casc_product << "', listfile '" << listfile << "'" << std::endl;
++  _listfile.initFromCSV(listfile);
++  LogDebug << "ClientData: listfile holds " << _listfile.fileDataIDToPathMap().size() << " entries" << std::endl;
+ 
+   switch (_open_mode)
+   {
+     case OpenMode::LOCAL:
+     {
+-      _archives.push_back(new Archive::CASCArchive(_path, "", _locale_mode, _open_mode, &_listfile));
++      _archives.push_back(new Archive::CASCArchive(_path, "", _casc_product, _locale_mode, _open_mode, &_listfile));
+       break;
+     }
+     case OpenMode::REMOTE:
+     {
+       assert(_cdn_cache_path.has_value());
+-      _archives.push_back(new Archive::CASCArchive(_path, _cdn_cache_path.value(), _locale_mode, _open_mode, &_listfile));
++      _archives.push_back(new Archive::CASCArchive(_path, _cdn_cache_path.value(), _casc_product, _locale_mode, _open_mode, &_listfile));
+       break;
+     }
+   }
+@@ -385,9 +402,22 @@ bool ClientData::readFile(Listfile::FileKey const& file_key, std::vector<char>&
+     std::uint64_t buf_size = (*it)->getFileSize(handle);
+     buffer.resize(buf_size);
+ 
+-    if (!(*it)->readFile(handle, buffer.data(), buf_size))
++    bool const read_ok = buf_size > 0 && (*it)->readFile(handle, buffer.data(), buf_size);
++    if (!read_ok)
+     {
+-      assert(false);
++      // The archive listed the file but could not deliver it (CASC: encrypted behind a missing TACT key,
++      // or a 0-byte entry). Returning true here handed callers a non-EOF ClientFile with no data -- the
++      // BLP header read on a Forever Beta liquid texture then crashed the map load
++      // (docs/client_re/42 sec 17.1). Treat it as missing and let the next archive try.
++      static std::atomic<int> logged_unreadable{0};
++      if (logged_unreadable++ < 32)
++      {
++        LogError << "ClientData::readFile: '" << file_key.stringRepr() << "' opened in " << (*it)->path()
++                 << " but " << (buf_size ? "the read failed" : "it is empty") << "; treating it as missing" << std::endl;
++      }
++      (*it)->closeFile(handle);
++      buffer.clear();
++      continue;
+     }
+ 
+     if (!(*it)->closeFile(handle))
+diff --git a/src/ClientFile.cpp b/src/ClientFile.cpp
+index 2e60871..6cb6803 100644
+--- a/src/ClientFile.cpp
++++ b/src/ClientFile.cpp
+@@ -67,9 +67,18 @@ std::size_t ClientFile::read(void* dest, size_t bytes)
+   if (_eof || !bytes)
+     return 0;
+ 
++  // A seek past the end (garbage offsets in a broken/foreign file) used to underflow `bytes` here and
++  // memcpy gigabytes -> heap corruption. Clamp: nothing readable past the end.
++  if (_pointer >= _buffer.size())
++  {
++    _eof = true;
++    return 0;
++  }
++
+   size_t rpos = _pointer + bytes;
+   if (rpos > _buffer.size()) {
+     bytes = _buffer.size() - _pointer;
++    rpos = _buffer.size();
+     _eof = true;
+   }
+ 
+diff --git a/src/Listfile.cpp b/src/Listfile.cpp
+index b96fcc2..4cd337f 100644
+--- a/src/Listfile.cpp
++++ b/src/Listfile.cpp
+@@ -77,7 +77,23 @@ void Listfile::initFromCSV(std::string const& listfile_path)
+ 
+       uid = std::atoi(uid_str.c_str());
+ 
+-      _path_to_fdid[ClientData::normalizeFilenameInternal(filename)] = uid;
++      // normalizeFilenameInternal rewrites a legacy ".mdx"/".mdl" suffix to ".m2", so the community
++      // listfile's MDX rows (modern stores still carry them under their own, much higher ids) land on
++      // the SAME key as the real M2. Whichever came last used to win -- the MDX id -- and every model
++      // opened by path failed (2026-09-15, Classic Era: elwynntreecanopy03.m2 -> 706753 = the .mdx).
++      // A real .m2 row always wins; an .mdx/.mdl row only fills a key nothing else claimed.
++      std::string const key = ClientData::normalizeFilenameInternal(filename);
++      bool const legacy_model_row = filename.size() > 4
++        && (ClientData::normalizeFilenameUnix(filename).ends_with(".mdx") || ClientData::normalizeFilenameUnix(filename).ends_with(".mdl")
++            || ClientData::normalizeFilenameUnix(filename).ends_with(".MDX") || ClientData::normalizeFilenameUnix(filename).ends_with(".MDL"));
++      if (legacy_model_row)
++      {
++        _path_to_fdid.emplace(key, uid);
++      }
++      else
++      {
++        _path_to_fdid[key] = uid;
++      }
+       _fdid_to_path[uid] = ClientData::normalizeFilenameWoW(filename);
+ 
+     }
+@@ -114,6 +130,16 @@ void Listfile::initFromFileList(std::vector<char> const& file_list_blob)
+   }
+ }
+ 
++void Listfile::registerPath(std::uint32_t file_data_id, std::string const& path) const
++{
++  if (!file_data_id || path.empty())
++  {
++    return;
++  }
++  _path_to_fdid[ClientData::normalizeFilenameInternal(path)] = file_data_id;
++  _fdid_to_path.emplace(file_data_id, ClientData::normalizeFilenameWoW(path));
++}
++
+ std::uint32_t Listfile::getFileDataID(std::string const& filename) const
+ {
+   auto it = _path_to_fdid.find(filename);

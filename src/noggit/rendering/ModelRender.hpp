@@ -52,6 +52,15 @@ namespace Noggit::Rendering
     Combiners_Opaque_Mod2xNA_Alpha,
     Combiners_Opaque_AddAlpha,
     Combiners_Opaque_AddAlpha_Alpha,
+    // Modern (Legion+ s_modelShaderEffect) combiners the MD21 path can select; expressions in m2_frag.glsl
+    // follow the client-derived WoWViewerCpp commonM2Material (docs/client_re/42 sec 3).
+    Combiners_Mod_AddAlpha,          // 23
+    Combiners_Mod_AddAlpha_Alpha,    // 24
+    Combiners_Opaque_Alpha_Alpha,    // 25
+    Combiners_Opaque_ModNA_Alpha,    // 26
+    Combiners_Mod_Add_Alpha,         // 27
+    Combiners_Opaque_Alpha,          // 28
+    Combiners_Opaque_Mod_Add_Wgt,    // 29
   };
 
   enum class texture_unit_lookup : int
@@ -81,6 +90,9 @@ namespace Noggit::Rendering
     // 224/255 with blending OFF (3.3.5a FUN_0081fe90 + table 0xa453b0 row 0). Only set for
     // blend 1 so groups of other blends never split on era.
     bool   classic_alpha = false;
+    // Third era: MD21 models alpha-key at 128/255 (Legion+ client; WoWViewerCpp `discardAlpha < 0.50196`),
+    // docs/client_re/42 sec 3. Only set for blend 1, like classic_alpha.
+    bool   modern_alpha = false;
     bool   backface_cull = true;
     // [pib-MDI 2026-08-07] carried for the billboard-doodad batch only (glow cards are commonly unlit and/or
     // unfogged; the tile-doodad batch always resolves these to false, so its grouping is unchanged).
@@ -98,7 +110,7 @@ namespace Noggit::Rendering
     auto identity() const
     {
       return std::tie(tex_array0, tex_array1, tu_lookup0, tu_lookup1, pixel_shader,
-                      tex_clamp0, tex_clamp1, blend_mode, classic_alpha, backface_cull, unfogged, unlit);
+                      tex_clamp0, tex_clamp1, blend_mode, classic_alpha, modern_alpha, backface_cull, unfogged, unlit);
     }
     bool operator<(StaticBatchKey const& o) const { return identity() < o.identity(); }
   };
@@ -114,7 +126,10 @@ namespace Noggit::Rendering
     // land in BoundingBox[0], the point the client keys its transparency distance-sort on). Consumed by the
     // per-frame per-instance back-to-front transparency sort in ModelRender::draw (single-instance overload).
     glm::vec3 sort_center = glm::vec3(0.f);
-    uint16_t index_start = 0, index_count = 0, vertex_start = 0, vertex_end = 0;
+    // 32-bit: Legion+ skins address up to (Level << 16) | start -- the Forever Beta HD character skins
+    // hold 147,966 triangle indices. As uint16 the shifted start truncated straight back to the raw value,
+    // so the section-Level fix in initRenderPasses never reached the draw call (docs/client_re/42 sec 22).
+    uint32_t index_start = 0, index_count = 0, vertex_start = 0, vertex_end = 0;
     uint16_t geoset_id = 0;
     uint16_t blend_mode = 0;
     texture_unit_lookup tu_lookups[2];
@@ -181,6 +196,22 @@ namespace Noggit::Rendering
     ~ModelRender();
 
     void upload() override;
+    // [2026-09-04 NATIVE VK DEADLOCK FIX] upload() is what fills Model::_textures (from
+    // _textureFilenames), and it was only ever reached lazily from GL's own draw paths. With VK
+    // owning the M2 pass, GL's draw is gated off -> the model never uploads -> _textures stays
+    // empty -> resolveStaticBatch rejects texture unit 0 (rej12/tex3) -> VK refuses the model ->
+    // it is never drawn -> it never uploads. A closed loop: every doodad first seen AFTER VK took
+    // ownership stayed permanently invisible (Westfall trees/grass/rocks, 136k instances).
+    // The VK feed calls this so a model uploads because VULKAN wants it, not only because GL drew it.
+    // MUST stay gated on finishedLoading(). upload() builds Model::_textures from
+    // _textureFilenames and then CLEARS the filenames, and sets _uploaded -- it is strictly
+    // one-shot. Called while the async load is still filling those filenames it produces a SHORT
+    // _textures array, destroys the data needed to ever repair it, and never runs again; the model
+    // is then permanently rejected (tex >= _textures.size() = rej12/tex3) and invisible forever.
+    // GL only ever reached upload() from its draw path, which never runs on an unloaded model --
+    // this restores that protection for the VK feed.
+    void ensureUploaded();   // defined in the .cpp: needs the complete Model type
+    [[nodiscard]] bool uploaded() const { return _uploaded; }
     void unload() override;
 
     void draw(glm::mat4x4 const& model_view

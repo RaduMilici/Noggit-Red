@@ -2,8 +2,6 @@
 #include <math/frustum.hpp>
 #include <atomic>
 #include <array>   // footstep terrain-type layer weights
-#include <sstream> // FOOTSTEP-LAYER diagnostic
-#include <mutex>   // per-tile texture->terrain table
 #include <string>
 #include <noggit/Brush.h>
 #include <noggit/TileWater.hpp>
@@ -33,6 +31,7 @@
 #include <QImage>
 #include <QtCore/QSettings>
 #include <limits>
+#include <cmath>
 
 MapChunk::MapChunk(MapTile* maintile, BlizzardArchive::ClientFile* f, bool bigAlpha,tile_mode mode
                     , Noggit::NoggitRenderContext context, bool init_empty, int chunk_idx, bool load_textures)
@@ -2082,234 +2081,63 @@ void MapChunk::registerChunkUpdate(unsigned flags)
   mt->registerChunkUpdate(flags);
 }
 
-namespace
+int MapChunk::groundTerrainTypeRowAt(glm::vec3 const& world_pos)
 {
-  // ===== PER-TEXTURE terrain types, built from the tile's own authoring (doc 38, 2026-08-27).
-  // WHY: the same ground texture is declared inconsistently across chunks. Under Stormwind,
-  // elwynnrockbasetest2 carries effect 7823 -- a FULLY EMPTY GroundEffectTexture row (no
-  // doodads, amount 0, type 0) -- while the very same texture carries effect 993 (an empty row
-  // that still declares TerrainType 2 = STONE) in most other chunks of the tile. A per-chunk
-  // reading therefore reports "nothing" exactly where the city is. The client resolves the
-  // terrain type per TEXTURE (its chunk layers hold a per-texture handle, and its unit-side type
-  // survives chunk-to-chunk moves), so mirror that: scan the whole tile ONCE and let a texture's
-  // authored type apply wherever that texture is used.
-  std::map<std::pair<int, int>, std::map<std::string, int>> g_tile_texture_terrain;
-  std::mutex g_tile_texture_terrain_mutex;
-
-  // Rich row = it authors doodads or a density, so its TerrainType 0 genuinely means Dirt.
-  // Fully empty row with type 0 = unauthored placeholder, NOT Dirt.
-  bool ground_effect_row_is_rich(DBCFile::Record const& rec)
-  {
-    for (int i = 0; i < 4; ++i)
-    {
-      unsigned const dd = rec.getUInt(GroundEffectTextureDB::Doodads + i);
-      if (dd && dd != 0xFFFFFFFFu)
-      {
-        return true;
-      }
-    }
-    return rec.getUInt(GroundEffectTextureDB::Amount()) != 0;
-  }
-
-  std::map<std::string, int> const& tile_texture_terrain(MapTile* mt)
-  {
-    std::pair<int, int> const key{static_cast<int>(mt->index.x), static_cast<int>(mt->index.z)};
-    std::lock_guard<std::mutex> const lock(g_tile_texture_terrain_mutex);
-    auto const it = g_tile_texture_terrain.find(key);
-    if (it != g_tile_texture_terrain.end())
-    {
-      return it->second;
-    }
-    auto& table = g_tile_texture_terrain[key];
-    for (unsigned cz = 0; cz < 16; ++cz)
-    {
-      for (unsigned cx = 0; cx < 16; ++cx)
-      {
-        MapChunk* const c = mt->getChunk(cx, cz);
-        if (!c || !c->texture_set)
-        {
-          continue;
-        }
-        int const n = static_cast<int>(c->texture_set->num());
-        for (int i = 0; i < n; ++i)
-        {
-          unsigned const eff = c->texture_set->getEffectForLayer(static_cast<std::size_t>(i));
-          if (!eff)
-          {
-            continue;
-          }
-          try
-          {
-            if (!gGroundEffectTextureDB.CheckIfIdExists(eff))
-            {
-              continue;
-            }
-            auto const rec = gGroundEffectTextureDB.getByID(eff);
-            int const t = static_cast<int>(rec.getUInt(GroundEffectTextureDB::TerrainType()));
-            // a declared type (or a rich row's explicit Dirt) becomes this texture's type
-            if (t > 0 || ground_effect_row_is_rich(rec))
-            {
-              table.emplace(c->texture_set->filename(static_cast<std::size_t>(i)), t);
-            }
-          }
-          catch (...) {}
-        }
-      }
-    }
-    return table;
-  }
-}
-
-int MapChunk::groundTerrainTypeRowAt(glm::vec3 const& world_pos,
-                                     std::string* out_dominant_texture)
-{
-  // TERRAIN footstep type (doc 38, corrected 2026-08-27 after the "grass on Stormwind stone"
-  // report). The terrain type is a property of the TEXTURE UNDER THE FOOT: the layer's MCLY
-  // effectId -> GroundEffectTexture -> TerrainType. Data proof that this is the general
-  // mechanism (not just a grass-scatter thing): GroundEffectTexture rows exist with ALL FOUR
-  // doodad slots empty (0xFFFFFFFF) purely to declare a type, and the Turtle table authors 628
-  // Stone / 148 Sand / 143 Soggy / 6 Wood rows.
-  //
-  // The layer is picked by ALPHA DOMINANCE at the position -- NOT by the MCNK doodadMapping,
-  // which is the ground-effect SCATTER table (it points at whichever layer may sprout grass and
-  // is commonly 0, which is what made every surface report the base layer's type).
+  // 3.3.5a FUN_007a0530 (RE'd 2026-09-09). The client indexes the map in 4.1667-yd cells
+  // (ROUND(v * 0.24 - 0.5) == floor(v * 0.24)): cell >> 7 = tile, >> 3 & 15 = chunk, & 7 = the
+  // 8x8 sub-cell. Row = the client's x axis (noggit z), column = its y axis (noggit x). A hole
+  // (4x4 bit (col >> 1) + 4 * (row >> 1)) answers nothing. Otherwise doodadMapping[row] holds the
+  // 2-bit layer index for the column (mask 3 << 2*col), and that layer's MCLY effectId is looked
+  // up in GroundEffectTexture for its TerrainType. No alpha-map dominance and no per-texture or
+  // per-tile fallbacks: an unauthored layer/effect is UNKNOWN (-1) and the footstep lookup then
+  // plays TerrainType 0 (World::footstepSoundEntry) -- exactly what the client does.
   if (!texture_set)
   {
     return -1;
   }
-  int const n_tex = static_cast<int>(texture_set->num());
-  if (n_tex <= 0)
+  int const n_layers = static_cast<int>(texture_set->num());
+  if (n_layers <= 0)
   {
     return -1;
   }
-
-  // texel in the chunk's 64x64 alpha grid (index convention x + 64*z, as texture_set uses)
-  float const u = (world_pos.x - mVertices[0].x) / CHUNKSIZE;
-  float const v = (world_pos.z - mVertices[0].z) / CHUNKSIZE;
-  int const tx = std::clamp(static_cast<int>(u * 64.0f), 0, 63);
-  int const tz = std::clamp(static_cast<int>(v * 64.0f), 0, 63);
-  std::size_t const offset = static_cast<std::size_t>(tx) + 64u * static_cast<std::size_t>(tz);
-
-  // per-layer coverage: layers 1..n-1 come from the alphamaps, layer 0 is the remainder
-  std::array<int, 4> weight{{0, 0, 0, 0}};
-  auto* amaps = texture_set->getAlphamaps();
-  int overlaid = 0;
-  for (int i = 1; i < n_tex && i < 4; ++i)
+  int const col = static_cast<int>(std::floor(world_pos.x * 0.24f)) & 7;
+  int const row = static_cast<int>(std::floor(world_pos.z * 0.24f)) & 7;
+  if (isHole(col >> 1, row >> 1))
   {
-    int a = 0;
-    if (amaps && (*amaps)[i - 1].has_value())
-    {
-      a = static_cast<int>((*amaps)[i - 1]->getAlpha(offset));
-    }
-    weight[i] = a;
-    overlaid += a;
+    return -1;
   }
-  weight[0] = std::max(0, 255 - overlaid);
-
-  // most-covering layer first; the first layer that actually authors a ground effect wins (a
-  // decorative overlay without one must not silence the base texture underneath it)
-  std::array<int, 4> order{{0, 1, 2, 3}};
-  std::sort(order.begin(), order.begin() + n_tex,
-            [&weight](int a, int b) { return weight[a] > weight[b]; });
-
-  int chosen = -1;
-  int chosen_layer = -1;
-  unsigned chosen_effect = 0;
-  char const* chosen_via = "none";
-
-  // 1) most-covering layer whose OWN effect row actually declares something (a non-zero type,
-  //    or an explicit Dirt on a row that authors doodads/density).
-  for (int k = 0; k < n_tex && chosen < 0; ++k)
+  std::uint16_t const* mapping = texture_set->getDoodadMappingBase();
+  int const layer = (mapping[row] >> (2 * col)) & 3;
+  unsigned effect = 0;
+  if (layer < n_layers)
   {
-    unsigned const effect_id = texture_set->getEffectForLayer(static_cast<std::size_t>(order[k]));
-    if (!effect_id)
-    {
-      continue;
-    }
-    try
-    {
-      if (!gGroundEffectTextureDB.CheckIfIdExists(effect_id))
-      {
-        continue;
-      }
-      auto const rec = gGroundEffectTextureDB.getByID(effect_id);
-      int const t = static_cast<int>(rec.getUInt(GroundEffectTextureDB::TerrainType()));
-      if (t > 0 || ground_effect_row_is_rich(rec))
-      {
-        chosen = t;
-        chosen_layer = order[k];
-        chosen_effect = effect_id;
-        chosen_via = "layer";
-      }
-    }
-    catch (...) {}
+    effect = texture_set->getEffectForLayer(static_cast<std::size_t>(layer));
   }
-
-  // 2) placeholder row here (e.g. Stormwind's ground uses the empty effect 7823): fall back to
-  //    what this TEXTURE is declared as elsewhere in the same tile (see tile_texture_terrain).
-  if (chosen < 0 && mt)
+  int type = -1;
+  try
   {
-    auto const& table = tile_texture_terrain(mt);
-    for (int k = 0; k < n_tex && chosen < 0; ++k)
+    if (effect && gGroundEffectTextureDB.CheckIfIdExists(effect))
     {
-      auto const hit = table.find(texture_set->filename(static_cast<std::size_t>(order[k])));
-      if (hit != table.end())
-      {
-        chosen = hit->second;
-        chosen_layer = order[k];
-        chosen_via = "texture-tile";
-      }
+      type = static_cast<int>(gGroundEffectTextureDB.getByID(effect)
+                                .getUInt(GroundEffectTextureDB::TerrainType()));
     }
   }
+  catch (...) {}
 
-  // 3) still nothing: hand the caller the dominant texture so it can resolve the type from the
-  //    WHOLE loaded map (the declaring chunks are often in a neighbouring tile -- Stormwind's
-  //    ground texture is declared Stone in 31_48/32_48 while the city itself sits on 30_47).
-  if (out_dominant_texture && n_tex > 0)
-  {
-    *out_dominant_texture = texture_set->filename(static_cast<std::size_t>(order[0]));
-  }
-
-  // FOOTSTEP-LAYER diag (one-shot x20): every layer's coverage + what it declares, so a wrong
-  // terrain type can be traced to the layer pick or to the map data itself in one session.
+  // FOOTSTEP-LAYER diag (one-shot x20): the client-side pick, traceable to the map data.
   {
     static std::atomic<int> s_layer_diag_left{20};
     if (s_layer_diag_left.load(std::memory_order_relaxed) > 0
         && s_layer_diag_left.fetch_sub(1, std::memory_order_relaxed) > 0)
     {
-      std::ostringstream layers;
-      for (int i = 0; i < n_tex; ++i)
-      {
-        unsigned const eff = texture_set->getEffectForLayer(static_cast<std::size_t>(i));
-        int tt = -1;
-        try
-        {
-          if (eff && gGroundEffectTextureDB.CheckIfIdExists(eff))
-          {
-            tt = static_cast<int>(gGroundEffectTextureDB.getByID(eff)
-                                    .getUInt(GroundEffectTextureDB::TerrainType()));
-          }
-        }
-        catch (...) {}
-        layers << " L" << i << "{w=" << weight[i] << " eff=" << eff << " T=" << tt << "}";
-      }
-      LogError << "FOOTSTEP-LAYER chunk=" << px << "," << py
-               << " texel=" << tx << "," << tz
-               << " nTex=" << n_tex << layers.str()
-               << " tex0='" << texture_set->filename(0) << "'"
-               << " -> via=" << chosen_via << " layer=" << chosen_layer
-               << " eff=" << chosen_effect << " row=" << chosen << std::endl;
+      LogError << "FOOTSTEP-LAYER chunk=" << px << "," << py << " cell=" << col << "," << row
+               << " mapping=0x" << std::hex << mapping[row] << std::dec
+               << " layer=" << layer << "/" << n_layers << " effect=" << effect
+               << " tex='" << (layer < n_layers ? texture_set->filename(static_cast<std::size_t>(layer)) : std::string("-"))
+               << "' -> row=" << type << std::endl;
     }
   }
-
-  if (chosen >= 0)
-  {
-    return chosen;
-  }
-  // Nothing authored here. The client leaves its cached terrain type at -1 in that case
-  // (FUN_005fa730/FUN_006706d0) and the footstep resolve then plays NOTHING -- silence is a
-  // real client state, so do not invent a Dirt step.
-  return -1;
+  return type;
 }
 
 std::vector<MapChunk::DetailDoodad> const& MapChunk::detailDoodads()

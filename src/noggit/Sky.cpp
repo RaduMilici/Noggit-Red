@@ -6,6 +6,7 @@
 #include <noggit/ModelManager.h> // ModelManager
 #include <noggit/Sky.h>
 #include <noggit/World.h>
+#include <noggit/project/CurrentProject.hpp>
 #include <noggit/application/NoggitApplication.hpp>
 #include <opengl/shader.hpp>
 #include <ClientFile.hpp>
@@ -17,11 +18,165 @@
 #include <string>
 #include <array>
 #include <cstring>
+#include <cstdlib>
+#include <cmath>
+#include <cfloat>
+#include <limits>
+#include <utility>
 
 const float skymul = 36.0f;
 
 namespace
 {
+  // [client RE 2026-09-09, wow335a.exe] the ZONE-LIGHT POLYGON TABLE, copied verbatim from the client's
+  // .data (11 entries @0x00adef58, one per Northrend zone, string pointers @0x00adee48). Each entry is an
+  // SVG path ("L x,y ... z") drawn in 33.33-yard map units; FUN_0077ed40 parses it at startup and maps it
+  // into world space (see zone_polygon_* constants), FUN_0077eed0 tests the CAMERA position against it every
+  // frame and FUN_007ed150 queues the light with value = 50 - signed distance (negative inside), which
+  // FUN_007ee6b0 blends BEFORE every positional light with weight = clamp(value / 100). This is how the
+  // client puts IceCrownSky under the whole Icecrown zone (Light 1703, LightParams 748) although Light.dbc
+  // only holds the zone's positional lights: the tiny-radius, buried lights 914/825/959/862/1847/1703/1796/
+  // 1777/1792/1589/1740 exist for this table alone.
+  struct ZoneLightPolygonDef { unsigned int map; int light_id; char const* svg_path; };
+  ZoneLightPolygonDef const ZONE_LIGHT_POLYGON_DEFS[] = {
+    // Light 914: Wintergrasp / Lake Wintergrasp aurora
+    {571, 914, "L 415.58442,531.25541 L 387.74026,529.59307 L 385.80086,526.82251 L 385.7316,520.17316 L 375.1342,520.8658 L 374.64936,522.04329 L 373.4026,522.11255 L 372.36364,520.8658 L 365.57576,520.72727 L 365.43723,519.06493 L 348.67533,518.78788 L 343.27273,515.87879 L 334.96104,515.87879 L 333.2987,517.26406 L 319.03031,517.54113 L 243.94805,475.29004 L 225.9394,566.44155 L 266.25109,632.93506 L 350.19914,653.71429 L 415.47711,629.01747 L 416.3857,586.28568 L 417.80507,564.21323 L 415.74891,558.96969 L 420,549.41992 L 420.329,545.35065 L 417.70834,543.36003 L 417.79667,534.77107 z"},
+    // Light 825: Borean Tundra aurora
+    {571, 825, "L 542.47619,512.69264 L 526.68398,512.27706 L 520.24243,507.15151 L 511.30736,502.02597 L 499.87879,501.47186 L 497.45455,505.48918 L 490.8052,505.48918 L 485.67966,503.34199 L 481.24675,496.7619 L 478.68398,497.03896 L 476.46753,500.50216 L 469.33334,503.54978 L 468.64069,506.38961 L 464.62338,509.85282 L 464.13853,512.76191 L 459.98268,512.7619 L 459.77489,519.48052 L 461.71429,521.28138 L 461.71429,529.59307 L 459.91342,531.53247 L 452.57143,532.50216 L 452.29437,530.83983 L 448.9697,529.87013 L 444.67533,529.87013 L 440.1039,534.58009 L 435.94805,534.71861 L 435.4632,536.45022 L 426.73593,536.24242 L 420.98701,535.68831 L 417.66234,534.99567 L 417.69697,543.34199 L 420.41559,545.36796 L 420.08658,549.54112 L 417.33334,555.30736 L 415.82685,558.9264 L 417.78355,564.20779 L 416.33156,585.52293 L 415.58849,629.51631 L 543.25237,643.44281 L 561.20821,606.2407 L 561.7316,571.5671 L 562.26195,560.9602 L 563.47509,556.54987 L 561.86725,540.03549 L 558.82251,536.24242 L 558.82251,531.94805 L 561.59307,527.37662 L 560.91028,525.07903 L 565.40464,521.28834 L 569.08547,517.3897 L 563.12877,516.65156 L 562.10848,514.5974 L 557.77147,517.15398 L 554.80062,518.02325 L 553.81376,515.66677 L 557.04829,511.88812 L 555.35931,506.73593 L 546.63204,506.5974 z"},
+    // Light 959: Grizzly Hills aurora
+    {571, 959, "L 658.42424,491.91342 L 652.74459,491.77489 L 651.08225,493.99134 L 650.8052,500.64069 L 646.64935,503.41125 L 641.94924,503.53298 L 638.79671,507.07733 L 628.46448,507.95892 L 626.12391,509.59987 L 625.75179,512.5385 L 610.24718,522.06959 L 609.40905,523.93072 L 601.56576,524.4008 L 595.21146,524.65409 L 589.00962,523.67743 L 588.19575,521.44129 L 585.09363,520.47975 L 584.84817,517.78375 L 568.95883,517.49358 L 565.64112,521.19039 L 560.6738,525.07903 L 561.59307,527.37662 L 558.68398,531.94805 L 558.82251,536.38095 L 561.67134,540.13345 L 563.57305,556.70521 L 562.3599,560.84544 L 561.21229,606.81111 L 561.22741,606.68005 L 590.12987,579.74026 L 602.18182,576.41559 L 602.87446,570.73593 L 603.98269,567.82684 L 607.37662,567.61905 L 608.62338,561.66233 L 611.84417,559.51515 L 615.16883,554.87446 L 617.13524,550.32961 L 621.18672,547.21005 L 624.99578,548.5234 L 632.57923,547.92932 L 638.39647,548.02789 L 642.10114,549.581 L 644.97464,552.13844 L 649.26806,552.72185 L 654.3234,551.1927 L 657.78565,548.10512 L 663.76937,546.6079 L 667.29423,544.86825 L 675.30159,547.4159 L 683.83518,550.88307 L 695.15021,565.17313 L 724.6491,565.13046 L 695.84514,480.29575 z"},
+    // Light 862: Howling Fjord aurora
+    {571, 862, "L 695.15101,565.24834 L 700.56477,576.68657 L 697.71973,584.91303 L 686.93483,589.08304 L 681.55461,592.64502 L 673.43847,598.56199 L 668.30068,598.00275 L 663.33606,595.08855 L 657.87412,586.26043 L 653.58968,584.60114 L 649.44376,585.40072 L 644.95152,588.55529 L 638.03018,592.4809 L 630.5201,592.597 L 621.9018,590.42739 L 616.20779,587.60173 L 609.14285,581.12554 L 607.30736,575.2381 L 607.16883,567.82684 L 603.84416,567.68831 L 602.87446,570.87446 L 602.04329,576.69263 L 589.85282,579.74026 L 561.01997,606.89803 L 543.41895,643.54753 L 552.78099,681.70681 L 573.81856,706.89785 L 647.85055,713.01615 L 727.44446,698.80992 L 740.88647,644.79209 L 724.61693,565.08148 z"},
+    // Light 1847: Howling Fjord east aurora
+    {571, 1847, "L 617.05115,550.47504 L 615.15582,554.83316 L 611.74927,559.54239 L 608.63947,561.63364 L 607.37795,567.55746 L 607.25131,575.52354 L 609.15926,581.22073 L 616.15564,587.61752 L 621.81081,590.47067 L 630.45837,592.58916 L 638.02497,592.45064 L 645.11439,588.55576 L 649.45702,585.33672 L 653.57925,584.59931 L 657.94984,586.35119 L 663.32795,595.21626 C 663.32795,595.21626 668.35699,598.07783 668.35699,598.07783 L 673.47556,598.49761 L 681.76985,592.51426 L 686.96945,589.08118 L 697.80117,584.88116 L 700.53681,576.62337 L 695.18955,565.25915 L 683.76721,550.72629 L 675.03046,547.40227 L 667.24876,544.8374 L 663.74426,546.58508 L 657.76307,548.15367 L 654.24669,551.24259 L 649.19952,552.74119 L 644.95435,552.06065 L 642.01606,549.582 L 638.37549,548.08022 L 632.72308,547.91719 L 624.92493,548.38524 L 621.13077,547.06675 z"},
+    // Light 1703: Icecrown (IceCrownSky)
+    {571, 1703, "L 497.59308,353.80086 L 481.66234,354.07792 L 385.80416,370.15744 L 326.81176,411.95793 L 354.00415,452.83963 L 356.12433,449.18867 L 358.49253,449.47677 L 360.63529,453.37524 L 377.47237,453.15916 L 384.34428,453.53416 L 389.45302,456.39572 L 403.53247,466.83983 L 406.23377,471.75757 L 412.46753,478.19913 L 412.88311,491.5671 L 421.61039,491.70563 L 421.74892,489.76624 L 431.58441,489.62771 L 434.56277,493.36797 L 440.45022,494.12988 L 446.61472,496.48485 L 449.59308,500.77922 L 451.04762,505.76624 L 453.67539,506.92368 L 456.54806,510.72589 L 460.00845,510.65891 L 460.04044,512.74692 L 463.94162,512.72891 L 464.62532,509.93217 L 468.70145,506.31075 L 469.30022,503.61989 L 476.46191,500.43926 L 478.72589,497.06273 L 481.43067,496.77175 L 481.34376,494.96248 L 475.42857,492.46753 L 473.42051,490.20907 L 471.09957,486.71862 L 470.96104,480.62338 L 473.35065,477.64502 L 474.94373,473.76623 L 479.61311,472.9242 L 486.61117,468.15311 L 489.64057,467.93101 L 489.86113,470.65471 L 496.48862,470.67711 L 499.79142,474.54366 L 503.33665,474.46216 L 505.60049,478.70967 L 509.80373,479.18228 L 519.5481,479.3432 L 519.52623,475.00197 L 516.97623,471.45727 L 516.5734,468.91689 L 513.78097,465.71852 L 506.69417,460.54611 L 506.54009,453.78116 L 501.10287,444.25446 L 500.52499,433.89126 L 497.44783,433.29732 L 497.59308,408.31168 z"},
+    // Light 1796: Sholazar Basin aurora
+    {571, 1796, "L 412.45434,478.09436 L 406.54061,471.96297 L 403.37534,466.73863 L 394.16765,459.68593 L 389.46584,456.25753 L 384.17632,453.51482 L 376.92771,453.22096 L 360.56936,453.41686 L 358.80618,449.40074 L 356.16142,449.20483 L 353.92036,452.92709 L 326.87313,411.98224 L 243.65219,475.1056 L 318.68554,517.07028 L 333.534,517.4789 L 335.00332,515.91164 L 343.23147,516.00959 L 348.7169,518.85026 L 365.36912,518.94822 L 365.66298,520.71139 L 372.32386,520.9073 L 373.51612,522.21432 L 374.70346,522.07579 L 375.26249,520.80934 L 385.71982,520.2167 L 389.80971,517.39343 L 394.31518,512.97709 L 397.13207,509.10034 L 402.94499,502.34473 L 409.20709,497.34584 L 412.92815,491.4214 z"},
+    // Light 1777: The Storm Peaks (Ulduar sky)
+    {571, 1777, "L 497.52381,385.87012 L 497.31602,433.38528 L 500.50217,433.87013 L 501.19481,444.05194 L 506.59741,453.74892 L 506.73594,460.53679 L 513.73927,465.6626 L 516.54638,468.89212 L 516.96245,471.54364 L 519.49106,474.95708 L 519.52617,479.54801 L 519.29757,485.57887 L 522.68513,487.44333 L 540.71684,487.39769 L 543.89051,486.15093 L 546.10288,484.75605 L 549.63908,484.82328 L 549.81818,479.86147 L 559.65368,479.44589 L 559.65368,475.98268 L 563.04762,475.08225 L 570.25108,474.52813 L 570.94373,468.64069 L 577.38528,468.64069 L 576.69264,463.65368 L 581.95671,460.74459 L 584.72727,462.68398 L 592.90043,462.54545 L 593.87013,458.66667 L 634.45888,458.66667 L 634.8052,443.84415 L 641.59308,443.63636 L 642.00866,386.07792 L 593.67422,354.19269 L 497.42571,353.74348 z"},
+    // Light 1792: Wintergrasp (smoky sky)
+    {571, 1792, "L 434.6833,493.4155 L 431.5591,489.5666 L 421.74892,489.6277 L 421.61039,491.5671 L 412.81385,491.42857 L 409.0736,497.24675 L 402.90909,502.37229 L 397.02164,509.2987 L 394.11255,513.17749 L 389.74892,517.4026 L 385.76039,520.14744 L 385.84527,526.88454 L 387.80724,529.60553 L 401.6142,530.50597 L 415.65119,531.25887 L 417.99501,534.96372 L 420.71323,535.60043 L 426.6942,536.20207 L 435.4797,536.57301 L 435.99408,534.62088 L 440.10816,534.42498 L 444.71201,529.82113 L 448.92404,529.82113 L 452.25448,530.89863 L 452.6463,532.26998 L 459.699,531.48635 L 461.75603,529.42931 L 461.65808,521.39707 L 459.699,519.34003 L 459.97606,512.71769 L 460.02529,510.62296 L 456.67887,510.60734 L 453.57677,506.7564 L 451.0751,505.99281 L 449.65176,501.16809 L 446.77137,496.50482 L 440.60266,494.0864 z"},
+    // Light 1589: Zul'Drak (ZulDrakSkyA)
+    {571, 1589, "L 642.15663,386.15103 L 641.52833,443.72348 L 634.72906,443.72601 L 634.52127,458.70639 L 593.70032,458.70639 L 593.01464,462.72251 L 584.59058,462.72251 L 582.06058,460.90196 L 576.75425,463.70205 L 577.4182,468.73745 L 570.85816,468.70876 L 570.34208,474.64423 L 562.87752,475.15777 L 559.71022,475.84837 L 559.61227,479.57063 L 549.71889,479.86449 L 549.64963,484.92246 L 550.60048,486.42743 L 550.60048,492.01081 L 549.71889,492.79445 L 549.71889,495.83103 L 546.68231,499.16147 L 546.58436,506.70394 L 555.49819,506.70394 L 556.86955,511.89551 L 553.82109,515.68704 L 554.75778,517.92127 L 557.82502,517.04701 L 562.09501,514.5126 L 563.04066,516.49936 L 569.01587,517.33443 L 584.91316,517.84232 L 585.012,520.48302 L 588.11694,521.49503 L 589.09648,523.94388 L 595.16964,524.53161 L 600.85099,524.43364 L 609.373,523.94388 L 610.05867,521.9848 L 618.18887,516.89118 L 625.63338,512.38529 L 626.22112,509.54461 L 628.66996,508.07531 L 638.56334,507.19371 L 641.99174,503.56941 L 646.59558,503.47145 L 650.80761,500.53283 L 651.10148,493.87194 L 652.66874,491.81491 L 658.53021,491.88417 L 695.82532,480.31081 L 677.03249,424.56931 z"},
+    // Light 1740: Crystalsong Forest (no skybox)
+    {571, 1740, "L 519.29515,485.58511 L 519.52617,479.54801 L 509.69114,479.18656 L 505.57186,478.7797 L 503.42658,474.56332 L 499.65934,474.56359 L 496.37696,470.65044 L 489.78598,470.68855 L 489.70965,467.82033 L 486.61957,468.09573 L 479.68237,472.87522 L 474.97836,473.80086 L 473.07359,477.78355 L 470.92641,480.65801 L 471.1342,486.64935 L 473.37993,490.21746 L 473.4716,490.31815 L 475.42857,492.46753 L 477.67966,493.4026 L 481.41992,494.96104 L 481.52381,496.83116 L 485.81818,503.54978 L 490.8052,505.35065 L 497.31602,505.35065 L 499.80953,501.47186 L 511.30736,502.02597 L 520.17316,507.01299 L 520.17316,507.01299 L 526.68398,512.13853 L 542.19914,512.55411 L 546.63204,506.5974 L 546.77056,499.25541 L 549.67965,495.65368 L 549.67965,492.88312 L 550.64935,491.63636 L 550.51082,486.37229 L 549.59011,484.92123 L 545.80206,484.85713 L 543.63817,486.25371 L 540.65057,487.4923 L 522.69277,487.41222 z"},
+  };
+
+  // FUN_0077ed40 (startup): SVG units -> world: x' = (x + OX) * 33.333, z' = ((y + OY) * 2^-10) * 34133.33.
+  // x' pairs with 17066.67 - client_y (= noggit x), z' with 17066.67 - client_x (= noggit z). The box is grown
+  // by the 50-yard fade (DAT_009f22ec) so the polygon test only runs where it can matter.
+  constexpr float ZONE_POLY_OFFSET_X = -1.6623375415802002f; // DAT_00a3e8ac
+  constexpr float ZONE_POLY_OFFSET_Y = -145.73159790039062f; // DAT_00a3e8a8
+  constexpr float ZONE_POLY_SCALE_X = 33.33333206176758f;    // DAT_00a3e554
+  constexpr float ZONE_POLY_SCALE_Y1 = 0.0009765625f;        // DAT_00a1c8a0
+  constexpr float ZONE_POLY_SCALE_Y2 = 34133.33203125f;      // DAT_009e2ac8
+  constexpr float ZONE_POLY_FADE = 50.f;                     // DAT_009f22ec
+  constexpr std::size_t ZONE_POLY_MAX_ACTIVE = 5;            // FUN_007ed150: the list holds five
+
+  std::vector<glm::vec2> parse_zone_polygon(char const* svg)
+  {
+    std::vector<glm::vec2> pts;
+    for (char const* p = svg; *p && *p != 'z'; ++p)
+    {
+      if (*p != 'M' && *p != 'L')
+      {
+        continue;
+      }
+      char const* xs = p + 2; // "L x,y "
+      char const* comma = xs;
+      while (*comma && *comma != ',')
+      {
+        ++comma;
+      }
+      if (!*comma)
+      {
+        break;
+      }
+      char const* ys = comma + 1;
+      float const x = static_cast<float>(std::atof(xs));
+      float const y = static_cast<float>(std::atof(ys));
+      pts.emplace_back((x + ZONE_POLY_OFFSET_X) * ZONE_POLY_SCALE_X
+                      , ((y + ZONE_POLY_OFFSET_Y) * ZONE_POLY_SCALE_Y1) * ZONE_POLY_SCALE_Y2);
+      p = ys;
+      while (*p && *p != ' ')
+      {
+        ++p;
+      }
+      if (!*p)
+      {
+        break;
+      }
+    }
+    return pts;
+  }
+
+  // FUN_007f9c90: even-odd crossing test plus the distance to the nearest edge (FUN_007f9bf0 = squared
+  // point-to-segment distance); the edge between the last and the first point closes the polygon. Negative
+  // inside.
+  float zone_polygon_signed_distance(std::vector<glm::vec2> const& pts, float x, float z)
+  {
+    float best = std::numeric_limits<float>::max();
+    bool inside = false;
+    std::size_t const n = pts.size();
+    for (std::size_t i = 0; i < n; ++i)
+    {
+      glm::vec2 const& a = pts[i];
+      glm::vec2 const& b = pts[(i + n - 1) % n];
+      float const dx = b.x - a.x;
+      float const dz = b.y - a.y;
+      float const len2 = dx * dx + dz * dz;
+      float d2;
+      if (len2 > 0.f)
+      {
+        float const t = ((x - a.x) * dx + (z - a.y) * dz) / len2;
+        if (t < 0.f)
+        {
+          d2 = (x - a.x) * (x - a.x) + (z - a.y) * (z - a.y);
+        }
+        else if (t > 1.f)
+        {
+          d2 = (x - b.x) * (x - b.x) + (z - b.y) * (z - b.y);
+        }
+        else
+        {
+          float const px = x - (a.x + dx * t);
+          float const pz = z - (a.y + dz * t);
+          d2 = px * px + pz * pz;
+        }
+      }
+      else
+      {
+        d2 = (x - a.x) * (x - a.x) + (z - a.y) * (z - a.y);
+      }
+      best = std::min(best, d2);
+      // client: (a.y < z && z <= b.y) || (b.y < z && z <= a.y), then the crossing's x against the point
+      if ((a.y < z && z <= b.y) || (b.y < z && z <= a.y))
+      {
+        float const xi = (b.x - a.x) * ((z - a.y) / (b.y - a.y)) + a.x;
+        if (xi < x)
+        {
+          inside = !inside;
+        }
+      }
+    }
+    float const dist = std::sqrt(best);
+    return inside ? -dist : dist;
+  }
+
+  // FUN_0077eed0 queues value = 50 - signed distance when that is positive; FUN_007ee6b0 turns it into
+  // weight = clamp(value / 100, 0, 1): full 50 yards inside the edge, half on it, gone 50 yards outside.
+  float zone_polygon_weight(float signed_distance)
+  {
+    if (!(signed_distance - ZONE_POLY_FADE < 0.f))
+    {
+      return 0.f;
+    }
+    float const value = -(signed_distance - ZONE_POLY_FADE);
+    float const f = (100.f - value) * 0.01f;
+    float const w = (f <= 0.f) ? 1.f : 1.f - f;
+    return std::max(0.f, std::min(1.f, w));
+  }
   struct RawDBC
   {
     bool valid = false;
@@ -212,6 +367,7 @@ namespace
         if (filename && *filename)
         {
           param->skybox.emplace(filename, context);
+          param->skybox_id = static_cast<int>(light_params.word(row, 2));
           // Field 2 = flags (WotLK-only column; absent on 1.12 -> field_count 2, so stays 0).
           if (light_skybox.field_count > 2)
           {
@@ -371,20 +527,35 @@ SkyParam::SkyParam(int paramId, Noggit::NoggitRenderContext context)
         {
             // LogError << "When trying to intialize sky " << data->getInt(LightDB::ID) << ", there was an error with getting an entry in a DBC (" << i << "). Sorry." << std::endl;
             LogError << "When trying to intialize sky, there was an error with getting an entry in LightIntBand DBC (" << i << "). Sorry." << std::endl;
-            DBCFile::Record rec = gLightIntBandDB.getByID(i);
-            int entries = rec.getInt(LightIntBandDB::Entries);
-
-            if (entries == 0)
+            // Fallback = the SAME band of LightParams 1 (ids 1..18), not band id `i`: id 0 never exists, so the
+            // old `getByID(i)` threw INSIDE this handler and std::terminate() took the process down -- the
+            // Forever Beta ships 827 LightParams rows but LightData for 815, and a map whose light names one
+            // of the 12 empty params (Caverns of Time, Development Land) crashed on open (crash dump
+            // noggit.exe.21860: DBCFile::NotFound out of SkyParam::SkyParam catch$12). WotLK data has no
+            // gaps, so this path never ran there. docs/client_re/42 sec 29.
+            mmin[i] = -1;
+            colorRows[i].clear();
+            int const fallback_id = 1 + i;
+            if (gLightIntBandDB.CheckIfIdExists(fallback_id))
             {
-                mmin[i] = -1;
-            }
-            else
-            {
-                mmin[i] = rec.getInt(LightIntBandDB::Times);
-                for (int l = 0; l < entries; l++)
+                try
                 {
-                    SkyColor sc(rec.getInt(LightIntBandDB::Times + l), rec.getInt(LightIntBandDB::Values + l));
-                    colorRows[i].push_back(sc);
+                    DBCFile::Record rec = gLightIntBandDB.getByID(fallback_id);
+                    int entries = rec.getInt(LightIntBandDB::Entries);
+                    if (entries > 0)
+                    {
+                        mmin[i] = rec.getInt(LightIntBandDB::Times);
+                        for (int l = 0; l < entries; l++)
+                        {
+                            SkyColor sc(rec.getInt(LightIntBandDB::Times + l), rec.getInt(LightIntBandDB::Values + l));
+                            colorRows[i].push_back(sc);
+                        }
+                    }
+                }
+                catch (...)
+                {
+                    mmin[i] = -1;
+                    colorRows[i].clear();
                 }
             }
         }
@@ -416,20 +587,30 @@ SkyParam::SkyParam(int paramId, Noggit::NoggitRenderContext context)
         catch (...)
         {
             LogError << "When trying to intialize sky, there was an error with getting an entry in LightFloatBand DBC (" << i << "). Sorry." << std::endl;
-            DBCFile::Record rec = gLightFloatBandDB.getByID(i);
-            int entries = rec.getInt(LightFloatBandDB::Entries);
-
-            if (entries == 0)
+            // Same rule as the colour bands above: param 1's band (ids 1..6), guarded, never a throw from here.
+            mmin_float[i] = -1;
+            floatParams[i].clear();
+            int const fallback_id = 1 + i;
+            if (gLightFloatBandDB.CheckIfIdExists(fallback_id))
             {
-                mmin_float[i] = -1;
-            }
-            else
-            {
-                mmin_float[i] = rec.getInt(LightFloatBandDB::Times);
-                for (int l = 0; l < entries; l++)
+                try
                 {
-                    SkyFloatParam sc(rec.getInt(LightFloatBandDB::Times + l), rec.getFloat(LightFloatBandDB::Values + l));
-                    floatParams[i].push_back(sc);
+                    DBCFile::Record rec = gLightFloatBandDB.getByID(fallback_id);
+                    int entries = rec.getInt(LightFloatBandDB::Entries);
+                    if (entries > 0)
+                    {
+                        mmin_float[i] = rec.getInt(LightFloatBandDB::Times);
+                        for (int l = 0; l < entries; l++)
+                        {
+                            SkyFloatParam sc(rec.getInt(LightFloatBandDB::Times + l), rec.getFloat(LightFloatBandDB::Values + l));
+                            floatParams[i].push_back(sc);
+                        }
+                    }
+                }
+                catch (...)
+                {
+                    mmin_float[i] = -1;
+                    floatParams[i].clear();
                 }
             }
         }
@@ -487,7 +668,24 @@ SkyParam::SkyParam(int paramId, Noggit::NoggitRenderContext context)
 
         if (skybox_id)
         {
-            skybox.emplace(gLightSkyboxDB.getByID(skybox_id).getString(LightSkyboxDB::filename), _context);
+            DBCFile::Record const skybox_rec = gLightSkyboxDB.getByID(skybox_id);
+            // modern clients name the skybox model by fileDataID (synthesized column 3); the string
+            // column then carries the listfile path (or an "fdid:" pseudo name) for display
+            std::uint32_t const skybox_fdid = gLightSkyboxDB.getFieldCount() > LightSkyboxDB::skyboxFileDataID
+                                            ? skybox_rec.getUInt(LightSkyboxDB::skyboxFileDataID) : 0u;
+            std::string const skybox_name = skybox_rec.getString(LightSkyboxDB::filename);
+            if (skybox_fdid && skybox_name.rfind("fdid:", 0) == 0)
+              skybox.emplace(BlizzardArchive::Listfile::FileKey(skybox_fdid), _context);
+            else if (skybox_fdid)
+              skybox.emplace(BlizzardArchive::Listfile::FileKey(skybox_name, skybox_fdid), _context);
+            else
+              skybox.emplace(skybox_name, _context);
+            // [2026-09-09] the id and flags were only stored by the raw-DBC fallback loader: on this path
+            // every param read skybox_id 0 / flags 0, so Skies::draw merged EVERY skybox into one slot
+            // (the citadel vanished under the zone light) and never applied the flag-1 day mapping or
+            // the flag-2 overlay rule.
+            this->skybox_id = skybox_id;
+            skybox_flags = skybox_rec.getInt(LightSkyboxDB::flags);
         }
     }
     catch (...)
@@ -1011,6 +1209,8 @@ Skies::Skies(unsigned int mapid, Noggit::NoggitRenderContext context)
   // sort skies from smallest to largest; global last.
   // smaller skies will have precedence when calculating weights to achieve smooth transitions etc.
   std::sort(skies.begin(), skies.end());
+
+  build_zone_polygons(mapid);
   
   int skies_with_skyboxes = 0;
   for (Sky& sky : skies)
@@ -1046,6 +1246,24 @@ void Skies::light_at(glm::vec3 const& pos, int time, glm::vec3* out_diffuse, glm
     ambient = default_sky->colorFor(LIGHT_GLOBAL_AMBIENT, time);
   }
 
+  // the client's zone-polygon lights come first (FUN_007f1360 blends the queued list before the heap)
+  {
+    std::vector<std::pair<int, float>> zone;
+    zone_polygon_weights(pos, zone);
+    for (auto const& entry : zone)
+    {
+      for (auto const& sky : skies)
+      {
+        if (sky.Id == entry.first)
+        {
+          diffuse = glm::mix(diffuse, sky.colorFor(LIGHT_GLOBAL_DIFFUSE, time), entry.second);
+          ambient = glm::mix(ambient, sky.colorFor(LIGHT_GLOBAL_AMBIENT, time), entry.second);
+          break;
+        }
+      }
+    }
+  }
+
   // far -> near so nearer volumes override, mirroring update_sky_colors' weighted mix order
   std::vector<Sky const*> ordered;
   ordered.reserve(skies.size());
@@ -1076,9 +1294,128 @@ void Skies::light_at(glm::vec3 const& pos, int time, glm::vec3* out_diffuse, glm
   *out_ambient = ambient;
 }
 
+void Skies::build_zone_polygons(unsigned int mapid)
+{
+  _zone_polygons.clear();
+  auto const* project = Noggit::Project::CurrentProject::get();
+  if (!project || project->projectVersion == Noggit::Project::ProjectVersion::CLASSIC)
+  {
+    return; // the 1.12 client has no such table
+  }
+  for (ZoneLightPolygonDef const& def : ZONE_LIGHT_POLYGON_DEFS)
+  {
+    if (def.map != mapid)
+    {
+      continue;
+    }
+    ZoneLightPolygon poly;
+    poly.light_id = def.light_id;
+    poly.points = parse_zone_polygon(def.svg_path);
+    if (poly.points.empty())
+    {
+      continue;
+    }
+    poly.min_x = poly.min_z = FLT_MAX;
+    poly.max_x = poly.max_z = -FLT_MAX;
+    for (glm::vec2 const& p : poly.points)
+    {
+      poly.min_x = std::min(poly.min_x, p.x);
+      poly.min_z = std::min(poly.min_z, p.y);
+      poly.max_x = std::max(poly.max_x, p.x);
+      poly.max_z = std::max(poly.max_z, p.y);
+    }
+    poly.min_x -= ZONE_POLY_FADE;
+    poly.min_z -= ZONE_POLY_FADE;
+    poly.max_x += ZONE_POLY_FADE;
+    poly.max_z += ZONE_POLY_FADE;
+    _zone_polygons.push_back(std::move(poly));
+  }
+  if (!_zone_polygons.empty())
+  {
+    LogError << "Turtle sky: map " << mapid << " has " << _zone_polygons.size()
+             << " client zone-light polygons" << std::endl;
+  }
+}
+
+void Skies::zone_polygon_weights(glm::vec3 const& pos, std::vector<std::pair<int, float>>& out) const
+{
+  out.clear();
+  for (ZoneLightPolygon const& poly : _zone_polygons)
+  {
+    if (out.size() >= ZONE_POLY_MAX_ACTIVE)
+    {
+      break;
+    }
+    // FUN_0077eed0: inclusive box test first (the box already carries the fade), then the polygon
+    if (!(poly.min_x <= pos.x && poly.min_z <= pos.z && pos.x <= poly.max_x && pos.z <= poly.max_z))
+    {
+      continue;
+    }
+    float const sd = zone_polygon_signed_distance(poly.points, pos.x, pos.z);
+    if (sd - ZONE_POLY_FADE < 0.f)
+    {
+      out.emplace_back(poly.light_id, zone_polygon_weight(sd));
+    }
+  }
+}
+
+void Skies::apply_zone_polygon_weights(glm::vec3 const& pos)
+{
+  for (Sky& sky : skies)
+  {
+    sky.zone_weight = 0.f;
+    sky.zone_order = -1;
+  }
+  std::vector<std::pair<int, float>> zone;
+  zone_polygon_weights(pos, zone);
+  for (std::size_t i = 0; i < zone.size(); ++i)
+  {
+    for (Sky& sky : skies)
+    {
+      if (sky.Id == zone[i].first)
+      {
+        sky.zone_weight = zone[i].second;
+        sky.zone_order = static_cast<int>(i);
+        break;
+      }
+    }
+  }
+}
+
+std::vector<std::pair<Sky*, float>> Skies::weighted_lights()
+{
+  std::vector<std::pair<Sky*, float>> out;
+  std::vector<Sky*> zone;
+  for (Sky& sky : skies)
+  {
+    if (sky.zone_weight > 0.f)
+    {
+      zone.push_back(&sky);
+    }
+  }
+  std::sort(zone.begin(), zone.end(), [](Sky* a, Sky* b) { return a->zone_order < b->zone_order; });
+  for (Sky* s : zone)
+  {
+    out.emplace_back(s, s->zone_weight);
+  }
+  for (Sky& sky : skies)
+  {
+    if (sky.weight > 0.f)
+    {
+      out.emplace_back(&sky, sky.weight);
+    }
+  }
+  return out;
+}
+
 Sky* Skies::findSkyWeights(glm::vec3 pos)
 {
   Sky* default_sky = nullptr;
+  for (Sky& sky : skies)
+  {
+    sky.zone_weight = 0.f;
+    sky.zone_order = -1;
+  }
 
   for (auto& sky : skies)
   {
@@ -1146,6 +1483,9 @@ Sky* Skies::findSkyWeights(glm::vec3 pos)
     }
 
   }
+
+  // [client RE 2026-09-09] the hardcoded zone polygons (camera x/z; the eval height plays no part)
+  apply_zone_polygon_weights(pos);
 
   return default_sky;
 }
@@ -1268,43 +1608,42 @@ void Skies::update_sky_colors(glm::vec3 pos, int time)
 
   }
 
-  // interpolation
-  for (size_t j = 0; j<skies.size(); j++) 
+  // interpolation -- the client's blend order (FUN_007f1360): the zone-POLYGON lights first (table order),
+  // then every positional light farthest-first (`skies` is sorted that way by findSkyWeights). Each light is
+  // lerped over the running result by its weight, so the nearest one wins.
+  auto const blend_light = [&](Sky const& sky, float weight)
   {
-    Sky const& sky = skies[j];
-
-    if (sky.weight>0)
+    // now calculate the color rows
+    for (int i = 0; i<NUM_SkyColorNames; ++i)
     {
-      // now calculate the color rows
-      for (int i = 0; i<NUM_SkyColorNames; ++i) 
+      if ((sky.colorFor(i, time).x>1.0f) || (sky.colorFor(i, time).y>1.0f) || (sky.colorFor(i, time).z>1.0f))
       {
-        if ((sky.colorFor(i, time).x>1.0f) || (sky.colorFor(i, time).y>1.0f) || (sky.colorFor(i, time).z>1.0f))
-        {
-          LogDebug << "Sky " << j << " " << i << " is out of bounds!" << std::endl;
-          continue;
-        }
-        auto timed_color = sky.colorFor(i, time);
-        color_set[i] = glm::mix(color_set[i], timed_color, sky.weight);
+        LogDebug << "Sky " << sky.Id << " " << i << " is out of bounds!" << std::endl;
+        continue;
       }
-
-      _fog_distance = (_fog_distance * (1.0f - sky.weight)) + (sky.floatParamFor(0, time) * sky.weight);
-      _fog_multiplier = (_fog_multiplier * (1.0f - sky.weight)) + (sky.floatParamFor(1, time) * sky.weight);
-      _cloud_coverage = (_cloud_coverage * (1.0f - sky.weight)) + (sky.floatParamForAirVariant(CLOUD_DENSITY, time) * sky.weight);
-      _celestial_flow = (_celestial_flow * (1.0f - sky.weight)) + (sky.floatParamFor(CELESTIAL_FLOW, time) * sky.weight);
-      // sky.skyParams[sky.curr_sky_param]->river_shallow_alpha(); // new
-      // sky.skyParams[sky.curr_sky_param].river_shallow_alpha(); // old
-      auto sky_param = active_sky_param(sky);
-      if (sky_param)
-      {
-        _river_shallow_alpha = (_river_shallow_alpha * (1.0f - sky.weight)) + (sky_param->river_shallow_alpha() * sky.weight);
-        _river_deep_alpha = (_river_deep_alpha * (1.0f - sky.weight)) + (sky_param->river_deep_alpha() * sky.weight);
-        _ocean_shallow_alpha = (_ocean_shallow_alpha * (1.0f - sky.weight)) + (sky_param->ocean_shallow_alpha() * sky.weight);
-        _ocean_deep_alpha = (_ocean_deep_alpha * (1.0f - sky.weight)) + (sky_param->ocean_deep_alpha() * sky.weight);
-
-        _glow = (_glow * (1.0f - sky.weight)) + (sky_param->glow() * sky.weight);
-      }
+      auto timed_color = sky.colorFor(i, time);
+      color_set[i] = glm::mix(color_set[i], timed_color, weight);
     }
 
+    _fog_distance = (_fog_distance * (1.0f - weight)) + (sky.floatParamFor(0, time) * weight);
+    _fog_multiplier = (_fog_multiplier * (1.0f - weight)) + (sky.floatParamFor(1, time) * weight);
+    _cloud_coverage = (_cloud_coverage * (1.0f - weight)) + (sky.floatParamForAirVariant(CLOUD_DENSITY, time) * weight);
+    _celestial_flow = (_celestial_flow * (1.0f - weight)) + (sky.floatParamFor(CELESTIAL_FLOW, time) * weight);
+    auto sky_param = active_sky_param(sky);
+    if (sky_param)
+    {
+      _river_shallow_alpha = (_river_shallow_alpha * (1.0f - weight)) + (sky_param->river_shallow_alpha() * weight);
+      _river_deep_alpha = (_river_deep_alpha * (1.0f - weight)) + (sky_param->river_deep_alpha() * weight);
+      _ocean_shallow_alpha = (_ocean_shallow_alpha * (1.0f - weight)) + (sky_param->ocean_shallow_alpha() * weight);
+      _ocean_deep_alpha = (_ocean_deep_alpha * (1.0f - weight)) + (sky_param->ocean_deep_alpha() * weight);
+
+      _glow = (_glow * (1.0f - weight)) + (sky_param->glow() * weight);
+    }
+  };
+  std::vector<std::pair<Sky*, float>> const ordered_lights = weighted_lights();
+  for (auto const& entry : ordered_lights)
+  {
+    blend_light(*entry.first, entry.second);
   }
 
   // Exterior WMO water flat colour = the WATER param's RIVER_COLOR_DARK band, weighted like every
@@ -1322,35 +1661,18 @@ void Skies::update_sky_colors(glm::vec3 pos, int time)
         water_river_dark = default_sky->colorFromParam(p, RIVER_COLOR_DARK, time);
       }
     }
-    for (Sky const& sky : skies)
+    for (auto const& entry : ordered_lights)
     {
-      if (sky.weight > 0)
+      Sky const& sky = *entry.first;
+      SkyParam const* p = sky.skyParams[CLEAR_WATER] ? sky.skyParams[CLEAR_WATER]
+                                                     : active_sky_param(sky);
+      if (p)
       {
-        SkyParam const* p = sky.skyParams[CLEAR_WATER] ? sky.skyParams[CLEAR_WATER]
-                                                       : active_sky_param(sky);
-        if (p)
-        {
-          water_river_dark = glm::mix(water_river_dark,
-                                      sky.colorFromParam(p, RIVER_COLOR_DARK, time), sky.weight);
-        }
+        water_river_dark = glm::mix(water_river_dark,
+                                    sky.colorFromParam(p, RIVER_COLOR_DARK, time), entry.second);
       }
     }
     Skies::set_water_river_dark(water_river_dark);
-  }
-
-  // NORTHREND SKY DOME (map 571) = dark & gloomy, not the DBC default light's bright cyan. The 3.3.5a
-  // client covers the gradient dome with a dark textured skybox; where noggit has no skybox (falloff gaps
-  // at editor height) the raw bright-cyan sky bands show through as a "blue sunny sky". Desaturate + darken
-  // the 5 sky-gradient bands so the bare dome reads gloomy like the zone should. Northrend-only -- map 571
-  // does not exist pre-WotLK, so the 1.12 render is untouched. Values tunable.
-  if (_map_id == 571)
-  {
-    for (int i = SKY_COLOR_0; i <= SKY_COLOR_4; ++i)
-    {
-      glm::vec3 const c = color_set[i];
-      float const lum = 0.30f * c.r + 0.59f * c.g + 0.11f * c.b;
-      color_set[i] = glm::mix(c, glm::vec3(lum), 0.75f) * 0.55f; // 75% desaturate toward grey, darken to 55%
-    }
   }
 
   // The 1.12 client uses pure LINEAR vertex fog (D3DFOG_LINEAR), verified via apitrace on Elwynn. The
@@ -1366,7 +1688,7 @@ void Skies::update_sky_colors(glm::vec3 pos, int time)
     {
       int weighted = 0;
       float total_zone_weight = 0.f;
-      for (auto const& s : skies) if (s.weight > 0.f) { ++weighted; total_zone_weight += s.weight; }
+      for (auto const& s : skies) if (s.weight > 0.f || s.zone_weight > 0.f) { ++weighted; total_zone_weight += std::max(s.weight, s.zone_weight); }
       // LIGHTSEL: the resulting outdoor light colour + how much of it is the GLOBAL DEFAULT light.
       // total_zone_weight < 1 means the sequential blend leaves (1 - total) of the pos-(0,0,0) default
       // light in the mix -- and map 0's default (Light id 1, param 12) is a garish ORANGE sun by day
@@ -1385,8 +1707,8 @@ void Skies::update_sky_colors(glm::vec3 pos, int time)
                << " weightedSkies=" << weighted << std::endl;
       for (auto const& s : skies)
       {
-        if (s.weight <= 0.f) continue;
-        LogError << "  sky id=" << s.Id << " w=" << s.weight
+        if (s.weight <= 0.f && s.zone_weight <= 0.f) continue;
+        LogError << "  sky id=" << s.Id << " w=" << s.weight << " zoneW=" << s.zone_weight << " zoneOrder=" << s.zone_order
                  << " fogDist=" << s.floatParamFor(0, time)
                  << " pos=(" << s.pos.x << "," << s.pos.y << "," << s.pos.z << ")"
                  << " r1=" << s.r1 << " r2=" << s.r2 << std::endl;
@@ -1611,13 +1933,13 @@ void Skies::tick_clouds(float dt_sec)
   }
 }
 
-void Skies::draw_clouds(glm::mat4x4 const& mvp, glm::vec3 const& camera_pos, int animtime)
+void Skies::draw_clouds(glm::mat4x4 const& mvp, glm::vec3 const& camera_pos, int animtime, bool covered)
 {
   QSettings cs;
   bool const on = cs.value("render/draw_clouds", true).toBool();
   // suppressed while the camera is underwater: draw nothing, but the tick below still runs on
   // the AIR density -- the deck texture stays intact for the moment of surfacing.
-  float const opacity = (on && !_cloud_draw_suppressed)
+  float const opacity = (on && !_cloud_draw_suppressed && !covered)
                       ? cs.value("render/cloud_density", 0.9f).toFloat() : 0.0f;
 
   if (!_clouds.initialized)
@@ -1767,7 +2089,7 @@ bool Skies::draw(glm::mat4x4 const& model_view
                 )
 {
   // Reset what this frame drew before the branches below refill it.
-  _vk_skybox_instance = nullptr;
+  _vk_skybox_instances.clear();
   _vk_stars_instance = nullptr;
 
   if (numSkies == 0)
@@ -1812,6 +2134,111 @@ bool Skies::draw(glm::mat4x4 const& model_view
     upload();
   }
 
+  // ---- [client RE 2026-09-09, wow335a.exe] the frame's SKYBOX LIST, built BEFORE the dome because it
+  // decides whether the dome is drawn at all.
+  //  * Zone polygons (FUN_0077eed0 / FUN_007ed150 / FUN_007ee6b0): the client's hardcoded per-zone polygon
+  //    table (ZONE_LIGHT_POLYGON_DEFS) queues its light with weight (50 - signed distance) / 100, blended
+  //    FIRST -- Icecrown's whole zone gets Light 1703 (IceCrownSky) as a full-weight base this way.
+  //  * Light blend (FUN_007f1360 / FUN_007ee5d0): then every light inside its outer radius, popped farthest-
+  //    first, weight 1 inside r1 falling linearly to 0 at r2 -- what findSkyWeights/update_sky_colors do.
+  //  * Slots (FUN_007ed4c0): a weighted light's LightParams.lightSkyboxId goes into one of THREE slots;
+  //    the same LightSkybox id reached through several lights ADDS its weights (clamped to 1), otherwise
+  //    the first free slot; a fourth distinct skybox is dropped.
+  //  * List (FUN_007f3230): the slots are walked in order; a skybox above 0.99 weight whose LightSkybox
+  //    flags lack 0x2 RESTARTS the list (it covers what came before); flag-0x2 skyboxes (the Northrend
+  //    aurora models) are overlays that never restart it.
+  //  * Draw (FUN_007f09b0): the stars model, the sun/moon billboards, the vertex-coloured gradient dome
+  //    and the cloud dome are drawn ONLY when no listed skybox is a full-weight non-overlay; then every
+  //    listed skybox in order with alpha = its weight (FUN_007f08c0 writes it into the model), a flag-0x1
+  //    one at the time-of-day frame (FUN_007ecf20: dayMinutes / 1440 x anim length). Under a full skybox
+  //    the background is the cleared frame, and the clear colour is the fog colour (light+0x8c).
+  //  * Sun/moon brightness x (1 - the strongest listed weight) (FUN_007ef6e0): WorldRender reads
+  //    skyboxCover() / skyboxCovers().
+  // The earlier "Northrend = sky type 2" reading (grey fog, no celestials, a darkened dome) was
+  // ScreenEffect.dbc's GHOST effect (FUN_004f7020 case 2) and is gone. WotLK projects only; the 1.12
+  // path keeps the single highest-weight skybox over the dome.
+  bool const wotlk_sky = []{
+    auto const* p = Noggit::Project::CurrentProject::get();
+    return p && p->projectVersion != Noggit::Project::ProjectVersion::CLASSIC;
+  }();
+  _skybox_list.clear();
+  _skybox_cover = 0.f;
+  _skybox_covers = false;
+  if (wotlk_sky)
+  {
+    struct Slot { SkyParam* param = nullptr; float weight = 0.f; };
+    Slot slot_arr[3]; // (not "slots": a Qt keyword macro)
+    // zone-polygon lights first (table order), then the positional ones farthest-first = the client's
+    // FUN_007f1360 blend order, which is the slot order
+    for (auto const& entry : weighted_lights())
+    {
+      SkyParam* p = drawable_skybox_param(*entry.first);
+      if (!p)
+      {
+        continue;
+      }
+      for (Slot& s : slot_arr)
+      {
+        if (s.param && s.param->skybox_id == p->skybox_id)
+        {
+          s.weight = std::min(1.f, s.weight + entry.second);
+          break;
+        }
+        if (!s.param)
+        {
+          s.param = p;
+          s.weight = entry.second;
+          break;
+        }
+      }
+    }
+    for (Slot const& s : slot_arr)
+    {
+      if (!s.param || s.weight <= 0.f)
+      {
+        continue;
+      }
+      bool const overlay = (s.param->skybox_flags & 0x2) != 0;
+      if (s.weight > 0.99f && !overlay)
+      {
+        _skybox_list.clear();
+      }
+      _skybox_list.push_back({&s.param->skybox.value(), s.param, s.weight, overlay});
+    }
+    for (SkyboxEntry const& e : _skybox_list)
+    {
+      _skybox_cover = std::max(_skybox_cover, e.weight);
+      _skybox_covers = _skybox_covers || (e.weight > 0.99f && !e.overlay);
+    }
+  }
+  else
+  {
+    Sky* top_sky = nullptr;
+    SkyParam* top_param = nullptr;
+    for (Sky& sky : skies)
+    {
+      SkyParam* sky_param = drawable_skybox_param(sky);
+      if (sky.weight > 0.f && sky_param && sky_param->skybox && (sky_param->skybox_flags & 0x2) == 0
+          && (!top_sky || sky.weight > top_sky->weight))
+      {
+        top_sky = &sky;
+        top_param = sky_param;
+      }
+    }
+    if (top_sky)
+    {
+      _skybox_list.push_back({&top_param->skybox.value(), top_param, top_sky->weight, false});
+    }
+  }
+
+  // a full skybox replaces the dome: paint it flat in the fog colour = the client's cleared frame
+  std::optional<glm::vec3> const flat = _skybox_covers ? std::optional<glm::vec3>(color_set[FOG_COLOR])
+                                                       : std::nullopt;
+  if (flat != _flat_dome_color)
+  {
+    _flat_dome_color = flat;
+    _need_color_buffer_update = true;
+  }
   if (_need_color_buffer_update)
   {
     update_color_buffer();
@@ -1840,83 +2267,59 @@ bool Skies::draw(glm::mat4x4 const& model_view
     }
   }
 
-  draw_clouds(projection * model_view, camera_pos, animtime);
+  // the cloud deck is not drawn under a full skybox (FUN_007efd00 / FUN_007f09b0); it keeps ticking
+  draw_clouds(projection * model_view, camera_pos, animtime, _skybox_covers);
 
-  bool has_skybox = false;
-  // Draw ONLY the highest-weight skybox. The loop below used to draw every weight>0 skybox opaquely in
-  // `skies` order (far->near after findSkyWeights' sort), so the LAST-drawn (nearest) light's skybox won
-  // -- a hard switch to whatever light is merely nearest, not the one that dominates the zone-light blend.
-  // In a big wotlk zone with many overlapping lights (Icecrown) that made the sky snap to the WRONG skybox
-  // at every boundary crossing. The client's dominant sky is the greatest-WEIGHT light, so pick that one.
-  // Aurora skyboxes (LightSkybox flag 0x2 = AuroraYellowGreen/AuroraOrange/DragonblightScarlet/DK-fire) are
-  // ADDITIVE OVERLAYS meant to be layered OVER a base sky, never a standalone skybox. The 3.3.5a client never
-  // selects one as THE skybox -> exclude them so noggit stops snapping to a raw aurora sky (see
-  // docs/client_re/30). RE: doc 29/30 + memory noggit-335a-skybox-selection-weighted-only.
-  auto const is_aurora_overlay = [](SkyParam const* p) { return p && (p->skybox_flags & 0x2) != 0; };
-  Sky* top_sky = nullptr;
-  SkyParam* top_param = nullptr;
-  for (Sky& sky : skies)
+  for (SkyboxEntry const& e : _skybox_list)
   {
-    SkyParam* sky_param = drawable_skybox_param(sky);
-    if (sky.weight > 0.f && sky_param && sky_param->skybox && !is_aurora_overlay(sky_param)
-        && (!top_sky || sky.weight > top_sky->weight))
-    {
-      top_sky = &sky;
-      top_param = sky_param;
-    }
-  }
-  if (top_sky && top_param && top_param->skybox)
-  {
-    Sky& sky = *top_sky;
-    SkyParam* sky_param = top_param;
-    {
-      has_skybox = true;
+    ModelInstance& model = *e.model;
+    SkyParam* sky_param = e.param;
+    model.model->trans = e.weight;
+    model.pos = camera_pos;
+    model.scale = 0.1f;
+    model.recalcExtents();
 
-      auto& model = sky_param->skybox.value();
-      model.model->trans = sky.weight;
-      model.pos = camera_pos;
-      model.scale = 0.1f;
-      model.recalcExtents();
-
-      // FULL-DAY SKYBOX (LightSkybox flag 0x1): the M2's single animation spans the whole day, so
-      // its frame is driven by TIME OF DAY rather than a free-running clock -- this is what makes the
-      // Storm Peaks / Icecrown / Zul'Drak skies visibly morph as you scrub time. Map the day fraction
-      // (0 = midnight) onto anim 0's length; Model::animate mods time by that length, so a value in
-      // [0, length) lands on the matching frame. Other skyboxes keep the free-running animtime.
-      int skybox_animtime = animtime;
-      if (sky_param->skybox_flags & 0x1)
+    // FULL-DAY SKYBOX (LightSkybox flag 0x1): the M2's single animation spans the whole day, so its
+    // frame is driven by TIME OF DAY rather than a free-running clock (FUN_007ecf20 sets animation 0
+    // at dayMinutes / 1440 x length). Map the day fraction (0 = midnight) onto anim 0's length;
+    // Model::animate mods time by that length, so a value in [0, length) lands on the matching frame.
+    // Other skyboxes keep the free-running animtime.
+    int skybox_animtime = animtime;
+    if (sky_param->skybox_flags & 0x1)
+    {
+      uint32_t const len = model.model->animationLength(0);
+      if (len > 0)
       {
-        uint32_t const len = model.model->animationLength(0);
-        if (len > 0)
-        {
-          float const day_frac = glm::fract(static_cast<float>(_last_time) / 2880.0f);
-          skybox_animtime = static_cast<int>(day_frac * static_cast<float>(len)) % static_cast<int>(len);
-        }
+        float const day_frac = glm::fract(static_cast<float>(_last_time) / 2880.0f);
+        skybox_animtime = static_cast<int>(day_frac * static_cast<float>(len)) % static_cast<int>(len);
       }
-
-      OpenGL::M2RenderState model_render_state;
-      model_render_state.tex_arrays = {0, 0};
-      model_render_state.tex_indices = {0, 0};
-      model_render_state.tex_unit_lookups = {-1, -1};
-      gl.blendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-      gl.disable(GL_BLEND);
-      gl.depthMask(GL_TRUE);
-      m2_shader.uniform("blend_mode", 0);
-      m2_shader.uniform("unfogged", static_cast<int>(model_render_state.unfogged));
-      m2_shader.uniform("unlit",  static_cast<int>(model_render_state.unlit));
-      m2_shader.uniform("tex_unit_lookup_1", 0);
-      m2_shader.uniform("tex_unit_lookup_2", 0);
-      m2_shader.uniform("masked_additive", 0);
-      m2_shader.uniform("pixel_shader", 0);
-
-      _vk_skybox_instance = &model;   // [VULKAN] fed to the VK M2 feed by WorldRender
-      model.model->renderer()->draw(model_view, model, m2_shader, model_render_state, frustum, 1000000, camera_pos, skybox_animtime, display_mode::in_3D);
     }
+
+    OpenGL::M2RenderState model_render_state;
+    model_render_state.tex_arrays = {0, 0};
+    model_render_state.tex_indices = {0, 0};
+    model_render_state.tex_unit_lookups = {-1, -1};
+    gl.blendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    gl.disable(GL_BLEND);
+    gl.depthMask(GL_TRUE);
+    m2_shader.uniform("blend_mode", 0);
+    m2_shader.uniform("unfogged", static_cast<int>(model_render_state.unfogged));
+    m2_shader.uniform("unlit",  static_cast<int>(model_render_state.unlit));
+    m2_shader.uniform("tex_unit_lookup_1", 0);
+    m2_shader.uniform("tex_unit_lookup_2", 0);
+    m2_shader.uniform("masked_additive", 0);
+    m2_shader.uniform("pixel_shader", 0);
+
+    _vk_skybox_instances.push_back(&model);   // [VULKAN] fed to the VK M2 feed by WorldRender
+    model.model->renderer()->draw(model_view, model, m2_shader, model_render_state, frustum, 1000000, camera_pos, skybox_animtime, display_mode::in_3D);
   }
-  // if it's night, draw the stars. CANON (confirmed via wow_westfall_night.trace: the client draws a
-  // full star group -- textured star sprites + an ~863-vert star sphere -- before the gradient dome).
+
+  // Stars at night. CANON (wow_westfall_night.trace: the client draws a full star group -- textured
+  // star sprites + an ~863-vert star sphere -- before the gradient dome). 3.3.5a never draws them under a
+  // full-weight non-overlay skybox (FUN_007f09b0); the 1.12 path keeps its "any skybox drew" rule.
   // Kept behind render/draw_stars (default ON) as a toggle.
-  if (light_stats.nightIntensity > 0 && !has_skybox
+  bool const stars_blocked = wotlk_sky ? _skybox_covers : !_skybox_list.empty();
+  if (light_stats.nightIntensity > 0 && !stars_blocked
       && QSettings().value("render/draw_stars", true).toBool())
   {
     stars.model->trans = light_stats.nightIntensity;
@@ -2184,6 +2587,12 @@ void Skies::update_color_buffer()
 
   auto ring_col_color = [&](int v, int col) -> glm::vec3
   {
+    if (_flat_dome_color)
+    {
+      // a full-weight skybox replaces the dome: what shows through its transparent layers is the
+      // client's cleared frame, and the clear colour is the fog colour (light+0x8c).
+      return *_flat_dome_color;
+    }
     int const band = skycolors[v];
     if (w <= 0.f || band == SKY_COLOR_0 || band == FOG_COLOR)
     {

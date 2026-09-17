@@ -111,7 +111,8 @@ void BuildMapListComponent::buildMapList(Noggit::Ui::Windows::NoggitWindow* pare
     auto pinned_maps = std::vector<Widget::MapListData>();
     auto maps = std::vector<Widget::MapListData>();
 
-    if (parent->_project->projectVersion == Noggit::Project::ProjectVersion::CLASSIC)
+    if (parent->_project->projectVersion == Noggit::Project::ProjectVersion::CLASSIC
+        || Noggit::Project::usesSynthesizedDbc(parent->_project->projectVersion))
     {
       for (DBCFile::Iterator iterator = gMapDB.begin(); iterator != gMapDB.end(); ++iterator)
       {
@@ -131,7 +132,7 @@ void BuildMapListComponent::buildMapList(Noggit::Ui::Windows::NoggitWindow* pare
 
           map_list_data.map_name = QString::fromUtf8(display_name.c_str());
           map_list_data.map_type_id = record.getInt(MapDB::AreaType);
-          map_list_data.expansion_id = 0;
+          map_list_data.expansion_id = gMapDB.getFieldCount() > MapDB::ExpansionID ? record.getInt(MapDB::ExpansionID) : 0;
 
           auto editable_world = World::IsEditableWorld(record);
           if (isTrackedTurtleMap(display_name) || isTrackedTurtleMap(directory))
@@ -294,9 +295,10 @@ void BuildMapListComponent::buildMapList(Noggit::Ui::Windows::NoggitWindow* pare
     }
     LogDebug << "BuildMapListComponent::buildMapList after create widgets" << std::endl;
 
-    if (parent->_project->projectVersion != Noggit::Project::ProjectVersion::CLASSIC)
+    if (parent->_project->projectVersion != Noggit::Project::ProjectVersion::CLASSIC
+        && !Noggit::Project::usesSynthesizedDbc(parent->_project->projectVersion))
     {
-      parent->_project->ClientDatabase->UnloadTable("Map");
+      parent->_project->ClientDatabase->UnloadTable("Map"); // only loaded on the DatabaseLib route above
     }
 
     LogDebug << "BuildMapListComponent::buildMapList end" << std::endl;

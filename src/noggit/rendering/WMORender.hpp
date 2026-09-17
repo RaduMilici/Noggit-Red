@@ -59,6 +59,7 @@ namespace Noggit::Rendering
         // Written with this draw's per-group portal visibility (empty = all visible / culling off),
         // so the caller can filter per-group WMO DOODADS the same way (hidden rooms hide their props).
         , std::vector<uint8_t>* out_group_visibility = nullptr
+        , uint16_t doodad_set = 0 // the instance's MODF doodad set: gates the MNLD lights (sec 15)
     );
 
     bool drawSkybox(glm::mat4x4 const& model_view

@@ -1,6 +1,7 @@
 // This file is part of Noggit3, licensed under GNU General Public License (version 3).
 
 #include <noggit/ChunkWater.hpp>
+#include <noggit/db2/ModernDBC.hpp>
 #include <noggit/TileWater.hpp>
 #include <noggit/liquid_layer.hpp>
 #include <noggit/MapChunk.h>
@@ -109,6 +110,24 @@ void ChunkWater::fromFile(BlizzardArchive::ClientFile &f, size_t basePos)
     //info
     f.seek(basePos + header.ofsInformation + sizeof(MH2O_Information)* k);
     f.read(&info, sizeof(MH2O_Information));
+
+    // Modern (CASC) ADTs: the second u16 is "liquid_object_or_lvf" -- values < 42 are the vertex format
+    // itself, values >= 42 are LiquidObject.db2 ids and the format comes from LiquidObject.LiquidTypeID ->
+    // LiquidType.MaterialID -> LiquidMaterial.LVF (azeroth_32_48: 5960 -> LiquidType 5 -> material 1 ->
+    // LVF 0, height + depth, 5 bytes per vertex in the file), with ocean (LiquidType 2, referenced as the
+    // absent LiquidObject 42) depth-only = LVF 2. Reading the harbour's 1-byte-per-vertex ocean layers as
+    // LVF 0 produced NaN / 1e38 heights and a fog-coloured wall across the screen (2026-09-16, GL trace
+    // call 2953950: the water batch of azeroth_29_48 had 43 such instances). WotLK data never exceeds 3.
+    if (info.liquid_vertex_format >= 42)
+    {
+      info.liquid_vertex_format = static_cast<std::uint16_t>(Noggit::DB2::liquidObjectVertexFormat(info.liquid_vertex_format, info.liquid_id));
+      // no vertex data at all = flat layer at min/max height, depth-only (WoWViewerCpp: `!offset_vertex_data
+      // && liquid_type != 2 -> 2`; liquid_layer reads nothing when ofsHeightMap is 0 either way)
+      if (!info.ofsHeightMap && info.liquid_vertex_format != 2)
+      {
+        info.liquid_vertex_format = 2;
+      }
+    }
 
     //mask
     if (info.ofsInfoMask > 0 && info.height > 0)

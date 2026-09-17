@@ -1,0 +1,42 @@
+diff --git a/src/DatabaseDefinition.cpp b/src/DatabaseDefinition.cpp
+index 9b94629..a654a21 100644
+--- a/src/DatabaseDefinition.cpp
++++ b/src/DatabaseDefinition.cpp
+@@ -48,9 +48,13 @@ namespace BlizzardDatabaseLib
+                 return Structures::DBDefinition();
+             }
+ 
+-            auto indexOfCommentsStart = line.find_first_of("//");
+-            auto indexOfForeignKeyStart = line.find_first_of("<");
+-            auto indexOfForeignKeyEnd = line.find_first_of(">");
++            // A comment may contain '<' / '>' (Map.dbd: "// default/if <= 0: 999"), which used to be taken
++            // for a foreign key start: the type substring then spanned the whole line, failed the type
++            // check and the entire definition came back EMPTY. Parse the declaration part only.
++            auto indexOfCommentsStart = line.find("//");
++            auto const declaration = indexOfCommentsStart == std::string::npos ? line : line.substr(0, indexOfCommentsStart);
++            auto indexOfForeignKeyStart = declaration.find_first_of("<");
++            auto indexOfForeignKeyEnd = declaration.find_first_of(">");
+             auto indexOfNameStart = line.find_first_of(" ");
+             auto indexOfNameEnd = line.find(" ", indexOfNameStart + 1);
+             auto indexofTypeEnd = indexOfForeignKeyStart == std::string::npos ? indexOfNameStart : indexOfForeignKeyStart;
+@@ -153,7 +157,10 @@ namespace BlizzardDatabaseLib
+ 
+             if (containsLayoutToken)
+             {
+-                auto layoutTokenSize = LAYOUT_TOKEN.size() - 1;
++                // "LAYOUT " is the whole token: size() - 1 left "T <hash>" in every entry, so a lookup by
++                // layout hash could never match and only the BUILD fallback ever resolved a definition
++                // (2026-09-16: a 1.60.1.69893 client whose build no table lists loaded nothing).
++                auto layoutTokenSize = LAYOUT_TOKEN.size();
+                 auto layoutHashesLine = line.substr(layoutTokenSize);
+                 layoutHashes = Extension::String::Split(layoutHashesLine, ",");
+             }
+@@ -185,7 +192,7 @@ namespace BlizzardDatabaseLib
+ 
+             if (containsCommentToken)
+             {
+-                auto commentTokenSize = COMMENT_TOKEN.size() - 1;
++                auto commentTokenSize = COMMENT_TOKEN.size();
+                 comment = line.substr(commentTokenSize);
+             }
+ 

@@ -57,6 +57,7 @@ public:
   // ("Invalid time of day override in Map ID %d. TOD = %d." when out of range). Stock uses it on
   // OrgrimmarArena (720); Ascension also on Uldum(1080)/Azzarfaire(1260)/nerubianarena(240)/etc.
   static const size_t TimeOfDayOverride = 62; // int, minutes, -1 = none
+  static const size_t ExpansionID = 63;       // uint (0 classic, 1 BC, 2 WotLK, ...)
   static std::string getMapName(int pMapID);
   static int findMapName(const std::string& map_name);
 };
@@ -122,6 +123,9 @@ public:
   static const size_t ID = 0;        // uint
   static const size_t filename = 1;    // string
   static const size_t flags = 2;      // uint
+  // Modern (CASC) clients only: the skybox model's fileDataID, appended by the DB2 -> DBC adapter
+  // (LightSkybox.db2 SkyboxFileDataID). Absent on WotLK data (field count 3) -- check getFieldCount().
+  static const size_t skyboxFileDataID = 3;
 };
 
 class LightIntBandDB : public DBCFile
@@ -465,6 +469,9 @@ public:
     // Reading the wrong column in WotLK returns a numeric 0 -> empty baked texture. Resolved per the
     // loaded project's client version (Turtle byte-identical). Defined in DBC.cpp.
     static size_t BakedTexture();
+    // Modern DB2 adapter only (column 21 of 22): the HD bake resolved from HDBakeMaterialResourcesID.
+    // Guard every read on getFieldCount() -- extracted DBCs stop at 21 columns. docs/client_re/42 sec 23.
+    static const size_t HDBakedTexture = 21;
   };
 
   class CreatureModelDataDB : public DBCFile
@@ -479,6 +486,9 @@ public:
     static const size_t ModelName = 2;
     static const size_t SizeClass = 3;
     static const size_t ModelScale = 4;
+    // Modern DB2 adapter only (column 28 of 29): the plain <-> HD sibling row of a character model, 0 when
+    // there is none. Guard on getFieldCount(). docs/client_re/42 sec 23.
+    static const size_t FidelitySibling = 28;
     // Turtle/1.12 16-field layout, last float column (f15). Verified from the extracted DBC:
     // HumanMale(49) 2.031, HumanFemale(50) 1.913, DwarfMale(53) 1.667, DwarfFemale(54) 1.528.
     static const size_t CollisionHeight = 15;

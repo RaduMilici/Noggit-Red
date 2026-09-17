@@ -150,6 +150,7 @@ wmo_liquid::wmo_liquid(BlizzardArchive::ClientFile* f,
                        bool interior_material_color,
                        glm::vec3 const& material_color,
                        bool indoor_channel,
+                       bool dbc_exterior,
                        std::vector<glm::vec3> const* group_vertices)
   : pos(glm::vec3(header.pos.x, header.pos.z, -header.pos.y))
   , xtiles(header.A)
@@ -158,6 +159,7 @@ wmo_liquid::wmo_liquid(BlizzardArchive::ClientFile* f,
   , _use_material_color(interior_material_color)
   , _material_color(material_color)
   , _indoor_channel(indoor_channel)
+  , _dbc_exterior(dbc_exterior)
 {
   // FLOATLIQ GEOMETRIC CLIP (2026-08-25) -- the exact rules of the PROVEN 3.3.5a data fix
   // (twmoa_toolkit/wmo/wmo_liquid_geometric_clip.py): Turtle authored flat liquid sheets covering a
@@ -728,7 +730,9 @@ void wmo_liquid::draw ( glm::mat4x4 const& transform
   water_shader.uniform ("wmo_water_river_dark", Skies::water_river_dark());
   // City channel (indoor+exterior_lit: canals/harbor/Booty Bay) vs open-air WMO pool (abbeygate
   // stream) -- picks the ocean-dark opaque look vs the river-blend look in the shader.
-  water_shader.uniform ("wmo_indoor_channel", _indoor_channel ? 1 : 0);
+  // 0 = open-air pool (legacy exterior), 1 = city channel (indoor+exterior-lit), 2 = DBC-path
+  // exterior water -> the client's flat river-deep colour (see wmo_liquid.hpp)
+  water_shader.uniform ("wmo_water_mode", waterMode());
   water_shader.uniform ("debug_liquid_color", wmo_liquid_debug_color_enabled()
                                                   ? debug_color_from_path(_debug_wmo_path)
                                                   : glm::vec4(0.0f));

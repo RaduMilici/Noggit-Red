@@ -100,6 +100,83 @@ namespace Noggit
       );
 
 
+      // Modern (CASC) clients: the community listfile (id;path csv) that names files noggit opens by
+      // path (DB2 tables, the map WDT) and labels ids in the UI. A project-local listfile.csv still wins.
+      {
+        auto* row = new QHBoxLayout();
+        auto* label = new QLabel("CASC listfile (modern clients)", this);
+        label->setMinimumWidth(ui->label_28->minimumWidth());
+        _casc_listfile_field = new QLineEdit(this);
+        _casc_listfile_field->setToolTip("Community listfile csv (id;path) used for CASC-backed projects when the project folder has no listfile.csv");
+        auto* browse = new QPushButton("Browse", this);
+        row->addWidget(label);
+        row->addWidget(_casc_listfile_field);
+        row->addWidget(browse);
+        ui->verticalLayout_21->addLayout(row);
+
+        connect(_casc_listfile_field, &QLineEdit::textChanged, [&](QString value)
+                {
+                  _settings->setValue("casc/listfile_path", value);
+                }
+        );
+        connect(browse, &QPushButton::clicked, [=]
+                {
+                  auto result(QFileDialog::getOpenFileName(nullptr, "CASC listfile", _casc_listfile_field->text(), "Listfile (*.csv *.txt);;All files (*)"));
+                  if (!result.isNull())
+                  {
+                    _casc_listfile_field->setText(result);
+                  }
+                }
+        );
+      }
+
+      // Modern (CASC) clients: texture fidelity. The Classic Forever 1.60.1 beta root lists 95,774 textures
+      // twice -- content flag 0x1 marks the 4x-resolution variant (512x1024 vs 128x256 for the same file
+      // id). The creature/character M2 duplicates are the 0x80 low-violence set and WMOs have no variants,
+      // so this is the whole HD/SD switch the client data offers. Read by ApplicationProject when the
+      // client storage opens (the root manifest is resolved once), so it applies on project open.
+      {
+        auto* hd_cb = new QCheckBox("Prefer HD texture variants (modern clients; applies when a project is opened)", this);
+        hd_cb->setObjectName("_casc_prefer_hd_checkbox");
+        hd_cb->setToolTip("When the client's root manifest lists a texture in both a high-resolution (content flag 0x1) and a "
+                          "low-resolution record, use the high-resolution one. Only records present in the local store are used "
+                          "either way. Untick for the low-resolution set. Reopen the project to apply.");
+        hd_cb->setChecked(_settings->value("casc/prefer_hd_textures", true).toBool());
+        ui->verticalLayout_21->addWidget(hd_cb);
+        connect(hd_cb, &QCheckBox::toggled, [this](bool checked)
+                {
+                  _settings->setValue("casc/prefer_hd_textures", checked);
+                  _settings->sync();
+                });
+      }
+
+      // Modern (CASC) clients: character model fidelity, LIVE. The Forever Beta pairs 18 plain/HD character
+      // files (humanmale.m2 / humanmale_hd.m2) through CreatureModelData rows and gives 8,568 display
+      // extras both a classic and an HD bake; the client's "character models" option swaps both at
+      // runtime. World.cpp resolves spawns through this value and MapView re-resolves them when it
+      // changes (docs/client_re/42 sec 23).
+      {
+        auto* row = new QHBoxLayout();
+        auto* label = new QLabel("Character models (modern clients)", this);
+        label->setMinimumWidth(ui->label_28->minimumWidth());
+        auto* fidelity = new QComboBox(this);
+        fidelity->setObjectName("_character_model_fidelity_combo");
+        fidelity->addItem("As authored by each display", 0);
+        fidelity->addItem("Classic (SD) models", 1);
+        fidelity->addItem("HD models", 2);
+        fidelity->setToolTip("Which variant of a paired character model NPCs use: the row the display authors, the plain file "
+                             "with its classic bake, or the _hd file with its HD bake. Applies live to loaded spawns.");
+        fidelity->setCurrentIndex(std::max(0, fidelity->findData(_settings->value("render/character_model_fidelity", 0).toInt())));
+        row->addWidget(label);
+        row->addWidget(fidelity);
+        ui->verticalLayout_21->addLayout(row);
+        connect(fidelity, qOverload<int>(&QComboBox::currentIndexChanged), [this, fidelity](int index)
+                {
+                  _settings->setValue("render/character_model_fidelity", fidelity->itemData(index).toInt());
+                  _settings->sync();
+                });
+      }
+
 #ifdef USE_MYSQL_UID_STORAGE
       ui->MySQL_box->setEnabled(true);
       ui->MySQL_box->setCheckable(true);
@@ -496,9 +573,9 @@ namespace Noggit
                 });
       }
 
-      // Distant horizon backdrop toggle (live): ON = draw the low-res far terrain silhouette beyond
-      // the detailed terrain (only appears with fog); OFF = no backdrop, so enabling fog never renders
-      // distant mesh past the view distance. Read live by WorldRender each frame.
+      // Distant horizon backdrop toggle (live): ON = draw the client's low-res WDL terrain (CMapLowDetail)
+      // in the fog colour beyond the detailed terrain, fog on or off; OFF = no backdrop. Read live by
+      // WorldRender each frame.
       {
         auto* horizon_cb = new QCheckBox(tr("Render distant horizon backdrop"), this);
         horizon_cb->setObjectName("_render_horizon_checkbox");
@@ -507,6 +584,28 @@ namespace Noggit
         connect(horizon_cb, &QCheckBox::toggled, [this](bool checked)
                 {
                   _settings->setValue("render_horizon", checked);
+                  _settings->sync();
+                });
+      }
+
+      // [2026-09-09] Horizon far clip scale (live) = the client's `horizonFarclipScale` CVar: the low-res
+      // backdrop reaches view distance x this (stock default 4.0, the client caps it at 6.0). Also sets
+      // how far the backdrop's tile selection looks. Match your Config.wtf value to see the same horizon.
+      {
+        auto* hz_label = new QLabel(this);
+        auto* hz_slider = new QSlider(Qt::Horizontal, this);
+        hz_slider->setObjectName("_horizon_farclip_scale_slider");
+        hz_slider->setMinimum(100);
+        hz_slider->setMaximum(600);
+        int const init_hz = static_cast<int>(_settings->value("horizon_farclip_scale", 4.0f).toFloat() * 100.f);
+        hz_slider->setValue(std::clamp(init_hz, 100, 600));
+        hz_label->setText(tr("Horizon far clip scale (client horizonFarclipScale): %1x").arg(hz_slider->value() / 100.0, 0, 'f', 2));
+        _perf_layout->addWidget(hz_label);
+        _perf_layout->addWidget(hz_slider);
+        connect(hz_slider, &QSlider::valueChanged, [this, hz_label](int v)
+                {
+                  hz_label->setText(tr("Horizon far clip scale (client horizonFarclipScale): %1x").arg(v / 100.0, 0, 'f', 2));
+                  _settings->setValue("horizon_farclip_scale", v / 100.0f);
                   _settings->sync();
                 });
       }
@@ -730,6 +829,7 @@ namespace Noggit
 
       ui->importPathField->setText(_settings->value("project/import_file", "import.txt").toString());
       ui->wmvLogPathField->setText(_settings->value("project/wmv_log_file").toString());
+      _casc_listfile_field->setText(_settings->value("casc/listfile_path").toString());
       ui->viewDistanceField->setValue(_settings->value("view_distance", 900.f).toFloat());
       ui->farZField->setValue(_settings->value("farZ", 900.f).toFloat());
       ui->_undock_tool_properties->setChecked(

@@ -664,7 +664,17 @@ int main(int argc, char *argv[])
     bool const ok = window->runVkParity(parser->value("vk-parity-map-id").toInt(),
                                         parser->value("vk-parity-cams"),
                                         parser->isSet("vk-parity-out") ? parser->value("vk-parity-out") : QString("vk_diff"),
-                                        1600, 900);
+                                        // [2026-09-05] NOGGIT_PARITY_SIZE=WxH: the harness was pinned at
+                                        // 1600x900 while the user runs 2288x1329, so window size was the
+                                        // one environmental delta never tested against their session.
+                                        []{ char const* v = std::getenv("NOGGIT_PARITY_SIZE");
+                                            int w = 1600, h = 900;
+                                            if (v && std::sscanf(v, "%dx%d", &w, &h) == 2 && w > 0 && h > 0) return w;
+                                            return 1600; }(),
+                                        []{ char const* v = std::getenv("NOGGIT_PARITY_SIZE");
+                                            int w = 1600, h = 900;
+                                            if (v && std::sscanf(v, "%dx%d", &w, &h) == 2 && w > 0 && h > 0) return h;
+                                            return 900; }());
     std::fflush(nullptr);
     std::_Exit(ok ? 0 : 3);
   }

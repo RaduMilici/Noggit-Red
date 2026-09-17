@@ -4,6 +4,7 @@
 #include <noggit/Log.h>
 #include <noggit/application/NoggitApplication.hpp>
 #include <noggit/project/CurrentProject.hpp>
+#include <noggit/db2/ModernDBC.hpp>
 #include <ClientFile.hpp>
 
 #include <string>
@@ -32,6 +33,24 @@ DBCFile::DBCFile(const std::string& _filename)
 void DBCFile::open(std::shared_ptr<BlizzardArchive::ClientData> clientData)
 {
   invalidate_id_index();
+
+  // Modern CASC clients ship WDC5 .db2 tables: re-emit them in this DBC's WotLK column layout so the
+  // fixed-index readers (gLightDB.getByID(..).getFloat(LightDB::PositionX) & co) keep working.
+  auto const* project = Noggit::Project::CurrentProject::get();
+  if (clientData && clientData->isCASC() && project && Noggit::Project::usesSynthesizedDbc(project->projectVersion))
+  {
+    if (Noggit::DB2::fillDBC(*this, filename))
+    {
+      LogDebug << "Opened DBC \"" << filename << "\" from the client's DB2 (" << recordCount << " records, "
+               << fieldCount << " fields)" << std::endl;
+    }
+    else
+    {
+      LogError << "The DBC file \"" << filename << "\" has no DB2 adapter; the table stays empty." << std::endl;
+    }
+    return;
+  }
+
   BlizzardArchive::ClientFile f (filename, clientData.get());
 
   if (f.isEof())
@@ -72,6 +91,22 @@ void DBCFile::open(std::shared_ptr<BlizzardArchive::ClientData> clientData)
   f.read (stringTable.data(), stringTable.size());
 
   f.close();
+}
+
+void DBCFile::loadSynthesized(std::uint32_t field_count, std::vector<unsigned char> records, std::vector<char> string_table)
+{
+  invalidate_id_index();
+  fieldCount = field_count;
+  recordSize = field_count * 4;
+  recordCount = recordSize ? static_cast<std::uint32_t>(records.size() / recordSize) : 0;
+  data = std::move(records);
+  data.resize(static_cast<std::size_t>(recordCount) * recordSize);
+  stringTable = std::move(string_table);
+  if (stringTable.empty())
+  {
+    stringTable.push_back('\0');
+  }
+  stringSize = static_cast<std::uint32_t>(stringTable.size());
 }
 
 void DBCFile::save()

@@ -29,6 +29,9 @@ namespace Noggit::Ui::Widget
       icon = QIcon(":/icon-battle");
     if (_map_data.expansion_id == 8)
       icon = QIcon(":/icon-shadow");
+    // Map.db2 of the modern clients numbers expansions past Shadowlands; keep an icon rather than a blank
+    if (icon.isNull())
+      icon = QIcon(_map_data.expansion_id > 8 ? ":/icon-shadow" : ":/icon-classic");
 
     _map_icon = new QLabel("", parent);
     _map_icon->setPixmap(icon.pixmap(QSize(32, 32)));

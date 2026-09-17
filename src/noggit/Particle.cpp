@@ -342,6 +342,25 @@ namespace
 
 }
 
+namespace
+{
+  // Head / Tail selector per era (docs/client_re/42 sec 4). v264 (WotLK): the bytes at emitter offset
+  // 0x2c / 0x2d are particleType / headOrTail (0 head, 1 tail, 2 both). Cata+ / MD21 (v274): those two
+  // bytes became multiTexScale[2] (fixed_point<int8, 2, 5>) and the style moved into the flags --
+  // 0x20000 HeadStyle, 0x40000 TailStyle (wowdev M2#Particle_flags, "Cata+"). Classic Era 1.15.9
+  // Northshire: 16 emitters carry 0x20000, none 0x40000.
+  int particle_style(Model const* model, ModelParticleEmitterDef const& mta)
+  {
+    if (model && model->renderEra() == Model::M2RenderEra::Modern)
+    {
+      bool const head = (mta.flags & 0x20000) != 0;
+      bool const tail = (mta.flags & 0x40000) != 0;
+      return tail ? (head ? 2 : 1) : 0;
+    }
+    return mta.ParticleType;
+  }
+}
+
 template<class T>
 T lifeRamp(float life, float mid, const T &a, const T &b, const T &c)
 {
@@ -396,8 +415,8 @@ ParticleSystem::ParticleSystem(Model* model_
   , pos (fixCoordSystem(mta.pos))
   , _texture_id (mta.texture)
   , blend (mta.blend)
-  , order (mta.ParticleType > 0 ? -1 : 0)
-  , type (mta.ParticleType)
+  , order (particle_style(model_, mta) > 0 ? -1 : 0)
+  , type (particle_style(model_, mta))
   , manim (0)
   , mtime (0)
   , manimtime(0)
@@ -946,7 +965,8 @@ void ParticleSystem::update(float dt)
   float debug_life = 0.0f;
 
   float grav = sane_particle_value(gravity.getValue(manim, mtime, manimtime), 0.0f);
-  float deaccel = sane_particle_value(deacceleration.getValue(manim, mtime, manimtime), 0.0f);
+  float deaccel = _has_z_source_override ? _z_source_override
+                                         : sane_particle_value(deacceleration.getValue(manim, mtime, manimtime), 0.0f);
 
   // spawn new particles
   if (emitter) {
@@ -1205,6 +1225,11 @@ void ParticleSystem::update(float dt)
     {
       p.color.a = lifeTrack<float>(_alpha_times, _alpha_values, rlife);
     }
+    // MD21 EXP2 multipliers (1.0 unless the file says otherwise)
+    p.color.r *= _color_mult;
+    p.color.g *= _color_mult;
+    p.color.b *= _color_mult;
+    p.color.a *= _alpha_mult;
 
     if (classic)
     {

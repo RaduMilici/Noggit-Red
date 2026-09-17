@@ -82,12 +82,24 @@ vec2 sphere_map(vec3 vert_view, vec3 norm_view)
 
 mat4 get_bone_matrix(uint bone_index)
 {
-  // w <= 0 (static) or out-of-range -> bind pose, exactly like GL
-  if (inst_tex.w <= 0 || bone_index >= uint(inst_tex.w))
+  int base = inst_tex.z;
+  int count = inst_tex.w;
+  // [CLUTTER PERSISTENT 2026-09-03] state.y bit 32: the instance data is BAKED ONCE (per-chunk
+  // buffer) so it cannot carry this frame's bone base. tex.z holds a stable SPECIES SLOT instead;
+  // slot k's header lives in bones[k] column 0 as (base, count), rewritten every frame -- grass
+  // keeps its wind sway with zero per-instance updates.
+  if ((inst_state.y & 32) != 0)
+  {
+    vec4 h = bones[inst_tex.z][0];
+    base = int(h.x);
+    count = int(h.y);
+  }
+  // count <= 0 (static) or out-of-range -> bind pose, exactly like GL
+  if (count <= 0 || bone_index >= uint(count))
   {
     return mat4(1.0);
   }
-  return bones[uint(inst_tex.z) + bone_index];
+  return bones[uint(base) + bone_index];
 }
 
 void main()

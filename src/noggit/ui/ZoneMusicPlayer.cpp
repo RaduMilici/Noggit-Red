@@ -15,6 +15,7 @@
 #include <QtWidgets/QSlider>
 #include <QtWidgets/QListWidget>
 #include <QtCore/QTemporaryFile>
+#include <noggit/audio/QtMediaTemp.hpp>
 #include <QtCore/QUrl>
 #include <QtCore/QSettings>
 #include <QtCore/QCoreApplication>
@@ -487,9 +488,11 @@ namespace Noggit::Ui
         delete temp;
         return;
       }
-      temp->write(file.getBuffer(), file.getSize());
+      std::string media_name = _files[index];
+      auto const bytes = Noggit::Audio::decodeForQtMedia(file.getBuffer(), file.getSize(), media_name);
+      temp->write(bytes.data(), static_cast<qint64>(bytes.size()));
       temp->close();
-      temp->rename(temp->fileName() + QString::fromStdString(_files[index]));
+      temp->rename(temp->fileName() + QString::fromStdString(media_name));
 
       // Drop the idle deck's previous temp file (that track already finished fading out).
       if (_deck_files[idle])
@@ -713,9 +716,11 @@ namespace Noggit::Ui
             auto* temp = new QTemporaryFile(this);
             if (temp->open())
             {
-              temp->write(file.getBuffer(), file.getSize());
+              std::string media_name = files[pick];
+              auto const bytes = Noggit::Audio::decodeForQtMedia(file.getBuffer(), file.getSize(), media_name);
+              temp->write(bytes.data(), static_cast<qint64>(bytes.size()));
               temp->close();
-              temp->rename(temp->fileName() + QString::fromStdString(files[pick]));
+              temp->rename(temp->fileName() + QString::fromStdString(media_name));
               if (_amb_files[idle])
               {
                 _amb_files[idle]->deleteLater();

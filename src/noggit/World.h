@@ -792,11 +792,6 @@ public:
   // [doc 38 water loops] Base liquid CLASS of a liquid id: 0 water/river, 1 ocean, 2 magma,
   // 3 slime -- the SoundWaterType.LiquidClass axis. Mirrors liquid_layer::mclq_liquid_type.
   static int liquidClassForId(int liquid_id);
-  // [doc 38 footsteps] TerrainType of a ground TEXTURE, gathered from every LOADED tile's
-  // authoring. Blizzard's per-chunk effect ids are inconsistent (the same texture is declared
-  // Stone in one tile and left as an empty placeholder row in the next), so a texture's type is
-  // resolved map-wide rather than per chunk. -1 = nothing authored anywhere loaded.
-  int terrainTypeForTexture(std::string const& texture_filename);
   // Nearest liquid of each class within `radius` around `center` (surface-plane distance).
   // Samples a ring of getLiquidAt probes (footstep-rate cost); feeds the WaterSoundPlayer
   // (doc 38 FUN_00462b50). liquid_id is carried through so the 3.3.5a path can read the
@@ -836,13 +831,17 @@ public:
   // CreatureSoundData resolution as the footstep id): e.g. CreatureSoundDataDB::Wound for the
   // damage-taken vocal. 0 = the row does not author that lane.
   std::uint32_t gameCharacterSoundEntry(std::size_t column);
-  // TerrainType ROW under a world position (doc 38): the NEAREST support surface decides --
-  // WMO floor -> the hit face's authored WMOMaterial.ground_type; terrain -> the MCNK
-  // doodadMapping layer -> GroundEffectTexture.TerrainType; M2 (crates) -> 0/Dirt (surface
-  // ground type not yet RE'd). model_view = the camera MV the probe expects (transposed).
+  // TerrainType ROW under a world position = the 3.3.5a client's CWorld ground-type cast
+  // (FUN_007c2a70, RE'd 2026-09-09): a ray from 0.1 above the feet 1000 down through every WMO
+  // (wmo_ground_query: the physics "support" face and the visible "typed" face are tracked
+  // independently); the terrain wins only when it is closer than the support face. WMO -> the
+  // typed face's MOMT.ground_type, or -1 when no typed face lies below (collision-only ghost
+  // floors); terrain -> MapChunk::groundTerrainTypeRowAt. -1 = unknown, which the footstep
+  // resolve turns into TerrainType 0. model_view = the camera MV the terrain probe expects.
   int groundTerrainTypeAt(glm::vec3 const& pos, glm::mat4x4 const& model_view);
   // FootstepTerrainLookup resolve: (footstep id x TerrainType row's SoundClass x wet) ->
-  // SoundEntries id (0 = none). Rows scanned once into a cache.
+  // SoundEntries id (0 = none). Rows scanned once into a cache. Client FUN_004cf170: a row that
+  // yields nothing (unknown -1, or no lookup entry for its class) is retried as row 0 (Dirt).
   int footstepSoundEntry(std::uint32_t footstep_id, int terrain_row, bool splash);
 
   // Spell details for the spawned creatures' permanent auras (fetched once per spawn reload from the
@@ -917,10 +916,6 @@ protected:
   bool _game_character_visible = false;
   bool _game_character_bubbles = false;
   float _game_char_collision_height = 2.031f; // see gameCharacterCollisionHeight()
-  // texture filename -> TerrainType row, accumulated from loaded tiles (terrainTypeForTexture)
-  std::map<std::string, int> _texture_terrain_types;
-  unsigned _texture_terrain_tiles_scanned = 0;
-  float _texture_terrain_last_scan_ms = -1.0e9f; // rescan-on-miss throttle (see the .cpp note)
   std::vector<std::uint32_t> _creature_display_ids; // see creatureDisplayIds()
   // [game mode] probe cache state (see ensureProbeCache / intersectProbe)
   static constexpr float k_probe_cache_radius = 45.0f; // covers the 25yd camera boom + corners + margin

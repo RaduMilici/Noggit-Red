@@ -21,6 +21,21 @@
 #include <string>
 #include <vector>
 #include <array>
+#include <optional>
+
+// Modern (CASC) clients: the fileDataIDs of a tile's split parts, straight from the WDT MAID chunk
+// (root, obj0, obj1, tex0, lod, mapTexture, mapTextureN, minimapTexture). See MapTileModern.cpp.
+struct ModernTileFiles
+{
+  std::uint32_t root = 0;
+  std::uint32_t obj0 = 0;
+  std::uint32_t obj1 = 0;
+  std::uint32_t tex0 = 0;
+  std::uint32_t lod = 0;
+  std::uint32_t map_texture = 0;
+  std::uint32_t map_texture_n = 0;
+  std::uint32_t minimap = 0;
+};
 
 namespace math
 {
@@ -61,6 +76,11 @@ public:
 
   void finishLoading() override;
   void waitForChildrenLoaded() override;
+
+  // Modern (CASC) clients: set by MapIndex before the tile is queued; finishLoading then reads the
+  // split parts and rebuilds one WotLK-shaped MCNK stream for the chunk code (MapTileModern.cpp).
+  void setModernFiles(ModernTileFiles const& files) { _modern_files = files; }
+  [[nodiscard]] bool isModernTile() const { return _modern_files.has_value(); }
 
   //! \todo on destruction, unload ModelInstances and WMOInstances on this tile:
   // a) either keep up the information what tiles the instances are on at all times
@@ -222,6 +242,9 @@ private:
   // MHDR:
   int mFlags = 0;
   bool mBigAlpha;
+
+  std::optional<ModernTileFiles> _modern_files;
+  void finishLoadingModern();
 
   // Data to be loaded and later unloaded.
   std::vector<std::string> mTextureFilenames;

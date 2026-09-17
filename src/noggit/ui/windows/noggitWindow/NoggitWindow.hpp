@@ -121,6 +121,8 @@ namespace Noggit::Ui::Windows
 
       std::unique_ptr<World> _world;
       QWidget* _map_creation_wizard_host = nullptr;
+      // the map picked in the map list (loadMap) -- what the lazily-created 'Edit map' wizard shows
+      int _selected_map_id = -1;
 
       bool map_loaded = false;
 

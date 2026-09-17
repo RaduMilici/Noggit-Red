@@ -19,6 +19,8 @@
 #include <optional>
 #include <string>
 #include <vector>
+#include <utility>
+#include <map>
 #include <cstdint>
 #include <unordered_map>
 #include <noggit/rendering/ModelRender.hpp>
@@ -213,7 +215,8 @@ public:
     return std::vector<T>(start, start + count);
   }
 
-  Model(const std::string& name, Noggit::NoggitRenderContext context );
+  // the FULL key: a fileDataID (modern CASC clients) is authoritative, the path is for display/heuristics
+  Model(BlizzardArchive::Listfile::FileKey const& file_key, Noggit::NoggitRenderContext context );
 
   std::vector<std::pair<float, std::tuple<int, int, int>>> intersect (glm::mat4x4 const& model_view, math::ray const&, int animtime);
 
@@ -282,6 +285,32 @@ public:
   Noggit::Rendering::ModelRender* renderer() { return &_renderer; }
 
   [[nodiscard]] bool usesClassicLayout() const { return _uses_classic_layout; }
+  // MD21-chunked (modern CASC) model: see unwrapMD21
+  [[nodiscard]] bool isModernMD21() const { return _modern_md21; }
+
+  // Render era of this FILE (docs/client_re/42): v256/257 classic layout = the 1.12 engine, v264 = the 3.3.5a
+  // engine, MD21 container (v27x, every modern CASC client) = the Legion+ engine. Drives the skin shader-id
+  // decoding, the uv sources, the alpha-key reference and the particle record semantics in ModelRender /
+  // Particle. Per file, not per project: a modern project can still open a WotLK-era M2 by path.
+  enum class M2RenderEra : std::uint8_t { Vanilla, WotLK, Modern };
+  [[nodiscard]] M2RenderEra renderEra() const
+  {
+    return _uses_classic_layout ? M2RenderEra::Vanilla : (_modern_md21 ? M2RenderEra::Modern : M2RenderEra::WotLK);
+  }
+
+  // EXP2 (M2ExtendedParticle, wowdev M2#EXP2): per emitter {zSource, colorMult, alphaMult, alphaCutoff track}.
+  struct ExtendedParticle
+  {
+    float z_source = 0.f;
+    float color_mult = 1.f;
+    float alpha_mult = 1.f;
+    std::vector<std::uint16_t> alpha_cutoff_times;   // fixed16 life stamps (0..32767)
+    std::vector<float> alpha_cutoff_values;          // fixed16 -> 0..1
+  };
+  [[nodiscard]] ExtendedParticle const* extendedParticle(std::size_t emitter) const
+  {
+    return emitter < _extended_particles.size() ? &_extended_particles[emitter] : nullptr;
+  }
   // Read-only view of the material table (renderflag/blend pairs) -- the WorldRender light-shaft
   // deferral inspects pass unlit flags through this (Model::_render_flags itself is private).
   [[nodiscard]] std::vector<ModelRenderFlags> const& renderFlagsTable() const { return _render_flags; }
@@ -391,6 +420,21 @@ private:
 
   bool _per_instance_animation;
   bool _uses_classic_layout = false;
+
+  // Modern (MD21-chunked) M2: the MD20 payload was unwrapped from its chunk (header offsets are
+  // payload-relative), and skins / textures / external animations are addressed by fileDataID from the
+  // SFID / TXID / AFID sibling chunks. See Model::unwrapMD21 and docs/client_re/41 section 7.
+  bool _modern_md21 = false;
+  std::vector<std::uint32_t> _skin_file_ids;
+  std::vector<std::uint32_t> _texture_file_ids;
+  std::map<std::pair<std::uint16_t, std::uint16_t>, std::uint32_t> _anim_file_ids;
+  std::uint32_t _skeleton_file_id = 0; // SKID: the .skel that owns this model's bones/sequences (Legion 7.3+)
+  bool graftSkeleton(std::vector<char>& payload);
+  std::vector<ExtendedParticle> _extended_particles; // EXP2, one per emitter (empty when the chunk is absent)
+  bool unwrapMD21(BlizzardArchive::ClientFile& f);
+  BlizzardArchive::Listfile::FileKey modelSkinKey(std::size_t skin_index) const;
+  // the model's path, or "" for an id-only (modern) key -- every path-based heuristic must tolerate ""
+  std::string modelPath() const { return _file_key.hasFilepath() ? _file_key.filepath() : std::string(); }
   bool _emits_light = false; // has an unlit+additive (emissive glow) material -- see emitsLight()
 public:
   // Water-surface effect model (fishing-pool "school": foam ring + bubbles + sparkles). Its effect

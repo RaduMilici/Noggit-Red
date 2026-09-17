@@ -115,6 +115,29 @@ MapCreationWizard::MapCreationWizard(std::shared_ptr<Project::NoggitProject> pro
 
   // Fill selector combo
 
+  if (Project::usesSynthesizedDbc(_project->projectVersion))
+  {
+    // modern CASC: Map comes from gMapDB (synthesized from Map.db2)
+    int count = 0;
+    for (DBCFile::Iterator it = gMapDB.begin(); it != gMapDB.end(); ++it)
+    {
+      int const map_id = static_cast<int>(it->getUInt(MapDB::MapID));
+      std::string name = it->getLocalizedString(MapDB::Name);
+      if (name.empty())
+        name = it->getString(MapDB::InternalName);
+      if (name.empty())
+        name = "Map " + std::to_string(map_id);
+      int const area_type = it->getInt(MapDB::AreaType);
+      if (area_type < 0 || area_type > 4)
+        continue;
+      _corpse_map_id->addItem(QString::number(map_id) + " - " + QString::fromUtf8(name.c_str()));
+      _corpse_map_id->setItemData(count + 1, QVariant(map_id));
+      count++;
+    }
+  }
+  else
+  {
+
   const auto& table = std::string("Map");
   auto mapTable = _project->ClientDatabase->LoadTable(table, readFileAsIMemStream);
 
@@ -140,6 +163,7 @@ MapCreationWizard::MapCreationWizard(std::shared_ptr<Project::NoggitProject> pro
   }
 
   _project->ClientDatabase->UnloadTable("Map");
+  }
 
   auto add_btn = new QPushButton("New",this);
   add_btn->setIcon(Noggit::Ui::FontAwesomeIcon(Noggit::Ui::FontAwesome::plus));
@@ -333,13 +357,18 @@ MapCreationWizard::MapCreationWizard(std::shared_ptr<Project::NoggitProject> pro
             removeMap();
           });
 
-  _connection = connect(reinterpret_cast<Noggit::Ui::Windows::NoggitWindow*>(parent),
-                        QOverload<int>::of(&Noggit::Ui::Windows::NoggitWindow::mapSelected)
-                        , [&] (int index)
-                              {
-                                selectMap(index);
-                              }
-  );
+  // Only a real NoggitWindow parent can be subscribed to; the main menu parents the wizard to a host
+  // widget and forwards mapSelected itself (NoggitWindow::ensureMapCreationWizard). The old
+  // reinterpret_cast of the host connected nothing.
+  if (auto* window = qobject_cast<Noggit::Ui::Windows::NoggitWindow*>(parent))
+  {
+    _connection = connect(window, QOverload<int>::of(&Noggit::Ui::Windows::NoggitWindow::mapSelected)
+                          , [this] (int index)
+                                {
+                                  selectMap(index);
+                                }
+    );
+  }
 
   connect(_difficulty_type, qOverload<int>(&QComboBox::currentIndexChanged), [this](int index) {
       selectMapDifficulty();
@@ -444,6 +473,48 @@ std::string MapCreationWizard::getDifficultyString()
 void MapCreationWizard::selectMap(int map_id)
 {
   _is_new_record = false;
+
+  if (Project::usesSynthesizedDbc(_project->projectVersion))
+  {
+    // Modern CASC projects: Map is served through gMapDB (there is no DB2 writer yet), so the tile grid
+    // is available for editing terrain while the Map.dbc fields stay read-only.
+    _cur_map_id = map_id;
+    if (_world)
+    {
+      delete _world;
+      _world = nullptr;
+    }
+    try
+    {
+      auto rec = gMapDB.getByID(map_id);
+      std::string const directoryName = rec.getString(MapDB::InternalName);
+      _world = new World(directoryName, map_id, Noggit::NoggitRenderContext::MAP_VIEW);
+      _minimap_widget->world(_world);
+
+      _directory->setText(QString::fromStdString(directoryName));
+      _directory->setEnabled(false);
+      _is_big_alpha->setChecked(_world->mapIndex.hasBigAlpha());
+      _is_big_alpha->setEnabled(false);
+      _sort_by_size_cat->setChecked(_world->mapIndex.sort_models_by_size_class());
+      _instance_type->setCurrentIndex(std::min(rec.getInt(MapDB::AreaType), _instance_type->count() - 1));
+      _map_name->fill(rec, MapDB::Name);
+      _area_table_id->setValue(rec.getInt(22));
+      _loading_screen->setValue(rec.getInt(MapDB::LoadingScreen));
+      _minimap_icon_scale->setValue(rec.getFloat(58));
+      _time_of_day_override->setValue(rec.getInt(MapDB::TimeOfDayOverride));
+      if (gMapDB.getFieldCount() > MapDB::ExpansionID)
+        _expansion_id->setCurrentIndex(std::min(rec.getInt(MapDB::ExpansionID), _expansion_id->count() - 1));
+      _raid_offset->setValue(rec.getInt(64));
+      _max_players->setValue(rec.getInt(65));
+    }
+    catch (DBCFile::NotFound const&)
+    {
+      LogError << "MapCreationWizard::selectMap: map " << map_id << " is not in Map.db2" << std::endl;
+    }
+    QSignalBlocker const difficulty_type_blocker(_difficulty_type);
+    _difficulty_type->clear();
+    return;
+  }
 
   auto table = _project->ClientDatabase->LoadTable("Map", readFileAsIMemStream);
   auto record = table.Record(map_id);
@@ -573,7 +644,8 @@ void MapCreationWizard::selectMapDifficulty()
     if (!_difficulty_type->count())
         return;
 
-  if (_project->projectVersion == Project::ProjectVersion::CLASSIC)
+  if (_project->projectVersion == Project::ProjectVersion::CLASSIC
+      || Project::usesSynthesizedDbc(_project->projectVersion))
     return;
 
     auto selected_difficulty_id = _difficulty_type->itemData(_difficulty_type->currentIndex()).toInt();
@@ -622,6 +694,12 @@ void MapCreationWizard::wheelEvent(QWheelEvent* event)
 
 void MapCreationWizard::saveCurrentEntry()
 {
+  if (Project::usesSynthesizedDbc(_project->projectVersion))
+  {
+    QMessageBox::information(this, "Not supported yet", "Editing Map.db2 rows is not supported for CASC (modern client) projects yet.");
+    return;
+  }
+
 
   if (_is_new_record)
   {
@@ -741,6 +819,12 @@ MapCreationWizard::~MapCreationWizard()
 
 void MapCreationWizard::addNewMap()
 {
+  if (Project::usesSynthesizedDbc(_project->projectVersion))
+  {
+    QMessageBox::information(this, "Not supported yet", "Editing Map.db2 rows is not supported for CASC (modern client) projects yet.");
+    return;
+  }
+
   _is_new_record = true;
   _cur_map_id = gMapDB.getEmptyRecordID();
 
@@ -784,6 +868,12 @@ void MapCreationWizard::addNewMap()
 
 void MapCreationWizard::removeMap()
 {
+  if (Project::usesSynthesizedDbc(_project->projectVersion))
+  {
+    QMessageBox::information(this, "Not supported yet", "Editing Map.db2 rows is not supported for CASC (modern client) projects yet.");
+    return;
+  }
+
   QMessageBox prompt;
   prompt.setIcon(QMessageBox::Warning);
   prompt.setWindowTitle("Remove Map");

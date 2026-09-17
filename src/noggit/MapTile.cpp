@@ -301,9 +301,15 @@ void MapTile::waitForChildrenLoaded()
 
 void MapTile::finishLoading()
 {
-  
+
   if (finished)
     return;
+
+  if (_modern_files)
+  {
+    finishLoadingModern();
+    return;
+  }
 
   auto abort_loading = [&] ()
   {

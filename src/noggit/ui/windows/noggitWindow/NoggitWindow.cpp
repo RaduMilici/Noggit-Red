@@ -1,3 +1,4 @@
+#include <QtCore/QCoreApplication>
 #include <noggit/ui/windows/about/About.h>
 #include <cmath>
 #include <noggit/MySqlSettings.hpp>
@@ -22,6 +23,7 @@
 #include <BlizzardDatabase.h>
 #include <QtGui/QCloseEvent>
 #include <QtGui/QImage>
+#include <QtGui/QKeyEvent>
 #include <QtGui/QScreen>
 #include <QtWidgets/QApplication>
 #include <QtWidgets/QHBoxLayout>
@@ -163,6 +165,18 @@ namespace Noggit::Ui::Windows
                                      }
     );
 
+    // The wizard is parented to its HOST widget, so it cannot subscribe to this window's mapSelected
+    // itself (it used to reinterpret_cast the host to the window -- a dead connection, the 'Edit map' tab
+    // stayed on "Select a map" forever). Forward the map-list selection while the tab is showing; the
+    // tab switch below syncs it otherwise, so the second World is only loaded when the tab is in use.
+    connect(this, &NoggitWindow::mapSelected, _map_creation_wizard, [this](int map_id)
+    {
+      if (_right_side && _right_side->currentIndex() == 1)
+        _map_creation_wizard->selectMap(map_id);
+    });
+    if (_selected_map_id >= 0)
+      _map_creation_wizard->selectMap(_selected_map_id);
+
     LogDebug << "NoggitWindow::ensureMapCreationWizard end" << std::endl;
   }
 
@@ -189,7 +203,8 @@ namespace Noggit::Ui::Windows
     setWindowIcon(QIcon(":/icon"));
 
     if (project->projectVersion == Project::ProjectVersion::CLASSIC
-        || project->projectVersion == Project::ProjectVersion::WOTLK)
+        || project->projectVersion == Project::ProjectVersion::WOTLK
+        || Project::usesSynthesizedDbc(project->projectVersion))
     {
       OpenDBs(project->ClientData);
     }
@@ -307,7 +322,10 @@ namespace Noggit::Ui::Windows
   )
   {
       LogDebug << "NoggitWindow::enterMapAt begin" << std::endl;
-      if (_world->mapIndex.hasAGlobalWMO())
+      // The "enter at the WMO's outer corner" convenience only applies when no explicit position was
+      // asked for: a bookmark (and the bench, which enters through the bookmark path) names a pose
+      // inside the dungeon and must land there (2026-09-16: every Molten Core capture stood outside).
+      if (_world->mapIndex.hasAGlobalWMO() && !from_bookmark)
       {
           // enter at mdoel's position
           // pos = glm::vec3(_world->mWmoEntry[0], _world->mWmoEntry.pos[1], _world->mWmoEntry.pos[2]);
@@ -393,18 +411,25 @@ namespace Noggit::Ui::Windows
 
     _world.reset();
 
-    auto table = _project->ClientDatabase->LoadTable("Map", readFileAsIMemStream);
-    auto record = table.Record(map_id);
-    auto directory_itr = record.Columns.find("Directory");
-    if (directory_itr != record.Columns.end() && !directory_itr->second.Value.empty())
+    // Modern CASC projects serve Map through gMapDB (synthesized from Map.db2); the DatabaseLib route
+    // below cannot read WDC5 and would hand back an empty table.
+    if (!Project::usesSynthesizedDbc(_project->projectVersion))
     {
-      _world = std::make_unique<World>(directory_itr->second.Value, map_id, Noggit::NoggitRenderContext::MAP_VIEW);
-      _minimap->world(_world.get());
-      _project->ClientDatabase->UnloadTable("Map");
-      return;
-    }
+      auto table = _project->ClientDatabase->LoadTable("Map", readFileAsIMemStream);
+      auto record = table.Record(map_id);
+      auto directory_itr = record.Columns.find("Directory");
+      if (directory_itr != record.Columns.end() && !directory_itr->second.Value.empty())
+      {
+        _world = std::make_unique<World>(directory_itr->second.Value, map_id, Noggit::NoggitRenderContext::MAP_VIEW);
+        _minimap->world(_world.get());
+        _project->ClientDatabase->UnloadTable("Map");
+        _selected_map_id = map_id;
+        emit mapSelected(map_id); // the 'Edit map' wizard follows the map list
+        return;
+      }
 
-    _project->ClientDatabase->UnloadTable("Map");
+      _project->ClientDatabase->UnloadTable("Map");
+    }
 
     if (gMapDB.getRecordCount() > 0)
     {
@@ -413,6 +438,8 @@ namespace Noggit::Ui::Windows
         auto dbc_record = gMapDB.getByID(map_id);
         _world = std::make_unique<World>(dbc_record.getString(MapDB::InternalName), map_id, Noggit::NoggitRenderContext::MAP_VIEW);
         _minimap->world(_world.get());
+        _selected_map_id = map_id;
+        emit mapSelected(map_id);
       }
       catch (DBCFile::NotFound const&)
       {
@@ -461,6 +488,14 @@ namespace Noggit::Ui::Windows
     resize(width, height);
     move(-20000, -20000); // far outside any monitor
     show();
+    // [2026-09-06] Re-apply the requested size AFTER show(): resize() before show() was being
+    // clamped by the window system / saved geometry, so NOGGIT_PARITY_SIZE never took effect and
+    // the harness stayed at 1328x850 while the user runs 2288x1329 -- the one environmental
+    // variable this rig had never actually tested.
+    resize(width, height);
+    QCoreApplication::processEvents();
+    resize(width, height);
+    QCoreApplication::processEvents();
     move(-20000, -20000);
     qApp->processEvents();
     loadMap(map_id);
@@ -517,8 +552,9 @@ namespace Noggit::Ui::Windows
     // NOGGIT_PARITY_SUN / _MOON keep the celestial billboards on so the VK pipeline is MEASURED.
     _map_view->_draw_sun.set(std::getenv("NOGGIT_PARITY_SUN") != nullptr);
     _map_view->_draw_moon.set(std::getenv("NOGGIT_PARITY_MOON") != nullptr);
-    _map_view->_draw_creature_spawns.set(false);
-    _map_view->getWorld()->setDrawCreatureSpawns(false);
+    // [2026-09-06] The harness must NEVER touch the creature-spawn toggle: its set(false) here was
+    // PERSISTED by the toggle's change handler into the USER's settings on every harness run
+    // (spawns came up off on every launch for three days). Spawns are whatever the user saved.
     // SILENT: the run is invisible, it must be inaudible too (zone music/ambience + one-shot sfx)
     _map_view->muteAudioForHarness();
 
@@ -577,6 +613,19 @@ namespace Noggit::Ui::Windows
       float bench_time = -1.0f;
       if (char const* tv = std::getenv("NOGGIT_BENCH_TIME"))
         bench_time = static_cast<float>(std::atof(tv));
+      // [HARNESS-ONLY, strip before commit] NOGGIT_BENCH_GAMEWALK=1: enter Game View at the bench
+      // pose (exactly what the toolbar's "Game view" toggle does) and hold W through the run, so the
+      // character's $FSD footstep events fire and the whole footstep chain (FS-STATE, FOOTSTEP-DIAG,
+      // FOOTSTEP-SURFACE, SFX-TRACE) lands in log.txt. Nothing else exercises footsteps offline.
+      bool const gamewalk = std::getenv("NOGGIT_BENCH_GAMEWALK")
+                         && std::atoi(std::getenv("NOGGIT_BENCH_GAMEWALK")) != 0;
+      if (gamewalk)
+      {
+        _map_view->setCameraDirty();
+        _map_view->_game_mode_camera.set(true);
+        _map_view->enterGameModeInPlace();
+        LogError << "[VK-BENCH] GAMEWALK: game view entered, W held from frame 90" << std::endl;
+      }
 
       for (int i = 0; i < bench_frames; ++i)
       {
@@ -584,6 +633,10 @@ namespace Noggit::Ui::Windows
           _map_view->getWorld()->time = bench_time;
         _map_view->getWorld()->animtime += 16.0f;
         _map_view->getWorld()->update_models_emitters(0.016f);
+        if (gamewalk && i == 90)
+          QCoreApplication::postEvent(_map_view, new QKeyEvent(QEvent::KeyPress, Qt::Key_W, Qt::NoModifier));
+        if (gamewalk && i == bench_frames - 5)
+          QCoreApplication::postEvent(_map_view, new QKeyEvent(QEvent::KeyRelease, Qt::Key_W, Qt::NoModifier));
         if (fly_step != 0.0)
         {
           // CIRCLE, not a straight line. A straight line at 2.5 yd/frame covers ~3200 yards over a
@@ -752,8 +805,6 @@ namespace Noggit::Ui::Windows
     }
     else
     {
-      _map_view->_draw_creature_spawns.set(false);
-      _map_view->getWorld()->setDrawCreatureSpawns(false);
       LogDebug << "capture-world-creatures: creature overlay disabled by NOGGIT_CAPTURE_CREATURES=0" << std::endl;
     }
     LogDebug << "capture-world-creatures: wait async begin" << std::endl;
@@ -1095,7 +1146,13 @@ namespace Noggit::Ui::Windows
     connect(_right_side, qOverload<int>(&QTabWidget::currentChanged), this, [this](int index)
     {
       if (index == 1)
+      {
         ensureMapCreationWizard();
+        // maps picked while the 'Enter map' tab was showing (or after leaving a map, which frees the
+        // wizard's world) are applied on the way in
+        if (_selected_map_id >= 0 && _map_creation_wizard->currentMapId() != _selected_map_id)
+          _map_creation_wizard->selectMap(_selected_map_id);
+      }
     });
     LogDebug << "NoggitWindow::buildMenu after edit-map tab" << std::endl;
 

@@ -216,10 +216,14 @@ void AsyncLoader::process()
         _state_changed.notify_all();
       }
     }
-    catch (BlizzardArchive::Exceptions::FileReadFailedError const&)
+    catch (BlizzardArchive::Exceptions::FileReadFailedError const& e)
     {
       std::lock_guard<std::mutex> const lock(_guard);
 
+      // the object names itself below; the exception names the FILE that could not be opened, which
+      // is not always the same (a model's .skin / .anim, a WMO's group file)
+      LogError << "Async load file error type=" << object->async_object_type_name()
+               << " key='" << async_object_key(object) << "' what='" << e.what() << "'" << std::endl;
       object->error_on_loading();
 
       if (object->is_required_when_saving())

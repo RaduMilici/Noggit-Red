@@ -276,6 +276,7 @@ void WMORender::draw(OpenGL::Scoped::use_program& wmo_shader
     , bool interior_only
     , WorldRender* world_renderer
     , std::vector<uint8_t>* out_group_visibility
+    , uint16_t doodad_set
 )
 {
   if (out_group_visibility)
@@ -489,7 +490,13 @@ void WMORender::draw(OpenGL::Scoped::use_program& wmo_shader
       // the frame's global light set (they live under the outdoor sky like terrain does).
       if (group->is_indoor() && !group->is_exterior_lit())
       {
-        world_renderer->setWmoGroupPointLights(_wmo, group->light_refs(), transform_matrix, camera);
+        // Modern groups (Shadowlands+) reference the root's MNLD lights through MNLR; older ones MOLT
+        // through MOLR (docs/client_re/42 sec 15).
+        bool const modern_refs = !group->new_light_refs().empty();
+        world_renderer->setWmoGroupPointLights(_wmo,
+                                               modern_refs ? _wmo->new_lights : _wmo->lights,
+                                               modern_refs ? group->new_light_refs() : group->light_refs(),
+                                               transform_matrix, camera, doodad_set);
       }
       else
       {

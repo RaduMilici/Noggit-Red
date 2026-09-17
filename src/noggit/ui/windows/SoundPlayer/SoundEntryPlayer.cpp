@@ -5,6 +5,7 @@
 #include <noggit/Log.h>
 #include <noggit/Misc.h>
 #include <ClientFile.hpp>
+#include <noggit/audio/QtMediaTemp.hpp>
 #include <noggit/application/NoggitApplication.hpp>
 
 #include <QtWidgets/QVBoxLayout>
@@ -190,11 +191,13 @@ namespace Noggit
             auto temp_file = new QTemporaryFile(this); // must parent for the object to be destroyed properly(and file deleted)
 
             temp_file->open();
-            temp_file->write(file.getBuffer(), file.getSize());
+            std::string media_name = item->text().toStdString();
+            auto const bytes = Noggit::Audio::decodeForQtMedia(file.getBuffer(), file.getSize(), media_name);
+            temp_file->write(bytes.data(), static_cast<qint64>(bytes.size()));
             temp_file->close();
             // default tempname is like User\AppData\Local\Temp\Noggit.qrRfsy ...We need to add back the file extension or it won't be read by the player!
             // must rename after closing or it doesn't write correctly
-            temp_file->rename(temp_file->fileName() + item->text());
+            temp_file->rename(temp_file->fileName() + QString::fromStdString(media_name));
             // file.save(); // saves file to project folder
             // auto save_path = file.getPath().string();
 

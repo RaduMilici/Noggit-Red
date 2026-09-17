@@ -109,7 +109,14 @@ void main()
       else
       {
         float pattern = texel.a;
-        if ((wmo_flags & 4) != 0)
+        if ((wmo_flags & 8) != 0)
+        {
+          // DBC-path EXTERIOR water (stock WotLK Stormwind canals): the client's flat river-deep
+          // colour, carried in the material-colour slot by the feed (see MapView / wmo_liquid.hpp).
+          water_rgb = v_wmo.yzw;
+          water_alpha = RiverColorDark.a;
+        }
+        else if ((wmo_flags & 4) != 0)
         {
           // City channel (SW canals/harbour, Booty Bay): ocean-deep navy body, opaque.
           water_rgb = mix(OceanColorDark.rgb, OceanColorLight.rgb, 0.12) * 0.85;

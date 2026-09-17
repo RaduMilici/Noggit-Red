@@ -336,7 +336,9 @@ void main()
       blade_shadow = py - pb * 2.0;
       blade_tint = vec3(pr, pg, pb) / 255.0;
     }
-    float shade = mix(0.25, 0.75, blade_shadow);
+    // [2026-09-02] SUNLIT brightness lowered 0.75 -> 0.55 on request; shadowed blades keep 0.25.
+    // Look tweak, not a client-matched value. Must stay in step with the GL copy in m2_frag.glsl.
+    float shade = mix(0.25, 0.55, blade_shadow);
     currColor = min(AmbientColor_FogEnd.xyz + DiffuseColor_FogStart.xyz * shade, vec3(1.0)) * blade_tint;
     lDiffuse = vec3(0.0);
   }

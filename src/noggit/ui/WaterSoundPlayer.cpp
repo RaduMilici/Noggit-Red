@@ -9,6 +9,7 @@
 
 #include <QtCore/QCoreApplication>
 #include <QtCore/QTemporaryFile>
+#include <noggit/audio/QtMediaTemp.hpp>
 #include <QtCore/QUrl>
 #include <QtMultimedia/QSoundEffect>
 
@@ -135,9 +136,11 @@ namespace Noggit::Ui
           auto* temp = new QTemporaryFile(this);
           if (temp->open())
           {
-            temp->write(file.getBuffer(), file.getSize());
+            std::string media_name = fn;
+            auto const bytes = Noggit::Audio::decodeForQtMedia(file.getBuffer(), file.getSize(), media_name);
+            temp->write(bytes.data(), static_cast<qint64>(bytes.size()));
             temp->close();
-            temp->rename(temp->fileName() + QString::fromStdString(fn));
+            temp->rename(temp->fileName() + QString::fromStdString(media_name));
             out = temp->fileName();
           }
           else { delete temp; }

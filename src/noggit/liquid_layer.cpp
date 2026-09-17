@@ -5,6 +5,7 @@
 #include <noggit/Log.h>
 #include <noggit/MapChunk.h>
 #include <noggit/Misc.h>
+#include <noggit/project/CurrentProject.hpp>
 #include <ClientFile.hpp>
 
 #include <algorithm>
@@ -15,7 +16,11 @@ namespace
 {
   inline glm::vec2 default_uv(int px, int pz)
   {
-    return {static_cast<float>(px) / 4.f, static_cast<float>(pz) / 4.f};
+    // ONE texture repeat per liquid CELL (4.1666yd) -- the client's scale (the WMO water builder
+    // FUN_006b6630 emits per-tile (i,j) UVs on the same 4.1666yd tiles). The old /4 made the
+    // texture repeat every 4 cells (~16.7yd) = a 4x zoom ("water texture looks 5-10x enlarged
+    // up close", 2026-08-25).
+    return {static_cast<float>(px), static_cast<float>(pz)};
   }
 
   // WoW LiquidType.dbc ids run in groups of four — water, ocean, magma, slime — repeated for the
@@ -109,6 +114,7 @@ liquid_layer::liquid_layer(ChunkWater* chunk, glm::vec3 const& base, mclq& liqui
       else
       {
         _depth[v_index] = static_cast<float>(v.water.depth) / 255.f;
+        _has_authored_depth = true; // MCLQ always carries the client's depth bytes
         _tex_coords[v_index] = default_uv(x, z);
       }
 
@@ -209,6 +215,7 @@ liquid_layer::liquid_layer(ChunkWater* chunk
           _depth[z * 9 + x] = static_cast<float>(depth) / 255.f;
         }
       }
+      _has_authored_depth = true;
     }
   }
 
@@ -223,6 +230,7 @@ liquid_layer::liquid_layer(liquid_layer&& other)
   , _subchunks(other._subchunks)
   , _vertices(other._vertices)
   , _depth(other._depth)
+  , _has_authored_depth(other._has_authored_depth)
   , _tex_coords(other._tex_coords)
   , _indices_by_lod(other._indices_by_lod)
   , pos(other.pos)
@@ -239,6 +247,7 @@ liquid_layer::liquid_layer(liquid_layer const& other)
   , _subchunks(other._subchunks)
   , _vertices(other._vertices)
   , _depth(other._depth)
+  , _has_authored_depth(other._has_authored_depth)
   , _tex_coords(other._tex_coords)
   , _indices_by_lod(other._indices_by_lod)
   , pos(other.pos)
@@ -256,6 +265,7 @@ liquid_layer& liquid_layer::operator= (liquid_layer&& other)
   std::swap(_subchunks, other._subchunks);
   std::swap(_vertices, other._vertices);
   std::swap(_depth, other._depth);
+  std::swap(_has_authored_depth, other._has_authored_depth);
   std::swap(_tex_coords, other._tex_coords);
   std::swap(pos, other.pos);
   std::swap(_indices_by_lod, other._indices_by_lod);
@@ -276,6 +286,7 @@ liquid_layer& liquid_layer::operator=(liquid_layer const& other)
   _subchunks = other._subchunks;
   _vertices = other._vertices;
   _depth = other._depth;
+  _has_authored_depth = other._has_authored_depth;
   _tex_coords = other._tex_coords;
   pos = other.pos;
   _indices_by_lod = other._indices_by_lod;
@@ -460,6 +471,15 @@ int liquid_layer::mclq_liquid_type() const
   case 4:  return 3; // slime
   case 21: return 3; // naxxramas slime
   default: break;
+  }
+
+  // Modern (CASC) projects: LiquidType is authored 8.x-style (the 1.60.1 PBR water is ids 1235..1343)
+  // and the DB2 -> DBC adapter writes the WotLK Type column from the row itself (ModernDBC
+  // buildLiquidType), so the class comes from the table. The "groups of four" heuristic below is a
+  // vanilla-id rule: on the Forever Beta it classed lake 1240 as slime and spring 1343 as magma.
+  if (Noggit::Project::isModernCascVersion(Noggit::Project::CurrentProject::get()->projectVersion))
+  {
+    return LiquidTypeDB::liquidClass(id);
   }
 
   // Non-base ids: WoW liquid ids group in 4s (water, ocean, magma, slime).

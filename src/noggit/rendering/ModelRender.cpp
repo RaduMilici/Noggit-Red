@@ -245,6 +245,18 @@ ModelRender::~ModelRender()
   }
 }
 
+void ModelRender::ensureUploaded()
+{
+  // MUST stay gated on finishedLoading(). upload() builds Model::_textures from _textureFilenames
+  // and then CLEARS the filenames, and sets _uploaded -- it is strictly one-shot. Run while the
+  // async load is still filling those filenames it produces a SHORT _textures array, destroys the
+  // data needed to repair it, and never runs again; the model is then permanently rejected
+  // (tex >= _textures.size() = rej12/tex3) and invisible for the rest of the session. GL only ever
+  // reached upload() from its draw path, which never runs on an unloaded model.
+  if (!_uploaded && _model->finishedLoading() && !_model->loading_failed())
+    upload();
+}
+
 void ModelRender::upload()
 {
   noggit::perf::Scoped _prof_up(noggit::perf::Phase::ModelUpload); // M2 spike hunt: model VBO/index upload
@@ -1346,6 +1358,16 @@ void ModelRender::setupVAO(OpenGL::Scoped::use_program& m2_shader)
 
 void ModelRender::fixShaderIdBlendOverride()
 {
+  // MODERN ERA: the skin's shader_id is authored (see computePixelShaderIDs); this WotLK runtime derivation
+  // -- and its "fuckporting" fallback, which forced every MD21 batch to shader 0 / one texture because the
+  // texture-unit lookup is empty in those files -- turned the leaves' Combiners_Mod (0x10) into
+  // Combiners_Opaque, so the texture alpha never keyed and canopies drew their black background
+  // (2026-09-16, elwynntreecanopy02/03).
+  if (_model->renderEra() == Model::M2RenderEra::Modern)
+  {
+    return;
+  }
+
   for (auto& pass : _render_passes)
   {
     if (pass.shader_id & 0x8000)
@@ -1449,7 +1471,8 @@ void ModelRender::fixShaderIDLayer()
   // Applying it drops render passes that share a renderflag_index (e.g. most
   // body-part geosets on character models), leaving only holes.  Just assign
   // texture/animation indices directly and return.
-  if (_model->_uses_classic_layout)
+  // Modern (MD21) files likewise: their layers are authored and merged by the tools already.
+  if (_model->_uses_classic_layout || _model->renderEra() == Model::M2RenderEra::Modern)
   {
     for (auto& pass : _render_passes)
     {
@@ -1558,13 +1581,22 @@ void ModelRender::fixShaderIDLayer()
         some_flags = (some_flags & 0xFF00);
       }
 
-      int16_t texture_unit_lookup = _model->_texture_unit_lookup[pass.texture_coord_combo_index];
+      // [2026-09-16 modern CASC clients] MD21 models ship an EMPTY texture-unit lookup (the skin's
+      // shader_id is authored, the WotLK-era layer merge below has nothing to derive it from), and
+      // indexing the empty vector read address 0 in the loader threads (Classic Era: metalcup04,
+      // westfalllamppost02, stormwindmageportal01). Out-of-range entries read as -1 ("no unit"), which
+      // keeps every merge branch below inert for such a model instead of faulting.
+      auto const unit_lookup = [this](std::size_t index) -> int16_t
+      {
+        return index < _model->_texture_unit_lookup.size() ? _model->_texture_unit_lookup[index] : int16_t(-1);
+      };
+      int16_t texture_unit_lookup = unit_lookup(pass.texture_coord_combo_index);
 
       if ((some_flags & 0xFF) < 2)
       {
         if ((_model->_render_flags[pass.renderflag_index].blend == 0) && (pass.texture_count == 2) && ((lower_bits == 4) || (lower_bits == 6)))
         {
-          if (texture_unit_lookup == 0 && (_model->_texture_unit_lookup[pass.texture_coord_combo_index + 1] == -1))
+          if (texture_unit_lookup == 0 && (unit_lookup(pass.texture_coord_combo_index + 1) == -1))
           {
             some_flags = (some_flags & 0xFF00) | 1;
           }
@@ -1827,16 +1859,190 @@ namespace
   }
 }
 
+namespace
+{
+  // ---------------------------------------------------------------------------------------------------
+  // MODERN ERA (MD21, Legion+ engine). The skin batch's shader_id is AUTHORED (wowdev M2/.skin: "Cataclysm
+  // and later ... M2GetPixelShaderID / M2GetVertexShaderID decode it; 0x8000 = index into
+  // s_modelShaderEffect"). The WotLK runtime recomputation above (fixShaderIdBlendOverride / fixShaderIDLayer)
+  // must not touch it. Tables and bit rules from the client-derived WoWViewerCpp m2Object.cpp (M2ShaderTable,
+  // getPixelShaderId, getVertexShaderId), docs/client_re/42 sec 3. Classic Era 1.15.9 content around
+  // Northshire uses 0x0 (212 batches), 0x10 (107: Combiners_Mod, texture alpha keys the leaves) and 0x8001
+  // (4: Opaque_AddAlpha over Diffuse_T1_Env = env-mapped weapon shine).
+  // ---------------------------------------------------------------------------------------------------
+  enum class ModernUV : std::uint8_t { T1, T2, Env };
+
+  struct ModernShaderEffect
+  {
+    ModelPixelShader pixel;
+    ModernUV uv0;
+    ModernUV uv1;
+  };
+
+  // s_modelShaderEffect, 0-based (WotLK's table in M2GetPixelShaderID above is 1-based: its case N is this
+  // index N-1). Pixel shaders noggit has no combiner for map to the nearest implemented one (3-texture
+  // variants drop the third texture; EdgeFade / Depth / Crossfade / Guild / Illum drop the effect); each
+  // such row is marked.
+  constexpr ModernShaderEffect s_modern_shader_effect[36] =
+  {
+    { ModelPixelShader::Combiners_Opaque_Mod2xNA_Alpha,    ModernUV::T1, ModernUV::Env }, // 0
+    { ModelPixelShader::Combiners_Opaque_AddAlpha,         ModernUV::T1, ModernUV::Env }, // 1
+    { ModelPixelShader::Combiners_Opaque_AddAlpha_Alpha,   ModernUV::T1, ModernUV::Env }, // 2
+    { ModelPixelShader::Combiners_Opaque_Mod2xNA_Alpha,    ModernUV::T1, ModernUV::Env }, // 3  Opaque_Mod2xNA_Alpha_Add (T1_Env_T1, 3rd tex dropped)
+    { ModelPixelShader::Combiners_Mod_AddAlpha,            ModernUV::T1, ModernUV::Env }, // 4
+    { ModelPixelShader::Combiners_Opaque_AddAlpha,         ModernUV::T1, ModernUV::T1  }, // 5
+    { ModelPixelShader::Combiners_Mod_AddAlpha,            ModernUV::T1, ModernUV::T1  }, // 6
+    { ModelPixelShader::Combiners_Mod_AddAlpha_Alpha,      ModernUV::T1, ModernUV::Env }, // 7
+    { ModelPixelShader::Combiners_Opaque_Alpha_Alpha,      ModernUV::T1, ModernUV::Env }, // 8
+    { ModelPixelShader::Combiners_Opaque_Mod2xNA_Alpha,    ModernUV::T1, ModernUV::Env }, // 9  Opaque_Mod2xNA_Alpha_3s (3rd tex dropped)
+    { ModelPixelShader::Combiners_Opaque_AddAlpha,         ModernUV::T1, ModernUV::T1  }, // 10 Opaque_AddAlpha_Wgt (texture weight dropped)
+    { ModelPixelShader::Combiners_Mod_Add_Alpha,           ModernUV::T1, ModernUV::Env }, // 11
+    { ModelPixelShader::Combiners_Opaque_ModNA_Alpha,      ModernUV::T1, ModernUV::Env }, // 12
+    { ModelPixelShader::Combiners_Mod_AddAlpha,            ModernUV::T1, ModernUV::Env }, // 13 Mod_AddAlpha_Wgt (weight dropped)
+    { ModelPixelShader::Combiners_Mod_AddAlpha,            ModernUV::T1, ModernUV::T1  }, // 14 Mod_AddAlpha_Wgt (weight dropped)
+    { ModelPixelShader::Combiners_Opaque_AddAlpha,         ModernUV::T1, ModernUV::T2  }, // 15 Opaque_AddAlpha_Wgt (weight dropped)
+    { ModelPixelShader::Combiners_Opaque_Mod_Add_Wgt,      ModernUV::T1, ModernUV::Env }, // 16
+    { ModelPixelShader::Combiners_Opaque_Mod2xNA_Alpha,    ModernUV::T1, ModernUV::Env }, // 17 Opaque_Mod2xNA_Alpha_UnshAlpha (3rd tex dropped)
+    { ModelPixelShader::Combiners_Mod,                     ModernUV::T1, ModernUV::T1  }, // 18 Mod_Dual_Crossfade (crossfade dropped)
+    { ModelPixelShader::Combiners_Mod,                     ModernUV::T1, ModernUV::T1  }, // 19 Mod_Depth (EdgeFade_T1)
+    { ModelPixelShader::Combiners_Opaque_Mod2xNA_Alpha,    ModernUV::T1, ModernUV::Env }, // 20 Opaque_Mod2xNA_Alpha_Alpha (T1_Env_T2, 3rd tex dropped)
+    { ModelPixelShader::Combiners_Mod_Mod,                 ModernUV::T1, ModernUV::T2  }, // 21 Mod_Mod (EdgeFade_T1_T2)
+    { ModelPixelShader::Combiners_Mod,                     ModernUV::T1, ModernUV::T2  }, // 22 Mod_Masked_Dual_Crossfade (crossfade dropped)
+    { ModelPixelShader::Combiners_Opaque_Alpha,            ModernUV::T1, ModernUV::T1  }, // 23
+    { ModelPixelShader::Combiners_Opaque_Mod2xNA_Alpha,    ModernUV::T1, ModernUV::Env }, // 24 Opaque_Mod2xNA_Alpha_UnshAlpha (T1_Env_T2, 3rd tex dropped)
+    { ModelPixelShader::Combiners_Mod,                     ModernUV::Env, ModernUV::Env }, // 25 Mod_Depth (EdgeFade_Env)
+    { ModelPixelShader::Combiners_Mod,                     ModernUV::T1, ModernUV::T2  }, // 26 Guild (guild colours dropped)
+    { ModelPixelShader::Combiners_Mod,                     ModernUV::T1, ModernUV::T2  }, // 27 Guild_NoBorder
+    { ModelPixelShader::Combiners_Opaque,                  ModernUV::T1, ModernUV::T2  }, // 28 Guild_Opaque
+    { ModelPixelShader::Combiners_Mod,                     ModernUV::T1, ModernUV::T1  }, // 29 Illum
+    { ModelPixelShader::Combiners_Mod_Mod,                 ModernUV::T1, ModernUV::T2  }, // 30 Mod_Mod_Mod_Const (3rd tex + const dropped)
+    { ModelPixelShader::Combiners_Mod_Mod,                 ModernUV::T1, ModernUV::T2  }, // 31 Mod_Mod_Mod_Const (Color_T1_T2_T3)
+    { ModelPixelShader::Combiners_Opaque,                  ModernUV::T1, ModernUV::T1  }, // 32
+    { ModelPixelShader::Combiners_Mod_Mod2x,               ModernUV::T1, ModernUV::T2  }, // 33 Mod_Mod2x (EdgeFade_T1_T2)
+    { ModelPixelShader::Combiners_Mod,                     ModernUV::T1, ModernUV::T1  }, // 34 Mod (EdgeFade_T1)
+    { ModelPixelShader::Combiners_Mod_Mod,                 ModernUV::T1, ModernUV::T2  }, // 35 Mod_Mod_Depth (EdgeFade_T1_T2)
+  };
+
+  std::optional<ModelPixelShader> M2GetPixelShaderIDModern(uint16_t texture_count, uint16_t shader_id)
+  {
+    if (shader_id & 0x8000)
+    {
+      std::uint16_t const index = shader_id & 0x7FFF;
+      if (index < 36)
+      {
+        return s_modern_shader_effect[index].pixel;
+      }
+      return std::nullopt;
+    }
+    if (texture_count <= 1)
+    {
+      return (shader_id & 0x70) ? ModelPixelShader::Combiners_Mod : ModelPixelShader::Combiners_Opaque;
+    }
+    int const lower = shader_id & 7;
+    if (shader_id & 0x70)
+    {
+      switch (lower)
+      {
+        case 0: return ModelPixelShader::Combiners_Mod_Opaque;
+        case 3: return ModelPixelShader::Combiners_Mod_Add;
+        case 4: return ModelPixelShader::Combiners_Mod_Mod2x;
+        case 6: return ModelPixelShader::Combiners_Mod_Mod2xNA;
+        case 7: return ModelPixelShader::Combiners_Mod_AddNA;
+        default: return ModelPixelShader::Combiners_Mod_Mod; // 1, 2, 5
+      }
+    }
+    switch (lower)
+    {
+      case 0: return ModelPixelShader::Combiners_Opaque_Opaque;
+      case 3:
+      case 7: return ModelPixelShader::Combiners_Opaque_AddAlpha;
+      case 4: return ModelPixelShader::Combiners_Opaque_Mod2x;
+      case 6: return ModelPixelShader::Combiners_Opaque_Mod2xNA;
+      default: return ModelPixelShader::Combiners_Opaque_Mod; // 1, 2, 5
+    }
+  }
+
+  // M2GetVertexShaderID reduced to what the uv stage needs: the source of each texture's coordinates.
+  void M2ModernUVSources(uint16_t texture_count, uint16_t shader_id, ModernUV (&out)[2])
+  {
+    out[0] = ModernUV::T1;
+    out[1] = ModernUV::T2;
+    if (shader_id & 0x8000)
+    {
+      std::uint16_t const index = shader_id & 0x7FFF;
+      if (index < 36)
+      {
+        out[0] = s_modern_shader_effect[index].uv0;
+        out[1] = s_modern_shader_effect[index].uv1;
+      }
+      return;
+    }
+    if (texture_count <= 1)
+    {
+      out[0] = (shader_id & 0x80) ? ModernUV::Env : ((shader_id & 0x4000) ? ModernUV::T2 : ModernUV::T1);
+      return;
+    }
+    if (!(shader_id & 0x80))
+    {
+      if (shader_id & 0x8)      { out[0] = ModernUV::T1; out[1] = ModernUV::Env; } // Diffuse_T1_Env
+      else if (shader_id & 0x4000) { out[0] = ModernUV::T1; out[1] = ModernUV::T2; } // Diffuse_T1_T2
+      else                      { out[0] = ModernUV::T1; out[1] = ModernUV::T1; }  // Diffuse_T1_T1
+    }
+    else
+    {
+      if (shader_id & 0x8)      { out[0] = ModernUV::Env; out[1] = ModernUV::Env; } // Diffuse_Env_Env
+      else                      { out[0] = ModernUV::Env; out[1] = ModernUV::T1; }  // Diffuse_Env_T1
+    }
+  }
+
+  texture_unit_lookup to_texture_unit_lookup(ModernUV uv)
+  {
+    switch (uv)
+    {
+      case ModernUV::Env: return texture_unit_lookup::environment;
+      case ModernUV::T2:  return texture_unit_lookup::t2;
+      default:            return texture_unit_lookup::t1;
+    }
+  }
+}
+
 void ModelRender::computePixelShaderIDs()
 {
+  bool const modern = _model->renderEra() == Model::M2RenderEra::Modern;
   for (auto& pass : _render_passes)
   {
-    pass.pixel_shader = M2GetPixelShaderID(pass.texture_count, pass.shader_id);
+    pass.pixel_shader = modern ? M2GetPixelShaderIDModern(pass.texture_count, pass.shader_id)
+                               : M2GetPixelShaderID(pass.texture_count, pass.shader_id);
+    if (modern && !pass.pixel_shader)
+    {
+      // an s_modelShaderEffect index past the table: keep the authored intent as far as the bits go
+      pass.pixel_shader = M2GetPixelShaderIDModern(pass.texture_count, pass.shader_id & 0x7FFF & ~0x8000);
+    }
   }
 }
 
 void ModelRender::initRenderPasses(ModelView const* view, ModelTexUnit const* tex_unit, ModelGeoset const* model_geosets)
 {
+  static char const* const debug_bones = std::getenv("NOGGIT_M2_DEBUG_BONES");
+  bool const debug_passes = debug_bones && *debug_bones && _model->modelPath().find(debug_bones) != std::string::npos;
+  if (debug_passes)
+  {
+    LogError << "[PASS-DEBUG] model=" << _model->modelPath() << " units=" << view->n_texture_unit << " submeshes=" << view->n_submesh
+             << " indices=" << view->n_index << " triangles=" << view->n_triangle << std::endl;
+    for (size_t j = 0; j < view->n_texture_unit; ++j)
+    {
+      size_t const g = tex_unit[j].submesh;
+      if (g < view->n_submesh)
+      {
+        LogError << "[PASS-DEBUG] unit=" << j << " geoset=" << model_geosets[g].id << " level=" << model_geosets[g].d2
+                 << " vstart=" << model_geosets[g].vstart << " vcount=" << model_geosets[g].vcount
+                 << " istart=" << model_geosets[g].istart << " icount=" << model_geosets[g].icount
+                 << " bones=" << model_geosets[g].d3 << " combo=" << model_geosets[g].d4
+                 << " textures=" << tex_unit[j].texture_count << " shader=0x" << std::hex << tex_unit[j].shader_id << std::dec
+                 << " flags=" << static_cast<int>(tex_unit[j].flags) << std::endl;
+      }
+    }
+  }
   _render_passes.reserve(view->n_texture_unit);
   for (size_t j = 0; j<view->n_texture_unit; j++)
   {
@@ -1846,7 +2052,7 @@ void ModelRender::initRenderPasses(ModelView const* view, ModelTexUnit const* te
     if (geoset >= view->n_submesh
         || tex_unit[j].renderflag_index >= _model->_render_flags.size()
         || tex_unit[j].texture_count == 0
-        || tex_unit[j].texture_count > 2
+        || (tex_unit[j].texture_count > 2 && _model->renderEra() != Model::M2RenderEra::Modern)
         || tex_unit[j].texture_combo_index >= _model->_texture_lookup.size()
         || tex_unit[j].texture_count > _model->_texture_lookup.size() - tex_unit[j].texture_combo_index
         || (!classic_static && tex_unit[j].transparency_combo_index != 0xFFFF && tex_unit[j].transparency_combo_index >= _model->_transparency_lookup.size()))
@@ -1856,15 +2062,35 @@ void ModelRender::initRenderPasses(ModelView const* view, ModelTexUnit const* te
     }
 
     ModelRenderPass pass(tex_unit[j], _model);
+    if (pass.texture_count > 2)
+    {
+      // 12.x batches carry up to six textures (Forever Beta HD characters: cloak geoset 1507, 6 textures,
+      // shader 0x801C Guild_Opaque); the two-texture combiner path draws the base pair instead of dropping
+      // the batch ("Skipping invalid model render pass 0" on every HD NPC). docs/client_re/42 sec 22.
+      pass.texture_count = 2;
+    }
     pass.ordering_thingy = model_geosets[geoset].BoundingBox[0].x;
     // Full submesh sort-centre for the per-frame transparency sort: BoundingBox[0] is the client's per-batch
     // sort point (classic geoset.center, wotlk SkinSection CenterPosition), so this matches WoW.exe's key.
     pass.sort_center = model_geosets[geoset].BoundingBox[0];
     pass.geoset_id = model_geosets[geoset].id;
 
-    pass.index_start = model_geosets[geoset].istart;
+    // M2SkinSection.Level (noggit's d2) is the HIGH WORD of the section's triangle start -- and of its
+    // vertex start -- once the skin's list outgrows a uint16 (wowdev .skin: "(level << 16) is added to
+    // startTriangle and alike"). The Forever Beta HD character skins hold 150,468 triangle indices in 130
+    // sections, 84 of them Level 1-2 (the customization geosets). Read raw, section 46 (geoset 507) started
+    // at triangle 1277 inside the body: 0 of the 83,655 vertex references of the leveled sections fell in
+    // their own section's vertex range; shifted, all 83,655 do and the ranges tile the list to the last
+    // index. That was the shredded night elf / human NPCs (torso and head drawn from the legs' triangles).
+    // Vanilla / WotLK skins never exceed 65,535 entries, so their Level is 0 and nothing changes for them;
+    // the shift is only applied when the list actually needs it (the beta's 41,543-vertex list is below
+    // the limit and its vertex starts are raw). docs/client_re/42 sec 22.
+    std::uint32_t const level = model_geosets[geoset].d2;
+    std::uint32_t const index_shift = (view->n_triangle > 0xFFFFu) ? (level << 16) : 0u;
+    std::uint32_t const vertex_shift = (view->n_index > 0xFFFFu) ? (level << 16) : 0u;
+    pass.index_start = model_geosets[geoset].istart | index_shift;
     pass.index_count = model_geosets[geoset].icount;
-    pass.vertex_start = model_geosets[geoset].vstart;
+    pass.vertex_start = model_geosets[geoset].vstart | vertex_shift;
     pass.vertex_end = pass.vertex_start + model_geosets[geoset].vcount;
 
     if (should_log_model_render_passes(_model))
@@ -2298,12 +2524,16 @@ bool ModelRenderPass::prepareDraw(OpenGL::Scoped::use_program& m2_shader, Model 
   // different eras re-apply GL state, and rides to m2_frag as alpha_key_classic for the test ref.
   bool const classic_alpha_key = m->_uses_classic_layout
     && effective_blend == static_cast<uint16_t>(M2Blend::Alpha_Key);
+  // third era (docs/client_re/42 sec 3): MD21 models key at 128/255
+  bool const modern_alpha_key = m->renderEra() == Model::M2RenderEra::Modern
+    && effective_blend == static_cast<uint16_t>(M2Blend::Alpha_Key);
   uint16_t const blend_state_key = effective_blend | (promote_to_alpha_blend ? 0x100 : 0)
-                                 | (classic_alpha_key ? 0x200 : 0);
+                                 | (classic_alpha_key ? 0x200 : 0) | (modern_alpha_key ? 0x400 : 0);
 
   if (model_render_state.blend != blend_state_key)
   {
     m2_shader.uniform("alpha_key_classic", classic_alpha_key ? 1 : 0);
+    m2_shader.uniform("alpha_key_modern", modern_alpha_key ? 1 : 0);
     switch (promote_to_alpha_blend ? M2Blend::Alpha : static_cast<M2Blend>(effective_blend))
     {
       default:
@@ -2865,6 +3095,17 @@ bool ModelRenderPass::bindTexture(size_t index, Model* m, ModelInstance const* i
 thread_local int g_last_static_batch_reject = 0;
 // [VK] sub-reason for reject 12 (texture unit 0 unresolved) -- which branch of resolve_unit bailed.
 thread_local int g_last_tex_unit_reject = 0;
+// [2026-09-03] true when the texture rejection is PERMANENT (lookup out of range / no backing
+// texture entry): GL's own bindTexture returns false for that pass on every frame, so GL never
+// draws it either. The VK classic feed uses this to skip just the pass (like a hidden geoset)
+// instead of dropping the whole model to the -- in native mode invisible -- GL fallback.
+thread_local bool g_last_reject_permanent = false;
+// [2026-09-04] Sub-reason for reject code 4, which is OVERLOADED (hidden geoset / z_buffered /
+// unfogged-unlit). vkFeedClassicBucket skipped the pass for ALL of them on the grounds that "GL
+// skips it too" -- true only for a genuinely hidden geoset. GL draws z_buffered passes normally,
+// so that blanket skip made every pass of such a model vanish (keys.empty() -> allHidden ->
+// dropped -> invisible in native). 1 = hidden geoset, 2 = z_buffered, 3 = unfogged/unlit.
+thread_local int g_last_rej4_reason = 0;
 
 bool ModelRenderPass::resolveStaticBatch(Model* m, StaticBatchKey& out, bool for_pib, ModelInstance const* rep) const
 {
@@ -2877,6 +3118,8 @@ bool ModelRenderPass::resolveStaticBatch(Model* m, StaticBatchKey& out, bool for
   // only on the draw thread (single-threaded) so plain statics are fine; dumped cumulatively every 200k calls.
   static unsigned long s_calls = 0, s_ok = 0, s_rej[16] = {0};
   ++s_calls;
+  g_last_reject_permanent = false;
+  g_last_rej4_reason = 0;
   auto dump = [&]()
   {
     // [VK phase C] NOGGIT_MDI_REJECT_EVERY lowers the dump interval so a 30s harness run reports it
@@ -2927,11 +3170,11 @@ bool ModelRenderPass::resolveStaticBatch(Model* m, StaticBatchKey& out, bool for
     std::vector<bool> const& visible_geosets =
       (rep && !rep->geosetVisibility().empty()) ? rep->geosetVisibility() : m->showGeosets;
     if (submesh < visible_geosets.size() && !visible_geosets[submesh])
-      return rej(4);
+    { g_last_rej4_reason = 1; return rej(4); }
     if (rep && !rep->controlledGeosetFamilies().empty()
         && noggit_geoset_hidden_by_controlled_family(m, rep->controlledGeosetFamilies(),
                                                      rep->visibleGeosetIds(), geoset_id))
-      return rej(4);
+    { g_last_rej4_reason = 1; return rej(4); }
   }
   auto const& renderflag = m->_render_flags[renderflag_index];
 
@@ -2957,9 +3200,9 @@ bool ModelRenderPass::resolveStaticBatch(Model* m, StaticBatchKey& out, bool for
   // constant 0/0 uniforms) but are ADMITTED per-group for the pib batch (carried in the key -- glow cards are
   // commonly unlit and/or unfogged).
   if (renderflag.flags.z_buffered)
-    return rej(4);
+  { g_last_rej4_reason = 2; return rej(4); }   // GL DRAWS these -- never treat as "hidden"
   if (!for_pib && (renderflag.flags.unfogged || renderflag.flags.unlit))
-    return rej(4);
+  { g_last_rej4_reason = 3; return rej(4); }
 
   // require mesh_color == (1,1,1,1). RGB: no animated colour track (rare). Alpha: EVALUATE the transparency
   // exactly as prepareDraw does and batch only when it is ~1 -- the common case is a CONSTANT-1 track (opaque
@@ -3038,12 +3281,21 @@ bool ModelRenderPass::resolveStaticBatch(Model* m, StaticBatchKey& out, bool for
   auto resolve_unit = [&](std::size_t index, GLuint& arr, int& layer, int& clamp, std::string& blp_name) -> int
   {
     if (index >= texture_count) { arr = 0; layer = 0; clamp = 0; return 0; }
-    if (textures[index] >= m->_texture_lookup.size()) { g_last_tex_unit_reject = 1; return -1; }
+    // [2026-09-04] These three "short table" conditions are PERMANENT only once the model has
+    // finished loading -- _texture_lookup / _specialTextures / _textures are all filled DURING the
+    // load. Marking them permanent unconditionally (2026-09-03) made every still-loading model skip
+    // all of its passes -> keys.empty() -> the whole bucket counted allHidden and DROPPED, which in
+    // native mode is invisible (no GL underneath). Measured: the same camera swung between
+    // allHidden=0 and allHidden=136585 run to run purely on load timing -- the missing trees,
+    // fences and attachments. A loading model must stay TRANSIENT and be retried next frame.
+    bool const load_done = m->finishedLoading() && !m->loading_failed();
+    if (textures[index] >= m->_texture_lookup.size()) { g_last_tex_unit_reject = 1; return load_done ? -2 : -1; }
     uint16_t const tex = m->_texture_lookup[textures[index]];
     // override-tolerant like bindTexture (doc 40): a resolved special override does not need
     // m->_textures[tex]; only the non-special / fallback path does (guarded at use below).
-    if (tex >= m->_specialTextures.size()) { g_last_tex_unit_reject = 2; return -1; }
-    if (m->_specialTextures[tex] == -1 && tex >= m->_textures.size()) { g_last_tex_unit_reject = 3; return -1; }
+    if (tex >= m->_specialTextures.size()) { g_last_tex_unit_reject = 2; return load_done ? -2 : -1; }
+    if (m->_specialTextures[tex] == -1 && tex >= m->_textures.size())
+    { g_last_tex_unit_reject = 3; return load_done ? -2 : -1; } // permanent ONLY once loaded
     scoped_blp_texture_reference const* sel = nullptr;
     if (m->_specialTextures[tex] != -1)
     {
@@ -3077,10 +3329,18 @@ bool ModelRenderPass::resolveStaticBatch(Model* m, StaticBatchKey& out, bool for
 
   int const r0 = resolve_unit(0, out.tex_array0, out.layer0, out.tex_clamp0, out.blp0);
   if (r0 != 1)
+  {
+    // -2 = PERMANENT (see g_last_reject_permanent): GL's bindTexture fails identically and
+    // prepareDraw skips the pass -- the VK feed may therefore skip just this pass too.
+    g_last_reject_permanent = (r0 == -2);
     return rej(12); // unit 0 must resolve
+  }
   int const r1 = resolve_unit(1, out.tex_array1, out.layer1, out.tex_clamp1, out.blp1);
-  if (r1 == -1)
+  if (r1 == -1 || r1 == -2)
+  {
+    g_last_reject_permanent = (r1 == -2); // GL also skips the pass on a failed unit-1 bind
     return rej(13); // unit 1 present but not batchable/deferred
+  }
 
   // static UV only (no animated texture matrix) -- mirror the prepareDraw tex_anim_lookup resolution
   auto static_uv = [&](std::size_t idx) -> bool
@@ -3099,6 +3359,7 @@ bool ModelRenderPass::resolveStaticBatch(Model* m, StaticBatchKey& out, bool for
   out.pixel_shader = static_cast<int>(ps.value());
   out.blend_mode = blend;
   out.classic_alpha = m->_uses_classic_layout && blend == static_cast<uint16_t>(M2Blend::Alpha_Key);
+  out.modern_alpha = m->renderEra() == Model::M2RenderEra::Modern && blend == static_cast<uint16_t>(M2Blend::Alpha_Key);
   out.unfogged = for_pib && renderflag.flags.unfogged; // tile batch always resolves these false (gated above)
   out.unlit = for_pib && renderflag.flags.unlit;
   bool const classic_alpha_pass = m->_uses_classic_layout && blend != static_cast<uint16_t>(M2Blend::Opaque);
@@ -3126,9 +3387,27 @@ void ModelRenderPass::initUVTypes(Model* m)
   tu_lookups[0] = texture_unit_lookup::none;
   tu_lookups[1] = texture_unit_lookup::none;
 
+  if (m->renderEra() == Model::M2RenderEra::Modern)
+  {
+    // MD21: the uv set per texture comes from the authored shader id (M2GetVertexShaderID / the
+    // s_modelShaderEffect vertex column), docs/client_re/42 sec 3. E.g. 0x8001 = Diffuse_T1_Env: the
+    // second texture (armorreflect) is sphere-mapped.
+    ModernUV sources[2];
+    M2ModernUVSources(texture_count, shader_id, sources);
+    tu_lookups[0] = to_texture_unit_lookup(sources[0]);
+    tu_lookups[1] = texture_count > 1 ? to_texture_unit_lookup(sources[1]) : texture_unit_lookup::none;
+    return;
+  }
+
   if (m->_texture_unit_lookup.size() < texture_coord_combo_index + texture_count)
   {
-    LogError << "model: texture_coord_combo_index out of range " << m->file_key().stringRepr() << std::endl;
+    // Modern (MD21) models ship an EMPTY texture-unit lookup: the uv set comes from the batch's
+    // shader id, and the t1/t2 fallback below is exactly the plain case. Only a WotLK file with a
+    // short table is worth a line.
+    if (!m->isModernMD21() || !m->_texture_unit_lookup.empty())
+    {
+      LogError << "model: texture_coord_combo_index out of range " << m->file_key().stringRepr() << std::endl;
+    }
 
     for (int i = 0; i < texture_count; ++i)
     {

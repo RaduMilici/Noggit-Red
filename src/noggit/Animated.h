@@ -399,9 +399,23 @@ namespace Animation
 
       _globalSequences = globalSequences;
       _globalSequenceID = animationBlock.seq;
-      if (_globalSequenceID != NO_GLOBAL_SEQUENCE)
+      if (_globalSequenceID != NO_GLOBAL_SEQUENCE && !_globalSequences)
       {
-        assert(_globalSequences && "Animation said to have global sequence, but pointer to global sequence data is nullptr");
+        // a track naming a global sequence on a model that has none (garbage/foreign data): getValue
+        // would dereference nullptr (SIGSEGV in ParticleSystem::update, 2026-09-15 Classic Era)
+        _globalSequenceID = NO_GLOBAL_SEQUENCE;
+      }
+
+      // The per-sequence header tables themselves must sit inside the M2 (garbage offsets in a broken or
+      // foreign file used to be dereferenced blindly).
+      auto const table_fits = [&file](std::uint32_t offset, std::uint32_t count)
+      {
+        return !count || (offset < file.getSize()
+                          && count <= (file.getSize() - offset) / sizeof(AnimationBlockHeader));
+      };
+      if (!table_fits(animationBlock.ofsTimes, animationBlock.nTimes) || !table_fits(animationBlock.ofsKeys, animationBlock.nKeys))
+      {
+        return; // no keys at all: the track evaluates as constant / absent
       }
 
       const AnimationBlockHeader* timestampHeaders = file.get<AnimationBlockHeader>(animationBlock.ofsTimes);
@@ -429,13 +443,29 @@ namespace Animation
           + static_cast<std::size_t>(keyHeaders[j].nEntries) * sizeof(DataType);
         return times_end <= ext->getSize() && keys_end <= ext->getSize();
       };
+      // Inline data gets the SAME check against the M2 itself. A sequence whose keys live in an .anim
+      // file that was not found (modern AFID miss, missing WotLK .anim) carries .anim-RELATIVE offsets
+      // here; reading them out of the M2 produced garbage counts -> multi-GB vectors ("bad allocation")
+      // and out-of-bounds reads. Such a sequence now ends up with an empty track instead.
+      auto const inline_usable = [&](std::uint32_t j) -> bool
+      {
+        if (j >= animationBlock.nTimes || j >= animationBlock.nKeys)
+        {
+          return false;
+        }
+        std::size_t const times_end = static_cast<std::size_t>(timestampHeaders[j].ofsEntries)
+          + static_cast<std::size_t>(timestampHeaders[j].nEntries) * sizeof(TimestampType);
+        std::size_t const keys_end = static_cast<std::size_t>(keyHeaders[j].ofsEntries)
+          + static_cast<std::size_t>(keyHeaders[j].nEntries) * sizeof(DataType);
+        return times_end <= file.getSize() && keys_end <= file.getSize();
+      };
 
       for (std::uint32_t j = 0; j < animationBlock.nTimes; ++j)
       {
         auto const* ext = external_file(j);
-        if (ext && !external_usable(j))
+        if (ext ? !external_usable(j) : !inline_usable(j))
         {
-          continue; // unusable external data -> leave this sequence's track empty
+          continue; // unusable data -> leave this sequence's track empty
         }
 
         const TimestampType* timestamps = ext ?
@@ -451,7 +481,7 @@ namespace Animation
       for (std::uint32_t j = 0; j < animationBlock.nKeys; ++j)
       {
         auto const* ext = external_file(j);
-        if (ext && !external_usable(j))
+        if (ext ? !external_usable(j) : !inline_usable(j))
         {
           continue; // keep data[j] consistent with the skipped times[j] above
         }

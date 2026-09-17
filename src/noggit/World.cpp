@@ -1,6 +1,7 @@
 // This file is part of Noggit3, licensed under GNU General Public License (version 3).
 
 #include <noggit/World.h>
+#include <noggit/db2/ModernDBC.hpp>
 #include <noggit/frame_profiler.hpp>
 #include <noggit/World.inl>
 
@@ -21,6 +22,7 @@
 #include <noggit/ui/TexturingGUI.h>
 #include <noggit/application/NoggitApplication.hpp>
 #include <noggit/project/CurrentProject.hpp>
+#include <QtCore/QSettings>
 #include <noggit/ActionManager.hpp>
 #include <external/tracy/Tracy.hpp>
 #include <ClientFile.hpp>
@@ -129,12 +131,13 @@ namespace
     return {0, 0, 0, 0};
   }
 
-  std::string resolve_item_texture_component_filename(std::string texture_name, CharacterTextureRegion region)
+  std::string resolve_item_texture_component_filename(std::string texture_name, CharacterTextureRegion region, std::uint32_t sex_id = 0)
   {
     if (texture_name.empty())
     {
       return {};
     }
+    texture_name = Noggit::DB2::resolveItemVariantName(texture_name, 0, sex_id); // "matres:<id>" (modern): male / female / any
 
     texture_name = BlizzardArchive::ClientData::normalizeFilenameInternal(std::move(texture_name));
     if (texture_name.find('/') != std::string::npos)
@@ -1010,6 +1013,8 @@ namespace
                                                  std::uint32_t race_id,
                                                  std::uint32_t sex_id)
   {
+    // modern clients: "modelres:<id>:<side>" -> the race / gender / side variant (docs/client_re/42 sec 13)
+    model_name = Noggit::DB2::resolveItemVariantName(model_name, race_id, sex_id);
     model_name = normalize_model_filename(std::move(model_name));
     // An EMPTY DBC component name normalises to just ".m2" (the normaliser appends the extension),
     // so the empty check below used to pass and the loader requested
@@ -1081,6 +1086,7 @@ namespace
 
       auto resolve_texture_path = [&](std::string texture_name)
       {
+        texture_name = Noggit::DB2::resolveItemVariantName(texture_name, race_id, sex_id); // "matres:<id>" (modern)
         auto texture = normalize_texture_filename(std::move(texture_name));
         if (texture.empty())
         {
@@ -1485,7 +1491,61 @@ namespace
       apply_character_default_geosets(selection);
       debug << " defaults=wmvxLegacy";
 
-      if (auto hair_geoset = resolve_classic_hair_geoset(race_id, sex_id, hair_style_id))
+      // Modern (CASC) NPCs: CreatureDisplayInfoOption -> ChrCustomization* is the geoset authority
+      // (docs/client_re/42 sec 14): 1.15.9's CharacterFacialHairStyles rows carry race/sex/variation 0 and the
+      // legacy HairStyleID disagrees with the chosen style on 247 NPCs (428 are bald: type 0 id 0). Type 0 is
+      // the hair (group 0, id 0 = none), 1/2/3 the facial families with ABSOLUTE ids (0 = X00 = none), 16/33
+      // troll tusk/ear groups. The Turtle goblin Geoset100 hair rule below is 1.12-only: the Classic Era goblin
+      // (ChrModel 17/18) has ordinary group-0 hair.
+      bool const modern_project = Noggit::Project::isModernCascVersion(Noggit::Project::CurrentProject::get()->projectVersion);
+      bool chain_geosets_applied = false;
+      if (modern_project)
+      {
+        auto const custom = Noggit::DB2::creatureCustomization(extra_display_id, race_id, sex_id);
+        if (custom.has_options)
+        {
+          chain_geosets_applied = true;
+          for (auto const& [type, geoset_id] : custom.geosets)
+          {
+            if (type > 99 || geoset_id > 99) continue;
+            if (type == 0)
+            {
+              if (geoset_id == 0)
+              {
+                assign_geoset_selection(selection, CharacterGeosetFamily::SkinOrHairStyle, 0, false);
+              }
+              else
+              {
+                add_geoset_visible_id(selection, static_cast<std::uint16_t>(geoset_id));
+              }
+            }
+            else
+            {
+              assign_geoset_selection(selection, static_cast<CharacterGeosetFamily>(type), geoset_id, false);
+            }
+            debug << " chainGeoset=" << (type * 100 + geoset_id);
+          }
+        }
+      }
+
+      if (modern_project)
+      {
+        // Geoset group 17 (eye glow): the WMVx legacy default shows xx01 for every family, and on the classic
+        // files 1701 is an 8-vertex nothing. The Forever Beta HD character files (humanmale_hd.m2 and kin)
+        // make 1701 the DEATH KNIGHT eye glow itself -- 60 additive vertices textured by the hardcoded
+        // `character/human/male/deathknighteyegloweffect.blp` (TXID 3537040), with 1702..1705 as the other
+        // glow colours -- so every HD NPC wore blue flames for eyes while its real eyes (3301, texture type
+        // 19) had no texture. The customization chain never carries a type-17 geoset, so the family stays
+        // hidden on modern projects; the eye texture goes in through the type-19 override.
+        // docs/client_re/42 sec 26.
+        hide_geoset_family(selection, CharacterGeosetFamily::EyeGlow);
+        debug << " eyeGlowHidden=1";
+      }
+
+      if (chain_geosets_applied)
+      {
+      }
+      else if (auto hair_geoset = resolve_classic_hair_geoset(race_id, sex_id, hair_style_id))
       {
         add_geoset_visible_id(selection, static_cast<std::uint16_t>(*hair_geoset));
         debug << " hairGeosetApplied=" << *hair_geoset;
@@ -1495,14 +1555,17 @@ namespace
         debug << " hairGeosetMissing=1";
       }
 
-      if (race_id == 9)
+      if (race_id == 9 && !modern_project)
       {
         auto const goblin_hair_variant = std::max<std::uint32_t>(hair_style_id, 1u);
         assign_geoset_selection(selection, CharacterGeosetFamily::Geoset100, goblin_hair_variant);
         debug << " goblinHairVariantApplied=" << goblin_hair_variant;
       }
 
-      if (auto facial_hair_geosets = resolve_classic_facial_hair_geosets(race_id, sex_id, facial_hair_id))
+      if (chain_geosets_applied)
+      {
+      }
+      else if (auto facial_hair_geosets = resolve_classic_facial_hair_geosets(race_id, sex_id, facial_hair_id))
       {
         // Column->group mapping verified against ScourgeMale + the vanilla DBC: column 2 selects
         // the 300 family and column 3 the 200 family, and the values are ABSOLUTE variant numbers
@@ -1562,8 +1625,13 @@ namespace
           {
             try
             {
-              helm_hides_hair = gHelmetGeosetVisDataDB.getByID(helmet_vis)
-                                  .getUInt(HelmetGeosetVisDataDB::HairFlags) != 0;
+              std::uint32_t const hair_mask = gHelmetGeosetVisDataDB.getByID(helmet_vis)
+                                                .getUInt(HelmetGeosetVisDataDB::HairFlags);
+              // Modern data (HelmetGeosetData re-emitted per race, docs/client_re/42 sec 14) is a race mask
+              // like the facial columns; the WotLK rule (any bit) stays as verified against the stock rows.
+              helm_hides_hair = modern_project && race_id >= 1 && race_id <= 32
+                              ? ((hair_mask >> (race_id - 1)) & 1u) != 0u
+                              : hair_mask != 0;
             }
             catch (DBCFile::NotFound const&) { /* keep the vis != 0 fallback */ }
           }
@@ -1853,6 +1921,91 @@ namespace
     return filename;
   }
 
+  // Settings > "Character models" (modern clients): 0 = as the display authors it, 1 = classic (SD),
+  // 2 = HD. Read at spawn resolution only; MapView re-resolves the spawns when the value changes.
+  int character_model_fidelity()
+  {
+    return QSettings().value("render/character_model_fidelity", 0).toInt();
+  }
+
+  struct CreatureModelChoice
+  {
+    std::uint32_t model_id = 0;
+    bool hd = false;       // the chosen row is the `_hd` file
+    bool swapped = false;  // the setting moved the display off its authored row
+  };
+
+  // The Forever Beta pairs 18 plain/HD character files through CreatureModelData rows (humanmale.m2 = 49,
+  // humanmale_hd.m2 = 7661, ...; the adapter's FidelitySibling column) and gives 8,568 of 8,915 display
+  // extras both a classic and an HD bake. The client's live "character models" option swaps both; this is
+  // that swap. Displays without a sibling (creatures, the 342 HD-only extras' models) stay as authored.
+  // docs/client_re/42 sec 23.
+  CreatureModelChoice choose_creature_model(DBCFile::Record const& display)
+  {
+    CreatureModelChoice choice;
+    choice.model_id = display.getUInt(CreatureDisplayInfoDB::ModelID);
+    try
+    {
+      auto model = gCreatureModelDataDB.getByID(choice.model_id);
+      std::string const path = normalize_model_filename(model.getString(CreatureModelDataDB::ModelName));
+      static std::string const hd_suffix = "_hd.m2";
+      choice.hd = path.size() > hd_suffix.size() && path.compare(path.size() - hd_suffix.size(), hd_suffix.size(), hd_suffix) == 0;
+      int const fidelity = character_model_fidelity();
+      if (fidelity == 0 || gCreatureModelDataDB.getFieldCount() <= CreatureModelDataDB::FidelitySibling)
+      {
+        return choice;
+      }
+      bool const want_hd = fidelity == 2;
+      if (want_hd == choice.hd)
+      {
+        return choice;
+      }
+      // Swap only when the display's extra carries the bake of the wanted fidelity. The Forever Beta has
+      // no classic bake on 342 extras -- every blood elf NPC among them (display 25879: BakeMaterialResourcesID
+      // 0, HD bake 210817) -- and ships no classic body skins for that race at all, so the SD file (classic
+      // UV layout, the whole square) would wear the HD-layout bake: a face across the torso, the "completely
+      // broken" SD blood elf. The client keeps such displays on the model their bake fits.
+      std::uint32_t const extra_id = display.getUInt(CreatureDisplayInfoDB::ExtendedDisplayInfoID);
+      if (extra_id && gCreatureDisplayInfoExtraDB.CheckIfIdExists(static_cast<int>(extra_id)))
+      {
+        auto extra = gCreatureDisplayInfoExtraDB.getByID(extra_id);
+        bool const has_hd_column = gCreatureDisplayInfoExtraDB.getFieldCount() > CreatureDisplayInfoExtraDB::HDBakedTexture;
+        std::string const classic_bake = extra.getString(CreatureDisplayInfoExtraDB::BakedTexture());
+        std::string const hd_bake = has_hd_column ? extra.getString(CreatureDisplayInfoExtraDB::HDBakedTexture) : std::string();
+        if ((want_hd && hd_bake.empty()) || (!want_hd && classic_bake.empty()))
+        {
+          return choice;
+        }
+      }
+      std::uint32_t const sibling = model.getUInt(CreatureModelDataDB::FidelitySibling);
+      if (sibling && gCreatureModelDataDB.CheckIfIdExists(static_cast<int>(sibling)))
+      {
+        choice.model_id = sibling;
+        choice.hd = want_hd;
+        choice.swapped = true;
+      }
+    }
+    catch (...)
+    {
+    }
+    return choice;
+  }
+
+  // The bake that matches the chosen model variant: HDBakeMaterialResourcesID for the `_hd` file,
+  // BakeMaterialResourcesID for the plain one (each falls back to the other when it is empty).
+  std::string creature_bake_for(DBCFile::Record const& display, DBCFile::Record const& display_extra)
+  {
+    bool const hd = choose_creature_model(display).hd;
+    bool const has_hd_column = gCreatureDisplayInfoExtraDB.getFieldCount() > CreatureDisplayInfoExtraDB::HDBakedTexture;
+    std::string const classic = display_extra.getString(CreatureDisplayInfoExtraDB::BakedTexture());
+    std::string const high = has_hd_column ? display_extra.getString(CreatureDisplayInfoExtraDB::HDBakedTexture) : std::string();
+    if (hd)
+    {
+      return high.empty() ? classic : high;
+    }
+    return classic.empty() ? high : classic;
+  }
+
   std::string normalize_baked_creature_texture_filename(std::string filename)
   {
     if (filename.empty())
@@ -1960,7 +2113,7 @@ namespace
       std::string model_dir;
       try
       {
-        auto model_id = display.getUInt(CreatureDisplayInfoDB::ModelID);
+        auto model_id = choose_creature_model(display).model_id;
         auto model = gCreatureModelDataDB.getByID(model_id);
         auto model_path = normalize_model_filename(model.getString(CreatureModelDataDB::ModelName));
         auto sep = model_path.rfind('/');
@@ -2008,7 +2161,7 @@ namespace
         try
         {
           auto display_extra = gCreatureDisplayInfoExtraDB.getByID(extra_display_id);
-          auto baked_texture = normalize_baked_creature_texture_filename(display_extra.getString(CreatureDisplayInfoExtraDB::BakedTexture()));
+          auto baked_texture = normalize_baked_creature_texture_filename(creature_bake_for(display, display_extra));
           auto* client = Noggit::Application::NoggitApplication::instance()->clientData();
           bool const is_character_model = model_dir.rfind("character/", 0) == 0;
           bool const baked_texture_exists = !baked_texture.empty() && client->exists(baked_texture);
@@ -2201,7 +2354,7 @@ namespace
       std::string model_dir;
       try
       {
-        auto model_id = display.getUInt(CreatureDisplayInfoDB::ModelID);
+        auto model_id = choose_creature_model(display).model_id;
         auto model = gCreatureModelDataDB.getByID(model_id);
         auto model_path = normalize_model_filename(model.getString(CreatureModelDataDB::ModelName));
         auto sep = model_path.rfind('/');
@@ -2309,7 +2462,7 @@ namespace
               {
                 auto const cape_item = gItemDisplayInfoDB.getByID(cape_display_id);
                 auto cape_texture = normalize_texture_filename(
-                  std::string(cape_item.getString(ItemDisplayInfoDB::ModelTexture1)));
+                  Noggit::DB2::resolveItemVariantName(cape_item.getString(ItemDisplayInfoDB::ModelTexture1), race_id, sex_id));
                 if (!cape_texture.empty() && cape_texture.find('/') == std::string::npos)
                 {
                   cape_texture = normalize_texture_filename("item/objectcomponents/cape/" + cape_texture);
@@ -2327,6 +2480,7 @@ namespace
           CharacterSectionTextures skin_section;
           CharacterSectionTextures face_section;
           CharacterSectionTextures hair_section;
+          std::string chain_eyes_texture; // modern texture type 19 (character eyes) from the customization chain
           CharacterSectionTextures facial_hair_section;
           CharacterSectionTextures underwear_section;
 
@@ -2367,6 +2521,45 @@ namespace
                                                                    std::nullopt,
                                                                    skin_id,
                                                                    skin_id);
+
+            // Modern (CASC) NPCs: no CharSections. The customization chain (docs/client_re/42 sec 14) names the
+            // hair texture (target 10 -> type 6), the extra skin (target 2 -> type 8) and the base skin (target 1,
+            // used only when the baked body texture is missing); the face / facial / scalp / underwear targets are
+            // type-1 composite sections that the NPC bake (BakeMaterialResourcesID) already contains.
+            if (Noggit::Project::isModernCascVersion(Noggit::Project::CurrentProject::get()->projectVersion))
+            {
+              auto const custom = Noggit::DB2::creatureCustomization(extra_display_id, race_id, sex_id);
+              for (auto const& texture : custom.textures)
+              {
+                if (texture.texture_type == 6 && hair_section.textures[0].empty())
+                {
+                  hair_section.textures[0] = texture.path;
+                  hair_section.found = true;
+                }
+                else if (texture.texture_type == 19 && chain_eyes_texture.empty())
+                {
+                  // Modern M2 texture type 19 = character eyes (Shadowlands+): the HD character files
+                  // texture their eye geoset 3301 with it and the customization chain names the file
+                  // (`character/human/eyes00_12_<id>.blp`, ChrModelTextureLayer target 25). Left unfilled,
+                  // the eyes drew with no texture. docs/client_re/42 sec 26.
+                  chain_eyes_texture = texture.path;
+                }
+                else if (texture.texture_type == 8 && skin_section.textures[1].empty())
+                {
+                  skin_section.textures[1] = texture.path;
+                  skin_section.found = true;
+                }
+                else if (texture.texture_type == 1 && texture.target == 1 && skin_section.textures[0].empty())
+                {
+                  skin_section.textures[0] = texture.path;
+                  skin_section.found = true;
+                }
+                if (debug_character_override)
+                {
+                  debug_details << " chainTexture[" << texture.texture_type << ":" << texture.target << "]='" << texture.path << "'";
+                }
+              }
+            }
           }
 
           if (debug_character_override)
@@ -2415,7 +2608,7 @@ namespace
                                        std::size_t texture_field,
                                        CharacterTextureRegion region)
           {
-            auto texture = resolve_item_texture_component_filename(item_display.getString(texture_field), region);
+            auto texture = resolve_item_texture_component_filename(item_display.getString(texture_field), region, sex_id);
             if (!texture.empty())
             {
               body_texture_layers.push_back({std::move(texture), region});
@@ -2527,6 +2720,15 @@ namespace
               character_skin_exists = client->exists(character_skin_texture);
             }
 
+            if (!chain_eyes_texture.empty() && client->exists(chain_eyes_texture))
+            {
+              append_override(19, chain_eyes_texture);
+              if (debug_character_override)
+              {
+                debug_details << " eyesTexture='" << chain_eyes_texture << "'";
+              }
+            }
+
             if (!hair_section.textures[0].empty() && client->exists(hair_section.textures[0]))
             {
               append_override(6, hair_section.textures[0]);
@@ -2582,7 +2784,7 @@ namespace
 
           if (!has_explicit_texture_variation)
           {
-            auto baked_texture = normalize_baked_creature_texture_filename(display_extra.getString(CreatureDisplayInfoExtraDB::BakedTexture()));
+            auto baked_texture = normalize_baked_creature_texture_filename(creature_bake_for(display, display_extra));
             bool const disable_baked_npc_textures = is_character_model && classic_probe_disable_baked_npc_textures_enabled();
             auto append_character_fallback = [&](std::string texture)
             {
@@ -2757,6 +2959,16 @@ namespace
         LogDebug << "Creature texture overrides: " << override_log.str() << std::endl;
         append_creature_geoset_trace("texture", override_log.str());
       }
+      {
+        // Diagnostic (NOGGIT_M2_DEBUG_BONES=<substring of the model path>): the resolved overrides at error
+        // level for the headless bench (docs/client_re/42 sec 25).
+        static char const* const debug_bones = std::getenv("NOGGIT_M2_DEBUG_BONES");
+        if (debug_bones && *debug_bones && model_dir.find(debug_bones) != std::string::npos)
+        {
+          LogError << "[TEXTURE-DEBUG] display=" << display_id << " dir='" << model_dir << "'" << debug_details.str()
+                   << " finalOverrides=[" << format_texture_override_list(overrides) << "]" << std::endl;
+        }
+      }
 
       return overrides;
     }
@@ -2776,7 +2988,7 @@ namespace
     try
     {
       auto display = gCreatureDisplayInfoDB.getByID(display_id);
-      auto model_id = display.getUInt(CreatureDisplayInfoDB::ModelID);
+      auto model_id = choose_creature_model(display).model_id;
       if (!model_id)
       {
         return {CreatureModelPathStatus::MissingModelInfo, {}};
@@ -2899,7 +3111,9 @@ bool World::IsEditableWorld(BlizzardDatabaseLib::Structures::BlizzardDatabaseRow
 
   if (!Noggit::Application::NoggitApplication::instance()->clientData()->exists(ssfilename.str()))
   {
-    Log << "World " << record.RecordId << ": " << lMapName << " has no WDT file!" << std::endl;
+    auto const name_column = record.Columns.find("MapName_lang");
+    Log << "World " << record.RecordId << ": " << lMapName << " has no WDT file!"
+        << (name_column != record.Columns.end() ? " (" + name_column->second.Value + ")" : std::string()) << std::endl;
     return false;
   }
 
@@ -3493,191 +3707,61 @@ bool World::setGameCharacterDisplayId(std::uint32_t display_id)
   return ok;
 }
 
-int World::terrainTypeForTexture(std::string const& texture_filename)
-{
-  if (texture_filename.empty())
-  {
-    return -1;
-  }
-  // Look first; only rescan when the answer is missing.
-  {
-    auto const early = _texture_terrain_types.find(texture_filename);
-    if (early != _texture_terrain_types.end())
-    {
-      return early->second;
-    }
-  }
-  // MISS -> rescan, throttled. NOTE (2026-08-27): the previous trigger used
-  // mapIndex.getNLoadedTiles(), which counts tiles QUEUED for load (incremented at load start),
-  // so it reached its final value while the tiles were still parsing: the table was built once
-  // from barely-loaded tiles and then never rebuilt, because the count never changed again.
-  // Stormwind is exactly the case that needs the rescan -- its own tile (30_47) declares only the
-  // empty effect 7823 for the ground texture, while the neighbours that stream in a moment later
-  // (31_48 / 32_48 / 32_47) declare it Stone via effect 993.
-  float const now_ms = static_cast<float>(animtime);
-  if (!_texture_terrain_types.empty() && now_ms - _texture_terrain_last_scan_ms < 2000.0f)
-  {
-    return -1; // recently scanned and still unknown; don't rescan every footstep
-  }
-  {
-    _texture_terrain_last_scan_ms = now_ms;
-    unsigned scanned_tiles = 0;
-    _texture_terrain_types.clear();
-    for (MapTile* tile : mapIndex.loaded_tiles())
-    {
-      if (!tile)
-      {
-        continue;
-      }
-      ++scanned_tiles;
-      for (unsigned cz = 0; cz < 16; ++cz)
-      {
-        for (unsigned cx = 0; cx < 16; ++cx)
-        {
-          MapChunk* const c = tile->getChunk(cx, cz);
-          if (!c || !c->texture_set)
-          {
-            continue;
-          }
-          int const n = static_cast<int>(c->texture_set->num());
-          for (int i = 0; i < n; ++i)
-          {
-            unsigned const eff = c->texture_set->getEffectForLayer(static_cast<std::size_t>(i));
-            if (!eff)
-            {
-              continue;
-            }
-            try
-            {
-              if (!gGroundEffectTextureDB.CheckIfIdExists(eff))
-              {
-                continue;
-              }
-              auto const rec = gGroundEffectTextureDB.getByID(eff);
-              int const t = static_cast<int>(rec.getUInt(GroundEffectTextureDB::TerrainType()));
-              if (t > 0) // only rows that actually declare a type teach us about the texture
-              {
-                _texture_terrain_types.emplace(
-                  c->texture_set->filename(static_cast<std::size_t>(i)), t);
-              }
-            }
-            catch (...) {}
-          }
-        }
-      }
-    }
-    _texture_terrain_tiles_scanned = scanned_tiles;
-    LogError << "FOOTSTEP-TEXTABLE rebuilt from " << scanned_tiles << " FINISHED tiles: "
-             << _texture_terrain_types.size() << " textures with an authored terrain type"
-             << " (looking for '" << texture_filename << "')" << std::endl;
-  }
-  auto const hit = _texture_terrain_types.find(texture_filename);
-  return hit == _texture_terrain_types.end() ? -1 : hit->second;
-}
 
 int World::groundTerrainTypeAt(glm::vec3 const& pos, glm::mat4x4 const& model_view)
 {
-  // Down-ray like the game ground probe: whatever supports the character decides the family.
-  glm::vec3 const origin(pos.x, pos.y + 2.0f, pos.z);
-  math::ray const ray(origin, glm::vec3(0.f, -1.f, 0.f));
-  selection_result const results(intersectProbe(model_view, ray, 12.0f));
+  // 3.3.5a CWorld ground-type cast (FUN_007c2a70 -> FUN_007c28f0 -> FUN_007c2700), RE'd
+  // 2026-09-09. Segment: 0.1 above the position, 1000 straight down.
+  constexpr float k_above = 0.1f;
+  constexpr float k_reach = 1000.0f;
+  glm::vec3 const origin(pos.x, pos.y + k_above, pos.z);
+  math::ray const ray(origin, glm::vec3(0.0f, -1.0f, 0.0f));
 
-  float best_dist = std::numeric_limits<float>::max();
-  int best_kind = -1; // 0 = terrain chunk, 1 = wmo, 2 = m2
-  WMOInstance* best_wmo = nullptr;
-  for (auto const& hit : results)
+  // every loaded WMO: the two nearest faces are tracked independently ACROSS all of them
+  wmo_ground_query q;
+  _model_instance_storage.for_each_wmo_instance([&](WMOInstance& inst)
   {
-    if (hit.first >= best_dist)
+    inst.groundQuery(ray, k_reach, q);
+  });
+
+  // terrain under the origin (nearest MapChunk hit of the same ray). The client compares it with
+  // the SUPPORT face only: a WMO floor keeps the answer while the terrain lies below it.
+  float terrain_dist = std::numeric_limits<float>::max();
+  for (auto const& hit : intersectProbe(model_view, ray, 12.0f))
+  {
+    if (hit.second.index() == eEntry_MapChunk && hit.first < terrain_dist)
     {
-      continue;
-    }
-    if (hit.second.index() == eEntry_MapChunk)
-    {
-      best_dist = hit.first;
-      best_kind = 0;
-    }
-    else if (hit.second.index() == eEntry_Object)
-    {
-      auto obj = std::get<selected_object_type>(hit.second);
-      best_dist = hit.first;
-      if (obj->which() == eWMO)
-      {
-        best_kind = 1;
-        best_wmo = static_cast<WMOInstance*>(obj);
-      }
-      else
-      {
-        best_kind = 2;
-      }
+      terrain_dist = hit.first;
     }
   }
+  bool const on_wmo = q.has_support() && !(terrain_dist < q.support_t);
 
-  // FOOTSTEP-SURFACE diag (one-shot x20): which surface each step actually resolves against.
-  // Needed because Stormwind's streets/interiors are WMO geometry whose materials are almost
-  // all "None" -- this names the branch, the WMO, and its authored ground type per step.
+  // FOOTSTEP-SURFACE diag (one-shot x20): which surface each step resolves against.
   {
     static std::atomic<int> s_surf_diag_left{20};
     if (s_surf_diag_left.load(std::memory_order_relaxed) > 0
         && s_surf_diag_left.fetch_sub(1, std::memory_order_relaxed) > 0)
     {
-      std::string wmo_name = "-";
-      int wmo_gt = -99;
-      if (best_kind == 1 && best_wmo)
-      {
-        wmo_name = best_wmo->wmo->file_key().stringRepr();
-        if (auto const g = best_wmo->groundHit(ray, 12.0f))
-        {
-          wmo_gt = g->second;
-        }
-      }
-      LogError << "FOOTSTEP-SURFACE kind=" << best_kind
-               << " (0=terrain 1=wmo 2=m2 -1=none)"
-               << " wmo='" << wmo_name << "' wmoGroundType=" << wmo_gt
+      LogError << "FOOTSTEP-SURFACE "
+               << (on_wmo ? "wmo" : (q.has_support() ? "terrain-above-wmo" : "terrain"))
+               << " support=" << (q.has_support() ? q.support_t : -1.0f)
+               << " typed=" << (q.has_typed() ? q.typed_t : -1.0f)
+               << " typedGroundType=" << q.typed_ground_type
+               << " terrainDist=" << (terrain_dist < std::numeric_limits<float>::max() ? terrain_dist : -1.0f)
                << " pos=(" << pos.x << "," << pos.y << "," << pos.z << ")" << std::endl;
     }
   }
 
-  if (best_kind == 1 && best_wmo)
+  if (on_wmo)
   {
-    // WMO floor: MOMT.ground_type is a TerrainType id, but it is only AUTHORED on a handful of
-    // materials (surveyed 2026-08-27: 2090 of 2176 materials across 400 Turtle WMOs are 10 =
-    // "None"; the authored ones are 0 Dirt / 2 Stone / 4 Wood on chapels, barns, ships...).
-    // Authored wins; "None" falls through to the ground the building stands on rather than
-    // inventing a type -- that is what makes Stormwind's streets sound like their own paving
-    // instead of one flat default everywhere.
-    // A WMO floor's OWN material decides -- including TerrainType 10 "None", which is an authored
-    // value (row 10 -> SoundClass 0 -> the generic step), not a gap. Data (2026-08-27): of 8280
-    // walkable floor triangles in Stormwind.wmo, 7424 are textured and every one declares None,
-    // while inns/barns/barracks author Wood/Stone on the floor they actually mean. Falling through
-    // to the ADT terrain here was the "grass footsteps on stone streets" bug -- it read the grass
-    // buried UNDER the city. Only a face with NO material at all (gt < 0, collision-only
-    // geometry: 856 of those 8280) has nothing to say, and then the ground beneath is the best
-    // available answer.
-    if (auto const g = best_wmo->groundHit(ray, 12.0f))
-    {
-      int const gt = g->second;
-      if (gt >= 0)
-      {
-        return gt;
-      }
-    }
+    // No typed face anywhere below (a collision-only ghost floor all the way down): the client
+    // copies the support record with face 0xFFFF, which resolves to no material -> -1, and the
+    // footstep lookup then retries with row 0.
+    return q.has_typed() ? q.typed_ground_type : -1;
   }
-  // M2 supports (crates/planks) carry no authored ground type either -> same fallback.
+  // nothing but the ground supports the position: the chunk's own rule (FUN_007a0530)
   MapChunk* const chunk = getChunkAt(pos);
-  if (!chunk)
-  {
-    return -1;
-  }
-  std::string dominant_texture;
-  int row = chunk->groundTerrainTypeRowAt(pos, &dominant_texture);
-  if (row < 0 && !dominant_texture.empty())
-  {
-    // This chunk carries only placeholder effect rows. Resolve the texture map-wide: the same
-    // ground texture is declared properly in other loaded tiles (Stormwind's ground texture is
-    // Stone in 31_48/32_48 while the city sits on 30_47).
-    row = terrainTypeForTexture(dominant_texture);
-  }
-  return row;
+  return chunk ? chunk->groundTerrainTypeRowAt(pos) : -1;
 }
 
 std::uint32_t World::gameCharacterFootstepId()
@@ -3796,30 +3880,7 @@ int World::footstepSoundEntry(std::uint32_t footstep_id, int terrain_row, bool s
   {
     return 0;
   }
-  // CLIENT LAW (FUN_00458450 bounds check `-1 < terrain_row`): an unknown terrain type plays
-  // NO footstep at all. Only wet steps still sound, via the splash column.
-  if (terrain_row < 0 && !splash)
-  {
-    return 0;
-  }
-  if (terrain_row < 0)
-  {
-    terrain_row = 0; // wading over unauthored ground still splashes (class 0 splash row)
-  }
-  // TerrainType row -> its SoundClass (f4) = the FootstepTerrainLookup axis (doc 38;
-  // FUN_00458450: array[row.field4] inside the footstep-id object).
-  int sound_class = 0;
-  try
-  {
-    if (gTerrainTypeDB.CheckIfIdExists(terrain_row))
-    {
-      sound_class = static_cast<int>(gTerrainTypeDB.getByID(terrain_row)
-                                       .getUInt(TerrainTypeDB::SoundClass));
-    }
-  }
-  catch (...) {}
-
-  // lazy one-time bake of the 179-row lookup, mirroring the client's FUN_00457040 table:
+  // lazy one-time bake of the FootstepTerrainLookup rows:
   // key = (footstep id, sound class) -> {normal, splash} SoundEntries.
   static std::map<std::pair<std::uint32_t, int>, std::pair<int, int>> s_lookup;
   static bool s_baked = false;
@@ -3838,11 +3899,43 @@ int World::footstepSoundEntry(std::uint32_t footstep_id, int terrain_row, bool s
     }
     catch (...) {}
   }
-  auto const hit = s_lookup.find({footstep_id, sound_class});
-  int const se = (hit == s_lookup.end()) ? 0
-                                         : (splash ? hit->second.second : hit->second.first);
+
+  // 3.3.5a FUN_004cf100: TerrainType row -> its SoundClass -> the footstep object's normal /
+  // splash array. 0 when the row does not exist or the class has no entry for this footstep id.
+  auto const resolve = [&](int row) -> int
+  {
+    if (row < 0)
+    {
+      return 0;
+    }
+    int sound_class = -1;
+    try
+    {
+      if (gTerrainTypeDB.CheckIfIdExists(row))
+      {
+        sound_class = static_cast<int>(gTerrainTypeDB.getByID(row).getUInt(TerrainTypeDB::SoundClass));
+      }
+    }
+    catch (...) {}
+    if (sound_class < 0)
+    {
+      return 0;
+    }
+    auto const hit = s_lookup.find({footstep_id, sound_class});
+    return hit == s_lookup.end() ? 0 : (splash ? hit->second.second : hit->second.first);
+  };
+  // 3.3.5a FUN_004cf170 (RE'd 2026-09-09): the lookup runs with the resolved row and, when that
+  // yields no sound -- an unknown row (-1: a collision-only WMO floor, an unauthored chunk layer)
+  // or no lookup entry for its class -- once more with TerrainType 0 (Dirt). Doc 38's "an unknown
+  // row plays nothing" was the 1.12 binary's rule, not this client's.
+  int se = resolve(terrain_row);
+  bool const retried = (se == 0 && terrain_row != 0);
+  if (retried)
+  {
+    se = resolve(0);
+  }
   // FOOTSTEP-DIAG (one-shot x12): the whole resolve chain in one line per step, so a wrong
-  // sound can be traced to the terrain row / sound class / lookup without another RE round.
+  // sound can be traced to the terrain row / lookup without another RE round.
   {
     static std::atomic<int> s_fs_diag_left{12};
     if (s_fs_diag_left.load(std::memory_order_relaxed) > 0
@@ -3850,7 +3943,7 @@ int World::footstepSoundEntry(std::uint32_t footstep_id, int terrain_row, bool s
     {
       LogError << "FOOTSTEP-DIAG fsId=" << footstep_id
                << " terrainRow=" << terrain_row
-               << " soundClass=" << sound_class
+               << (retried ? " (no sound -> retried as row 0)" : "")
                << " splash=" << (splash ? 1 : 0)
                << " -> soundEntry=" << se << std::endl;
     }
@@ -4212,6 +4305,20 @@ bool World::ensureCreatureSpawnModel(CreatureSpawnOverlay& spawn)
                     << geoset_selection.debug_summary;
         LogDebug << "Creature geoset selection: " << geoset_line.str() << std::endl;
         append_creature_geoset_trace("selection", geoset_line.str());
+      }
+      // Diagnostic (NOGGIT_M2_DEBUG_BONES=<substring of the model path>, see Model.cpp): the selection at
+      // error level so the headless bench log carries it (docs/client_re/42 sec 25).
+      {
+        static char const* const debug_bones = std::getenv("NOGGIT_M2_DEBUG_BONES");
+        if (debug_bones && *debug_bones && spawn.model_path.find(debug_bones) != std::string::npos)
+        {
+          std::ostringstream ids;
+          for (auto id : geoset_selection.visible_ids) ids << id << ' ';
+          std::ostringstream fams;
+          for (auto f : geoset_selection.controlled_families) fams << f << ' ';
+          LogError << "[GEOSET-DEBUG] guid=" << spawn.guid << " display=" << spawn.display_id << " model='" << spawn.model_path
+                   << "' visible=[" << ids.str() << "] controlled=[" << fams.str() << "]" << geoset_selection.debug_summary << std::endl;
+        }
       }
     }
 

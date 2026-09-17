@@ -26,6 +26,8 @@ namespace Noggit::Project
     client_configuration.insert("ClientPath", project->ClientPath.c_str());
     client_configuration.insert("ClientVersion",
                                 ClientVersionFactory::MapToStringVersion(project->projectVersion).c_str());
+    if (!project->ClientProduct.empty())
+      client_configuration.insert("Product", project->ClientProduct.c_str());
 
     auto pinned_maps = QJsonArray();
     for (auto const& pinnedMap: project->PinnedMaps)

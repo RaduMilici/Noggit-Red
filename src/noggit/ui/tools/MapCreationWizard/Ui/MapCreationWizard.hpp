@@ -86,8 +86,12 @@ namespace Noggit
       ~MapCreationWizard();
 
       void wheelEvent(QWheelEvent *event) override;
-      void destroyFakeWorld() { if(_world) delete _world; _world = nullptr; _minimap_widget->world (nullptr); };
+      // _cur_map_id is reset too, so the next tab switch re-selects the map list's choice
+      void destroyFakeWorld() { if(_world) delete _world; _world = nullptr; _minimap_widget->world (nullptr); _cur_map_id = -1; };
       void addNewMap();
+      // the map shown on the tile grid (-1 = none / "Select a map")
+      int currentMapId() const { return _world ? _cur_map_id : -1; }
+      void selectMap(int map_id);
     signals:
       void map_dbc_updated();
 
@@ -142,7 +146,6 @@ namespace Noggit
 
       std::string getDifficultyString();
 
-      void selectMap(int map_id);
       void selectMapDifficulty();
 
       void saveCurrentEntry();

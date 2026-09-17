@@ -107,8 +107,18 @@ MapIndex::MapIndex (const std::string &pBasename, int map_id, World* world,
   // 2048-byte 4-bit; trusting the bit makes the alpha reader consume 4096 bytes per layer,
   // which misreads texture blends on every chunk and runs past the file buffer on the last
   // chunk of a tile (access violation -> whole tile fails to load).
-  mBigAlpha = (mphd.flags & FLAG_BIG_ALPHA)
-           && Noggit::Project::CurrentProject::get()->projectVersion != Noggit::Project::ProjectVersion::CLASSIC;
+  // Alpha-map bit depth of the UNCOMPRESSED MCAL layers. WotLK reads 8-bit 4096-byte layers only
+  // behind MPHD 0x4. Cata+ clients select the 8-bit formats when the WDT has 0x4 OR 0x80
+  // (adt_has_height_texturing) -- wowdev ADT/v18 MCAL: 4096 / compressed are "used when bit depth
+  // is 8, i.e. 0x4 or 0x80 set in the WDT's MPHD". Scarlet Enclave (Classic Era map 2856) is 0x3ca:
+  // 0x80 without 0x4; most of its layers are RLE (MCLY 0x200, decided per layer in Alphamap) but a
+  // few chunks per tile are plain 4096-byte maps, and reading those as 4-bit 2048 blended them as
+  // noise ("still broken ground textures in some areas", docs/client_re/42 sec 12). The 3.3.5a
+  // client ignores 0x80, so WotLK projects keep the 0x4-only rule.
+  auto const project_version = Noggit::Project::CurrentProject::get()->projectVersion;
+  bool const wdt_big_alpha = (mphd.flags & FLAG_BIG_ALPHA)
+    || (Noggit::Project::isModernCascVersion(project_version) && (mphd.flags & FLAG_HEIGHT_TEXTURING));
+  mBigAlpha = wdt_big_alpha && project_version != Noggit::Project::ProjectVersion::CLASSIC;
   if ((mphd.flags & FLAG_BIG_ALPHA) && !mBigAlpha)
   {
     LogDebug << "WDT \"" << basename << "\" sets MPHD big-alpha flag on a classic project; ignoring it (1.12 client behavior)." << std::endl;
@@ -152,32 +162,65 @@ MapIndex::MapIndex (const std::string &pBasename, int map_id, World* world,
 		}
 	}
 
-  if (!theFile.isEof() && mHasAGlobalWMO)
+  // Trailing chunks, by name: MWMO/MODF (global WMO maps), MAID (modern CASC clients: per-tile fileDataIDs
+  // of the split ADT parts -- root, obj0, obj1, tex0, lod, mapTexture, mapTextureN, minimapTexture) and
+  // anything else skipped (MAI2 on 2.5.x points at files the store does not even ship).
+  //! \note We actually don't load WMO only worlds, so MWMO/MODF are only recorded.
+  while (theFile.getPos() + 8 <= theFile.getSize())
   {
-    //! \note We actually don't load WMO only worlds, so we just stop reading here, k?
-    //! \bug MODF reads wrong. The assertion fails every time. Somehow, it keeps being MWMO. Or are there two blocks?
-    //! \nofuckingbug  on eof read returns just without doing sth to the var and some wdts have a MWMO without having a MODF so only checking for eof above is not enough
-
-    // mHasAGlobalWMO = false;
-
-    // - MWMO ----------------------------------------------
-
     theFile.read(&fourcc, 4);
     theFile.read(&size, 4);
+    std::size_t const chunk_end = theFile.getPos() + size;
+    if (chunk_end > theFile.getSize())
+    {
+      break;
+    }
 
-    assert(fourcc == 'MWMO');
+    if (fourcc == 'MWMO')
+    {
+      globalWMOName = std::string(theFile.getPointer(), size);
+    }
+    else if (fourcc == 'MODF' && size >= sizeof(ENTRY_MODF))
+    {
+      theFile.read(&wmoEntry, sizeof(ENTRY_MODF));
+      // Modern WDTs (MPHD 0x200 MAID) ship no MWMO: MODF flags 0x8 = nameID is the WMO's fileDataID
+      // (moltencore.wdt: nameID 108286, flags 0x8, MAIN empty). Resolve it to a path the WMO instance can
+      // open -- the listfile name, or a synthetic one registered for the id (docs/client_re/42 sec 10).
+      if ((wmoEntry.flags & 0x8) && wmoEntry.nameID && globalWMOName.empty())
+      {
+        auto* listfile = Noggit::Application::NoggitApplication::instance()->clientData()->listfile();
+        std::string path = listfile ? listfile->getPath(wmoEntry.nameID) : std::string();
+        if (path.empty() && listfile)
+        {
+          path = "fdid/" + std::to_string(wmoEntry.nameID) + ".wmo";
+          listfile->registerPath(wmoEntry.nameID, path);
+        }
+        globalWMOName = path;
+        LogDebug << "WDT global WMO by fileDataID " << wmoEntry.nameID << " -> '" << globalWMOName << "'" << std::endl;
+      }
+    }
+    else if (fourcc == 'MAID' && size >= 64 * 64 * 32)
+    {
+      _has_maid = true;
+      for (int j = 0; j < 64; ++j)
+      {
+        for (int i = 0; i < 64; ++i)
+        {
+          theFile.read(mTiles[j][i].file_ids.data(), 32);
+        }
+      }
+    }
 
-    globalWMOName = std::string(theFile.getPointer(), size);
-    theFile.seekRelative(size);
+    theFile.seek(chunk_end);
+  }
 
-    // - MODF ----------------------------------------------
-
-    theFile.read(&fourcc, 4);
-    theFile.read(&size, 4);
-
-    assert(fourcc == 'MODF');
-
-    theFile.read(&wmoEntry, sizeof(ENTRY_MODF));
+  if (_has_maid)
+  {
+    int present = 0;
+    for (int j = 0; j < 64; ++j)
+      for (int i = 0; i < 64; ++i)
+        present += (mTiles[j][i].file_ids[0] != 0 && (mTiles[j][i].flags & 1)) ? 1 : 0;
+    LogDebug << "WDT \"" << basename << "\" carries MAID: " << present << " tiles addressed by fileDataID." << std::endl;
   }
 
   // -----------------------------------------------------
@@ -457,6 +500,12 @@ MapTile* MapIndex::loadTile(const TileIndex& tile, bool reloading, bool load_mod
      mBigAlpha, load_models, use_mclq_green_lava(), reloading, _world, _context, tile_mode::edit, load_textures);
 
   MapTile* adt = mTiles[tile.z][tile.x].tile.get();
+
+  if (_has_maid)
+  {
+    auto const& ids = mTiles[tile.z][tile.x].file_ids;
+    adt->setModernFiles(ModernTileFiles{ ids[0], ids[1], ids[2], ids[3], ids[4], ids[5], ids[6], ids[7] });
+  }
 
   AsyncLoader::instance().queue_for_load(adt);
   _n_loaded_tiles++;

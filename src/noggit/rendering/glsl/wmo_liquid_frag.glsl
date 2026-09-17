@@ -47,8 +47,10 @@ uniform vec3 material_color;
 // matches the WATER param family, so Skies feeds this per frame from CLEAR_WATER.
 uniform vec3 wmo_water_river_dark;
 // 1 = city water channel (MOGP indoor 0x2000 + exterior_lit: SW canals/harbor, Booty Bay) -> the
-// ocean-dark opaque look; 0 = open-air WMO pool (Northshire abbeygate stream) -> river blend.
-uniform int wmo_indoor_channel;
+// ocean-dark opaque look; 0 = open-air WMO pool (Northshire abbeygate stream) -> river blend;
+// 2 = EXTERIOR water on the LiquidType.dbc path (stock WotLK Stormwind canals) -> the client's
+// flat river-deep colour (wmo_water_river_dark), see wmo_liquid.hpp.
+uniform int wmo_water_mode;
 uniform vec3 camera; // for the user-directed sun/moon glitter lobe on exterior WMO water
 uniform vec3 sheen_dir; // TO the drawn sun/moon disc (WorldRender celestial_dir)
 
@@ -147,7 +149,17 @@ void main()
       // pat*body*1.0 -- between the old canal punch and the old ocean shine. liquid_frag (ADT)
       // uses the same law.
       float pattern = texel.a;
-      if (wmo_indoor_channel == 1)
+      if (wmo_water_mode == 2)
+      {
+        // DBC-PATH EXTERIOR WATER (stock 3.3.5a Stormwind canals: EXTERIOR groups, groupLiquid 5
+        // "Slow Water"): the client law as pinned above -- ONE flat zone colour, Light band 17 =
+        // river deep (#234A69 at Stormwind noon), depth only in the alpha. These groups carry neither
+        // the indoor flag (Turtle/vanilla canal encoding) nor a legacy id, so they used to fall into
+        // the open-air-pool river blend and came out olive green.
+        water_rgb = wmo_water_river_dark;
+        water_alpha = RiverColorDark.a * water_alpha_mult;
+      }
+      else if (wmo_water_mode == 1)
       {
         // CITY CHANNEL (canals/harbor/Booty Bay): ocean-deep navy body, fully opaque
         // (user-directed rounds 8-9; round 19: "a tad darker" -> x0.8). ROUND 21 (2026-08-28,

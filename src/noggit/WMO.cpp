@@ -33,7 +33,12 @@ WMO::WMO(BlizzardArchive::Listfile::FileKey const& file_key, Noggit::NoggitRende
 
 void WMO::finishLoading ()
 {
-  BlizzardArchive::ClientFile f(_file_key.filepath(), Noggit::Application::NoggitApplication::instance()->clientData());
+  // 2026-09-15: chunk DISPATCH instead of a fixed chunk order. Modern (CASC) roots drop MOTX and MODN
+  // (MOMT texture fields and a MODI array carry fileDataIDs), add GFID (group files by id) and MOSI
+  // (skybox by id), and interleave new chunks (MOUV, MOSI, MDAL, MAVG ...). Group files are unchanged.
+  // Measured on 1.15.9 / 2.5.6 human_farm/farm.wmo -- docs/client_re/41 section 6.
+  auto* client_data = Noggit::Application::NoggitApplication::instance()->clientData();
+  BlizzardArchive::ClientFile f(_file_key, client_data);
   if (f.isEof()) {
     LogError << "Error loading WMO \"" << _file_key.stringRepr() << "\"." << std::endl;
     return;
@@ -46,6 +51,12 @@ void WMO::finishLoading ()
 
   char const* ddnames = nullptr;
   char const* groupnames = nullptr;
+  std::vector<char> texbuf;                  // MOTX: texture names (WotLK); empty on modern roots
+  bool have_motx = false;
+  std::vector<std::uint32_t> doodad_ids;     // MODI: doodad model fileDataIDs (modern)
+  std::size_t modd_pos = 0;                  // MODD entries are resolved after the loop (MODI follows MODD)
+  std::size_t doodad_count = 0;
+  std::uint32_t skybox_file_id = 0;          // MOSI
 
   // - MVER ----------------------------------------------
 
@@ -95,68 +106,67 @@ void WMO::finishLoading ()
   ambient_light_color.z = static_cast<float>(ambient_color.r) / 255.f;
   ambient_light_color.w = static_cast<float>(ambient_color.a) / 255.f;
 
-  // - MOTX ----------------------------------------------
-
-  f.read (&fourcc, 4);
-  f.read (&size, 4);
-
-  assert (fourcc == 'MOTX');
-
-  std::vector<char> texbuf (size);
-  f.read (texbuf.data(), texbuf.size());
-
-  // - MOMT ----------------------------------------------
-
-  f.read (&fourcc, 4);
-  f.read (&size, 4);
-
-  assert (fourcc == 'MOMT');
-
-  std::size_t const num_materials (size / 0x40);
-  materials.resize (num_materials);
-  material_env_texture_missing.assign (num_materials, 0u);
-
   // note: used to map to size_t, but our other values don't support that.
-  //std::map<std::uint32_t, std::size_t> texture_offset_to_inmem_index;
   std::map<std::uint32_t, std::uint32_t> texture_offset_to_inmem_index;
 
+  // MOTX offset (WotLK) or fileDataID (modern) -> index into `textures`
   auto load_texture
-    ( [&] (std::uint32_t ofs, bool is_second_texture)
+    ( [&] (std::uint32_t ofs_or_id, bool is_second_texture)
       {
-        // An EMPTY MOTX entry means the material simply has NO texture in that slot.
-        //
-        // Substituting the green shanecube placeholder is reasonable for a missing FIRST texture (it makes
-        // an authoring error obvious), but it is wrong for the SECOND: Env/EnvMetal ADD that layer
-        // (out = lighting(tex) + tex_2 * tex * tex.a), so the placeholder's bright-green grid got added on
-        // top of the surface -- and because the env coordinate is a reflection vector, the green swam
-        // across the model as the camera turned. Stormwind's SW_Harbor_Docks.wmo does exactly this: the
-        // docked ship's 4 EnvMetal materials (front/rear/blade/metalhull) declare an EMPTY texture2, while
-        // the standalone Transport_Icebreaker_ship_nomasts.wmo names a real env map (WR_ENV.BLP) and
-        // renders correctly. Black is the neutral element for an additive layer, so an absent env map now
-        // contributes nothing. Note this path never logged "file not found" -- the name is empty, not
-        // missing -- which is why it hid for so long. [2026-07-30]
-        bool const is_empty = !texbuf[ofs];
-        std::string texture
-          (is_empty ? std::string(is_second_texture ? "tileset/generic/black.blp"
-                                                    : "textures/shanecube.blp")
-                    : std::string(&texbuf[ofs]));
+        bool const by_id = !have_motx;
+        bool is_empty;
+        std::string texture;
 
-        // Custom WMOs (Turtle world/custom/kttown/kttown.wmo) reference textures by BARE filename
-        // (window.blp, floor.blp, wall3.blp) with NO directory. A bare name collides with same-named
-        // root textures shipped by other patches, so noggit's patch load-order resolves them to the WRONG
-        // image ("wrong textures" on the building). Resolve a directory-less name from the WMO's OWN folder
-        // first (world/custom/kttown/window.blp) -- a unique, collision-free path -- and only fall back to
-        // the bare name if no co-located texture exists. Standard full-path MOTX entries are unaffected.
-        if (texture.find('/') == std::string::npos && texture.find('\\') == std::string::npos)
+        if (by_id)
         {
-          std::string const wmo_path = _file_key.filepath();
-          auto const slash = wmo_path.find_last_of("/\\");
-          if (slash != std::string::npos)
+          is_empty = ofs_or_id == 0;
+          if (is_empty)
           {
-            std::string const co_located = wmo_path.substr(0, slash + 1) + texture;
-            if (Noggit::Application::NoggitApplication::instance()->clientData()->exists(co_located))
+            texture = is_second_texture ? "tileset/generic/black.blp" : "textures/shanecube.blp";
+          }
+          else
+          {
+            std::string const path = client_data->listfile()->getPath(ofs_or_id);
+            texture = path.empty() ? "fdid:" + std::to_string(ofs_or_id)
+                                   : BlizzardArchive::ClientData::normalizeFilenameInternal(path);
+          }
+        }
+        else
+        {
+          // An EMPTY MOTX entry means the material simply has NO texture in that slot.
+          //
+          // Substituting the green shanecube placeholder is reasonable for a missing FIRST texture (it makes
+          // an authoring error obvious), but it is wrong for the SECOND: Env/EnvMetal ADD that layer
+          // (out = lighting(tex) + tex_2 * tex * tex.a), so the placeholder's bright-green grid got added on
+          // top of the surface -- and because the env coordinate is a reflection vector, the green swam
+          // across the model as the camera turned. Stormwind's SW_Harbor_Docks.wmo does exactly this: the
+          // docked ship's 4 EnvMetal materials (front/rear/blade/metalhull) declare an EMPTY texture2, while
+          // the standalone Transport_Icebreaker_ship_nomasts.wmo names a real env map (WR_ENV.BLP) and
+          // renders correctly. Black is the neutral element for an additive layer, so an absent env map now
+          // contributes nothing. Note this path never logged "file not found" -- the name is empty, not
+          // missing -- which is why it hid for so long. [2026-07-30]
+          is_empty = ofs_or_id >= texbuf.size() || !texbuf[ofs_or_id];
+          texture = is_empty ? std::string(is_second_texture ? "tileset/generic/black.blp"
+                                                             : "textures/shanecube.blp")
+                             : std::string(&texbuf[ofs_or_id]);
+
+          // Custom WMOs (Turtle world/custom/kttown/kttown.wmo) reference textures by BARE filename
+          // (window.blp, floor.blp, wall3.blp) with NO directory. A bare name collides with same-named
+          // root textures shipped by other patches, so noggit's patch load-order resolves them to the WRONG
+          // image ("wrong textures" on the building). Resolve a directory-less name from the WMO's OWN folder
+          // first (world/custom/kttown/window.blp) -- a unique, collision-free path -- and only fall back to
+          // the bare name if no co-located texture exists. Standard full-path MOTX entries are unaffected.
+          if (_file_key.hasFilepath() && texture.find('/') == std::string::npos && texture.find('\\') == std::string::npos)
+          {
+            std::string const wmo_path = _file_key.filepath();
+            auto const slash = wmo_path.find_last_of("/\\");
+            if (slash != std::string::npos)
             {
-              texture = co_located;
+              std::string const co_located = wmo_path.substr(0, slash + 1) + texture;
+              if (client_data->exists(co_located))
+              {
+                texture = co_located;
+              }
             }
           }
         }
@@ -164,7 +174,7 @@ void WMO::finishLoading ()
         // Empty entries resolve to a DIFFERENT substitute depending on the slot, so fold the slot into the
         // cache key for them -- otherwise a first-slot shanecube could be handed back for a second slot
         // (or vice versa) whenever both reference the same empty offset.
-        std::uint32_t const cache_key = (is_empty && is_second_texture) ? (ofs | 0x80000000u) : ofs;
+        std::uint32_t const cache_key = (is_empty && is_second_texture) ? (ofs_or_id | 0x80000000u) : ofs_or_id;
 
         auto const mapping
           (texture_offset_to_inmem_index.emplace(cache_key, static_cast<std::uint32_t>(textures.size())));
@@ -177,220 +187,282 @@ void WMO::finishLoading ()
       }
     );
 
-  for (size_t i(0); i < num_materials; ++i)
+  // ---------------------------------------------------------------- chunk loop
+  while (f.getPos() + 8 <= f.getSize())
   {
-    f.read(&materials[i], sizeof(WMOMaterial));
-
-    uint32_t shader = materials[i].shader;
-    bool use_second_texture = (shader == 6 || shader == 5 || shader == 3);
-
-    materials[i].texture1 = load_texture(materials[i].texture_offset_1, false);
-    if (use_second_texture)
+    f.read (&fourcc, 4);
+    f.read (&size, 4);
+    std::size_t const chunk_end = f.getPos() + size;
+    if (chunk_end > f.getSize())
     {
-      material_env_texture_missing[i] = !texbuf[materials[i].texture_offset_2] ? 1u : 0u;
-      materials[i].texture2 = load_texture(materials[i].texture_offset_2, true);
-    }
-  }
-
-  // - MOGN ----------------------------------------------
-
-  f.read (&fourcc, 4);
-  f.read (&size, 4);
-
-  assert (fourcc == 'MOGN');
-
-  groupnames = reinterpret_cast<char const*> (f.getPointer ());
-
-  f.seekRelative (size);
-
-  // - MOGI ----------------------------------------------
-
-  f.read (&fourcc, 4);
-  f.read (&size, 4);
-
-  assert (fourcc == 'MOGI');
-
-  groups.reserve(nGroups);
-  for (int i (0); i < nGroups; ++i) {
-    groups.emplace_back (this, &f, i, groupnames);
-  }
-
-  // - MOSB ----------------------------------------------
-
-  f.read (&fourcc, 4);
-  f.read (&size, 4);
-
-  assert (fourcc == 'MOSB');
-
-  if (size > 4)
-  {
-    std::string path = BlizzardArchive::ClientData::normalizeFilenameInternal(std::string (reinterpret_cast<char const*>(f.getPointer ())));
-    auto from = std::string("mdx");
-    auto to = std::string("m2");
-    size_t start_pos = 0;
-    while ((start_pos = path.find(from, start_pos)) != std::string::npos) {
-        path.replace(start_pos, from.length(), to);
-        start_pos += to.length(); // Handles case where 'to' is a substring of 'from'
+      LogError << "WMO \"" << _file_key.stringRepr() << "\": chunk runs past the file; stopping." << std::endl;
+      break;
     }
 
-    if (path.length())
+    switch (fourcc)
     {
-      if (Noggit::Application::NoggitApplication::instance()->clientData()->exists(path))
+      case 'MOTX':
       {
-        skybox = scoped_model_reference(path, _context);
+        texbuf.assign(f.getPointer(), f.getPointer() + size);
+        have_motx = true;
+        break;
       }
+      case 'MOMT':
+      {
+        std::size_t const num_materials (size / 0x40);
+        materials.resize (num_materials);
+        material_env_texture_missing.assign (num_materials, 0u);
+
+        for (size_t i(0); i < num_materials; ++i)
+        {
+          f.read(&materials[i], sizeof(WMOMaterial));
+
+          uint32_t shader = materials[i].shader;
+          bool use_second_texture = (shader == 6 || shader == 5 || shader == 3);
+
+          materials[i].texture1 = load_texture(materials[i].texture_offset_1, false);
+          if (use_second_texture)
+          {
+            bool const second_missing = have_motx
+              ? (materials[i].texture_offset_2 >= texbuf.size() || !texbuf[materials[i].texture_offset_2])
+              : materials[i].texture_offset_2 == 0;
+            material_env_texture_missing[i] = second_missing ? 1u : 0u;
+            materials[i].texture2 = load_texture(materials[i].texture_offset_2, true);
+          }
+        }
+        break;
+      }
+      case 'MOGN':
+      {
+        groupnames = reinterpret_cast<char const*> (f.getPointer ());
+        break;
+      }
+      case 'MOGI':
+      {
+        std::size_t const group_count = std::min<std::size_t>(nGroups, size / 32);
+        groups.reserve(group_count);
+        for (int i (0); i < static_cast<int>(group_count); ++i) {
+          groups.emplace_back (this, &f, i, groupnames);
+        }
+        break;
+      }
+      case 'MOSB':
+      {
+        if (size > 4)
+        {
+          std::string path = BlizzardArchive::ClientData::normalizeFilenameInternal(std::string (reinterpret_cast<char const*>(f.getPointer ())));
+          auto from = std::string("mdx");
+          auto to = std::string("m2");
+          size_t start_pos = 0;
+          while ((start_pos = path.find(from, start_pos)) != std::string::npos) {
+              path.replace(start_pos, from.length(), to);
+              start_pos += to.length(); // Handles case where 'to' is a substring of 'from'
+          }
+
+          if (path.length())
+          {
+            if (client_data->exists(path))
+            {
+              skybox = scoped_model_reference(path, _context);
+            }
+          }
+        }
+        break;
+      }
+      case 'MOSI':
+      {
+        if (size >= 4)
+        {
+          f.read(&skybox_file_id, 4);
+        }
+        break;
+      }
+      case 'MOPV':
+      {
+        // Portal polygon corners. Same X/Z-up -> Y-up swap the rest of the WMO geometry uses.
+        _portal_vertices.reserve(size / 12);
+        for (size_t i (0); i < size / 12; ++i)
+        {
+          f.read (ff, 12);
+          _portal_vertices.push_back(glm::vec3(ff[0], ff[2], -ff[1]));
+        }
+        break;
+      }
+      case 'MOPT':
+      {
+        // Each MOPT is uint16 base_index, uint16 count, then a 16-byte C4Plane. The plane is STORED (in the
+        // swapped coord convention, an orthogonal transform, so distances are invariant) -- AttenTransVerts
+        // (RE_notes/19) needs the authored plane for its on-plane test. Culling still recomputes its own.
+        _portal_info.reserve(size / 0x14);
+        for (size_t i (0); i < size / 0x14; ++i)
+        {
+          wmo_portal_info info;
+          f.read (&info.base_vertex, 2);
+          f.read (&info.vertex_count, 2);
+          float plane[4];
+          f.read (plane, 16);
+          info.plane_normal = glm::vec3(plane[0], plane[2], -plane[1]); // same swap as MOPV/MOVT
+          info.plane_dist = plane[3];
+          _portal_info.push_back(info);
+        }
+        break;
+      }
+      case 'MOPR':
+      {
+        _portal_refs.resize(size / sizeof(WMOPR));
+        if (size)
+        {
+          f.read (_portal_refs.data(), size);
+        }
+        break;
+      }
+      case 'MNLD':
+      {
+        // Shadowlands+ dynamic lights (wowdev WMO/MNLD, 184 bytes each): int type (0 point, 1 spot), int
+        // lightIndex, int flags (0x1 blend colours, 0x2 shadow), int doodadSet, CImVector innerColor, C3Vector
+        // position, C3Vector rotation, float attenStart, attenEnd, intensity, CImVector outerColor, float
+        // blendStart, blendEnd, flicker, cookie fdid, falloff, cone angles, half-float scale / multiplier.
+        // Modern groups reference these through MNLR instead of MOLT through MOLR: Karazhan Crypts
+        // (classic_md_crypt_d.wmo, Classic Era 1.15.9) carries 283 of them and 389 MNLR refs against 0 MOLR
+        // refs, with a black MOHD ambient and MOCV averaging 2/255 -- ALL of its interior light. Without
+        // them every room drew black. docs/client_re/42 sec 15.
+        constexpr std::size_t record_size = 184;
+        std::size_t const count = size / record_size;
+        new_lights.reserve(count);
+        for (std::size_t i = 0; i < count; ++i)
+        {
+          char rec[record_size];
+          f.read(rec, record_size);
+          WMOLight l;
+          std::memcpy(&l.light_type, rec + 0, 4);
+          std::memcpy(&l.flags, rec + 8, 4);
+          std::memcpy(&l.doodad_set, rec + 12, 4);
+          std::memcpy(&l.color, rec + 16, 4);
+          glm::vec3 p;
+          std::memcpy(&p, rec + 20, 12);
+          float atten_end = 0.f;
+          std::memcpy(&atten_end, rec + 48, 4);
+          std::memcpy(&l.intensity, rec + 52, 4);
+          std::fill(std::begin(l.unk), std::end(l.unk), 0.f);
+          l.pos = glm::vec3(p.x, p.z, -p.y); // same axis swap as MOLT / MOVT
+          l.r = atten_end;
+          l.modern = true;
+          float const fr = ((l.color & 0x00ff0000) >> 16) / 255.0f;
+          float const fg = ((l.color & 0x0000ff00) >> 8) / 255.0f;
+          float const fb = (l.color & 0x000000ff) / 255.0f;
+          l.fcolor = glm::vec4(fr, fg, fb, 1.0f);
+          new_lights.push_back(l);
+        }
+        break;
+      }
+      case 'MOLT':
+      {
+        // Trust the CHUNK SIZE so a bad MOHD.nLights can't run the read past the chunk. Each MOLT entry is
+        // 0x30 bytes; min() is a no-op when the header agrees with the chunk (every valid WMO).
+        std::size_t const light_count = std::min<std::size_t> (nLights, size / 0x30);
+        lights.reserve(light_count);
+        for (size_t i (0); i < light_count; ++i) {
+          WMOLight l;
+          l.init (&f);
+          lights.push_back (l);
+        }
+        break;
+      }
+      case 'MODS':
+      {
+        // Robustness (Turtle world/custom/kt_Farm/ktfarm.wmo, kt_Inn/ktinn.wmo): read the doodad-set count from
+        // the CHUNK SIZE, not blindly from MOHD.nDoodadSets. Those custom WMOs carry a MOHD nDoodadSets (6, 4)
+        // that OVERRUNS their actual 32-byte (1-set) MODS chunk -> reading nDoodadSets*32 bytes ran past the
+        // chunk and DESYNCED every following chunk. Clamp to what the chunk holds.
+        std::size_t const set_count = std::min<std::size_t> (nDoodadSets, size / 32);
+        doodadsets.reserve(set_count);
+        for (size_t i (0); i < set_count; ++i) {
+          WMODoodadSet dds;
+          f.read (&dds, 32);
+          doodadsets.push_back (dds);
+        }
+        break;
+      }
+      case 'MODN':
+      {
+        if (size)
+        {
+          ddnames = reinterpret_cast<char const*> (f.getPointer ());
+        }
+        break;
+      }
+      case 'MODD':
+      {
+        // Guard a corrupt MODD chunk size. `size / 0x28` is the doodad count; a broken/custom (fuckported) WMO
+        // -- e.g. Turtle's world/wmo/playerhousing/human/humanlevelonetest.wmo -- can carry a bogus MODD size of
+        // over a gigabyte, which made this create TENS OF MILLIONS of wmo_doodad_instance (34.5M observed, ~7GB,
+        // froze the client at load). Doodad refs (MODR) are uint16, so nothing past index 65535 is ever
+        // referenceable -- clamp there. reserve() must use the clamped count too or it alone allocates GBs.
+        modd_pos = f.getPos();
+        doodad_count = size / 0x28;
+        constexpr std::size_t MAX_WMO_MODD_DOODADS = 65536;
+        if (doodad_count > MAX_WMO_MODD_DOODADS)
+        {
+          LogError << "WMO \"" << _file_key.stringRepr() << "\" MODD claims " << doodad_count << " doodads "
+                   << "(corrupt chunk); clamping to " << MAX_WMO_MODD_DOODADS << " to avoid OOM/freeze." << std::endl;
+          doodad_count = MAX_WMO_MODD_DOODADS;
+        }
+        break;
+      }
+      case 'MODI':
+      {
+        doodad_ids.resize(size / 4);
+        if (size >= 4)
+        {
+          f.read(doodad_ids.data(), (size / 4) * 4);
+        }
+        break;
+      }
+      case 'GFID':
+      {
+        _group_file_ids.resize(size / 4);
+        if (size >= 4)
+        {
+          f.read(_group_file_ids.data(), (size / 4) * 4);
+        }
+        break;
+      }
+      case 'MFOG':
+      {
+        int nfogs = size / 0x30;
+        // [2026-07-24] Defensive: assert() is a NO-OP in Release, so a misaligned/garbage MFOG chunk silently made
+        // nfogs balloon to ~28.7 MILLION for a Stormwind WMO -- its per-fog loop then cost ~3.4s/frame in
+        // World::collect_camera_fog (0 fps in Stormwind). A real WMO has at most a few dozen fogs; reject an
+        // absurd count so we neither allocate 1.4 GB nor iterate garbage every frame.
+        if (nfogs < 0 || nfogs > 4096)
+        {
+          LogError << "WMO: invalid MFOG chunk (absurd nfogs=" << nfogs << ") -- skipping placed fog" << std::endl;
+          nfogs = 0;
+        }
+        fogs.reserve(nfogs);
+
+        for (int i (0); i < nfogs; ++i)
+        {
+          WMOFog fog;
+          fog.init (&f);
+          fogs.push_back (std::move(fog));
+        }
+        break;
+      }
+      default:
+        // MOVV / MOVB (visible-block data), MCVP, MOUV, MDAL, MAVG/MAVD, MOLP/MOLS/MNLD ...: not consumed
+        break;
     }
+
+    f.seek (chunk_end);
   }
 
-  f.seekRelative (size);
-
-  // - MOPV ----------------------------------------------
-
-  f.read (&fourcc, 4);
-  f.read(&size, 4);
-
-  assert (fourcc == 'MOPV');
-
-  // Portal polygon corners. Same X/Z-up -> Y-up swap the rest of the WMO geometry uses.
-  _portal_vertices.reserve(size / 12);
-  for (size_t i (0); i < size / 12; ++i)
+  // - MODD (resolved after the loop: the name source is MODN before it or MODI after it) --------------
+  if (doodad_count && !ddnames && doodad_ids.empty())
   {
-    f.read (ff, 12);
-    _portal_vertices.push_back(glm::vec3(ff[0], ff[2], -ff[1]));
+    LogError << "WMO \"" << _file_key.stringRepr() << "\" has doodads but neither MODN nor MODI; ignoring them." << std::endl;
+    doodad_count = 0;
   }
-
-  // - MOPT ----------------------------------------------
-
-  f.read (&fourcc, 4);
-  f.read (&size, 4);
-
-  assert (fourcc == 'MOPT');
-
-  // Each MOPT is uint16 base_index, uint16 count, then a 16-byte C4Plane. The plane is STORED (in the
-  // swapped coord convention, an orthogonal transform, so distances are invariant) -- AttenTransVerts
-  // (RE_notes/19) needs the authored plane for its on-plane test. Culling still recomputes its own.
-  _portal_info.reserve(size / 0x14);
-  for (size_t i (0); i < size / 0x14; ++i)
-  {
-    wmo_portal_info info;
-    f.read (&info.base_vertex, 2);
-    f.read (&info.vertex_count, 2);
-    float plane[4];
-    f.read (plane, 16);
-    info.plane_normal = glm::vec3(plane[0], plane[2], -plane[1]); // same swap as MOPV/MOVT
-    info.plane_dist = plane[3];
-    _portal_info.push_back(info);
-  }
-
-  // - MOPR ----------------------------------------------
-
-  f.read (&fourcc, 4);
-  f.read (&size, 4);
-
-  assert(fourcc == 'MOPR');
-
-  _portal_refs.resize(size / sizeof(WMOPR));
-  if (size)
-  {
-    f.read (_portal_refs.data(), size);
-  }
-
-  // - MOVV ----------------------------------------------
-
-  f.read (&fourcc, 4);
-  f.read (&size, 4);
-
-  assert (fourcc == 'MOVV');
-
-  f.seekRelative (size);
-
-  // - MOVB ----------------------------------------------
-
-  f.read (&fourcc, 4);
-  f.read (&size, 4);
-
-  assert (fourcc == 'MOVB');
-
-  f.seekRelative (size);
-
-  // - MOLT ----------------------------------------------
-
-  f.read (&fourcc, 4);
-  f.read (&size, 4);
-
-  assert (fourcc == 'MOLT');
-
-  // Same header-vs-chunk-size guard as MODS below: trust the CHUNK SIZE so a bad MOHD.nLights can't run
-  // the read past the chunk and desync the stream. Each MOLT entry is 0x30 bytes; min() is a no-op when
-  // the header agrees with the chunk (every valid WMO), and seeking to the chunk end keeps alignment.
-  std::size_t const molt_end = f.getPos () + size;
-  std::size_t const light_count = std::min<std::size_t> (nLights, size / 0x30);
-  lights.reserve(light_count);
-  for (size_t i (0); i < light_count; ++i) {
-    WMOLight l;
-    l.init (&f);
-    lights.push_back (l);
-  }
-  f.seek (molt_end);
-
-  // - MODS ----------------------------------------------
-
-  f.read (&fourcc, 4);
-  f.read (&size, 4);
-
-  assert (fourcc == 'MODS');
-
-  // Robustness (Turtle world/custom/kt_Farm/ktfarm.wmo, kt_Inn/ktinn.wmo): read the doodad-set count from
-  // the CHUNK SIZE, not blindly from MOHD.nDoodadSets. Those custom WMOs carry a MOHD nDoodadSets (6, 4)
-  // that OVERRUNS their actual 32-byte (1-set) MODS chunk -> reading nDoodadSets*32 bytes ran past the
-  // chunk and DESYNCED every following chunk (MODN/MODD/MFOG read from garbage offsets -> MODD "claimed"
-  // 34.5M doodads -> async loader crash, SEH 0xC0000005). Clamp to what the chunk holds and seek to its
-  // end so the stream stays aligned. min() is a no-op for valid WMOs (nDoodadSets == size/32).
-  std::size_t const mods_end = f.getPos () + size;
-  std::size_t const set_count = std::min<std::size_t> (nDoodadSets, size / 32);
-  doodadsets.reserve(set_count);
-  for (size_t i (0); i < set_count; ++i) {
-    WMODoodadSet dds;
-    f.read (&dds, 32);
-    doodadsets.push_back (dds);
-  }
-  f.seek (mods_end);
-
-  // - MODN ----------------------------------------------
-
-  f.read (&fourcc, 4);
-  f.read (&size, 4);
-
-  assert (fourcc == 'MODN');
-
-  if (size)
-  {
-    ddnames = reinterpret_cast<char const*> (f.getPointer ());
-    f.seekRelative (size);
-  }
-
-  // - MODD ----------------------------------------------
-
-  f.read (&fourcc, 4);
-  f.read (&size, 4);
-
-  assert (fourcc == 'MODD');
-
-  // Guard a corrupt MODD chunk size. `size / 0x28` is the doodad count; a broken/custom (fuckported) WMO
-  // -- e.g. Turtle's world/wmo/playerhousing/human/humanlevelonetest.wmo -- can carry a bogus MODD size of
-  // over a gigabyte, which made this create TENS OF MILLIONS of wmo_doodad_instance (34.5M observed, ~7GB,
-  // froze the client at load). Doodad refs (MODR) are uint16, so nothing past index 65535 is ever
-  // referenceable -- clamp there. reserve() must use the clamped count too or it alone allocates GBs.
-  std::size_t const modd_end = f.getPos () + size;
-  std::size_t doodad_count = size / 0x28;
-  constexpr std::size_t MAX_WMO_MODD_DOODADS = 65536;
-  if (doodad_count > MAX_WMO_MODD_DOODADS)
-  {
-    LogError << "WMO \"" << _file_key.stringRepr() << "\" MODD claims " << doodad_count << " doodads "
-             << "(corrupt chunk); clamping to " << MAX_WMO_MODD_DOODADS << " to avoid OOM/freeze." << std::endl;
-    doodad_count = MAX_WMO_MODD_DOODADS;
-  }
-
   modelis.reserve(doodad_count);
   for (size_t i (0); i < doodad_count; ++i)
   {
@@ -404,42 +476,30 @@ void WMO::finishLoading ()
       uint32_t flags_unused : 4;
     } x;
 
-    size_t after_entry (f.getPos() + 0x28);
+    f.seek (modd_pos + i * 0x28);
     f.read (&x, sizeof (x));
 
-    modelis.emplace_back(ddnames + x.name_offset, &f, _context);
+    if (!doodad_ids.empty())
+    {
+      // modern: name_offset is an INDEX into MODI. An unresolvable entry still gets an instance so the
+      // groups' MODR indices stay aligned (it fails to load and is skipped by the renderer).
+      std::uint32_t const fdid = x.name_offset < doodad_ids.size() ? doodad_ids[x.name_offset] : 0u;
+      BlizzardArchive::Listfile::FileKey key(fdid);
+      key.deduceOtherComponent(client_data->listfile());
+      modelis.emplace_back(key, &f, _context);
+    }
+    else
+    {
+      modelis.emplace_back(BlizzardArchive::Listfile::FileKey(std::string(ddnames + x.name_offset)), &f, _context);
+    }
     model_nearest_light_vector.emplace_back();
-
-    f.seek (after_entry);
   }
 
-  f.seek (modd_end); // keep chunk alignment even if the doodad count was clamped
-
-  // - MFOG ----------------------------------------------
-
-  f.read (&fourcc, 4);
-  f.read (&size, 4);
-
-  assert (fourcc == 'MFOG');
-
-  int nfogs = size / 0x30;
-  // [2026-07-24] Defensive: assert() is a NO-OP in Release, so a misaligned/garbage MFOG chunk silently made
-  // nfogs balloon to ~28.7 MILLION for a Stormwind WMO -- its per-fog loop then cost ~3.4s/frame in
-  // World::collect_camera_fog (0 fps in Stormwind). A real WMO has at most a few dozen fogs; reject an
-  // absurd count (or a fourcc mismatch) so we neither allocate 1.4 GB nor iterate garbage every frame.
-  if (fourcc != 'MFOG' || nfogs < 0 || nfogs > 4096)
+  if (skybox_file_id && !skybox)
   {
-    LogError << "WMO: invalid MFOG chunk (fourcc mismatch or absurd nfogs=" << nfogs
-             << ") -- skipping placed fog" << std::endl;
-    nfogs = 0;
-  }
-  fogs.reserve(nfogs);
-
-  for (size_t i (0); i < nfogs; ++i)
-  {
-    WMOFog fog;
-    fog.init (&f);
-    fogs.push_back (std::move(fog));
+    BlizzardArchive::Listfile::FileKey key(skybox_file_id);
+    key.deduceOtherComponent(client_data->listfile());
+    skybox = scoped_model_reference(key, _context);
   }
 
   for (auto& group : groups)
@@ -661,6 +721,7 @@ WMOGroup::WMOGroup(WMOGroup const& other)
   , fog(other.fog)
   , _doodad_ref(other._doodad_ref)
   , _light_refs(other._light_refs)
+  , _new_light_refs(other._new_light_refs)
   , _batches(other._batches)
   , _vertices(other._vertices)
   , _normals(other._normals)
@@ -692,14 +753,32 @@ namespace
 
 void WMOGroup::load()
 {
-  // open group file
-  std::stringstream curNum;
-  curNum << "_" << std::setw (3) << std::setfill ('0') << num;
+  // open group file: "<root>_NNN.wmo" (WotLK) or the GFID fileDataID (modern CASC roots)
+  auto* client_data = Noggit::Application::NoggitApplication::instance()->clientData();
+  BlizzardArchive::Listfile::FileKey group_key;
+  if (static_cast<std::size_t>(num) < wmo->_group_file_ids.size() && wmo->_group_file_ids[num])
+  {
+    group_key = BlizzardArchive::Listfile::FileKey(wmo->_group_file_ids[num]);
+    group_key.deduceOtherComponent(client_data->listfile());
+  }
+  else if (wmo->file_key().hasFilepath())
+  {
+    std::stringstream curNum;
+    curNum << "_" << std::setw (3) << std::setfill ('0') << num;
 
-  std::string fname = wmo->file_key().filepath();
-  fname.insert (fname.find (".wmo"), curNum.str ());
+    std::string fname = wmo->file_key().filepath();
+    auto const ext = fname.find (".wmo");
+    fname.insert (ext == std::string::npos ? fname.size() : ext, curNum.str ());
+    group_key = BlizzardArchive::Listfile::FileKey(fname);
+  }
+  else
+  {
+    LogError << "Error loading WMO group " << num << " of \"" << wmo->file_key().stringRepr() << "\": no GFID and no path." << std::endl;
+    return;
+  }
+  std::string const fname = group_key.stringRepr();
 
-  BlizzardArchive::ClientFile f(fname, Noggit::Application::NoggitApplication::instance()->clientData());
+  BlizzardArchive::ClientFile f(group_key, client_data);
   if (f.isEof()) {
     LogError << "Error loading WMO \"" << fname << "\"." << std::endl;
     return;
@@ -722,9 +801,12 @@ void WMOGroup::load()
   // - MOGP ----------------------------------------------
 
   f.read (&fourcc, 4);
-  f.seekRelative (4);
+  uint32_t mogp_size = 0;
+  f.read (&mogp_size, 4);
 
   assert (fourcc == 'MOGP');
+
+  std::size_t const mogp_end = std::min<std::size_t>(f.getPos() + mogp_size, f.getSize());
 
   f.read (&header, sizeof (wmo_group_header));
 
@@ -743,39 +825,279 @@ void WMOGroup::load()
   BoundingBoxMin = ::glm::vec3 (header.box1[0], header.box1[2], -header.box1[1]);
   BoundingBoxMax = ::glm::vec3 (header.box2[0], header.box2[2], -header.box2[1]);
 
-  // - MOPY ----------------------------------------------
+  // - MOGP sub-chunks: DISPATCH by name (2026-09-15). The fixed WotLK order (MOPY MOVI MOVT MONR MOTV MOBA
+  // then flag-gated MOLR/MODR/MOBN/MOBR/MPB*/MOCV/MLIQ/MORI/MORB/MOTV/MOCV) breaks on modern (CASC) groups,
+  // which insert MOGX / MOBS / MFVR / MDAL and replace MOPY by MPY2 (u16 flags, u16 material); a mismatch
+  // used to be "handled" by reading the wrong chunk as the expected one (MPY2 bytes as MOVI indices ->
+  // garbage index buffer -> heap corruption). Unknown chunks are skipped; the semantics of repeated
+  // chunks (second MOTV / second MOCV) follow the header flags exactly as before.
+  std::vector<wmo_triangle_material_info> mopy_entries;
+  int motv_seen = 0;
+  int mocv_seen = 0;
 
-  f.read (&fourcc, 4);
-  f.read (&size, 4);
-
-  assert (fourcc == 'MOPY');
-  // PER-TRIANGLE MATERIALS. This chunk used to be SKIPPED outright (`f.seekRelative(size)`), which
-  // left `_material_infos` permanently EMPTY -- so every `tri < _material_infos.size()` test in
-  // this file silently evaluated false: the collidable/detail filter never applied, and the
-  // footstep ground-type lookup could never find a face's material (2026-08-27, the "grass
-  // footsteps on Stormwind stone" report -- it fell through to the terrain BENEATH the city).
-  // Entry = {flags:u8, material:u8}; material 0xFF marks a collision-only (invisible) face.
-  std::vector<wmo_triangle_material_info> mopy_entries(size / sizeof(wmo_triangle_material_info));
-  if (!mopy_entries.empty())
+  while (f.getPos() + 8 <= mogp_end)
   {
-    f.read(mopy_entries.data(), mopy_entries.size() * sizeof(wmo_triangle_material_info));
+    f.read (&fourcc, 4);
+    f.read (&size, 4);
+    std::size_t const chunk_end = f.getPos() + size;
+    if (chunk_end > mogp_end)
+    {
+      LogError << "WMO group \"" << fname << "\": chunk runs past MOGP; stopping." << std::endl;
+      break;
+    }
+
+    switch (fourcc)
+    {
+      case 'MOPY':
+      {
+        // PER-TRIANGLE MATERIALS. This chunk used to be SKIPPED outright (`f.seekRelative(size)`), which
+        // left `_material_infos` permanently EMPTY -- so every `tri < _material_infos.size()` test in
+        // this file silently evaluated false: the collidable/detail filter never applied, and the
+        // footstep ground-type lookup could never find a face's material (2026-08-27, the "grass
+        // footsteps on Stormwind stone" report -- it fell through to the terrain BENEATH the city).
+        // Entry = {flags:u8, material:u8}; material 0xFF marks a collision-only (invisible) face.
+        mopy_entries.resize(size / sizeof(wmo_triangle_material_info));
+        if (!mopy_entries.empty())
+        {
+          f.read(mopy_entries.data(), mopy_entries.size() * sizeof(wmo_triangle_material_info));
+        }
+        break;
+      }
+      case 'MPY2':
+      {
+        // modern replacement of MOPY: {u16 flags, u16 material} per triangle
+        std::size_t const count = size / 4;
+        mopy_entries.resize(count);
+        for (std::size_t i = 0; i < count; ++i)
+        {
+          std::uint16_t flags16 = 0, material16 = 0;
+          f.read(&flags16, 2);
+          f.read(&material16, 2);
+          std::uint8_t const flags8 = static_cast<std::uint8_t>(flags16 & 0xFF);
+          std::memcpy(&mopy_entries[i].flags, &flags8, 1);
+          mopy_entries[i].texture = static_cast<std::uint8_t>(std::min<std::uint16_t>(material16, 0xFF));
+        }
+        break;
+      }
+      case 'MOVI':
+      {
+        _indices.resize (size / sizeof (uint16_t));
+        f.read (_indices.data (), size);
+        break;
+      }
+      case 'MOVT':
+      {
+        // let's hope it's padded to 12 bytes, not 16...
+        ::glm::vec3 const* vertices = reinterpret_cast< ::glm::vec3 const*>(f.getPointer ());
+
+        VertexBoxMin = ::glm::vec3 (std::numeric_limits<float>::max(), std::numeric_limits<float>::max(), std::numeric_limits<float>::max());
+        VertexBoxMax = ::glm::vec3 (std::numeric_limits<float>::lowest(), std::numeric_limits<float>::lowest(), std::numeric_limits<float>::lowest());
+
+        rad = 0;
+
+        _vertices.resize(size / sizeof (::glm::vec3));
+
+        for (size_t i = 0; i < _vertices.size(); ++i)
+        {
+          _vertices[i] = glm::vec3(vertices[i].x, vertices[i].z, -vertices[i].y);
+
+          ::glm::vec3& v = _vertices[i];
+
+          if (v.x < VertexBoxMin.x) VertexBoxMin.x = v.x;
+          if (v.y < VertexBoxMin.y) VertexBoxMin.y = v.y;
+          if (v.z < VertexBoxMin.z) VertexBoxMin.z = v.z;
+          if (v.x > VertexBoxMax.x) VertexBoxMax.x = v.x;
+          if (v.y > VertexBoxMax.y) VertexBoxMax.y = v.y;
+          if (v.z > VertexBoxMax.z) VertexBoxMax.z = v.z;
+        }
+
+        center = (VertexBoxMax + VertexBoxMin) * 0.5f;
+        rad = (VertexBoxMax - center).length () + 300.0f;;
+        break;
+      }
+      case 'MONR':
+      {
+        _normals.resize (size / sizeof (::glm::vec3));
+        f.read (_normals.data(), size);
+
+        for (auto& n : _normals)
+        {
+          n = {n.x, n.z, -n.y};
+        }
+        break;
+      }
+      case 'MOTV':
+      {
+        // first set = the material uvs; a second set (has_two_motv) feeds the env/blend layers
+        if (motv_seen == 0)
+        {
+          _texcoords.resize (size / sizeof (glm::vec2));
+          f.read (_texcoords.data (), size);
+        }
+        else if (motv_seen == 1)
+        {
+          _texcoords_2.resize(size / sizeof(glm::vec2));
+          f.read(_texcoords_2.data(), size);
+        }
+        ++motv_seen;
+        break;
+      }
+      case 'MOBA':
+      {
+        _batches.resize (size / sizeof (wmo_batch));
+        f.read (_batches.data (), size);
+        // Legion+ batches (wowdev SMOBatch): flag 0x2 = flag_use_material_id_large -- the material index is
+        // the uint16 at +0x0A (inside the old bounding-box bytes) and `material_id` at +0x17 stays 0. EVERY
+        // batch of the Classic Era 1.15.9 SoD WMOs sets it (Karazhan Crypts 172/172, the Scarlet Enclave
+        // monastery 308/308), so every surface drew with material 0's texture: "missing textures" inside the
+        // crypt, wrong textures on the monastery. docs/client_re/42 sec 15.
+        for (auto& batch : _batches)
+        {
+          if (batch.flags & 0x2)
+          {
+            uint16_t large = 0;
+            std::memcpy(&large, &batch.unused[10], sizeof(large));
+            if (large < 256)
+            {
+              batch.texture = static_cast<uint8_t>(large);
+            }
+            else
+            {
+              LogError << "WMO group \"" << fname << "\": batch material id " << large
+                       << " does not fit the 8-bit material index; keeping " << int(batch.texture) << std::endl;
+            }
+          }
+        }
+        // NOTE: initRenderBatches() is deferred to the END of load() so it runs after MOCV is parsed
+        // (MOCV comes after MOBA in the file).
+        break;
+      }
+      case 'MNLR':
+      {
+        // Modern light refs: u16 indices into the root's MNLD list (the MOLR of Shadowlands+ groups).
+        std::size_t const count = size / sizeof(uint16_t);
+        _new_light_refs.resize(count);
+        for (std::size_t i = 0; i < count; ++i)
+        {
+          uint16_t ref = 0;
+          f.read(&ref, sizeof(ref));
+          _new_light_refs[i] = static_cast<int16_t>(std::min<uint16_t>(ref, 0x7fffu));
+        }
+        break;
+      }
+      case 'MOLR':
+      {
+        // Per-group light references: indices into the root MOLT list naming which lights illuminate
+        // THIS group (the client's per-room lighting). Used by WorldRender to scope the point-light
+        // UBO per interior group instead of the global nearest-16 pool.
+        _light_refs.resize (size / sizeof (int16_t));
+        f.read (_light_refs.data (), _light_refs.size () * sizeof (int16_t));
+        break;
+      }
+      case 'MODR':
+      {
+        // Guard a corrupt MODR chunk size: a huge count would allocate gigabytes and feed the doodad
+        // explosion in WMO::doodads_per_group. A group realistically has at most a few thousand refs.
+        std::uint32_t count = size / sizeof (int16_t);
+        constexpr std::uint32_t MAX_DOODAD_REFS = 1000000u;
+        if (count > MAX_DOODAD_REFS)
+        {
+          LogError << "WMO group MODR ref count " << count << " is absurd; clamping to " << MAX_DOODAD_REFS
+                   << " (corrupt chunk)." << std::endl;
+          count = MAX_DOODAD_REFS;
+        }
+        _doodad_ref.resize (count);
+        f.read (_doodad_ref.data (), count * sizeof (int16_t));
+        break;
+      }
+      case 'MOCV':
+      {
+        // lighting colours first (has_vertex_color), the texture-blend set after (use_mocv2_for_texture_blending)
+        bool const lighting_set = header.flags.has_vertex_color && mocv_seen == 0;
+        if (lighting_set)
+        {
+          load_mocv(f, size);
+        }
+        else if (header.flags.use_mocv2_for_texture_blending)
+        {
+          std::vector<CImVector> mocv_2(size / sizeof(CImVector));
+          f.read(mocv_2.data(), size);
+          _blend_alphas.resize(mocv_2.size());
+
+          for (int i = 0; i < mocv_2.size(); ++i)
+          {
+            float alpha = static_cast<float>(mocv_2[i].a) / 255.f;
+
+            // the second mocv is texture-blend ONLY -> its own stream, so it no longer clobbers .w
+            // (which carries the portal-openness doorway fade for indoor groups)
+            _blend_alphas[i] = alpha;
+            if (!header.flags.has_vertex_color)
+            {
+              // no lighting MOCV: keep a placeholder colour (rgb unused; HasMOCV stays off)
+              _vertex_colors.emplace_back(0.f, 0.f, 0.f, alpha);
+            }
+          }
+        }
+        ++mocv_seen;
+        break;
+      }
+      case 'MLIQ':
+      {
+        if (size < 0x1E)
+        {
+          break;
+        }
+        WMOLiquidHeader hlq;
+        f.read(&hlq, 0x1E);
+
+        // Interior WMO water takes its RGB from the WMO material's baked MOMT.diffColor (client
+        // FUN_006b6420), NOT the zone day/night water light. A group is "outdoor" water only when an
+        // EXTERIOR / exterior-lit MOGP flag is set (& 0x48); otherwise it's indoor. diffColor is a
+        // D3DCOLOR stored BGRA in the file, so the raw bytes land in CArgb as r=Blue, g=Green, b=Red --
+        // the true linear RGB is therefore (b, g, r). Verified against the real Timbermaw WMO: bytes
+        // (46,29,25) -> RGB(25,29,46), the dark blue seen in-game (vs the green Felwood zone water).
+        bool const interior_water = !(header.flags.exterior || header.flags.exterior_lit);
+        bool use_material_color = false;
+        glm::vec3 material_color(0.0f);
+        if (interior_water
+            && hlq.material_id >= 0
+            && static_cast<std::size_t>(hlq.material_id) < wmo->materials.size())
+        {
+          auto const& dc = wmo->materials[hlq.material_id].diffuse_color;
+          material_color = glm::vec3(dc.b, dc.g, dc.r) / 255.0f;
+          use_material_color = true;
+        }
+
+        lq = std::make_unique<wmo_liquid> ( &f
+            , hlq
+            , header.group_liquid
+            , (bool)wmo->flags.use_liquid_type_dbc_id
+            , (bool)header.flags.ocean
+            , fname
+            , use_material_color
+            , material_color
+            , (bool)header.flags.indoor // city channel (canals) vs open-air pool (see wmo_liquid.hpp)
+            // [2026-09-09] exterior water authored on the LiquidType.dbc path (stock WotLK Stormwind
+            // canals: EXTERIOR groups, groupLiquid 5) -> the client's flat river-deep colour instead of
+            // the open-air-pool river blend that turned them olive green (see wmo_liquid.hpp)
+            , (bool)wmo->flags.use_liquid_type_dbc_id && !interior_water && !header.flags.indoor
+            , &_vertices // group mesh for the FLOATLIQ geometric clip (phantom flat-sheet tiles)
+        );
+        break;
+      }
+      default:
+        // MOBN / MOBR (bsp), MPBV / MPBP / MPBI / MPBG, MORI / MORB, MOGX, MOBS, MFVR, MDAL, MOLV, MOPL,
+        // MOTA, MOLM / MOLD ...: not consumed
+        break;
+    }
+
+    f.seek (chunk_end);
   }
-
-  // - MOVI ----------------------------------------------
-
-  f.read (&fourcc, 4);
-  f.read (&size, 4);
-
-  assert (fourcc == 'MOVI');
-
-  _indices.resize (size / sizeof (uint16_t));
-
-  f.read (_indices.data (), size);
 
   // SAFETY: only adopt the table when it matches the triangle count exactly. A short/mismatched
   // MOPY combined with the collidable filter could otherwise make real FLOOR faces non-collidable
   // and drop the player through the world -- leaving it empty preserves the old behaviour.
-  if (mopy_entries.size() == _indices.size() / 3)
+  if (!mopy_entries.empty() && mopy_entries.size() == _indices.size() / 3)
   {
     _material_infos = std::move(mopy_entries);
   }
@@ -784,382 +1106,6 @@ void WMOGroup::load()
     LogError << "WMO group: MOPY has " << mopy_entries.size() << " entries for "
              << (_indices.size() / 3) << " triangles -- ignoring (per-face materials unavailable)"
              << std::endl;
-  }
-
-  // - MOVT ----------------------------------------------
-
-  f.read (&fourcc, 4);
-  f.read (&size, 4);
-
-  assert (fourcc == 'MOVT');
-
-  // let's hope it's padded to 12 bytes, not 16...
-  ::glm::vec3 const* vertices = reinterpret_cast< ::glm::vec3 const*>(f.getPointer ());
-
-  VertexBoxMin = ::glm::vec3 (std::numeric_limits<float>::max(), std::numeric_limits<float>::max(), std::numeric_limits<float>::max());
-  VertexBoxMax = ::glm::vec3 (std::numeric_limits<float>::lowest(), std::numeric_limits<float>::lowest(), std::numeric_limits<float>::lowest());
-
-  rad = 0;
-
-  _vertices.resize(size / sizeof (::glm::vec3));
-
-  for (size_t i = 0; i < _vertices.size(); ++i)
-  {
-    _vertices[i] = glm::vec3(vertices[i].x, vertices[i].z, -vertices[i].y);
-
-    ::glm::vec3& v = _vertices[i];
-
-    if (v.x < VertexBoxMin.x) VertexBoxMin.x = v.x;
-    if (v.y < VertexBoxMin.y) VertexBoxMin.y = v.y;
-    if (v.z < VertexBoxMin.z) VertexBoxMin.z = v.z;
-    if (v.x > VertexBoxMax.x) VertexBoxMax.x = v.x;
-    if (v.y > VertexBoxMax.y) VertexBoxMax.y = v.y;
-    if (v.z > VertexBoxMax.z) VertexBoxMax.z = v.z;
-  }
-
-  center = (VertexBoxMax + VertexBoxMin) * 0.5f;
-  rad = (VertexBoxMax - center).length () + 300.0f;;
-
-  f.seekRelative (size);
-
-  // - MONR ----------------------------------------------
-
-  f.read (&fourcc, 4);
-  f.read (&size, 4);
-
-  assert (fourcc == 'MONR');
-
-  _normals.resize (size / sizeof (::glm::vec3));
-
-  f.read (_normals.data(), size);
-
-  for (auto& n : _normals)
-  {
-    n = {n.x, n.z, -n.y};
-  }
-
-  // - MOTV ----------------------------------------------
-
-  f.read (&fourcc, 4);
-  f.read (&size, 4);
-
-  assert (fourcc == 'MOTV');
-
-  _texcoords.resize (size / sizeof (glm::vec2));
-
-  f.read (_texcoords.data (), size);
-
-  // - MOBA ----------------------------------------------
-
-  f.read (&fourcc, 4);
-  f.read (&size, 4);
-
-  assert (fourcc == 'MOBA');
-
-  _batches.resize (size / sizeof (wmo_batch));
-  f.read (_batches.data (), size);
-
-  // NOTE: initRenderBatches() is deferred to the END of load() so it runs after MOCV is parsed
-  // (MOCV comes after MOBA in the file).
-
-  // - MOLR ----------------------------------------------
-  if (header.flags.has_light)
-  {
-    f.read (&fourcc, 4);
-    f.read (&size, 4);
-
-    if (fourcc != 'MOLR')
-    {
-      LogError << "Broken header in WMO \"" << fname << "\". Trying to continue reading." << std::endl;
-      f.seek (f.getPos() - 8);
-    }
-    else
-    {
-      // Per-group light references: indices into the root MOLT list naming which lights illuminate
-      // THIS group (the client's per-room lighting). Used by WorldRender to scope the point-light
-      // UBO per interior group instead of the global nearest-16 pool.
-      _light_refs.resize (size / sizeof (int16_t));
-      f.read (_light_refs.data (), _light_refs.size () * sizeof (int16_t));
-    }
-
-  }
-  // - MODR ----------------------------------------------
-  if (header.flags.has_doodads)
-  {
-    f.read (&fourcc, 4);
-    f.read (&size, 4);
-
-    if (fourcc != 'MODR')
-    {
-      LogError << "Broken header in WMO \"" << fname << "\". Trying to continue reading." << std::endl;
-      f.seek (f.getPos() - 8);
-    }
-    else
-    {
-      // Guard a corrupt MODR chunk size: a huge count would allocate gigabytes and feed the doodad
-      // explosion in WMO::doodads_per_group. A group realistically has at most a few thousand refs.
-      std::uint32_t count = size / sizeof (int16_t);
-      constexpr std::uint32_t MAX_DOODAD_REFS = 1000000u;
-      std::size_t const chunk_end = f.getPos () + size;
-      if (count > MAX_DOODAD_REFS)
-      {
-        LogError << "WMO group MODR ref count " << count << " is absurd; clamping to " << MAX_DOODAD_REFS
-                 << " (corrupt chunk)." << std::endl;
-        count = MAX_DOODAD_REFS;
-      }
-      _doodad_ref.resize (count);
-      f.read (_doodad_ref.data (), count * sizeof (int16_t));
-      f.seek (chunk_end); // keep chunk alignment even if we clamped a corrupt count
-    }
-
-  }
-  // - MOBN ----------------------------------------------
-  if (header.flags.has_bsp_tree)
-  {
-    f.read (&fourcc, 4);
-    f.read (&size, 4);
-
-    if (fourcc != 'MOBN')
-    {
-      LogError << "Broken header in WMO \"" << fname << "\". Trying to continue reading." << std::endl;
-      f.seek (f.getPos() - 8);
-    }
-    else
-    {
-      f.seekRelative(size);
-    }
-
-  }
-  // - MOBR ----------------------------------------------
-  if (header.flags.has_bsp_tree)
-  {
-    f.read (&fourcc, 4);
-    f.read (&size, 4);
-
-    if (fourcc != 'MOBR')
-    {
-      LogError << "Broken header in WMO \"" << fname << "\". Trying to continue reading." << std::endl;
-      f.seek (f.getPos() - 8);
-    }
-    else
-    {
-      f.seekRelative (size);
-      // std::vector<uint16_t> bsp_indices;
-      // bsp_indices.resize(size / sizeof(uint16_t));
-      // f.read(bsp_indices.data(), size);
-      // _bsp_indices = bsp_indices;
-    }
-  }
-  
-  if (header.flags.flag_0x400)
-  {
-    // - MPBV ----------------------------------------------
-    f.read (&fourcc, 4);
-    f.read (&size, 4);
-
-    if (fourcc != 'MPBV')
-    {
-      LogError << "Broken header in WMO \"" << fname << "\". Trying to continue reading." << std::endl;
-      f.seek (f.getPos() - 8);
-    }
-    else
-    {
-      f.seekRelative (size);
-    }
-
-    // - MPBP ----------------------------------------------
-    f.read (&fourcc, 4);
-    f.read (&size, 4);
-
-    if (fourcc != 'MPBP')
-    {
-      LogError << "Broken header in WMO \"" << fname << "\". Trying to continue reading." << std::endl;
-      f.seek (f.getPos() - 8);
-    }
-    else
-    {
-      f.seekRelative (size);
-    }
-
-    // - MPBI ----------------------------------------------
-    f.read (&fourcc, 4);
-    f.read (&size, 4);
-
-    if (fourcc != 'MPBI')
-    {
-      LogError << "Broken header in WMO \"" << fname << "\". Trying to continue reading." << std::endl;
-      f.seek (f.getPos() - 8);
-    }
-    else
-    {
-      f.seekRelative (size);
-    }
-
-    // - MPBG ----------------------------------------------
-    f.read (&fourcc, 4);
-    f.read (&size, 4);
-
-    if (fourcc != 'MPBG')
-    {
-      LogError << "Broken header in WMO \"" << fname << "\". Trying to continue reading." << std::endl;
-      f.seek (f.getPos() - 8);
-    }
-    else
-    {
-
-      f.seekRelative (size);
-    }
-  }
-  // - MOCV ----------------------------------------------
-  if (header.flags.has_vertex_color)
-  {
-    f.read (&fourcc, 4);
-    f.read (&size, 4);
-
-    if (fourcc != 'MOCV')
-    {
-      LogError << "Broken header in WMO \"" << fname << "\". Trying to continue reading." << std::endl;
-      f.seek (f.getPos() - 8);
-    }
-    else
-    {
-      load_mocv(f, size);
-    }
-
-  }
-  // - MLIQ ----------------------------------------------
-  if (header.flags.has_water)
-  {
-    f.read (&fourcc, 4);
-    f.read (&size, 4);
-
-    if (fourcc != 'MLIQ')
-    {
-      LogError << "Broken header in WMO \"" << fname << "\". Trying to continue reading." << std::endl;
-      f.seek (f.getPos() - 8);
-    }
-    else
-    {
-      WMOLiquidHeader hlq;
-      f.read(&hlq, 0x1E);
-
-      // Interior WMO water takes its RGB from the WMO material's baked MOMT.diffColor (client
-      // FUN_006b6420), NOT the zone day/night water light. A group is "outdoor" water only when an
-      // EXTERIOR / exterior-lit MOGP flag is set (& 0x48); otherwise it's indoor. diffColor is a
-      // D3DCOLOR stored BGRA in the file, so the raw bytes land in CArgb as r=Blue, g=Green, b=Red --
-      // the true linear RGB is therefore (b, g, r). Verified against the real Timbermaw WMO: bytes
-      // (46,29,25) -> RGB(25,29,46), the dark blue seen in-game (vs the green Felwood zone water).
-      bool const interior_water = !(header.flags.exterior || header.flags.exterior_lit);
-      bool use_material_color = false;
-      glm::vec3 material_color(0.0f);
-      if (interior_water
-          && hlq.material_id >= 0
-          && static_cast<std::size_t>(hlq.material_id) < wmo->materials.size())
-      {
-        auto const& dc = wmo->materials[hlq.material_id].diffuse_color;
-        material_color = glm::vec3(dc.b, dc.g, dc.r) / 255.0f;
-        use_material_color = true;
-      }
-
-      lq = std::make_unique<wmo_liquid> ( &f
-          , hlq
-          , header.group_liquid
-          , (bool)wmo->flags.use_liquid_type_dbc_id
-          , (bool)header.flags.ocean
-          , fname
-          , use_material_color
-          , material_color
-          , (bool)header.flags.indoor // city channel (canals) vs open-air pool (see wmo_liquid.hpp)
-          , &_vertices // group mesh for the FLOATLIQ geometric clip (phantom flat-sheet tiles)
-      );
-
-      // creating the wmo liquid doesn't move the position
-      f.seekRelative(size - 0x1E);
-    }
-
-  }
-  if (header.flags.has_mori_morb)
-  {
-    // - MORI ----------------------------------------------
-    f.read (&fourcc, 4);
-    f.read (&size, 4);
-
-    if (fourcc != 'MORI')
-    {
-      LogError << "Broken header in WMO \"" << fname << "\". Trying to continue reading." << std::endl;
-      f.seek (f.getPos() - 8);
-    }
-    else
-    {
-      f.seekRelative (size);
-    }
-
-    // - MORB ----------------------------------------------
-    f.read(&fourcc, 4);
-    f.read(&size, 4);
-
-    if (fourcc != 'MORB')
-    {
-      LogError << "Broken header in WMO \"" << fname << "\". Trying to continue reading." << std::endl;
-      f.seek (f.getPos() - 8);
-    }
-    else
-    {
-      f.seekRelative (size);
-    }
-
-  }
-
-  // - MOTV ----------------------------------------------
-  if (header.flags.has_two_motv)
-  {
-    f.read (&fourcc, 4);
-    f.read (&size, 4);
-
-    if (fourcc != 'MOTV')
-    {
-      LogError << "Broken header in WMO \"" << fname << "\". Trying to continue reading." << std::endl;
-      f.seek (f.getPos() - 8);
-    }
-    else
-    {
-      _texcoords_2.resize(size / sizeof(glm::vec2));
-      f.read(_texcoords_2.data(), size);
-    }
-
-  }
-  // - MOCV ----------------------------------------------
-  if (header.flags.use_mocv2_for_texture_blending)
-  {
-    f.read (&fourcc, 4);
-    f.read (&size, 4);
-
-    if (fourcc != 'MOCV')
-    {
-      LogError << "Broken header in WMO \"" << fname << "\". Trying to continue reading." << std::endl;
-      f.seek (f.getPos() - 8);
-    }
-    else
-    {
-      std::vector<CImVector> mocv_2(size / sizeof(CImVector));
-      f.read(mocv_2.data(), size);
-      _blend_alphas.resize(mocv_2.size());
-
-      for (int i = 0; i < mocv_2.size(); ++i)
-      {
-        float alpha = static_cast<float>(mocv_2[i].a) / 255.f;
-
-        // the second mocv is texture-blend ONLY -> its own stream, so it no longer clobbers .w
-        // (which carries the portal-openness doorway fade for indoor groups)
-        _blend_alphas[i] = alpha;
-        if (!header.flags.has_vertex_color)
-        {
-          // no lighting MOCV: keep a placeholder colour (rgb unused; HasMOCV stays off)
-          _vertex_colors.emplace_back(0.f, 0.f, 0.f, alpha);
-        }
-      }
-    }
-
   }
 
   //dl_light = 0;
@@ -1225,12 +1171,25 @@ void WMOGroup::load()
     // capture (colorFromInt), NOT _vertex_colors[i].w (already clobbered by fix/portal above). alpha 0
     // for verts with no MOCV.
     _ground_alphas.resize(_vertices.size());
+    // MOHD 0x8 (Cata+ exports -- every SoD WMO, e.g. Karazhan Crypts): the client skips FixColorVertexAlpha
+    // except for ONE step -- the vertices of the interior and exterior batches get alpha 0 / 255 and only the
+    // transition batch keeps its authored alpha (wowdev CMapObjGroup::FixColorVertexAlpha; the face path in
+    // load_mocv already applies it). The RAW alpha of these files is 255 on every deep-interior vertex
+    // (crypt: 16 of 19 groups all-255, the entrance group near 0 -- the inverse of WotLK files), so sampling
+    // it as the doorway spill lit every prop inside the black rooms with the outdoor light.
+    // docs/client_re/42 sec 16.
+    std::size_t const interior_vertex_start = header.transparency_batches_count > 0
+      ? static_cast<std::size_t>(_batches[header.transparency_batches_count - 1].vertex_end) + 1u : 0u;
     for (std::size_t i = 0; i < _vertices.size(); ++i)
     {
       _ground_colors[i] = glm::u8vec3(static_cast<std::uint8_t>(glm::clamp(eff_amb.x + _vertex_colors[i].x, 0.f, 1.f) * 255.f)
                                     , static_cast<std::uint8_t>(glm::clamp(eff_amb.y + _vertex_colors[i].y, 0.f, 1.f) * 255.f)
                                     , static_cast<std::uint8_t>(glm::clamp(eff_amb.z + _vertex_colors[i].z, 0.f, 1.f) * 255.f));
-      float const pa = (i < _mocv_pristine_alpha.size()) ? _mocv_pristine_alpha[i] : 0.f;
+      float pa = (i < _mocv_pristine_alpha.size()) ? _mocv_pristine_alpha[i] : 0.f;
+      if (wmo->flags.do_not_fix_vertex_color_alpha && i >= interior_vertex_start)
+      {
+        pa = 0.f; // interior batch of a do-not-fix file: the client's fixed alpha is 0 (this group is TRUE indoor)
+      }
       _ground_alphas[i] = static_cast<std::uint8_t>(glm::clamp(pa, 0.f, 1.f) * 255.f + 0.5f);
     }
   }
@@ -2002,88 +1961,80 @@ void WMOGroup::intersect (math::ray const& ray, std::vector<float>* results, flo
   }
 }
 
-std::optional<std::pair<float, int>> WMOGroup::groundHit(math::ray const& ray, float max_dist) const
+void WMOGroup::groundQuery(math::ray const& ray, float reach, wmo_ground_query& io) const
 {
-  // [doc 38 footsteps] the physics batch walk (see intersect above) with the hit TRIANGLE kept:
-  // per-tri MOPY material -> WMOMaterial.ground_type = the authored TerrainType row of the
-  // floor the character stands on (bridges, docks, building interiors).
-  // A WMO floor is very often COLLISION-ONLY geometry (MOPY material index 0xFF -- the invisible
-  // physics plane above/below the visible floor). Such a face carries NO material and therefore
-  // no ground type, so track the nearest textured face separately: it is the visible floor whose
-  // material actually declares the type. Returning 0 for a material-less hit (as this did before
-  // 2026-08-27) made every Stormwind step read as an authored "Dirt".
-  std::optional<float> best_any;
-  std::optional<float> best_textured;
-  int best_ground = -1;
-  for (auto&& batch : _batches)
+  // 3.3.5a CWorld ground-type cast, per group (FUN_007c25d0 -> FUN_007c1dc0 -> BSP walk
+  // FUN_007ca600 / per-face FUN_007c6600). RE'd 2026-09-09 for "Stormwind streets fall back to
+  // the ADT texture": beside the canals the character stands on a COLLISION-only ghost face
+  // (MOPY 0x48, material 0xFF -- Stormwind_284 'canalB' tri 20833) that no render batch holds, so
+  // a batch-only walk saw nothing at all. The client's BSP references every face, and its
+  // per-face test keeps TWO nearest hits: the type is read from the "typed" one however far
+  // below the support it lies (the canal floor, 30 yd down, in that spot).
+  if (header.flags.value & 0x410080u) // unreachable / always_draw / 0x400000: never queried
   {
-    if (batch.index_count == 0)
+    return;
+  }
+  if (!ray.intersect_bounds(VertexBoxMin, VertexBoxMax))
+  {
+    return;
+  }
+  if (!header.flags.exterior)
+  {
+    // interior room: only a room the origin is INSIDE can hold the floor under it (FUN_007ae920)
+    glm::vec3 const& o = ray.origin();
+    if (o.x < VertexBoxMin.x || o.x > VertexBoxMax.x || o.y < VertexBoxMin.y || o.y > VertexBoxMax.y
+        || o.z < VertexBoxMin.z || o.z > VertexBoxMax.z)
+    {
+      return;
+    }
+  }
+  std::size_t const tri_count = std::min(_indices.size() / 3, _material_infos.size());
+  for (std::size_t tri = 0; tri < tri_count; ++tri)
+  {
+    std::uint8_t const fl = static_cast<std::uint8_t>(_material_infos[tri].flags.value);
+    if (fl & 0x82u) // the walk's skip mask: 0x02 faces and the 0x80 visited mark
     {
       continue;
     }
-    for (size_t i (batch.index_start); i < batch.index_start + batch.index_count; i += 3)
+    bool const render = (fl & 0x20u) != 0;
+    bool const collision = (fl & 0x08u) != 0;
+    bool const detail = (fl & 0x04u) != 0;
+    bool const for_support = render || collision;
+    bool const for_typed = render || (!collision && detail);
+    if (!for_support && !for_typed)
     {
-      size_t const tri = i / 3;
-      // NO collidable/detail filter here. This query asks "what surface am I standing ON", which
-      // is a VISUAL question -- and in Stormwind the visible street is DETAIL|RENDER geometry
-      // (2293 of its walkable faces; only 573 are plain RENDER), while the faces that actually
-      // block movement are separate COLLISION-only ones carrying material 0xFF = no material at
-      // all. Filtering by isCollidable() (the physics rule) therefore threw away every face that
-      // HAS a material and left the query with nothing -- the ground type fell back to the ADT
-      // terrain buried under the city, i.e. grass footsteps on the stone streets (2026-08-27).
-      if ( auto&& distance
-         = ray.intersect_triangle ( _vertices[_indices[i + 0]]
-                                  , _vertices[_indices[i + 1]]
-                                  , _vertices[_indices[i + 2]]
-                                  )
-         )
-      {
-        if (max_dist > 0.0f && *distance > max_dist)
-        {
-          continue;
-        }
-        if (!best_any || *distance < *best_any)
-        {
-          best_any = *distance;
-        }
-        if (tri < _material_infos.size())
-        {
-          std::uint8_t const mat = _material_infos[tri].texture;
-          if (mat != 0xff && mat < wmo->materials.size()
-              && (!best_textured || *distance < *best_textured))
-          {
-            best_textured = *distance;
-            best_ground = static_cast<int>(wmo->materials[mat].ground_type);
-          }
-        }
-      }
+      continue;
+    }
+    std::size_t const i = tri * 3;
+    auto const d = ray.intersect_triangle ( _vertices[_indices[i + 0]]
+                                          , _vertices[_indices[i + 1]]
+                                          , _vertices[_indices[i + 2]]
+                                          );
+    if (!d || *d < 0.0f || *d > reach)
+    {
+      continue;
+    }
+    if (for_support && *d <= io.support_t)
+    {
+      io.support_t = *d;
+    }
+    if (for_typed && *d <= io.typed_t)
+    {
+      io.typed_t = *d;
+      std::uint8_t const mat = _material_infos[tri].texture;
+      io.typed_ground_type = (mat != 0xff && mat < wmo->materials.size())
+                           ? static_cast<int>(wmo->materials[mat].ground_type)
+                           : -1;
     }
   }
-  if (best_textured)
-  {
-    return std::make_pair(*best_textured, best_ground);
-  }
-  if (best_any)
-  {
-    return std::make_pair(*best_any, -1); // collision-only hit: type unknown, caller falls back
-  }
-  return std::nullopt;
 }
 
-std::optional<std::pair<float, int>> WMO::groundHit(math::ray const& ray, float max_dist) const
+void WMO::groundQuery(math::ray const& ray, float reach, wmo_ground_query& io) const
 {
-  std::optional<std::pair<float, int>> best;
   for (auto const& group : groups)
   {
-    if (auto const hit = group.groundHit(ray, max_dist))
-    {
-      if (!best || hit->first < best->first)
-      {
-        best = hit;
-      }
-    }
+    group.groundQuery(ray, reach, io);
   }
-  return best;
 }
 
 void WMOGroup::drawLiquid ( glm::mat4x4 const& transform

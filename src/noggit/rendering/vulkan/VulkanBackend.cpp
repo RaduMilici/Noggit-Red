@@ -4,6 +4,7 @@
 #ifdef _WIN32
 
 #include <fstream>
+#include <algorithm>   // [VKFLASH] std::sort for the median
 #include <atomic>
 #include <noggit/rendering/vulkan/VulkanBackend.hpp>
 #include <noggit/Log.h>
@@ -17,6 +18,33 @@
 #include <cstring>
 #include <string>
 #include <vector>
+
+// [VKTRACE 2026-09-02] frame counter and the frame of the last terrain atlas rebuild.
+static std::uint64_t g_vk_trace_frame = 0;
+static std::uint64_t g_vk_trace_last_rebuild_frame = 0;
+
+// [VKFLASH] Ring of recent frame state + collapse detector. See the note in scratchpad/vkflash.py.
+struct VkTraceRow
+{
+  std::uint64_t f = 0;
+  std::uint32_t vis = 0, m2 = 0, wmo = 0, widx = 0;
+  float cam[3] = { 0.f, 0.f, 0.f };
+  int mvp = 0;
+  std::uint64_t rebuild = 0;
+};
+static VkTraceRow g_vk_ring[48];
+static std::size_t g_vk_ring_n = 0;
+static std::uint64_t g_vk_flash_last = 0;
+
+static std::uint32_t vkTraceMedian(std::uint32_t VkTraceRow::*field)
+{
+  std::uint32_t v[48];
+  std::size_t n = g_vk_ring_n < 48 ? g_vk_ring_n : 48;
+  if (n < 16) { return 0; }
+  for (std::size_t i = 0; i < n; ++i) { v[i] = g_vk_ring[i].*field; }
+  std::sort(v, v + n);
+  return v[n / 2];
+}
 
 namespace Noggit::Rendering::VK
 {
@@ -86,8 +114,22 @@ namespace Noggit::Rendering::VK
     VkInstanceCreateInfo ci{};
     ci.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
     ci.pApplicationInfo = &app;
+    // [NATIVE PRESENT, 2026-09-03] surface extensions so the backend can own a swapchain and
+    // present without GL. Universal on Windows drivers; falls back to a surfaceless instance
+    // (compose mode) if a driver ever lacks them.
+    char const* surf_exts[] = { "VK_KHR_surface", "VK_KHR_win32_surface" };
+    ci.enabledExtensionCount = 2;
+    ci.ppEnabledExtensionNames = surf_exts;
 
-    VkResult const r = vkCreateInstance(&ci, nullptr, &_instance);
+    VkResult r = vkCreateInstance(&ci, nullptr, &_instance);
+    _present_capable = (r == VK_SUCCESS);
+    if (r == VK_ERROR_EXTENSION_NOT_PRESENT)
+    {
+      LogError << "[VK] VK_KHR_win32_surface unavailable -- native presentation disabled" << std::endl;
+      ci.enabledExtensionCount = 0;
+      ci.ppEnabledExtensionNames = nullptr;
+      r = vkCreateInstance(&ci, nullptr, &_instance);
+    }
     if (r != VK_SUCCESS)
     {
       LogError << "[VK] vkCreateInstance failed: " << vkres(r) << std::endl;
@@ -103,6 +145,23 @@ namespace Noggit::Rendering::VK
     vkGetPhysicalDeviceMemoryProperties = reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties>(ld("vkGetPhysicalDeviceMemoryProperties"));
     vkCreateDevice = reinterpret_cast<PFN_vkCreateDevice>(ld("vkCreateDevice"));
     vkGetDeviceProcAddr = reinterpret_cast<PFN_vkGetDeviceProcAddr>(ld("vkGetDeviceProcAddr"));
+    // [NATIVE PRESENT] surface entry points (instance level)
+    if (_present_capable)
+    {
+      _pfn_vkCreateWin32SurfaceKHR = ld("vkCreateWin32SurfaceKHR");
+      vkDestroySurfaceKHR = reinterpret_cast<PFN_vkDestroySurfaceKHR>(ld("vkDestroySurfaceKHR"));
+      vkGetPhysicalDeviceSurfaceSupportKHR = reinterpret_cast<PFN_vkGetPhysicalDeviceSurfaceSupportKHR>(ld("vkGetPhysicalDeviceSurfaceSupportKHR"));
+      vkGetPhysicalDeviceSurfaceCapabilitiesKHR = reinterpret_cast<PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR>(ld("vkGetPhysicalDeviceSurfaceCapabilitiesKHR"));
+      vkGetPhysicalDeviceSurfaceFormatsKHR = reinterpret_cast<PFN_vkGetPhysicalDeviceSurfaceFormatsKHR>(ld("vkGetPhysicalDeviceSurfaceFormatsKHR"));
+      vkGetPhysicalDeviceSurfacePresentModesKHR = reinterpret_cast<PFN_vkGetPhysicalDeviceSurfacePresentModesKHR>(ld("vkGetPhysicalDeviceSurfacePresentModesKHR"));
+      if (!_pfn_vkCreateWin32SurfaceKHR || !vkDestroySurfaceKHR
+          || !vkGetPhysicalDeviceSurfaceSupportKHR || !vkGetPhysicalDeviceSurfaceCapabilitiesKHR
+          || !vkGetPhysicalDeviceSurfaceFormatsKHR || !vkGetPhysicalDeviceSurfacePresentModesKHR)
+      {
+        LogError << "[VK] surface entry points missing -- native presentation disabled" << std::endl;
+        _present_capable = false;
+      }
+    }
     return vkEnumeratePhysicalDevices && vkCreateDevice && vkGetDeviceProcAddr;
   }
 
@@ -165,7 +224,10 @@ namespace Noggit::Rendering::VK
     qci.queueCount = wanted_queues;
     qci.pQueuePriorities = (wanted_queues > 1) ? prios : &prio;
 
-    char const* exts[] = {
+    // [NATIVE PRESENT] VK_KHR_swapchain joins the list when the instance has surface support.
+    // The retry ladder below keeps descriptor indexing and the swapchain INDEPENDENT: losing one
+    // must never cost the other.
+    std::vector<char const*> exts = {
       "VK_KHR_external_memory",
       "VK_KHR_external_memory_win32",
       "VK_KHR_external_semaphore",
@@ -175,6 +237,13 @@ namespace Noggit::Rendering::VK
       // [phase B] descriptor indexing = one sampler2D[] for every tileset (bindless terrain)
       "VK_KHR_maintenance3",
       "VK_EXT_descriptor_indexing",
+    };
+    if (_present_capable)
+      exts.push_back("VK_KHR_swapchain");
+    auto const drop_ext = [&](char const* name)
+    {
+      for (std::size_t i = 0; i < exts.size(); ++i)
+        if (std::strcmp(exts[i], name) == 0) { exts.erase(exts.begin() + i); return; }
     };
     VkPhysicalDeviceDescriptorIndexingFeaturesEXT dif{};
     dif.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES_EXT;
@@ -208,18 +277,52 @@ namespace Noggit::Rendering::VK
     ci.pEnabledFeatures = &feats;
     ci.queueCreateInfoCount = 1;
     ci.pQueueCreateInfos = &qci;
-    ci.enabledExtensionCount = static_cast<std::uint32_t>(std::size(exts));
-    ci.ppEnabledExtensionNames = exts;
+    ci.enabledExtensionCount = static_cast<std::uint32_t>(exts.size());
+    ci.ppEnabledExtensionNames = exts.data();
 
     VkResult r = vkCreateDevice(_phys, &ci, nullptr, &_device);
+    if (r != VK_SUCCESS && _present_capable)
+    {
+      // EXTENSION_NOT_PRESENT does not say WHICH extension. Before blaming descriptor indexing,
+      // try the same config without the swapchain -- so a hypothetical no-present device still
+      // gets its bindless terrain.
+      std::vector<char const*> no_sc(exts.begin(), exts.end() - 1); // swapchain was pushed last
+      ci.enabledExtensionCount = static_cast<std::uint32_t>(no_sc.size());
+      ci.ppEnabledExtensionNames = no_sc.data();
+      VkResult const r2 = vkCreateDevice(_phys, &ci, nullptr, &_device);
+      if (r2 == VK_SUCCESS)
+      {
+        LogError << "[VK] VK_KHR_swapchain unavailable -- native presentation disabled" << std::endl;
+        _present_capable = false;
+        exts = no_sc;
+        r = r2;
+      }
+      else
+      {
+        ci.enabledExtensionCount = static_cast<std::uint32_t>(exts.size());
+        ci.ppEnabledExtensionNames = exts.data();
+      }
+    }
     _descriptor_indexing = (r == VK_SUCCESS);
     if (r != VK_SUCCESS)
     {
       // fall back to the phase-0 device (no bindless terrain; clay path only)
       LogError << "[VK] descriptor indexing unavailable (" << vkres(r) << ") -- textured terrain disabled" << std::endl;
       ci.pNext = nullptr;
-      ci.enabledExtensionCount = static_cast<std::uint32_t>(std::size(exts)) - 2u;
+      drop_ext("VK_KHR_maintenance3");
+      drop_ext("VK_EXT_descriptor_indexing");
+      ci.enabledExtensionCount = static_cast<std::uint32_t>(exts.size());
+      ci.ppEnabledExtensionNames = exts.data();
       r = vkCreateDevice(_phys, &ci, nullptr, &_device);
+      if (r != VK_SUCCESS && _present_capable)
+      {
+        LogError << "[VK] still failing (" << vkres(r) << ") -- retrying without VK_KHR_swapchain too" << std::endl;
+        _present_capable = false;
+        drop_ext("VK_KHR_swapchain");
+        ci.enabledExtensionCount = static_cast<std::uint32_t>(exts.size());
+        ci.ppEnabledExtensionNames = exts.data();
+        r = vkCreateDevice(_phys, &ci, nullptr, &_device);
+      }
     }
     if (r != VK_SUCCESS)
     {
@@ -302,6 +405,24 @@ namespace Noggit::Rendering::VK
     vkUpdateDescriptorSets = reinterpret_cast<PFN_vkUpdateDescriptorSets>(ld("vkUpdateDescriptorSets"));
     vkCmdBindDescriptorSets = reinterpret_cast<PFN_vkCmdBindDescriptorSets>(ld("vkCmdBindDescriptorSets"));
     vkCmdCopyBufferToImage = reinterpret_cast<PFN_vkCmdCopyBufferToImage>(ld("vkCmdCopyBufferToImage"));
+    vkCmdBlitImage = reinterpret_cast<PFN_vkCmdBlitImage>(ld("vkCmdBlitImage"));
+    vkCmdCopyImageToBuffer = reinterpret_cast<PFN_vkCmdCopyImageToBuffer>(ld("vkCmdCopyImageToBuffer"));
+    vkFreeCommandBuffers = reinterpret_cast<PFN_vkFreeCommandBuffers>(ld("vkFreeCommandBuffers"));
+    // [NATIVE PRESENT] swapchain entry points (device level)
+    if (_present_capable)
+    {
+      vkCreateSwapchainKHR = reinterpret_cast<PFN_vkCreateSwapchainKHR>(ld("vkCreateSwapchainKHR"));
+      vkDestroySwapchainKHR = reinterpret_cast<PFN_vkDestroySwapchainKHR>(ld("vkDestroySwapchainKHR"));
+      vkGetSwapchainImagesKHR = reinterpret_cast<PFN_vkGetSwapchainImagesKHR>(ld("vkGetSwapchainImagesKHR"));
+      vkAcquireNextImageKHR = reinterpret_cast<PFN_vkAcquireNextImageKHR>(ld("vkAcquireNextImageKHR"));
+      vkQueuePresentKHR = reinterpret_cast<PFN_vkQueuePresentKHR>(ld("vkQueuePresentKHR"));
+      if (!vkCreateSwapchainKHR || !vkDestroySwapchainKHR || !vkGetSwapchainImagesKHR
+          || !vkAcquireNextImageKHR || !vkQueuePresentKHR || !vkCmdBlitImage)
+      {
+        LogError << "[VK] swapchain entry points missing -- native presentation disabled" << std::endl;
+        _present_capable = false;
+      }
+    }
 
     if (!_pfn_vkGetMemoryWin32HandleKHR || !_pfn_vkGetSemaphoreWin32HandleKHR)
     {
@@ -416,7 +537,9 @@ namespace Noggit::Rendering::VK
 
   bool VulkanBackend::createSharedImage()
   {
-    VkImageUsageFlags const usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    // [NATIVE PRESENT] TRANSFER_SRC: the per-frame present path blits this image into the swapchain.
+    VkImageUsageFlags const usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+                                  | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
     if (!createExportableImage(VK_FORMAT_R8G8B8A8_UNORM, usage, _image, _image_mem, _image_mem_size, _image_mem_handle))
       return false;
     // depth-as-colour: R32F, written by every fragment shader (location 1), imported by GL as GL_R32F
@@ -516,7 +639,7 @@ namespace Noggit::Rendering::VK
     ici.extent = { _width, _height, 1 };
     ici.mipLevels = 1;
     ici.arrayLayers = 1;
-    ici.samples = VK_SAMPLE_COUNT_1_BIT;
+    ici.samples = _samples; // [MSAA] the depth target renders at the scene sample count
     ici.tiling = VK_IMAGE_TILING_OPTIMAL;
     ici.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
     ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -594,6 +717,135 @@ namespace Noggit::Rendering::VK
 
     if (!createDepthTarget())
       return false;
+
+    // [MSAA 2026-09-03] native-present MSAA: render into multisampled colour+z+depth and let the
+    // render pass RESOLVE into the existing single-sample exportable images (_image / _z_image),
+    // so the blit/present/readback/parity plumbing is untouched. Sample-1 keeps the original
+    // 3-attachment layout below, byte for byte.
+    if (_samples != VK_SAMPLE_COUNT_1_BIT)
+    {
+      auto const make_ms = [&](VkFormat fmt, VkImage& img, VkDeviceMemory& mem, VkImageView& view) -> bool
+      {
+        VkImageCreateInfo ici{};
+        ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+        ici.imageType = VK_IMAGE_TYPE_2D;
+        ici.format = fmt;
+        ici.extent = { _width, _height, 1 };
+        ici.mipLevels = 1;
+        ici.arrayLayers = 1;
+        ici.samples = _samples;
+        ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+        ici.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+        ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        if (vkCreateImage(_device, &ici, nullptr, &img) != VK_SUCCESS)
+          return false;
+        VkMemoryRequirements req{};
+        vkGetImageMemoryRequirements(_device, img, &req);
+        VkPhysicalDeviceMemoryProperties mp{};
+        vkGetPhysicalDeviceMemoryProperties(_phys, &mp);
+        std::uint32_t type = UINT32_MAX;
+        for (std::uint32_t i = 0; i < mp.memoryTypeCount; ++i)
+          if ((req.memoryTypeBits & (1u << i))
+              && (mp.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))
+          {
+            type = i;
+            break;
+          }
+        VkMemoryAllocateInfo mai{};
+        mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        mai.allocationSize = req.size;
+        mai.memoryTypeIndex = type;
+        if (type == UINT32_MAX || vkAllocateMemory(_device, &mai, nullptr, &mem) != VK_SUCCESS
+            || vkBindImageMemory(_device, img, mem, 0) != VK_SUCCESS)
+          return false;
+        VkImageViewCreateInfo vci{};
+        vci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        vci.image = img;
+        vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        vci.format = fmt;
+        vci.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        vci.subresourceRange.levelCount = 1;
+        vci.subresourceRange.layerCount = 1;
+        return vkCreateImageView(_device, &vci, nullptr, &view) == VK_SUCCESS;
+      };
+      if (!make_ms(VK_FORMAT_R8G8B8A8_UNORM, _ms_color_image, _ms_color_mem, _ms_color_view)
+          || !make_ms(VK_FORMAT_R32_SFLOAT, _ms_z_image, _ms_z_mem, _ms_z_view))
+      {
+        LogError << "[VK] MSAA target creation failed -- falling back to 1 sample" << std::endl;
+        _samples = VK_SAMPLE_COUNT_1_BIT;
+        // NOTE: _depth_image was already created at the higher count; recreate it single-sample.
+        if (_depth_view) { vkDestroyImageView(_device, _depth_view, nullptr); _depth_view = VK_NULL_HANDLE; }
+        if (_depth_image) { vkDestroyImage(_device, _depth_image, nullptr); _depth_image = VK_NULL_HANDLE; }
+        if (_depth_mem) { vkFreeMemory(_device, _depth_mem, nullptr); _depth_mem = VK_NULL_HANDLE; }
+        if (!createDepthTarget())
+          return false;
+      }
+    }
+    if (_samples != VK_SAMPLE_COUNT_1_BIT)
+    {
+      VkAttachmentDescription atts[5]{};
+      atts[0].format = VK_FORMAT_R8G8B8A8_UNORM;          // MS colour
+      atts[0].samples = _samples;
+      atts[0].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+      atts[0].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE; // resolved, never read back
+      atts[0].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+      atts[0].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+      atts[0].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+      atts[0].finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+      atts[1] = atts[0];
+      atts[1].format = VK_FORMAT_R32_SFLOAT;              // MS depth-as-colour
+      atts[2].format = VK_FORMAT_D32_SFLOAT;              // MS depth
+      atts[2].samples = _samples;
+      atts[2].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+      atts[2].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+      atts[2].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+      atts[2].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+      atts[2].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+      atts[2].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+      atts[3].format = VK_FORMAT_R8G8B8A8_UNORM;          // resolve -> exportable colour
+      atts[3].samples = VK_SAMPLE_COUNT_1_BIT;
+      atts[3].loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;   // fully overwritten by the resolve
+      atts[3].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+      atts[3].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+      atts[3].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+      atts[3].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+      atts[3].finalLayout = VK_IMAGE_LAYOUT_GENERAL;      // blit/present/GL-import layout
+      atts[4] = atts[3];
+      atts[4].format = VK_FORMAT_R32_SFLOAT;              // resolve -> exportable z
+      VkAttachmentReference crefs[2]{};
+      crefs[0] = { 0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
+      crefs[1] = { 1, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
+      VkAttachmentReference rrefs[2]{};
+      rrefs[0] = { 3, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
+      rrefs[1] = { 4, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
+      VkAttachmentReference dref{ 2, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL };
+      VkSubpassDescription sub{};
+      sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+      sub.colorAttachmentCount = 2;
+      sub.pColorAttachments = crefs;
+      sub.pResolveAttachments = rrefs;
+      sub.pDepthStencilAttachment = &dref;
+      VkRenderPassCreateInfo rci{};
+      rci.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+      rci.attachmentCount = 5;
+      rci.pAttachments = atts;
+      rci.subpassCount = 1;
+      rci.pSubpasses = &sub;
+      if (vkCreateRenderPass(_device, &rci, nullptr, &_render_pass) != VK_SUCCESS)
+        return false;
+      VkImageView views[5] = { _ms_color_view, _ms_z_view, _depth_view, _view, _z_view };
+      VkFramebufferCreateInfo fci{};
+      fci.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+      fci.renderPass = _render_pass;
+      fci.attachmentCount = 5;
+      fci.pAttachments = views;
+      fci.width = _width;
+      fci.height = _height;
+      fci.layers = 1;
+      LogError << "[VK] MSAA x" << static_cast<int>(_samples)
+               << " targets ready (resolve -> exportable images)" << std::endl;
+      return vkCreateFramebuffer(_device, &fci, nullptr, &_framebuffer) == VK_SUCCESS;
+    }
 
     // Colour + depth. initialLayout UNDEFINED + loadOp CLEAR every frame (previous contents replaced);
     // colour finalLayout GENERAL = the cross-API interop layout GL waits on. No explicit barriers needed.
@@ -704,7 +956,7 @@ namespace Noggit::Rendering::VK
 
     VkPipelineMultisampleStateCreateInfo ms{};
     ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
-    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    ms.rasterizationSamples = _samples; // [MSAA] every pipeline renders at the scene sample count
 
     VkPipelineColorBlendAttachmentState cba[2]{};
     cba[1].colorWriteMask = VK_COLOR_COMPONENT_R_BIT; // [phase A] depth-as-colour attachment
@@ -825,6 +1077,74 @@ namespace Noggit::Rendering::VK
       }
       if (dome_vs) vkDestroyShaderModule(_device, dome_vs, nullptr);
       if (dome_fs) vkDestroyShaderModule(_device, dome_fs, nullptr);
+    }
+    // [2026-09-08 WDL HORIZON] low-res distant terrain (client CMapLowDetail): position-only vertices,
+    // push-only layout (mvp + flat colour), depth test LEQUAL. Two pipelines: solid cells write depth,
+    // MAHO hole cells do not (CMapLowDetail::RenderTile draws them as a second range with the
+    // depth-write state flipped). The client's [511/512, 1023/1024] viewport depth slice lives in
+    // horizon.vert, so the viewport state stays the shared one.
+    {
+      VkShaderModule hz_vs = loadShaderModule("horizon.vert.spv");
+      VkShaderModule hz_fs = loadShaderModule("horizon.frag.spv");
+      if (hz_vs && hz_fs)
+      {
+        if (!_horizon_layout)
+        {
+          VkPushConstantRange range{};
+          range.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+          range.size = 80;   // mat4 + vec4 colour
+          VkPipelineLayoutCreateInfo hlci{};
+          hlci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+          hlci.pushConstantRangeCount = 1;
+          hlci.pPushConstantRanges = &range;
+          if (vkCreatePipelineLayout(_device, &hlci, nullptr, &_horizon_layout) != VK_SUCCESS)
+            _horizon_layout = VK_NULL_HANDLE;
+        }
+
+        VkVertexInputBindingDescription hbind{ 0, 12, VK_VERTEX_INPUT_RATE_VERTEX };
+        VkVertexInputAttributeDescription hattr{ 0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0 };
+        VkPipelineVertexInputStateCreateInfo hvin{};
+        hvin.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+        hvin.vertexBindingDescriptionCount = 1;
+        hvin.pVertexBindingDescriptions = &hbind;
+        hvin.vertexAttributeDescriptionCount = 1;
+        hvin.pVertexAttributeDescriptions = &hattr;
+
+        VkPipelineDepthStencilStateCreateInfo hds = ds;
+        hds.depthTestEnable = VK_TRUE;
+        hds.depthWriteEnable = VK_TRUE;
+        hds.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
+
+        stages[0].module = hz_vs;
+        stages[1].module = hz_fs;
+        pci.pVertexInputState = &hvin;
+        pci.pDepthStencilState = &hds;
+        VkPipelineLayout const prev_hz_layout = pci.layout;
+        if (_horizon_layout)
+          pci.layout = _horizon_layout;
+        VkResult const rh = vkCreateGraphicsPipelines(_device, _pipeline_cache, 1, &pci, nullptr, &_horizon_pipeline);
+        if (rh != VK_SUCCESS)
+        {
+          LogError << "[VK] horizon pipeline create failed: " << vkres(rh) << " (no distant backdrop)" << std::endl;
+          _horizon_pipeline = VK_NULL_HANDLE;
+        }
+        hds.depthWriteEnable = VK_FALSE;   // MAHO hole cells
+        VkResult const rh2 = vkCreateGraphicsPipelines(_device, _pipeline_cache, 1, &pci, nullptr, &_horizon_pipeline_nowrite);
+        if (rh2 != VK_SUCCESS)
+        {
+          LogError << "[VK] horizon (hole cells) pipeline create failed: " << vkres(rh2) << std::endl;
+          _horizon_pipeline_nowrite = VK_NULL_HANDLE;
+        }
+        pci.pVertexInputState = &vin;
+        pci.pDepthStencilState = &ds;
+        pci.layout = prev_hz_layout;
+      }
+      else
+      {
+        LogError << "[VK] horizon shaders missing (horizon.vert.spv / horizon.frag.spv): no distant backdrop" << std::endl;
+      }
+      if (hz_vs) vkDestroyShaderModule(_device, hz_vs, nullptr);
+      if (hz_fs) vkDestroyShaderModule(_device, hz_fs, nullptr);
     }
     vkDestroyShaderModule(_device, vs, nullptr);
     return true;
@@ -1227,7 +1547,7 @@ namespace Noggit::Rendering::VK
 
     VkPipelineMultisampleStateCreateInfo ms{};
     ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
-    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    ms.rasterizationSamples = _samples; // [MSAA] every pipeline renders at the scene sample count
 
     VkPipelineDepthStencilStateCreateInfo ds{};
     ds.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
@@ -1636,6 +1956,152 @@ namespace Noggit::Rendering::VK
   // =====================================================================================================
   // [VULKAN phase B, 2026-08-29] TEXTURED TERRAIN -- the first pass Vulkan owns.
   // =====================================================================================================
+
+  // [2026-09-04 NATIVE UI COMPOSITE] Self-contained on purpose: the shared `pci` scaffolding in
+  // createTerrainPipeline is a state machine several pipelines borrow from and restore, and it has
+  // already caused one wrong-vertex-stride bug. This builds its own create-info from scratch.
+  bool VulkanBackend::createUiPipeline()
+  {
+    if (_ui_pipeline)
+      return true;
+    if (!_particle_layout || !_render_pass)
+      return false;   // shares the particle layout (same mat4+vec4 push, same two sets)
+
+    VkShaderModule vs = loadShaderModule("ui.vert.spv");
+    VkShaderModule fs = loadShaderModule("ui.frag.spv");
+    if (!vs || !fs)
+    {
+      if (vs) vkDestroyShaderModule(_device, vs, nullptr);
+      if (fs) vkDestroyShaderModule(_device, fs, nullptr);
+      LogError << "[VK] UI overlay: shader modules missing (ui.vert.spv/ui.frag.spv)" << std::endl;
+      return false;
+    }
+
+    VkPipelineShaderStageCreateInfo stages[2]{};
+    stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+    stages[0].module = vs;
+    stages[0].pName = "main";
+    stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    stages[1].module = fs;
+    stages[1].pName = "main";
+
+    VkPipelineVertexInputStateCreateInfo vin{};   // no buffers: 3 generated vertices
+    vin.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+
+    VkPipelineInputAssemblyStateCreateInfo ia{};
+    ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+    VkViewport vp{};
+    vp.width = static_cast<float>(_width);
+    vp.height = static_cast<float>(_height);
+    vp.maxDepth = 1.0f;
+    VkRect2D sc{};
+    sc.extent = { _width, _height };
+    VkPipelineViewportStateCreateInfo vps{};
+    vps.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+    vps.viewportCount = 1;
+    vps.pViewports = &vp;
+    vps.scissorCount = 1;
+    vps.pScissors = &sc;
+
+    VkPipelineRasterizationStateCreateInfo rs{};
+    rs.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+    rs.polygonMode = VK_POLYGON_MODE_FILL;
+    rs.cullMode = VK_CULL_MODE_NONE;
+    rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    rs.lineWidth = 1.0f;
+
+    VkPipelineMultisampleStateCreateInfo ms{};
+    ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+    ms.rasterizationSamples = _samples;
+
+    VkPipelineDepthStencilStateCreateInfo ds{};   // an overlay: never tested, never written
+    ds.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+    ds.depthTestEnable = VK_FALSE;
+    ds.depthWriteEnable = VK_FALSE;
+    ds.depthCompareOp = VK_COMPARE_OP_ALWAYS;
+
+    VkPipelineColorBlendAttachmentState cba[2]{};
+    cba[0].blendEnable = VK_TRUE;
+    cba[0].srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+    cba[0].dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    cba[0].colorBlendOp = VK_BLEND_OP_ADD;
+    cba[0].srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+    cba[0].dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+    cba[0].alphaBlendOp = VK_BLEND_OP_ADD;
+    cba[0].colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT
+                          | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    cba[1].colorWriteMask = 0;   // never disturb the depth-as-colour attachment
+    VkPipelineColorBlendStateCreateInfo cb{};
+    cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+    cb.attachmentCount = 2;
+    cb.pAttachments = cba;
+
+    VkGraphicsPipelineCreateInfo pci{};
+    pci.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    pci.stageCount = 2;
+    pci.pStages = stages;
+    pci.pVertexInputState = &vin;
+    pci.pInputAssemblyState = &ia;
+    pci.pViewportState = &vps;
+    pci.pRasterizationState = &rs;
+    pci.pMultisampleState = &ms;
+    pci.pDepthStencilState = &ds;
+    pci.pColorBlendState = &cb;
+    pci.layout = _particle_layout;
+    pci.renderPass = _render_pass;
+    pci.subpass = 0;
+
+    VkResult const r = vkCreateGraphicsPipelines(_device, _pipeline_cache, 1, &pci, nullptr, &_ui_pipeline);
+    vkDestroyShaderModule(_device, vs, nullptr);
+    vkDestroyShaderModule(_device, fs, nullptr);
+    if (r != VK_SUCCESS)
+    {
+      _ui_pipeline = VK_NULL_HANDLE;
+      LogError << "[VK] UI overlay pipeline create failed: " << vkres(r) << std::endl;
+      return false;
+    }
+    LogError << "[VK] UI overlay pipeline ready" << std::endl;
+    return true;
+  }
+
+  bool VulkanBackend::setUiOverlay(void const* rgba, std::uint32_t width, std::uint32_t height)
+  {
+    if (!_ready || !rgba || !width || !height)
+    {
+      _ui_visible = false;
+      return true;               // nothing to draw is not an error
+    }
+    if (!_ui_pipeline && !createUiPipeline())
+    {
+      _ui_visible = false;
+      return false;
+    }
+
+    if (_ui_tex < 0 || width != _ui_w || height != _ui_h)
+    {
+      // First use, or the window was resized: a new slot at the new extent.
+      _ui_tex = addTexture(static_cast<std::uint32_t const*>(rgba), width, height);
+      if (_ui_tex < 0)
+      {
+        _ui_visible = false;
+        return false;
+      }
+      _ui_w = width;
+      _ui_h = height;
+      LogError << "[VK] UI overlay texture: slot " << _ui_tex << " " << width << "x" << height << std::endl;
+    }
+    else if (!updateTexturePixelsInPlace(_ui_tex, rgba, width, height))
+    {
+      _ui_visible = false;
+      return false;
+    }
+    _ui_visible = true;
+    return true;
+  }
 
   bool VulkanBackend::uploadImage2D(std::uint32_t width, std::uint32_t height, VkFormat format, std::uint32_t bpp,
                                     std::vector<std::vector<std::uint8_t>> const& mips, VkImage& image,
@@ -2160,6 +2626,22 @@ namespace Noggit::Rendering::VK
       static std::vector<std::vector<std::uint8_t>> amip(1), smip(1);
       amip[0].assign(alpha_rgba8, alpha_rgba8 + static_cast<std::size_t>(aw) * ah * 4u);
       smip[0].assign(shadow_r8, shadow_r8 + static_cast<std::size_t>(aw) * ah);
+      // [2026-09-02] These images and their memory are referenced by _tt_dset, which command
+      // buffers ALREADY SUBMITTED are bound to. Destroying and freeing them below without waiting is
+      // a GPU use-after-free -- this function had no synchronisation of any kind. It is driven by
+      // tileset streaming (log: 13 -> 187 -> ... -> 410 tilesets, 23 full rebuilds in one session),
+      // so it fires exactly when the camera moves: "the moment I start moving it flashes and all my
+      // doodads disappear, anti aliasing breaks".
+      //
+      // Drain the submit thread first -- it hands work to the queue independently of this thread, so
+      // vkDeviceWaitIdle alone would still race a submission already in flight.
+      {
+        std::unique_lock<std::mutex> lk(_submit_mutex);
+        _submit_done_cv.wait(lk, [this] { return !_submit_pending; });
+      }
+      if (_device && vkDeviceWaitIdle)
+        vkDeviceWaitIdle(_device);
+
       if (_alpha_view) vkDestroyImageView(_device, _alpha_view, nullptr);
       if (_alpha_image) vkDestroyImage(_device, _alpha_image, nullptr);
       if (_alpha_mem) vkFreeMemory(_device, _alpha_mem, nullptr);
@@ -2191,6 +2673,7 @@ namespace Noggit::Rendering::VK
     _terrain_dirty_v.clear(); _terrain_dirty_i.clear(); _terrain_dirty_c.clear();
     _atlas_dirty_bands.clear();
     _tt_ready = true;
+    g_vk_trace_last_rebuild_frame = g_vk_trace_frame;   // [VKTRACE]
     LogError << "[VK] TEXTURED terrain: " << chunk_count << " chunks, " << _textures.size() << " tilesets, atlas "
              << aw << "x" << ah << std::endl;
     return true;
@@ -2285,7 +2768,7 @@ namespace Noggit::Rendering::VK
     rs.lineWidth = 1.0f;
     VkPipelineMultisampleStateCreateInfo ms{};
     ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
-    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    ms.rasterizationSamples = _samples; // [MSAA] every pipeline renders at the scene sample count
     VkPipelineDepthStencilStateCreateInfo ds{};
     ds.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
     ds.depthTestEnable = VK_TRUE;
@@ -2720,6 +3203,111 @@ namespace Noggit::Rendering::VK
   }
 
 
+  // ---- [VULKAN CLUTTER PERSISTENT, 2026-09-03] --------------------------------------------------
+
+  std::int32_t VulkanBackend::clutterRegisterChunk(float const* tf, float const* interior,
+                                                   std::int32_t const* tex, std::int32_t const* state,
+                                                   std::size_t n)
+  {
+    if (!_ready || !tf || !interior || !tex || !state || !n)
+      return -1;
+    ClutterChunkBuf c;
+    c.count = static_cast<std::uint32_t>(n);
+    c.off_in = static_cast<VkDeviceSize>(n) * 64u;
+    c.off_tx = c.off_in + static_cast<VkDeviceSize>(n) * 16u;
+    c.off_st = c.off_tx + static_cast<VkDeviceSize>(n) * 16u;
+    VkDeviceSize const bytes = c.off_st + static_cast<VkDeviceSize>(n) * 16u;
+
+    VkBufferCreateInfo bci{};
+    bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bci.size = bytes;
+    bci.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
+    bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    if (vkCreateBuffer(_device, &bci, nullptr, &c.buf) != VK_SUCCESS)
+      return -1;
+    VkMemoryRequirements req{};
+    vkGetBufferMemoryRequirements(_device, c.buf, &req);
+    VkPhysicalDeviceMemoryProperties mp{};
+    vkGetPhysicalDeviceMemoryProperties(_phys, &mp);
+    std::uint32_t type = UINT32_MAX;
+    for (std::uint32_t i = 0; i < mp.memoryTypeCount; ++i)
+      if ((req.memoryTypeBits & (1u << i))
+          && (mp.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)
+          && (mp.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))
+      {
+        type = i;
+        break;
+      }
+    VkMemoryAllocateInfo mai{};
+    mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    mai.allocationSize = req.size;
+    mai.memoryTypeIndex = type;
+    void* p = nullptr;
+    if (type == UINT32_MAX || vkAllocateMemory(_device, &mai, nullptr, &c.mem) != VK_SUCCESS
+        || vkBindBufferMemory(_device, c.buf, c.mem, 0) != VK_SUCCESS
+        || vkMapMemory(_device, c.mem, 0, VK_WHOLE_SIZE, 0, &p) != VK_SUCCESS || !p)
+    {
+      if (c.mem) vkFreeMemory(_device, c.mem, nullptr);
+      vkDestroyBuffer(_device, c.buf, nullptr);
+      return -1;
+    }
+    std::memcpy(static_cast<char*>(p),             tf,       n * 64u);
+    std::memcpy(static_cast<char*>(p) + c.off_in,  interior, n * 16u);
+    std::memcpy(static_cast<char*>(p) + c.off_tx,  tex,      n * 16u);
+    std::memcpy(static_cast<char*>(p) + c.off_st,  state,    n * 16u);
+    vkUnmapMemory(_device, c.mem);
+    c.used = true;
+
+    for (std::size_t i = 0; i < _clutter_chunks.size(); ++i)
+      if (!_clutter_chunks[i].used)
+      {
+        _clutter_chunks[i] = c;
+        return static_cast<std::int32_t>(i);
+      }
+    _clutter_chunks.push_back(c);
+    return static_cast<std::int32_t>(_clutter_chunks.size() - 1u);
+  }
+
+  void VulkanBackend::clutterReleaseChunk(std::int32_t slot)
+  {
+    if (slot < 0 || static_cast<std::size_t>(slot) >= _clutter_chunks.size())
+      return;
+    ClutterChunkBuf& c = _clutter_chunks[static_cast<std::size_t>(slot)];
+    if (!c.used)
+      return;
+    retireBuffer(c.buf, c.mem);   // frame-in-flight safe (same rule as every grow)
+    c = ClutterChunkBuf{};
+  }
+
+  bool VulkanBackend::setClutterFrame(ClutterDraw const* draws, std::size_t count)
+  {
+    _clutter_draws.clear();
+    if (!_ready || !draws || !count)
+      return true;   // nothing visible is not an error
+    _clutter_draws.assign(draws, draws + count);
+    // one indirect record per draw, in the given order -- runs are issued as contiguous spans
+    static std::vector<M2Draw> cmds;   // scratch; single-threaded feed path
+    cmds.clear();
+    cmds.reserve(count);
+    for (std::size_t i = 0; i < count; ++i)
+    {
+      M2Draw d;
+      d.index_count = draws[i].index_count;
+      d.instance_count = draws[i].instance_count;
+      d.first_index = draws[i].first_index;
+      d.vertex_offset = draws[i].base_vertex;
+      d.first_instance = draws[i].first_instance;
+      cmds.push_back(d);
+    }
+    if (!writeHostBuffer(VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT, cmds.data(), cmds.size() * sizeof(M2Draw),
+                         _clutter_indirect, _clutter_indirect_mem, _clutter_indirect_cap))
+    {
+      _clutter_draws.clear();
+      return false;
+    }
+    return true;
+  }
+
   // ================= [VULKAN phase D] WMO pass =================
   //
   // Geometry is one append-only arena (stride 56) mirrored out of WMOGroupRender::upload(); the
@@ -2914,7 +3502,7 @@ namespace Noggit::Rendering::VK
     rs.lineWidth = 1.0f;
     VkPipelineMultisampleStateCreateInfo ms{};
     ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
-    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    ms.rasterizationSamples = _samples; // [MSAA] every pipeline renders at the scene sample count
     VkPipelineDepthStencilStateCreateInfo ds{};
     ds.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
     ds.depthTestEnable = VK_TRUE;
@@ -3119,7 +3707,7 @@ namespace Noggit::Rendering::VK
     rs.lineWidth = 1.0f;
     VkPipelineMultisampleStateCreateInfo ms{};
     ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
-    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    ms.rasterizationSamples = _samples; // [MSAA] every pipeline renders at the scene sample count
     VkPipelineDepthStencilStateCreateInfo ds{};
     ds.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
     ds.depthTestEnable = VK_TRUE;
@@ -3223,162 +3811,8 @@ namespace Noggit::Rendering::VK
     LogError << "[VK] M2 batched pipelines ready (6 blend/cull variants)" << std::endl;
     return true;
   }
-
-  bool VulkanBackend::createDoodadPipeline()
-  {
-    VkShaderModule vs = loadShaderModule("doodad.vert.spv");
-    VkShaderModule fs = loadShaderModule("doodad.frag.spv");
-    if (!vs || !fs)
-    {
-      if (vs) vkDestroyShaderModule(_device, vs, nullptr);
-      if (fs) vkDestroyShaderModule(_device, fs, nullptr);
-      LogError << "[VK] doodad shaders missing (doodads skipped)" << std::endl;
-      return true; // soft-optional
-    }
-
-    VkPipelineShaderStageCreateInfo stages[2]{};
-    stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
-    stages[0].module = vs;
-    stages[0].pName = "main";
-    stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
-    stages[1].module = fs;
-    stages[1].pName = "main";
-
-    VkVertexInputBindingDescription binds[2]{};
-    binds[0].binding = 0;
-    binds[0].stride = 24;
-    binds[0].inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
-    binds[1].binding = 1;
-    binds[1].stride = 64;
-    binds[1].inputRate = VK_VERTEX_INPUT_RATE_INSTANCE;
-    VkVertexInputAttributeDescription attrs[6]{};
-    attrs[0] = { 0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0 };
-    attrs[1] = { 1, 0, VK_FORMAT_R32G32B32_SFLOAT, 12 };
-    for (std::uint32_t i = 0; i < 4; ++i)
-      attrs[2 + i] = { 2 + i, 1, VK_FORMAT_R32G32B32A32_SFLOAT, i * 16 };
-    VkPipelineVertexInputStateCreateInfo vin{};
-    vin.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-    vin.vertexBindingDescriptionCount = 2;
-    vin.pVertexBindingDescriptions = binds;
-    vin.vertexAttributeDescriptionCount = 6;
-    vin.pVertexAttributeDescriptions = attrs;
-
-    VkPipelineInputAssemblyStateCreateInfo ia{};
-    ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
-    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-
-    VkViewport vp{};
-    vp.width = static_cast<float>(_width);
-    vp.height = static_cast<float>(_height);
-    vp.maxDepth = 1.0f;
-    VkRect2D sc{};
-    sc.extent = { _width, _height };
-    VkPipelineViewportStateCreateInfo vps{};
-    vps.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
-    vps.viewportCount = 1;
-    vps.pViewports = &vp;
-    vps.scissorCount = 1;
-    vps.pScissors = &sc;
-
-    VkPipelineRasterizationStateCreateInfo rs{};
-    rs.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
-    rs.polygonMode = VK_POLYGON_MODE_FILL;
-    rs.cullMode = VK_CULL_MODE_NONE;
-    rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
-    rs.lineWidth = 1.0f;
-
-    VkPipelineMultisampleStateCreateInfo ms{};
-    ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
-    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-
-    VkPipelineDepthStencilStateCreateInfo ds{};
-    ds.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
-    ds.depthTestEnable = VK_TRUE;
-    ds.depthWriteEnable = VK_TRUE;
-    ds.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
-
-    VkPipelineColorBlendAttachmentState cba[2]{};
-    cba[1].colorWriteMask = VK_COLOR_COMPONENT_R_BIT; // [phase A] depth-as-colour attachment
-    cba[0].colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT
-                       | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-    VkPipelineColorBlendStateCreateInfo cb{};
-    cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
-    cb.attachmentCount = 2;
-    cb.pAttachments = cba;
-
-    VkGraphicsPipelineCreateInfo pci{};
-    pci.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
-    pci.stageCount = 2;
-    pci.pStages = stages;
-    pci.pVertexInputState = &vin;
-    pci.pInputAssemblyState = &ia;
-    pci.pViewportState = &vps;
-    pci.pRasterizationState = &rs;
-    pci.pMultisampleState = &ms;
-    pci.pColorBlendState = &cb;
-    pci.pDepthStencilState = &ds;
-    pci.layout = _terrain_layout; // same push block
-    pci.renderPass = _render_pass;
-    VkResult const r = vkCreateGraphicsPipelines(_device, _pipeline_cache, 1, &pci, nullptr, &_doodad_pipeline);
-    vkDestroyShaderModule(_device, vs, nullptr);
-    vkDestroyShaderModule(_device, fs, nullptr);
-    if (r != VK_SUCCESS)
-    {
-      LogError << "[VK] doodad pipeline create failed: " << vkres(r) << " (doodads skipped)" << std::endl;
-      _doodad_pipeline = VK_NULL_HANDLE;
-    }
-    return true;
-  }
-
-  bool VulkanBackend::setDoodads(float const* pn_verts, std::size_t vertex_count,
-                                 std::uint32_t const* indices, std::size_t index_count,
-                                 float const* instance_mat4s, std::size_t instance_count,
-                                 DoodadDraw const* draws, std::size_t draw_count)
-  {
-    if (!_ready)
-      return false;
-
-    _doodad_draws.clear();
-
-    if (!vertex_count || !index_count || !instance_count || !draw_count)
-      return true; // nothing to draw here
-
-    // [finding 104] Geometry is append-only (the Model/WMOGroup span cache of finding 81), so only
-    // the tail moves. A cache reset shrinks it, which fails the append test and falls back to a
-    // full write -- as does a capacity grow, inside writeHostBufferRanges.
-    std::size_t const vbytes = vertex_count * 24;
-    std::size_t const ibytes = index_count * 4;
-    std::pair<std::size_t, std::size_t> vr{ _doodad_vbo_written,
-                                            vbytes > _doodad_vbo_written ? vbytes - _doodad_vbo_written : 0 };
-    std::pair<std::size_t, std::size_t> ir{ _doodad_ibo_written,
-                                            ibytes > _doodad_ibo_written ? ibytes - _doodad_ibo_written : 0 };
-    bool const v_app = vbytes >= _doodad_vbo_written && vr.second;
-    bool const i_app = ibytes >= _doodad_ibo_written && ir.second;
-    if (!writeHostBufferRanges(VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, pn_verts, vbytes,
-                               v_app ? &vr : nullptr, v_app ? 1u : 0u,
-                               _doodad_vbo, _doodad_vbo_mem, _doodad_vbo_cap)
-        || !writeHostBufferRanges(VK_BUFFER_USAGE_INDEX_BUFFER_BIT, indices, ibytes,
-                                  i_app ? &ir : nullptr, i_app ? 1u : 0u,
-                                  _doodad_ibo, _doodad_ibo_mem, _doodad_ibo_cap)
-        // instances really do change every rebuild, but they are small and need no recreate
-        || !writeHostBuffer(VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, instance_mat4s, instance_count * 64,
-                            _doodad_inst, _doodad_inst_mem, _doodad_inst_cap))
-    {
-      LogError << "[VK] doodad upload failed" << std::endl;
-      _doodad_vbo_written = _doodad_ibo_written = 0;   // force a full write next time
-      return false;
-    }
-    _doodad_vbo_written = vbytes;
-    _doodad_ibo_written = ibytes;
-    _doodad_draws.assign(draws, draws + draw_count);
-    static int s_dood_log = 0;
-    if (s_dood_log++ < 3)
-      LogError << "[VK] doodads: " << draw_count << " models / " << instance_count
-               << " instances / " << vertex_count << " verts" << std::endl;
-    return true;
-  }
+  // [2026-09-03] createDoodadPipeline / setDoodads (the untextured clay path) removed --
+  // the M2 batches carry every doodad; nothing fed or recorded this since 2026-09-02.
 
   bool VulkanBackend::setWaterMesh(float const* pos_normal_interleaved, std::size_t vertex_count,
                                    std::uint32_t const* indices, std::size_t index_count)
@@ -3575,6 +4009,51 @@ namespace Noggit::Rendering::VK
     return true;
   }
 
+  bool VulkanBackend::setHorizon(float const* xyz, std::size_t vertex_count, std::uint32_t vertex_generation,
+                                 std::uint32_t const* solid, std::size_t solid_count,
+                                 std::uint32_t const* holes, std::size_t hole_count, float const* rgb,
+                                 float const* mvp16)
+  {
+    if (!_ready)
+      return false;
+    _horizon_solid_count = 0;
+    _horizon_hole_count = 0;
+    if (!xyz || !vertex_count || (!solid_count && !hole_count) || !rgb || !mvp16)
+      return true;   // nothing to draw this frame
+    std::memcpy(_horizon_mvp, mvp16, sizeof(_horizon_mvp));
+
+    // the whole map's WDL mesh: uploaded once, again only when the generation changes
+    if (vertex_generation != _horizon_vertex_generation || !_horizon_vbo)
+    {
+      if (!writeHostBuffer(VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, xyz, vertex_count * 3 * sizeof(float),
+                           _horizon_vbo, _horizon_vbo_mem, _horizon_vbo_cap))
+      {
+        LogError << "[VK] horizon vertex upload failed (" << vertex_count << " verts)" << std::endl;
+        return false;
+      }
+      _horizon_vertex_generation = vertex_generation;
+      LogError << "[VK] horizon mesh uploaded: verts=" << vertex_count << " gen=" << vertex_generation << std::endl;
+    }
+
+    // solid range first, hole range after it: one index buffer, two draws
+    static std::vector<std::uint32_t> combined;
+    combined.resize(solid_count + hole_count);
+    if (solid_count) std::memcpy(combined.data(), solid, solid_count * sizeof(std::uint32_t));
+    if (hole_count) std::memcpy(combined.data() + solid_count, holes, hole_count * sizeof(std::uint32_t));
+    if (!writeHostBuffer(VK_BUFFER_USAGE_INDEX_BUFFER_BIT, combined.data(), combined.size() * sizeof(std::uint32_t),
+                         _horizon_ibo, _horizon_ibo_mem, _horizon_ibo_cap))
+    {
+      LogError << "[VK] horizon index upload failed" << std::endl;
+      return false;
+    }
+    _horizon_solid_count = static_cast<std::uint32_t>(solid_count);
+    _horizon_hole_count = static_cast<std::uint32_t>(hole_count);
+    _horizon_color[0] = rgb[0];
+    _horizon_color[1] = rgb[1];
+    _horizon_color[2] = rgb[2];
+    return true;
+  }
+
   bool VulkanBackend::setCloudDome(float const* pos_uv_alpha, std::size_t vertex_count,
                                    std::uint16_t const* indices, std::size_t index_count)
   {
@@ -3684,13 +4163,31 @@ namespace Noggit::Rendering::VK
     return true;
   }
 
-  bool VulkanBackend::init(std::uint32_t width, std::uint32_t height)
+  bool VulkanBackend::init(std::uint32_t width, std::uint32_t height, std::uint32_t msaa_samples)
   {
     _width = width;
     _height = height;
+    // [MSAA] requested count now; clamped to what the device's framebuffers support below.
+    _samples = static_cast<VkSampleCountFlagBits>(
+        msaa_samples >= 8u ? 8u : msaa_samples >= 4u ? 4u : msaa_samples >= 2u ? 2u : 1u);
+    auto const clamp_samples = [this]()
+    {
+      if (_samples != VK_SAMPLE_COUNT_1_BIT)
+      {
+        VkPhysicalDeviceProperties p{};
+        vkGetPhysicalDeviceProperties(_phys, &p);
+        VkSampleCountFlags const ok = p.limits.framebufferColorSampleCounts
+                                    & p.limits.framebufferDepthSampleCounts;
+        while (_samples != VK_SAMPLE_COUNT_1_BIT && !(ok & _samples))
+          _samples = static_cast<VkSampleCountFlagBits>(_samples >> 1);
+        LogError << "[VK] MSAA sample count: " << static_cast<int>(_samples) << std::endl;
+      }
+      return true;
+    };
     // The pipeline cache must exist BEFORE the first pipeline is built -- everything below passes it.
     auto const seed_cache = [this]() { createPipelineCache(); return true; };
     if (!loadLoader() || !createInstance() || !pickDeviceAndQueue() || !createDevice()
+        || !clamp_samples()
         || !seed_cache() || !createCopyQueue()
         || !createSharedImage() || !createSemaphores() || !createRenderTarget() || !createPipeline()
         || !createTextureInfra()
@@ -3699,11 +4196,18 @@ namespace Noggit::Rendering::VK
         // With the old order _tt_dsl was still null, water silently fell back to the terrain layout
         // (set 0 only) and its lighting reads returned zeros -> fully transparent water.
         || (_descriptor_indexing && !createTerrainTexInfra())
-        || !createTerrainPipeline() || !createDoodadPipeline())
+        || !createTerrainPipeline())
     {
       LogError << "[VK] init failed -- staying on pure GL" << std::endl;
       return false;
     }
+    // [2026-09-04] Build the UI overlay pipeline EAGERLY, here, with every other pipeline. It was
+    // created lazily from setUiOverlay() on the main thread while the recorder threads were already
+    // running -- a needless variable when its draws were producing no fragments. Non-fatal: the
+    // editor must still run if only the overlay fails.
+    if (!createUiPipeline())
+      LogError << "[VK] UI overlay pipeline unavailable -- overlay will not composite" << std::endl;
+
     // Persist the cache HERE, not only at shutdown: a hard exit (the harness uses std::_Exit) would
     // otherwise never write it, and the next launch would recompile every pipeline again.
     savePipelineCache();
@@ -3965,6 +4469,7 @@ namespace Noggit::Rendering::VK
                    << " tex=" << _cloud_tex_index << " opacity=" << _cloud_opacity << std::endl;
         }
       }
+
       float push[20]; // mat4 (16) + time + pad
       std::memcpy(push, mvp16, 16 * sizeof(float));
       push[16] = t;
@@ -4080,19 +4585,49 @@ namespace Noggit::Rendering::VK
         }
       }
 
-      // doodads (opaque, instanced) after the terrain
-      if (pass_on(8) && want(3) && _doodad_pipeline && !_doodad_draws.empty())
+      // [2026-09-08 WDL HORIZON] the low-res distant terrain, in the client's slot: after terrain and
+      // WMOs, before M2s (CMap::RenderLowDetail). Solid cells write depth, MAHO hole cells do not; the
+      // far depth slice is in horizon.vert. Its OWN projection (near = far clip - 50, far = 4 x
+      // farclip, the client's FUN_00791170) comes in through setHorizon, not the scene mvp.
+      if (pass_on(1024) && want(2) && _horizon_pipeline && _horizon_layout && _horizon_vbo && _horizon_ibo
+          && (_horizon_solid_count || _horizon_hole_count) && mvp16)
       {
-        vkCmdBindPipeline(rec, VK_PIPELINE_BIND_POINT_GRAPHICS, _doodad_pipeline);
-        VkBuffer vbs[2] = { _doodad_vbo, _doodad_inst };
-        VkDeviceSize offs[2] = { 0, 0 };
-        vkCmdBindVertexBuffers(rec, 0, 2, vbs, offs);
-        vkCmdBindIndexBuffer(rec, _doodad_ibo, 0, VK_INDEX_TYPE_UINT32);
-        for (DoodadDraw const& d : _doodad_draws)
+        float hz_push[20];
+        std::memcpy(hz_push, _horizon_mvp, 16 * sizeof(float));
+        hz_push[16] = _horizon_color[0];
+        hz_push[17] = _horizon_color[1];
+        hz_push[18] = _horizon_color[2];
+        hz_push[19] = 0.f;
+        VkDeviceSize const hz_zero = 0;
+        vkCmdBindVertexBuffers(rec, 0, 1, &_horizon_vbo, &hz_zero);
+        vkCmdBindIndexBuffer(rec, _horizon_ibo, 0, VK_INDEX_TYPE_UINT32);
+        if (_horizon_solid_count)
         {
-          vkCmdDrawIndexed(rec, d.index_count, d.instance_count, d.first_index, d.base_vertex, d.first_instance);
+          vkCmdBindPipeline(rec, VK_PIPELINE_BIND_POINT_GRAPHICS, _horizon_pipeline);
+          vkCmdPushConstants(rec, _horizon_layout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(hz_push), hz_push);
+          vkCmdDrawIndexed(rec, _horizon_solid_count, 1, 0, 0, 0);
+        }
+        if (_horizon_hole_count && _horizon_pipeline_nowrite)
+        {
+          vkCmdBindPipeline(rec, VK_PIPELINE_BIND_POINT_GRAPHICS, _horizon_pipeline_nowrite);
+          vkCmdPushConstants(rec, _horizon_layout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(hz_push), hz_push);
+          vkCmdDrawIndexed(rec, _horizon_hole_count, 1, _horizon_solid_count, 0, 0);
+        }
+        {
+          static int s_hzd = 0;
+          if ((s_hzd++ % 300) == 0)
+            LogError << "[VK] horizon draw issued: solid=" << _horizon_solid_count
+                     << " holes=" << _horizon_hole_count << std::endl;
         }
       }
+
+      // doodads (opaque, instanced) after the terrain
+      // [2026-09-02 NATIVE VK] The CLAY doodad pass was removed here. doodad.frag had no sampler,
+      // no UVs and no alpha test -- lambert mud, "clay doodads until textures land" -- so compose
+      // mode never fed it (MapView skipped setDoodads when compose_ok) and _doodad_draws was empty
+      // on all 1383 traced frames. It was also redundant: vk_feeding is set independently of
+      // compose_ok, so vkFeedClassicBucket routes the same tile doodads into the TEXTURED _m2_*
+      // arena in both modes. Doodads render through the M2 pipeline like everything else.
 
       // [phase C] M2 / doodad batches: ONE vkCmdDrawIndexedIndirect for every batch VK owns
       // every buffer bound below must exist -- binding a VK_NULL_HANDLE vertex buffer faults in the driver
@@ -4103,6 +4638,8 @@ namespace Noggit::Rendering::VK
         VkDescriptorSet m2_sets[2] = { _dset, _tt_dset };
         vkCmdBindDescriptorSets(rec, VK_PIPELINE_BIND_POINT_GRAPHICS, _m2_layout, 0, 2, m2_sets, 0, nullptr);
         push[18] = _m2_slice_dist;   // m2.frag: per-pixel object-cull slice
+        if (_m2_footprint_probe.load(std::memory_order_relaxed))
+          push[17] = static_cast<float>(static_cast<int>(push[17]) | 64);   // term bit 6 = FOOTPRINT
         // [2026-09-01 DITHER FIX] m2.vert now builds a CAMERA-RELATIVE clip position (see the note
         // there), so this pass needs mvp * translate(camera) rather than the absolute mvp -- the same
         // matrix the celestial pass already builds. Written into a copy so the passes after M2 keep
@@ -4183,6 +4720,90 @@ namespace Noggit::Rendering::VK
             for (std::uint32_t c = 0; c < _m2_draw_count; ++c)
               vkCmdDrawIndexedIndirect(rec, _m2_indirect,
                                        static_cast<VkDeviceSize>(c) * sizeof(M2Draw), 1, sizeof(M2Draw));
+          }
+        }
+      }
+
+      // [CLUTTER PERSISTENT] draws over per-chunk instance buffers, same M2 pipeline family. Skip
+      // bit 8 (freed by the clay removal). Self-contained: rebinds sets/pushes/buffers, so it works
+      // whether or not the main M2 block ran this frame.
+      if (pass_on(8) && want(3) && _m2_pipeline && !_clutter_draws.empty() && _clutter_indirect
+          && _m2_vbo && _m2_ibo && _dset && _tt_dset)
+      {
+        VkDescriptorSet cl_sets[2] = { _dset, _tt_dset };
+        vkCmdBindDescriptorSets(rec, VK_PIPELINE_BIND_POINT_GRAPHICS, _m2_layout, 0, 2, cl_sets, 0, nullptr);
+        float cl_push[20];
+        std::memcpy(cl_push, push, sizeof(cl_push));
+        cl_push[18] = _m2_slice_dist;
+        for (int r = 0; r < 4; ++r)   // camera-relative mvp, exactly like the M2 pass
+        {
+          cl_push[12 + r] = mvp16[0 + r] * _sky_camera[0]
+                          + mvp16[4 + r] * _sky_camera[1]
+                          + mvp16[8 + r] * _sky_camera[2]
+                          + mvp16[12 + r];
+        }
+        vkCmdPushConstants(rec, _m2_layout,
+                           VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(cl_push), cl_push);
+        vkCmdBindIndexBuffer(rec, _m2_ibo, 0, VK_INDEX_TYPE_UINT16);
+        VkPipeline last_p = VK_NULL_HANDLE;
+        std::int32_t last_slot = -2;
+        std::size_t i = 0;
+        while (i < _clutter_draws.size())
+        {
+          ClutterDraw const& d0 = _clutter_draws[i];
+          std::size_t run = 1;
+          while (i + run < _clutter_draws.size()
+                 && _clutter_draws[i + run].state_key == d0.state_key
+                 && _clutter_draws[i + run].chunk_slot == d0.chunk_slot)
+            ++run;
+          bool ok = d0.chunk_slot >= 0
+                 && static_cast<std::size_t>(d0.chunk_slot) < _clutter_chunks.size()
+                 && _clutter_chunks[static_cast<std::size_t>(d0.chunk_slot)].used;
+          if (ok)
+          {
+            std::int32_t const blend = d0.state_key & 0xF;
+            std::int32_t const cull = (d0.state_key >> 4) & 1;
+            bool const classic_alpha = (d0.state_key >> 5) & 1;
+            int const cls = (blend == 2 || (blend == 1 && classic_alpha))
+                              ? 1 : ((blend == 3 || blend == 4) ? 2 : 0);
+            VkPipeline p = _m2_pipelines[cls * 2 + cull];
+            if (!p) p = _m2_pipeline;
+            if (p != last_p)
+            {
+              vkCmdBindPipeline(rec, VK_PIPELINE_BIND_POINT_GRAPHICS, p);
+              last_p = p;
+            }
+            if (d0.chunk_slot != last_slot)
+            {
+              ClutterChunkBuf const& cb = _clutter_chunks[static_cast<std::size_t>(d0.chunk_slot)];
+              VkBuffer cl_vbs[5] = { _m2_vbo, cb.buf, cb.buf, cb.buf, cb.buf };
+              VkDeviceSize cl_offs[5] = { 0, 0, cb.off_in, cb.off_tx, cb.off_st };
+              vkCmdBindVertexBuffers(rec, 0, 5, cl_vbs, cl_offs);
+              last_slot = d0.chunk_slot;
+            }
+            if (_multi_draw_indirect)
+            {
+              vkCmdDrawIndexedIndirect(rec, _clutter_indirect,
+                                       static_cast<VkDeviceSize>(i) * sizeof(M2Draw),
+                                       static_cast<std::uint32_t>(run), sizeof(M2Draw));
+            }
+            else
+            {
+              for (std::size_t c = 0; c < run; ++c)
+                vkCmdDrawIndexedIndirect(rec, _clutter_indirect,
+                                         static_cast<VkDeviceSize>(i + c) * sizeof(M2Draw),
+                                         1, sizeof(M2Draw));
+            }
+          }
+          i += run;
+        }
+        {
+          static std::atomic<unsigned> s_cl_log{0};
+          if ((s_cl_log++ % 300u) == 0)
+          {
+            std::lock_guard<std::mutex> lk(recordLogMutex());
+            LogError << "[VK] clutter persistent draw issued: draws=" << _clutter_draws.size()
+                     << " chunks(buffers)=" << _clutter_chunks.size() << std::endl;
           }
         }
       }
@@ -4324,13 +4945,56 @@ namespace Noggit::Rendering::VK
           LogError << "[VK] particle draws issued: " << issued << " of " << _particle_draws.size() << std::endl;
         }
       }
+
+      // [2026-09-04 NATIVE UI COMPOSITE] The editor overlay, LAST: after every world pass so it sits
+      // on top of the finished frame. Blended, no depth, three generated vertices, and it shares the
+      // particle pipeline layout so the sets bound here are exactly the ones it needs.
+      // [2026-09-06 DIAG] The M2 slice discard measures from the LIGHTING-UBO camera (Camera_Pad);
+    // print what this process actually uploaded there, next to the slice, once per ~5 s.
+    {
+      static std::atomic<int> s_cam_log{0};
+      if (want(4) && (s_cam_log.fetch_add(1) % 300) == 0)
+      {
+        std::lock_guard<std::mutex> lk(recordLogMutex());
+        LogError << "[VK] M2 GPU-side: slice=" << _m2_slice_dist
+                 << " uboCam=(" << _sky_camera[0] << "," << _sky_camera[1] << "," << _sky_camera[2]
+                 << ") draws=" << _m2_draw_count << std::endl;
+      }
+    }
+    if (pass_on(512) && want(4) && _ui_pipeline && _ui_visible && _ui_tex >= 0
+          && _particle_layout && _dset && _tt_dset)
+      {
+        vkCmdBindPipeline(rec, VK_PIPELINE_BIND_POINT_GRAPHICS, _ui_pipeline);
+        VkDescriptorSet usets[2] = { _dset, _tt_dset };
+        vkCmdBindDescriptorSets(rec, VK_PIPELINE_BIND_POINT_GRAPHICS, _particle_layout, 0, 2,
+                                usets, 0, nullptr);
+        float upush[20]{};
+        upush[16] = static_cast<float>(_ui_tex);   // vec4.x = bindless index (the mat4 is unused)
+        vkCmdPushConstants(rec, _particle_layout,
+                           VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                           0, sizeof(upush), upush);
+        vkCmdDraw(rec, 3, 1, 0, 0);
+      }
     }
     else
     {
-      vkCmdBindPipeline(rec, VK_PIPELINE_BIND_POINT_GRAPHICS, _pipeline);
-      float push[4] = { t, 0.f, 0.f, 0.f };
-      vkCmdPushConstants(rec, _pipe_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), push);
-      vkCmdDraw(rec, 3, 1, 0, 0); // fullscreen triangle
+      // [2026-09-02] Was: bind _pipeline (the VK-1 skeleton, test.vert/test.frag) and draw a
+      // FULLSCREEN triangle. test.frag is an animated hue sweep --
+      //   col = 0.5 + 0.5 * cos(pc.time + vec3(0.0, 2.1, 4.2) + rings * 3.0)
+      // -- so every frame that landed here repainted the whole screen with a colour-cycling pattern
+      // and skipped all the real passes with it: "everything flashes blue and all the doodads go
+      // missing". It was bring-up scaffolding to prove the SPIR-V path worked end to end, and it had
+      // no business running once there was a scene to draw.
+      //
+      // A frame with no camera matrix has nothing to contribute, so record nothing at all.
+      static std::atomic<int> s_no_mvp{0};
+      int const n = s_no_mvp.fetch_add(1, std::memory_order_relaxed);
+      if (n == 0 || (n % 600) == 0)
+      {
+        std::lock_guard<std::mutex> lk(recordLogMutex());
+        LogError << "[VK] recordInto with no mvp16 -- nothing recorded (occurrence " << (n + 1)
+                 << "). Previously this painted the test pattern over the frame." << std::endl;
+      }
     }
   }
 
@@ -4339,6 +5003,82 @@ namespace Noggit::Rendering::VK
   // the recording itself -- only around the handoff.
   void VulkanBackend::recordGroups(float t, float const* mvp16)
   {
+    // [VKTRACE] What each pass guard actually sees this frame. Draw guards, not timers.
+    {
+      static int const s_trace = []() -> int {
+        char const* v = std::getenv("NOGGIT_VK_TRACE");
+        return (v && *v) ? std::atoi(v) : 60;  // [VKTRACE] heartbeat; VKFLASH carries the detail
+      }();
+      std::uint64_t const f = g_vk_trace_frame++;
+      // [VKFLASH] The reported flash happens at the GL->VK HANDOVER, in VK's first frames --
+      // exactly where a median-based detector cannot arm yet. So trace the first 150 frames of
+      // VK activity unconditionally, then fall back to the heartbeat.
+      if (f < 150 || (s_trace > 0 && (f % static_cast<std::uint64_t>(s_trace)) == 0))
+      {
+        std::lock_guard<std::mutex> lk(recordLogMutex());
+        LogError << "[VKTRACE] f=" << f
+                 << " mvp=" << (mvp16 ? 1 : 0)
+                 << " | terrain idx=" << _terrain_index_count
+                 << " vis=" << _terrain_visible_chunks
+                 << " ttReady=" << (_tt_ready ? 1 : 0)
+                 << " ttPipe=" << (_tt_pipeline != VK_NULL_HANDLE)
+                 << " ttCidx=" << (_tt_cidx != VK_NULL_HANDLE)
+                 << " | m2 pipe=" << (_m2_pipeline != VK_NULL_HANDLE)
+                 << " draws=" << _m2_draw_count
+                 << " | wmo=" << _wmo_draws.size()
+                 << " | water pipe=" << (_water_pipeline != VK_NULL_HANDLE)
+                 << " idx=" << _water_index_count
+                 << " | cam=" << _sky_camera[0] << "," << _sky_camera[1] << "," << _sky_camera[2]
+                 << " mvpT=" << (mvp16 ? mvp16[12] : 0.f)
+                 << "," << (mvp16 ? mvp16[13] : 0.f)
+                 << "," << (mvp16 ? mvp16[14] : 0.f)
+                 << " | lastRebuild=" << g_vk_trace_last_rebuild_frame
+                 << std::endl;
+      }
+
+      // [VKFLASH] ring + collapse detection
+      {
+        VkTraceRow row;
+        row.f = f;
+        row.vis = _terrain_visible_chunks;
+        row.m2 = static_cast<std::uint32_t>(_m2_draw_count);
+        row.wmo = static_cast<std::uint32_t>(_wmo_draws.size());
+        row.widx = _water_index_count;
+        row.cam[0] = _sky_camera[0]; row.cam[1] = _sky_camera[1]; row.cam[2] = _sky_camera[2];
+        row.mvp = mvp16 ? 1 : 0;
+        row.rebuild = g_vk_trace_last_rebuild_frame;
+
+        std::uint32_t const mv = vkTraceMedian(&VkTraceRow::vis);
+        std::uint32_t const mm = vkTraceMedian(&VkTraceRow::m2);
+        bool const collapsed = mv > 200 && mm > 50
+                            && (row.vis * 4u < mv || row.m2 * 4u < mm);
+        if (collapsed && f > g_vk_flash_last + 120)
+        {
+          g_vk_flash_last = f;
+          std::lock_guard<std::mutex> lk2(recordLogMutex());
+          LogError << "[VKFLASH] collapse at f=" << f
+                   << " (vis " << row.vis << " vs median " << mv
+                   << ", m2 " << row.m2 << " vs median " << mm
+                   << "). Preceding frames:" << std::endl;
+          std::size_t const n = g_vk_ring_n < 48 ? g_vk_ring_n : 48;
+          std::size_t const base = g_vk_ring_n < 48 ? 0 : (g_vk_ring_n % 48);
+          for (std::size_t i = 0; i < n; ++i)
+          {
+            VkTraceRow const& r = g_vk_ring[(base + i) % 48];
+            LogError << "[VKFLASH]   f=" << r.f
+                     << " vis=" << r.vis << " m2=" << r.m2
+                     << " wmo=" << r.wmo << " widx=" << r.widx
+                     << " mvp=" << r.mvp
+                     << " cam=" << r.cam[0] << "," << r.cam[1]
+                     << "," << r.cam[2]
+                     << " rebuild=" << r.rebuild << std::endl;
+          }
+        }
+        g_vk_ring[g_vk_ring_n % 48] = row;
+        ++g_vk_ring_n;
+      }
+    }
+
     static int const s_threads = []() -> int {
       char const* v = std::getenv("NOGGIT_VK_RECORD_THREADS");
       return (v && *v) ? std::atoi(v) : 1;   // 0 = record inline (the single-threaded A/B)
@@ -4435,12 +5175,16 @@ namespace Noggit::Rendering::VK
       for (;;)
       {
         bool wait_gl = false;
+        bool wait_acquire = false;
+        bool signal_sem = true;
         {
           std::unique_lock<std::mutex> lock(_submit_mutex);
           _submit_cv.wait(lock, [this] { return _submit_quit || _submit_pending; });
           if (_submit_quit)
             return;
           wait_gl = _submit_wait_gl;
+          wait_acquire = _submit_wait_acquire;    // [NATIVE PRESENT]
+          signal_sem = _submit_signal_sem;
         }
 
         VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
@@ -4448,15 +5192,18 @@ namespace Noggit::Rendering::VK
         si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
         si.commandBufferCount = 1;
         si.pCommandBuffers = &_cmd;
-        si.signalSemaphoreCount = 1;
-        si.pSignalSemaphores = &_vk_done;
+        // [NATIVE PRESENT] binary semaphore: signal only when GL or the present will wait it
+        si.signalSemaphoreCount = signal_sem ? 1u : 0u;
+        si.pSignalSemaphores = signal_sem ? &_vk_done : nullptr;
         // same copy-batch wait as the inline path: the uploads run on a separate queue, so this is
         // what orders them before the draws that sample them (instead of a CPU fence wait)
-        VkSemaphore waits[2];
-        VkPipelineStageFlags wait_stages[2];
+        VkSemaphore waits[3];
+        VkPipelineStageFlags wait_stages[3];
         std::uint32_t wait_count = 0;
         if (wait_gl) { waits[wait_count] = _gl_done; wait_stages[wait_count] = wait_stage; ++wait_count; }
         if (_copy_signalled) { waits[wait_count] = _copy_done; wait_stages[wait_count] = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT; ++wait_count; _copy_signalled = false; }
+        // [NATIVE PRESENT] the swapchain blit waits its acquire at the transfer stage
+        if (wait_acquire) { waits[wait_count] = _sc_acquire; wait_stages[wait_count] = VK_PIPELINE_STAGE_TRANSFER_BIT; ++wait_count; }
         if (wait_count)
         {
           si.waitSemaphoreCount = wait_count;
@@ -4464,6 +5211,11 @@ namespace Noggit::Rendering::VK
           si.pWaitDstStageMask = wait_stages;
         }
         VkResult const r = vkQueueSubmit(_queue, 1, &si, _fence);
+        // [NATIVE PRESENT] present as soon as the work is queued -- before any optional CPU sync
+        if (r == VK_SUCCESS)
+          presentAcquiredImage();
+        else
+          _sc_acquired = false;
         if (r == VK_SUCCESS && !s_no_hard_sync)
         {
           // [phase A HARD SYNC] the cross-API semaphores were found not to order the GPU work on this
@@ -4505,6 +5257,8 @@ namespace Noggit::Rendering::VK
     startSubmitThread();
     std::lock_guard<std::mutex> lock(_submit_mutex);
     _submit_wait_gl = wait_gl_done;
+    _submit_wait_acquire = _sc_acquired;                              // [NATIVE PRESENT]
+    _submit_signal_sem = _frame_sem_external_wait || _sc_acquired;    // [NATIVE PRESENT]
     _submit_result = VK_SUCCESS;
     _submit_pending = true;
     _submit_cv.notify_one();
@@ -4562,6 +5316,407 @@ namespace Noggit::Rendering::VK
     return _submit_result == VK_SUCCESS;
   }
 
+  // ---- [VULKAN NATIVE PRESENT, 2026-09-03] --------------------------------------------------------
+  // The backend owns presentation: a surface on a native child window, a swapchain, a per-frame
+  // blit recorded into the frame's own command buffer, and vkQueuePresentKHR right after the
+  // submit. The offscreen render target stays exactly as it was (exportable; the parity harness's
+  // GL import keeps working) -- presentation is a pure consumer of it.
+
+  bool VulkanBackend::initPresent(void* hwnd)
+  {
+    if (_present_active)
+      return true;
+    if (!_present_capable || !_device || !hwnd)
+      return false;
+    _present_hwnd = hwnd;
+    if (!_surface)
+    {
+      VkWin32SurfaceCreateInfoKHR sci{};
+      sci.sType = VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR;
+      sci.hinstance = ::GetModuleHandleA(nullptr);
+      sci.hwnd = static_cast<HWND>(hwnd);
+      if (reinterpret_cast<PFN_vkCreateWin32SurfaceKHR>(_pfn_vkCreateWin32SurfaceKHR)(_instance, &sci, nullptr, &_surface) != VK_SUCCESS)
+      {
+        LogError << "[VK] vkCreateWin32SurfaceKHR failed -- native present unavailable" << std::endl;
+        _present_capable = false;
+        return false;
+      }
+      VkBool32 supported = VK_FALSE;
+      vkGetPhysicalDeviceSurfaceSupportKHR(_phys, _queue_family, _surface, &supported);
+      if (!supported)
+      {
+        LogError << "[VK] graphics queue family cannot present -- native present unavailable" << std::endl;
+        vkDestroySurfaceKHR(_instance, _surface, nullptr);
+        _surface = VK_NULL_HANDLE;
+        _present_capable = false;
+        return false;
+      }
+    }
+    if (!_sc_acquire)
+    {
+      VkSemaphoreCreateInfo semci{};
+      semci.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+      if (vkCreateSemaphore(_device, &semci, nullptr, &_sc_acquire) != VK_SUCCESS)
+      {
+        LogError << "[VK] acquire semaphore create failed" << std::endl;
+        return false;
+      }
+    }
+    if (!createSwapchainInternal())
+      return false;
+    _present_active = true;
+    LogError << "[VK] NATIVE PRESENT active: swapchain " << _sc_extent.width << "x" << _sc_extent.height
+             << " format=" << _sc_format << " images=" << _sc_images.size() << std::endl;
+    return true;
+  }
+
+  bool VulkanBackend::createSwapchainInternal()
+  {
+    VkSurfaceCapabilitiesKHR caps{};
+    if (vkGetPhysicalDeviceSurfaceCapabilitiesKHR(_phys, _surface, &caps) != VK_SUCCESS)
+    {
+      LogError << "[VK] surface capabilities query failed" << std::endl;
+      return false;
+    }
+    VkExtent2D ext = caps.currentExtent;
+    if (ext.width == 0xFFFFFFFFu)   // surface lets the application choose
+      ext = { _width, _height };
+    if (ext.width == 0 || ext.height == 0)
+    {
+      _sc_needs_recreate = true;    // minimised: retry when the window has a size again
+      return false;
+    }
+    auto const clampv = [](std::uint32_t v, std::uint32_t lo, std::uint32_t hi)
+    { return v < lo ? lo : (hi && v > hi ? hi : v); };
+    ext.width = clampv(ext.width, caps.minImageExtent.width, caps.maxImageExtent.width);
+    ext.height = clampv(ext.height, caps.minImageExtent.height, caps.maxImageExtent.height);
+
+    // format: prefer 8-bit UNORM -- the frame is already display-referred, an SRGB target would
+    // re-encode it and shift every colour
+    std::uint32_t fn = 0;
+    vkGetPhysicalDeviceSurfaceFormatsKHR(_phys, _surface, &fn, nullptr);
+    std::vector<VkSurfaceFormatKHR> fmts(fn);
+    if (fn)
+      vkGetPhysicalDeviceSurfaceFormatsKHR(_phys, _surface, &fn, fmts.data());
+    VkSurfaceFormatKHR pick{};
+    pick.format = VK_FORMAT_B8G8R8A8_UNORM;
+    pick.colorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+    if (!fmts.empty())
+    {
+      pick = fmts[0];
+      for (auto const& f : fmts)
+        if (f.format == VK_FORMAT_B8G8R8A8_UNORM || f.format == VK_FORMAT_R8G8B8A8_UNORM)
+        {
+          pick = f;
+          break;
+        }
+    }
+
+    // present mode: MAILBOX (uncapped, tear-free) > IMMEDIATE (uncapped) > FIFO (always there).
+    // FIFO would cap the editor AND the benches at vsync -- last resort only.
+    VkPresentModeKHR mode = VK_PRESENT_MODE_FIFO_KHR;
+    {
+      std::uint32_t pn = 0;
+      vkGetPhysicalDeviceSurfacePresentModesKHR(_phys, _surface, &pn, nullptr);
+      std::vector<VkPresentModeKHR> modes(pn);
+      if (pn)
+        vkGetPhysicalDeviceSurfacePresentModesKHR(_phys, _surface, &pn, modes.data());
+      for (auto m : modes)
+        if (m == VK_PRESENT_MODE_MAILBOX_KHR) { mode = m; break; }
+      if (mode == VK_PRESENT_MODE_FIFO_KHR)
+        for (auto m : modes)
+          if (m == VK_PRESENT_MODE_IMMEDIATE_KHR) { mode = m; break; }
+    }
+
+    std::uint32_t count = caps.minImageCount + 1;
+    if (caps.maxImageCount && count > caps.maxImageCount)
+      count = caps.maxImageCount;
+
+    VkSwapchainCreateInfoKHR sci{};
+    sci.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
+    sci.surface = _surface;
+    sci.minImageCount = count;
+    sci.imageFormat = pick.format;
+    sci.imageColorSpace = pick.colorSpace;
+    sci.imageExtent = ext;
+    sci.imageArrayLayers = 1;
+    // [DIAG] TRANSFER_SRC when the surface allows it, so readbackPresented() can capture exactly
+    // what the window shows. Universal on desktop; absent -> present-readback simply unavailable.
+    _sc_transfer_src = (caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) != 0;
+    sci.imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT
+                   | (caps.supportedUsageFlags & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)
+                   | (_sc_transfer_src ? VK_IMAGE_USAGE_TRANSFER_SRC_BIT : 0);
+    sci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    sci.preTransform = caps.currentTransform;
+    sci.compositeAlpha = (caps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR)
+                           ? VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR
+                           : static_cast<VkCompositeAlphaFlagBitsKHR>(caps.supportedCompositeAlpha & (~caps.supportedCompositeAlpha + 1u));
+    sci.presentMode = mode;
+    sci.clipped = VK_TRUE;
+    sci.oldSwapchain = _swapchain;
+
+    VkSwapchainKHR ns = VK_NULL_HANDLE;
+    VkResult const r = vkCreateSwapchainKHR(_device, &sci, nullptr, &ns);
+    if (r != VK_SUCCESS)
+    {
+      LogError << "[VK] vkCreateSwapchainKHR failed: " << vkres(r) << std::endl;
+      return false;
+    }
+    if (_swapchain)
+      vkDestroySwapchainKHR(_device, _swapchain, nullptr); // retired via oldSwapchain; queue idled by callers on recreate
+    _swapchain = ns;
+    _sc_format = pick.format;
+    _sc_extent = ext;
+    std::uint32_t n = 0;
+    vkGetSwapchainImagesKHR(_device, _swapchain, &n, nullptr);
+    _sc_images.resize(n);
+    if (n)
+      vkGetSwapchainImagesKHR(_device, _swapchain, &n, _sc_images.data());
+    _sc_needs_recreate = false;
+    _sc_acquired = false;
+    LogError << "[VK] swapchain: " << ext.width << "x" << ext.height << " x" << n
+             << " mode=" << (mode == VK_PRESENT_MODE_MAILBOX_KHR ? "MAILBOX"
+                             : mode == VK_PRESENT_MODE_IMMEDIATE_KHR ? "IMMEDIATE" : "FIFO")
+             << std::endl;
+    return true;
+  }
+
+  // Called right after vkQueueSubmit on whichever thread submitted (queue access is externally
+  // synchronised there). No-op unless renderFrame acquired an image this frame.
+  void VulkanBackend::presentAcquiredImage()
+  {
+    if (!_present_active || !_sc_acquired)
+      return;
+    _sc_acquired = false;
+    _sc_presented_once = true;   // [DIAG] a readback of _sc_index is now meaningful
+    VkPresentInfoKHR pi{};
+    pi.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+    pi.waitSemaphoreCount = 1;
+    pi.pWaitSemaphores = &_vk_done;
+    pi.swapchainCount = 1;
+    pi.pSwapchains = &_swapchain;
+    pi.pImageIndices = &_sc_index;
+    VkResult const r = vkQueuePresentKHR(_queue, &pi);
+    if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR)
+    {
+      _sc_needs_recreate = true;
+    }
+    else if (r != VK_SUCCESS)
+    {
+      static int s_err = 0;
+      if (s_err++ < 8)
+        LogError << "[VK] vkQueuePresentKHR failed: " << vkres(r) << std::endl;
+    }
+  }
+
+  bool VulkanBackend::readbackImage(std::vector<std::uint8_t>& out)
+  {
+    if (!_ready || !vkCmdCopyImageToBuffer || !vkFreeCommandBuffers)
+      return false;
+    waitFrameComplete();
+    vkQueueWaitIdle(_queue); // capture cadence: a full sync is fine
+
+    std::size_t const bytes = std::size_t(_width) * std::size_t(_height) * 4u;
+    VkBuffer buf = VK_NULL_HANDLE;
+    VkDeviceMemory mem = VK_NULL_HANDLE;
+    {
+      VkBufferCreateInfo bci{};
+      bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+      bci.size = bytes;
+      bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+      bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+      if (vkCreateBuffer(_device, &bci, nullptr, &buf) != VK_SUCCESS)
+        return false;
+      VkMemoryRequirements req{};
+      vkGetBufferMemoryRequirements(_device, buf, &req);
+      VkPhysicalDeviceMemoryProperties mp{};
+      vkGetPhysicalDeviceMemoryProperties(_phys, &mp);
+      std::uint32_t type = UINT32_MAX;
+      for (std::uint32_t i = 0; i < mp.memoryTypeCount; ++i)
+        if ((req.memoryTypeBits & (1u << i))
+            && (mp.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)
+            && (mp.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))
+        {
+          type = i;
+          break;
+        }
+      VkMemoryAllocateInfo mai{};
+      mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+      mai.allocationSize = req.size;
+      mai.memoryTypeIndex = type;
+      if (type == UINT32_MAX || vkAllocateMemory(_device, &mai, nullptr, &mem) != VK_SUCCESS
+          || vkBindBufferMemory(_device, buf, mem, 0) != VK_SUCCESS)
+      {
+        if (mem) vkFreeMemory(_device, mem, nullptr);
+        vkDestroyBuffer(_device, buf, nullptr);
+        return false;
+      }
+    }
+
+    VkCommandBufferAllocateInfo ai{};
+    ai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    ai.commandPool = _pool;
+    ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    ai.commandBufferCount = 1;
+    VkCommandBuffer c = VK_NULL_HANDLE;
+    bool ok = vkAllocateCommandBuffers(_device, &ai, &c) == VK_SUCCESS;
+    if (ok)
+    {
+      VkCommandBufferBeginInfo bi{};
+      bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+      bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+      vkBeginCommandBuffer(c, &bi);
+      VkBufferImageCopy rc{};
+      rc.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+      rc.imageExtent = { _width, _height, 1 };
+      vkCmdCopyImageToBuffer(c, _image, VK_IMAGE_LAYOUT_GENERAL, buf, 1, &rc);
+      vkEndCommandBuffer(c);
+      VkSubmitInfo si{};
+      si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+      si.commandBufferCount = 1;
+      si.pCommandBuffers = &c;
+      ok = vkQueueSubmit(_queue, 1, &si, VK_NULL_HANDLE) == VK_SUCCESS
+        && vkQueueWaitIdle(_queue) == VK_SUCCESS;
+    }
+    if (ok)
+    {
+      void* p = nullptr;
+      ok = vkMapMemory(_device, mem, 0, VK_WHOLE_SIZE, 0, &p) == VK_SUCCESS && p;
+      if (ok)
+      {
+        out.resize(bytes);
+        std::memcpy(out.data(), p, bytes);
+        vkUnmapMemory(_device, mem);
+      }
+    }
+    if (c)
+      vkFreeCommandBuffers(_device, _pool, 1, &c);
+    vkDestroyBuffer(_device, buf, nullptr);
+    vkFreeMemory(_device, mem, nullptr);
+    return ok;
+  }
+
+  bool VulkanBackend::readbackPresented(std::vector<std::uint8_t>& out)
+  {
+    if (!_ready || !_present_active || !_sc_transfer_src || !_sc_presented_once
+        || _sc_index >= _sc_images.size() || !vkCmdCopyImageToBuffer || !vkFreeCommandBuffers)
+      return false;
+    waitFrameComplete();
+    vkQueueWaitIdle(_queue);
+    VkImage const src = _sc_images[_sc_index];   // last presented, layout PRESENT_SRC_KHR
+    std::size_t const bytes = std::size_t(_sc_extent.width) * _sc_extent.height * 4u;
+
+    VkBuffer buf = VK_NULL_HANDLE;
+    VkDeviceMemory mem = VK_NULL_HANDLE;
+    VkBufferCreateInfo bci{};
+    bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bci.size = bytes;
+    bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    if (vkCreateBuffer(_device, &bci, nullptr, &buf) != VK_SUCCESS)
+      return false;
+    VkMemoryRequirements req{};
+    vkGetBufferMemoryRequirements(_device, buf, &req);
+    VkPhysicalDeviceMemoryProperties mp{};
+    vkGetPhysicalDeviceMemoryProperties(_phys, &mp);
+    std::uint32_t type = UINT32_MAX;
+    for (std::uint32_t i = 0; i < mp.memoryTypeCount; ++i)
+      if ((req.memoryTypeBits & (1u << i))
+          && (mp.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)
+          && (mp.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))
+      { type = i; break; }
+    VkMemoryAllocateInfo mai{};
+    mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    mai.allocationSize = req.size;
+    mai.memoryTypeIndex = type;
+    if (type == UINT32_MAX || vkAllocateMemory(_device, &mai, nullptr, &mem) != VK_SUCCESS
+        || vkBindBufferMemory(_device, buf, mem, 0) != VK_SUCCESS)
+    {
+      if (mem) vkFreeMemory(_device, mem, nullptr);
+      vkDestroyBuffer(_device, buf, nullptr);
+      return false;
+    }
+
+    VkCommandBufferAllocateInfo ai{};
+    ai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    ai.commandPool = _pool;
+    ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    ai.commandBufferCount = 1;
+    VkCommandBuffer c = VK_NULL_HANDLE;
+    bool ok = vkAllocateCommandBuffers(_device, &ai, &c) == VK_SUCCESS;
+    if (ok)
+    {
+      VkCommandBufferBeginInfo bi{};
+      bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+      bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+      vkBeginCommandBuffer(c, &bi);
+      VkImageMemoryBarrier b{};
+      b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+      b.srcAccessMask = 0;
+      b.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+      b.oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+      b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+      b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      b.image = src;
+      b.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+      vkCmdPipelineBarrier(c, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                           0, 0, nullptr, 0, nullptr, 1, &b);
+      VkBufferImageCopy rc{};
+      rc.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+      rc.imageExtent = { _sc_extent.width, _sc_extent.height, 1 };
+      vkCmdCopyImageToBuffer(c, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, &rc);
+      VkImageMemoryBarrier back = b;
+      back.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+      back.dstAccessMask = 0;
+      back.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+      back.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+      vkCmdPipelineBarrier(c, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                           0, 0, nullptr, 0, nullptr, 1, &back);
+      vkEndCommandBuffer(c);
+      VkSubmitInfo si{};
+      si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+      si.commandBufferCount = 1;
+      si.pCommandBuffers = &c;
+      ok = vkQueueSubmit(_queue, 1, &si, VK_NULL_HANDLE) == VK_SUCCESS
+        && vkQueueWaitIdle(_queue) == VK_SUCCESS;
+    }
+    if (ok)
+    {
+      void* p = nullptr;
+      ok = vkMapMemory(_device, mem, 0, VK_WHOLE_SIZE, 0, &p) == VK_SUCCESS && p;
+      if (ok)
+      {
+        // swapchain is B8G8R8A8; emit RGBA8 BOTTOM-UP (savePng mirrors vertically like GL rows)
+        std::uint32_t const w = _sc_extent.width, h = _sc_extent.height;
+        out.resize(bytes);
+        auto const* srcpx = static_cast<std::uint8_t const*>(p);
+        bool const bgra = (_sc_format == VK_FORMAT_B8G8R8A8_UNORM
+                        || _sc_format == VK_FORMAT_B8G8R8A8_SRGB);
+        for (std::uint32_t y = 0; y < h; ++y)
+        {
+          std::uint8_t const* srow = srcpx + std::size_t(y) * w * 4u;
+          std::uint8_t* drow = out.data() + std::size_t(h - 1u - y) * w * 4u;
+          for (std::uint32_t x = 0; x < w; ++x)
+          {
+            std::uint8_t const b0 = srow[x * 4 + 0], g0 = srow[x * 4 + 1],
+                               r0 = srow[x * 4 + 2], a0 = srow[x * 4 + 3];
+            drow[x * 4 + 0] = bgra ? r0 : b0;
+            drow[x * 4 + 1] = g0;
+            drow[x * 4 + 2] = bgra ? b0 : r0;
+            drow[x * 4 + 3] = a0;
+          }
+        }
+        vkUnmapMemory(_device, mem);
+      }
+    }
+    if (c)
+      vkFreeCommandBuffers(_device, _pool, 1, &c);
+    vkDestroyBuffer(_device, buf, nullptr);
+    vkFreeMemory(_device, mem, nullptr);
+    return ok;
+  }
+
   bool VulkanBackend::renderFrame(float t, bool wait_gl_done, float const* mvp16)
   {
     SlowCall _sc_renderFrame("renderFrame");
@@ -4577,8 +5732,54 @@ namespace Noggit::Rendering::VK
     // CPU pacing: the previous frame must be fully done before _cmd and the fence are reused. With
     // the submit thread that means joining it first -- it owns both the submit and the fence wait.
     waitFrameComplete();
+    // [NATIVE PRESENT] with no GL wait anywhere in the native frame, a submit-thread failure would
+    // otherwise spin silently forever -- surface it here (the thread has finished: pending==false).
+    if (_submit_started && _submit_result != VK_SUCCESS)
+    {
+      LogError << "[VK] previous submit failed: " << vkres(_submit_result)
+               << " -- backend going inert" << std::endl;
+      _ready = false;
+      return false;
+    }
     vkWaitForFences(_device, 1, &_fence, VK_TRUE, UINT64_MAX);
     vkResetFences(_device, 1, &_fence);
+
+    // [NATIVE PRESENT] Acquire the swapchain image this frame blits into. After the fence wait
+    // above exactly ONE frame is in flight, so the single acquire semaphore is free again.
+    bool present_this_frame = false;
+    if (_present_active)
+    {
+      if (_sc_needs_recreate)
+      {
+        vkQueueWaitIdle(_queue);       // resize is rare; make the old chain safe to retire
+        createSwapchainInternal();     // a zero-sized window leaves the flag set -- retried later
+      }
+      if (!_sc_needs_recreate && _swapchain)
+      {
+        VkResult ar = vkAcquireNextImageKHR(_device, _swapchain, UINT64_MAX, _sc_acquire,
+                                            VK_NULL_HANDLE, &_sc_index);
+        if (ar == VK_ERROR_OUT_OF_DATE_KHR)
+        {
+          vkQueueWaitIdle(_queue);
+          if (createSwapchainInternal())
+            ar = vkAcquireNextImageKHR(_device, _swapchain, UINT64_MAX, _sc_acquire,
+                                       VK_NULL_HANDLE, &_sc_index);
+        }
+        if (ar == VK_SUCCESS || ar == VK_SUBOPTIMAL_KHR)
+        {
+          if (ar == VK_SUBOPTIMAL_KHR)
+            _sc_needs_recreate = true; // present this frame, rebuild before the next
+          present_this_frame = true;
+        }
+        else
+        {
+          static int s_aq_err = 0;
+          if (s_aq_err++ < 8)
+            LogError << "[VK] vkAcquireNextImageKHR failed: " << vkres(ar) << std::endl;
+        }
+      }
+    }
+    _sc_acquired = present_this_frame;
 
     VkCommandBufferBeginInfo bi{};
     bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
@@ -4589,10 +5790,20 @@ namespace Noggit::Rendering::VK
     // mesh uploaded this draws the REAL scene geometry depth-tested with the live camera MVP; before the
     // first mesh, the fullscreen ring pattern proves the skeleton.
     VkClearValue clears[3]{};
-    clears[0].color.float32[0] = 0.35f; // sky-ish backdrop behind the terrain
-    clears[0].color.float32[1] = 0.55f;
-    clears[0].color.float32[2] = 0.80f;
-    clears[0].color.float32[3] = 1.0f;
+    // [2026-09-02] Was an OPAQUE SKY-BLUE (0.35, 0.55, 0.80, 1.0) -- "sky-ish backdrop behind the
+    // terrain", scaffolding from before there was a real skydome/cloud pass. VK clears its colour
+    // attachment to this EVERY FRAME and composes it into GL, so anywhere VK contributes no geometry
+    // the result is solid blue. At the GL->VK handover VK has almost nothing yet (traced: vis=0 and
+    // wmo=0 for its first frames while ownership has already switched), which is the reported
+    // "everything flashes blue the moment the map loads". It also keeps doodads blue-holed for the
+    // whole session, because compose mode never feeds them (setDoodads is skipped when compose_ok,
+    // MapView.cpp; traced doodad=0 on all 1383 frames) while GL is gated off from drawing them.
+    //
+    // Clear to TRANSPARENT BLACK so a texel VK never wrote composes as nothing instead of as sky.
+    clears[0].color.float32[0] = 0.0f;
+    clears[0].color.float32[1] = 0.0f;
+    clears[0].color.float32[2] = 0.0f;
+    clears[0].color.float32[3] = 0.0f;
     clears[1].color.float32[0] = 1.0f; // depth-as-colour background = far (GL compose discards >= 1)
     clears[2].depthStencil.depth = 1.0f;
     VkRenderPassBeginInfo rbi{};
@@ -4641,7 +5852,17 @@ namespace Noggit::Rendering::VK
     VkCommandBuffer secs[kGroupCount];
     for (int g = 0; g < kGroupCount; ++g)
     {
-      vkEndCommandBuffer(_recorders[g].cmd);
+      // [2026-09-04 DIAG] A secondary that fails to END is INVALID, and executing it silently drops
+      // everything recorded in it -- the whole group. Group 4 carries water, celestials, particles
+      // and the UI overlay, and none of them were verifiably rendering. Never ignore this result.
+      VkResult const er = vkEndCommandBuffer(_recorders[g].cmd);
+      if (er != VK_SUCCESS)
+      {
+        static std::atomic<int> s_end_err{0};
+        if (s_end_err.fetch_add(1) < 10)
+          LogError << "[VK] SECONDARY END FAILED group=" << g << " res=" << vkres(er)
+                   << " -- every draw in this group is discarded" << std::endl;
+      }
       secs[g] = _recorders[g].cmd;
     }
     // Executed in GROUP ORDER, which is the order the single-threaded path recorded them in --
@@ -4651,6 +5872,49 @@ namespace Noggit::Rendering::VK
     vkCmdEndRenderPass(_cmd);
     if (_ts_pool)
       vkCmdWriteTimestamp(_cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, _ts_pool, 1);
+
+    // [NATIVE PRESENT] blit the finished frame into the acquired swapchain image, inside the SAME
+    // command buffer: one submit per frame, and the present just waits the frame semaphore.
+    if (present_this_frame)
+    {
+      VkImage const dst = _sc_images[_sc_index];
+      VkImageMemoryBarrier bar[2]{};
+      bar[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+      bar[0].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+      bar[0].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+      bar[0].oldLayout = VK_IMAGE_LAYOUT_GENERAL;   // render pass finalLayout
+      bar[0].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+      bar[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      bar[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      bar[0].image = _image;
+      bar[0].subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+      bar[1] = bar[0];
+      bar[1].srcAccessMask = 0;
+      bar[1].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+      bar[1].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED; // previous contents replaced wholesale
+      bar[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+      bar[1].image = dst;
+      vkCmdPipelineBarrier(_cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                           VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 2, bar);
+      VkImageBlit blit{};
+      blit.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+      blit.dstSubresource = blit.srcSubresource;
+      // our image is GL-oriented (row 0 = BOTTOM row); the swapchain shows row 0 at the TOP -> flip
+      blit.srcOffsets[0] = { 0, static_cast<std::int32_t>(_height), 0 };
+      blit.srcOffsets[1] = { static_cast<std::int32_t>(_width), 0, 1 };
+      blit.dstOffsets[0] = { 0, 0, 0 };
+      blit.dstOffsets[1] = { static_cast<std::int32_t>(_sc_extent.width),
+                             static_cast<std::int32_t>(_sc_extent.height), 1 };
+      vkCmdBlitImage(_cmd, _image, VK_IMAGE_LAYOUT_GENERAL, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                     1, &blit, VK_FILTER_LINEAR);
+      VkImageMemoryBarrier to_present = bar[1];
+      to_present.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+      to_present.dstAccessMask = 0;
+      to_present.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+      to_present.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+      vkCmdPipelineBarrier(_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                           0, 0, nullptr, 0, nullptr, 1, &to_present);
+    }
     _image_initialized = true;
 
     // [overnight 04:11] throttled content-stats line for morning diagnosis (every ~900 frames)
@@ -4660,7 +5924,6 @@ namespace Noggit::Rendering::VK
       {
         LogError << "[VK] frame content: terrainIdx=" << _terrain_index_count
                  << " waterIdx=" << _water_index_count
-                 << " doodadDraws=" << _doodad_draws.size()
                  << " sky=" << (_sky_pipeline ? 1 : 0)
                  << " tex=" << (_dset ? 1 : 0) << std::endl;
       }
@@ -4684,15 +5947,21 @@ namespace Noggit::Rendering::VK
       si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
       si.commandBufferCount = 1;
       si.pCommandBuffers = &_cmd;
-      si.signalSemaphoreCount = 1;
-      si.pSignalSemaphores = &_vk_done;
+      // [NATIVE PRESENT] _vk_done is BINARY: signal only when someone will consume it (GL in
+      // compose mode, the present when an image was acquired). Signalling with no waiter would
+      // leave it signalled and make the NEXT signal invalid.
+      bool const signal_sem = _frame_sem_external_wait || _sc_acquired;
+      si.signalSemaphoreCount = signal_sem ? 1u : 0u;
+      si.pSignalSemaphores = signal_sem ? &_vk_done : nullptr;
       // Wait on the texture-copy batch too when one was submitted this frame: the copy runs on a
       // SEPARATE queue, so nothing else orders it before the draws that sample those textures.
-      VkSemaphore waits[2];
-      VkPipelineStageFlags wait_stages[2];
+      VkSemaphore waits[3];
+      VkPipelineStageFlags wait_stages[3];
       std::uint32_t wait_count = 0;
       if (wait_gl_done) { waits[wait_count] = _gl_done; wait_stages[wait_count] = wait_stage; ++wait_count; }
       if (_copy_signalled) { waits[wait_count] = _copy_done; wait_stages[wait_count] = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT; ++wait_count; _copy_signalled = false; }
+      // [NATIVE PRESENT] the blit into the swapchain image must wait for its acquire
+      if (_sc_acquired) { waits[wait_count] = _sc_acquire; wait_stages[wait_count] = VK_PIPELINE_STAGE_TRANSFER_BIT; ++wait_count; }
       if (wait_count)
       {
         si.waitSemaphoreCount = wait_count;
@@ -4702,10 +5971,12 @@ namespace Noggit::Rendering::VK
       VkResult const r = vkQueueSubmit(_queue, 1, &si, _fence);
       if (r != VK_SUCCESS)
       {
+        _sc_acquired = false;   // nothing to present; the backend is going inert anyway
         LogError << "[VK] submit failed: " << vkres(r) << " -- backend going inert" << std::endl;
         _ready = false;
         return false;
       }
+      presentAcquiredImage();   // [NATIVE PRESENT] no-op unless an image was acquired this frame
       vkWaitForFences(_device, 1, &_fence, VK_TRUE, UINT64_MAX);
       return true;
     }
@@ -4739,6 +6010,17 @@ namespace Noggit::Rendering::VK
         if (*pair) { vkDestroyBuffer(_device, *pair, nullptr); *pair = VK_NULL_HANDLE; }
       for (auto* m : { &_wmo_vbo_mem, &_wmo_ibo_mem, &_wmo_xforms_mem, &_wmo_batches_mem, &_wmo_amb_mem })
         if (*m) { vkFreeMemory(_device, *m, nullptr); *m = VK_NULL_HANDLE; }
+
+      // [CLUTTER PERSISTENT]
+      for (ClutterChunkBuf& cc : _clutter_chunks)
+        if (cc.used)
+        {
+          vkDestroyBuffer(_device, cc.buf, nullptr);
+          vkFreeMemory(_device, cc.mem, nullptr);
+          cc = ClutterChunkBuf{};
+        }
+      if (_clutter_indirect) vkDestroyBuffer(_device, _clutter_indirect, nullptr);
+      if (_clutter_indirect_mem) vkFreeMemory(_device, _clutter_indirect_mem, nullptr);
 
       _m2_pipeline = VK_NULL_HANDLE;
       if (_m2_layout) vkDestroyPipelineLayout(_device, _m2_layout, nullptr);
@@ -4780,13 +6062,6 @@ namespace Noggit::Rendering::VK
       if (_dpool) vkDestroyDescriptorPool(_device, _dpool, nullptr); // frees _dset with it
       if (_dsl) vkDestroyDescriptorSetLayout(_device, _dsl, nullptr);
       if (_sampler) vkDestroySampler(_device, _sampler, nullptr);
-      if (_doodad_pipeline) vkDestroyPipeline(_device, _doodad_pipeline, nullptr);
-      if (_doodad_vbo) vkDestroyBuffer(_device, _doodad_vbo, nullptr);
-      if (_doodad_vbo_mem) vkFreeMemory(_device, _doodad_vbo_mem, nullptr);
-      if (_doodad_ibo) vkDestroyBuffer(_device, _doodad_ibo, nullptr);
-      if (_doodad_ibo_mem) vkFreeMemory(_device, _doodad_ibo_mem, nullptr);
-      if (_doodad_inst) vkDestroyBuffer(_device, _doodad_inst, nullptr);
-      if (_doodad_inst_mem) vkFreeMemory(_device, _doodad_inst_mem, nullptr);
       if (_water_pipeline) vkDestroyPipeline(_device, _water_pipeline, nullptr);
       if (_water_layout) { vkDestroyPipelineLayout(_device, _water_layout, nullptr); _water_layout = VK_NULL_HANDLE; }
       if (_water_indirect) vkDestroyBuffer(_device, _water_indirect, nullptr);
@@ -4810,8 +6085,17 @@ namespace Noggit::Rendering::VK
       if (_depth_view) vkDestroyImageView(_device, _depth_view, nullptr);
       if (_depth_image) vkDestroyImage(_device, _depth_image, nullptr);
       if (_depth_mem) vkFreeMemory(_device, _depth_mem, nullptr);
+      // [MSAA]
+      if (_ms_color_view) vkDestroyImageView(_device, _ms_color_view, nullptr);
+      if (_ms_color_image) vkDestroyImage(_device, _ms_color_image, nullptr);
+      if (_ms_color_mem) vkFreeMemory(_device, _ms_color_mem, nullptr);
+      if (_ms_z_view) vkDestroyImageView(_device, _ms_z_view, nullptr);
+      if (_ms_z_image) vkDestroyImage(_device, _ms_z_image, nullptr);
+      if (_ms_z_mem) vkFreeMemory(_device, _ms_z_mem, nullptr);
       if (_sky_pipeline) vkDestroyPipeline(_device, _sky_pipeline, nullptr);
       if (_skydome_pipeline) vkDestroyPipeline(_device, _skydome_pipeline, nullptr);
+      if (_horizon_pipeline) vkDestroyPipeline(_device, _horizon_pipeline, nullptr);
+      if (_horizon_pipeline_nowrite) vkDestroyPipeline(_device, _horizon_pipeline_nowrite, nullptr);
       if (_cloud_pipeline) vkDestroyPipeline(_device, _cloud_pipeline, nullptr);
       for (VkPipeline& pp : _particle_pipelines)
         if (pp) { vkDestroyPipeline(_device, pp, nullptr); pp = VK_NULL_HANDLE; }
@@ -4841,6 +6125,11 @@ namespace Noggit::Rendering::VK
       if (_skydome_vbo_mem) vkFreeMemory(_device, _skydome_vbo_mem, nullptr);
       if (_skydome_ibo) vkDestroyBuffer(_device, _skydome_ibo, nullptr);
       if (_skydome_ibo_mem) vkFreeMemory(_device, _skydome_ibo_mem, nullptr);
+      if (_horizon_layout) vkDestroyPipelineLayout(_device, _horizon_layout, nullptr);
+      if (_horizon_vbo) vkDestroyBuffer(_device, _horizon_vbo, nullptr);
+      if (_horizon_vbo_mem) vkFreeMemory(_device, _horizon_vbo_mem, nullptr);
+      if (_horizon_ibo) vkDestroyBuffer(_device, _horizon_ibo, nullptr);
+      if (_horizon_ibo_mem) vkFreeMemory(_device, _horizon_ibo_mem, nullptr);
       if (_pipeline) vkDestroyPipeline(_device, _pipeline, nullptr);
       if (_pipe_layout) vkDestroyPipelineLayout(_device, _pipe_layout, nullptr);
       if (_framebuffer) vkDestroyFramebuffer(_device, _framebuffer, nullptr);
@@ -4855,8 +6144,21 @@ namespace Noggit::Rendering::VK
       if (_image_mem) vkFreeMemory(_device, _image_mem, nullptr);
       if (_fence) vkDestroyFence(_device, _fence, nullptr);
       if (_pool) vkDestroyCommandPool(_device, _pool, nullptr);
+      // [NATIVE PRESENT] swapchain objects go before the device (surface after, it is instance-level)
+      if (_swapchain && vkDestroySwapchainKHR)
+        vkDestroySwapchainKHR(_device, _swapchain, nullptr);
+      _swapchain = VK_NULL_HANDLE;
+      if (_sc_acquire)
+        vkDestroySemaphore(_device, _sc_acquire, nullptr);
+      _sc_acquire = VK_NULL_HANDLE;
+      _present_active = false;
       vkDestroyDevice(_device, nullptr);
       _device = VK_NULL_HANDLE;
+    }
+    if (_surface && _instance && vkDestroySurfaceKHR)
+    {
+      vkDestroySurfaceKHR(_instance, _surface, nullptr);
+      _surface = VK_NULL_HANDLE;
     }
     if (_instance && vkDestroyInstance)
     {

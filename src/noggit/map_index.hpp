@@ -3,6 +3,7 @@
 #pragma once
 
 #include <noggit/map_enums.hpp>
+#include <array>
 #include <noggit/MapHeaders.h>
 #include <noggit/MapTile.h>
 #include <noggit/Misc.h>
@@ -37,6 +38,8 @@ private:
   uint32_t flags;
   std::unique_ptr<MapTile> tile;
   bool onDisc;
+  // Modern (CASC) WDT MAID: root, obj0, obj1, tex0, lod, mapTexture, mapTextureN, minimapTexture ids
+  std::array<std::uint32_t, 8> file_ids{};
 
 
   MapTileEntry() : flags(0), tile(nullptr) {}
@@ -296,6 +299,8 @@ private:
   uint32_t highestGUID;
 
   MPHD mphd;
+  // WDT carried a MAID chunk: tiles are split files addressed by fileDataID (modern CASC clients)
+  bool _has_maid = false;
 
   // Holding all MapTiles there can be in a World.
   MapTileEntry mTiles[64][64];

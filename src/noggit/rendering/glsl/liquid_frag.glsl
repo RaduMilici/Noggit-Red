@@ -21,6 +21,7 @@ uniform float water_alpha_mult; // dev opacity lever (1 = unchanged)
 uniform vec3 camera;                 // for the water specular view direction
 uniform vec3 sun_spec_color;         // sun-band colour (LightIntBand band 9), same as terrain specular
 uniform int draw_water_specular;     // toggle (render/water_specular)
+uniform vec3 sheen_dir;              // TO the drawn sun/moon disc (WorldRender celestial_dir)
 
 in float depth_;
 in vec2 tex_coord_;
@@ -30,6 +31,8 @@ flat in uint type;
 flat in vec2 anim_uv;
 flat in int tex_frame;
 flat in uint shadow_chunk_index;
+flat in uint row_color_light_v;   // 0x80RRGGBB: this liquid row's shallow colour (PBR water), else 0
+flat in uint row_color_dark_v;
 in vec2 shadow_uv;
 in vec3 world_pos_;
 
@@ -215,21 +218,65 @@ void main()
     // Stormwind canal green up close). Give rivers a MUCH steeper ramp so the deep (blue) river colour shows
     // in the channel middle by ~20 units while the shallow edges stay on the green LIGHT colour.
     float ocean_color_depth = clamp(depth_ * 0.012, 0.0, 1.0); // ocean: light -> dark over ~80 units
-    float river_color_depth = clamp(depth_ * 0.05,  0.0, 1.0); // river: reaches the deep (blue) colour by ~20 units
+    float river_color_depth = clamp(depth_ * 0.05,  0.0, 1.0); // river: reaches the zone's deep colour by ~20 units
     float alpha_depth = clamp(depth_ * 0.08,  0.0, 1.0); // ~opaque by ~12 units
 
-    // Rivers/canals: the in-game city water is a fairly UNIFORM muted dark teal -- its depth colour gradient
-    // is barely visible. So use ONE dark-teal base (clean ocean deep-water blue nudged ~25% toward the zone's
-    // green, then DARKENED to the client's muted look) with only a SUBTLE depth darkening on top, instead of a
-    // strong shallow->deep colour ramp. The bright foam flecks come from the additive water-texture shine. The
-    // river ALPHA still depth-ramps for transparency. Ocean branch unchanged. Knobs: green 0.25, dark 0.72,
-    // depth-darken 0.22.
-    vec3 river_base = mix(OceanColorLight.rgb, RiverColorLight.rgb, 0.25) * 0.72;
-    float cd = (type == 1) ? ocean_color_depth : river_color_depth;
-    vec4 lerp = (type == 1)
-              ? mix (OceanColorLight, OceanColorDark, cd)
-              : vec4(river_base * (1.0 - 0.22 * river_color_depth),
-                     mix(RiverColorLight.a, RiverColorDark.a, cd));
+    // Rivers/lakes colour -- CONDITIONAL on whether the zone authors real OCEAN water (2026-08-23,
+    // Stormwind-canal green regression). Two facts settled it by runtime dump + DBC:
+    //   * Western Plaguelands (inland murk): ocean bands UNAUTHORED = (0,0,0); its river band is the
+    //     authored muddy-brown/olive -> the client shows brown. Pure river band is correct here.
+    //   * Stormwind city (light 77, coastal): ocean bands AUTHORED blue (~17,74,88); its river band is
+    //     GREEN (~78,92,20). The canals are river-typed ADT liquid, so a pure river band renders them
+    //     grass-green -- but the in-game canals read a muted teal-blue (they share the harbour's blue
+    //     water body). The 2026-08-07 tuning (blend the river colour 75% toward the zone ocean colour,
+    //     darken x0.72) reproduces that; user-confirmed. Applying it GLOBALLY is what blued WPL, so it
+    //     is now GATED on the ocean bands being authored: coastal zones get the teal blend, inland
+    //     zones (ocean == 0) keep their pure river band. Ocean branch unchanged.
+    // Does the zone author a REAL, visible OCEAN water colour? [WATERSNAP 2026-08-23, fly-through log]
+    // Caer Darrow / WPL lake is a MIX of river-typed and OCEAN-typed ADT chunks, but WPL's ocean band is
+    // near-black (measured oceanL=2,9,11 / oceanD=0,3,5). The ocean-typed lake chunks therefore rendered
+    // BLACK and SNAPPED against the warm river-typed chunks as the camera crossed the type boundary. The
+    // 1.12 client shows the whole lake warm -> an inland "ocean" chunk with no real ocean colour is just
+    // LAKE water and must use the zone's river/lake band, not a near-black ocean band. Gate on ocean
+    // BRIGHTNESS (max channel), not a tiny non-zero sum, so near-black inland ocean bands fall back to
+    // river while a genuine blue ocean (e.g. oceanL max ~0.34) still uses the ocean colour.
+    float ocean_lum = max(max(OceanColorLight.r, OceanColorLight.g), OceanColorLight.b);
+    bool ocean_bright = ocean_lum > 0.1;
+    bool use_ocean = (type == 1) && ocean_bright;
+
+    float cd = use_ocean ? ocean_color_depth : river_color_depth;
+    vec4 lerp;
+    if ((row_color_light_v & 0x80000000u) != 0u)
+    {
+      // 1.60.1 PBR water (LiquidType material 130): the row carries its own colours and the zone's
+      // river/ocean bands are unauthored (black) for those maps. Color[1] = the water body colour,
+      // Color[2] = the deep colour (LiquidRender.cpp / doc 42 sec 19); the alpha ramp stays the zone's
+      // LightParams water alphas, the depth ramp follows the row's ocean/water class.
+      vec3 row_light = vec3(float((row_color_light_v >> 16u) & 255u), float((row_color_light_v >> 8u) & 255u), float(row_color_light_v & 255u)) / 255.0;
+      vec3 row_dark  = vec3(float((row_color_dark_v  >> 16u) & 255u), float((row_color_dark_v  >> 8u) & 255u), float(row_color_dark_v  & 255u)) / 255.0;
+      bool row_ocean = (type == 1);
+      float row_cd = row_ocean ? ocean_color_depth : river_color_depth;
+      float row_a = row_ocean ? mix(OceanColorLight.a, OceanColorDark.a, row_cd)
+                              : mix(RiverColorLight.a, RiverColorDark.a, row_cd);
+      lerp = vec4(mix(row_light, row_dark, row_cd), row_a);
+    }
+    else if (use_ocean)
+    {
+      lerp = mix (OceanColorLight, OceanColorDark, cd);
+    }
+    else
+    {
+      // River / lake water (includes inland "ocean"-typed chunks with no real ocean colour). COASTAL
+      // rivers where the zone DOES author a blue ocean (Stormwind canals) keep the 2026-08-07 teal blend.
+      vec3 river_shallow = ocean_bright
+                         ? mix(RiverColorLight.rgb, OceanColorLight.rgb, 0.75) * 0.72
+                         : RiverColorLight.rgb;
+      vec3 river_deep    = ocean_bright
+                         ? mix(RiverColorDark.rgb,  OceanColorDark.rgb,  0.75) * 0.72
+                         : RiverColorDark.rgb;
+      lerp = vec4(mix(river_shallow, river_deep, cd),
+                  mix(RiverColorLight.a, RiverColorDark.a, cd));
+    }
 
     // (A4 authored-alpha RESOLVED 2026-07-13: the earlier "too transparent" was the LightParams
     // OFF-BY-ONE, not zero endpoints -- the classic branch read river_shallow from the glow column
@@ -245,7 +292,9 @@ void main()
     // Base water body = the depth-tinted zone ocean/river colour (lighter coast -> darker deep). The
     // surface texture is NOT modulated in here -- the client adds it additively (see below), so the
     // base stays a clean blue/teal and the texture shows up as the bright shine on top.
-    vec3 water_rgb = lerp.rgb;
+    // Round 20 (user): the SURFACE body colour a tad darker -- x0.85 on the depth-mixed zone band
+    // (the sliding-texture layer stays at its strength; underwater tint untouched).
+    vec3 water_rgb = lerp.rgb * 0.85;
 
     // WATER SHINE -- reverse-engineered from wow_cap_westfall_ocean.trace. The 1.12 client draws the
     // ocean surface ADDITIVELY (SRCBLEND=SRCALPHA, DESTBLEND=ONE) with LIGHTING=FALSE, SPECULARENABLE
@@ -267,25 +316,86 @@ void main()
       vec3 half_vec   = normalize(to_light + to_view);
       float sun_sheen = pow(clamp(dot(vec3(0.0, 1.0, 0.0), half_vec), 0.0, 1.0), 8.0);
 
-      // Additive shine: broad term (1.2) so the white texels sparkle over the whole surface, plus a
-      // strong sun-band ramp (3.0) so the reflection glows where the sun actually reflects to the eye.
-      water_rgb += sun_spec_color * ripple * (1.2 + 3.0 * sun_sheen);
+      // Additive shine, WATER-COLOR MODULATED [2026-08-22]. The client's additive pass is
+      // MODULATE(texture x per-vertex diffuse) where the vertex diffuse IS the depth-lerped zone
+      // water colour -- so in a murk zone (WPL: riverDeep RGB 62,72,56, dim orange light) the shine
+      // self-dims with the water, while a bright ocean sparkles. The old raw sun-coloured broad term
+      // (sun_spec x ripple x 1.2) added ~0.3 of warm light REGARDLESS of the zone, doubling the
+      // brightness of authored-dark water ("WPL still feels bright" with a correct dark base).
+      //   broad term  = texel x waterColor (the client's own additive formula)
+      //   sun glint   = the validated sun-band sparkle, now also scaled by the water colour so
+      //                 murk pools don't catch an ocean-strength glint.
+      // Additive surface texture (trace-confirmed: the client draws the water surface with
+      // DESTBLEND=ONE = ADDITIVE over the water body). The sliding ripple texture must be clearly
+      // VISIBLE. It was too faint because texel*lerp self-dims to ~nothing on WPL's dark water, so add a
+      // direct (non-modulated) texel component too, then the water-colour-modulated part on top, plus
+      // the sun-band glint.
+      // [2026-08-24 UNIFIED SURFACE LAYER] The 1.12 water textures (lake_a / ocean_h) store the
+      // sliding pattern in ALPHA -- their RGB is near-black (measured mean 4-7/255), so every
+      // texel.rgb term here was multiplying ~zero. Pattern = texel.a, ONE strength across all
+      // water bodies (ADT + WMO). NO sun/view glint term: the CLIENT draws water with
+      // LIGHTING=FALSE, no SetMaterial, no specular -- its only "shine" is this modulated
+      // additive pass (trace-proven, wow_cap_westfall_ocean). The old sun_sheen half-vector hack
+      // was ours and read as "shine from every direction" (user round 11) -- removed.
+      float pat = texel.a;
+      // USER-DIRECTED GLITTER (2026-08-25: "surface sliding texture too bright... needs to shine
+      // brighter when angled at moon or source of light"). DELIBERATE DEVIATION from the trace
+      // (the 1.12 client's water pattern is direction-constant): the pattern layer is now dim at
+      // baseline and blooms in a sun/moon-aligned lobe -- view reflected off the flat surface vs
+      // the day/night light direction (LightDir tracks the moon at night, so night glitter is
+      // moonlight automatically). Peak (perfect alignment) = 1.5x the old constant strength.
+      // Round 2 (user: "isn't working, same opacity all across" + "underwater dark again"):
+      //  - guard a degenerate/below-horizon light dir (night hours author the sun under the
+      //    horizon -> the lobe never aligned -> uniform 0.15 everywhere). Lift the dir to at
+      //    least 8deg above the horizon so a glitter band always exists toward the light azimuth.
+      //  - lobe widened pow 20 -> 8 (a broad glare band like sun on wet ground, not a pinpoint).
+      //  - baseline raised 0.15 -> 0.25.
+      //  - camera UNDER the surface keeps the full constant pattern: the dimmed layer seen from
+      //    below is what read as "underwater dark again".
+      float sheen = 1.0;
+      if (camera.y >= world_pos_.y)
+      {
+        vec3 sheen_V = normalize(camera - world_pos_);
+        // ROUND 3 (user: "backwards -- I have to put my back to the sun"): key the lobe on the
+        // DRAWN sun/moon disc (celestial_dir: true render frame, sun by day / moon by night).
+        // The old lighting dayDir sits in the terrain-normal frame, which mirrored the azimuth.
+        vec3 sheen_L = sheen_dir;
+        float L_len = length(sheen_L);
+        if (L_len > 0.001)
+        {
+          sheen_L /= L_len;
+          sheen_L.y = max(sheen_L.y, 0.14); // keep the disc at least ~8deg above the horizon
+          sheen_L = normalize(sheen_L);
+          float sheen_align = clamp(dot(reflect(-sheen_V, vec3(0.0, 1.0, 0.0)), sheen_L), 0.0, 1.0);
+          sheen = 0.25 + 1.25 * pow(sheen_align, 8.0);
+        }
+      }
+      water_rgb += (vec3(pat) * 0.30
+                 + pat * lerp.rgb * 1.0) * sheen;
     }
     water_rgb = clamp(water_rgb, 0.0, 1.0);
 
-    // PER-ZONE AUTHORED TRANSPARENCY (A4, now propagation-verified): each zone's water fades from its
-    // authored SHALLOW alpha at the shore to its DEEP alpha offshore. The endpoints ride the .a channel
-    // of the zone Ocean/River colours (WorldRender packs _skies->{ocean,river}_{shallow,deep}_alpha from
-    // LightParams cols 5-8; SkyParam defaults them to 0.6 so they are never 0). Rivers read more
-    // see-through (~0.5 shallow) than oceans (~0.75); both go opaque (1.0) in deep water. Uses the
-    // STEEPER alpha_depth ramp so only the shallow shore shows the seafloor. water_alpha_mult = dev lever.
+    // WATER OPACITY = the zone's AUTHORED shallow->deep alpha (LightParams cols 5-8), depth-ramped.
+    // [2026-08-23 CORRECTION of the same day's mistake:] the "WPL water is 2-4% opacity" measurement
+    // that briefly replaced this with `deep_a * alpha_depth` (no shallow floor) was taken from the
+    // WRONG trace pass — the stride-24 draws at wow_cap_wpl_water.trace calls 3694+ run under
+    // DESTBLEND=ONE, i.e. they are the ADDITIVE surface-texture pass; their 0..11 vertex alpha is the
+    // additive fade, NOT the base water film. The base alpha-blend pass keeps the authored floor —
+    // and LightParams authors waterShallow=0.5 for WPL exactly like everywhere else. Removing the
+    // floor made every shallow river/canal in the world nearly INVISIBLE (user report). Authored
+    // endpoints, depth-ramped, restored:
     float shallow_a = (type == 1) ? OceanColorLight.a : RiverColorLight.a;
     float deep_a    = (type == 1) ? OceanColorDark.a  : RiverColorDark.a;
     float water_alpha = mix(shallow_a, deep_a, alpha_depth);
     out_color = vec4(water_rgb, clamp(water_alpha * water_alpha_mult, 0.0, 1.0));
   }
 
-  if (FogColor_FogOn.w != 0 && type != 2) // reference applies no fog to lava
+  // [2026-08-22] Fog applies to ALL liquid types, lava included -- the old "reference applies no
+  // fog to lava" exclusion was noggit3 behaviour, not the client's: the game's fixed-function fog
+  // stays enabled for the magma draw, so distant lava fades into the haze like the terrain around
+  // it (the exclusion made lava punch through fog at full saturation). Alpha is left alone: the
+  // lava stays opaque and shows the fogged colour, and the dimmed rgb naturally stops the bloom.
+  if (FogColor_FogOn.w != 0)
   {
     float start = AmbientColor_FogEnd.w * DiffuseColor_FogStart.w;
 
@@ -302,5 +412,23 @@ void main()
     float fogFactor = 1.0 - f4;
 
     out_color.rgb = mix(out_color.rgb, FogColor_FogOn.rgb, fogFactor);
+
+    // FOGGED-OUT EMISSIVE LIQUID MUST STOP BLOOMING (round 28): the bloom bright pass treats
+    // alpha > 0.88 as emissive and re-brightens those texels AFTER fog. Lava writes alpha 1.0 at
+    // any distance, so a fully-fogged lava plane still glowed and drew a hard seam against the
+    // (correctly dark) fogged terrain -- the "terrain line in the distance" seen from under lava.
+    // Fade the emissive flag out with visibility f4; min() leaves ordinary water alpha untouched.
+    out_color.a = min(out_color.a, mix(0.85, 1.0, f4));
+  }
+
+  // [2026-08-27 user: "blue sky horizon band underwater"] Seen from BELOW, the distant surface
+  // must sink into the water fog like the terrain does -- but deep water writes alpha ~1.0 and
+  // the bloom bright-pass treats >0.88 as EMISSIVE, re-brightening it AFTER fog (the round-28
+  // lava-seam mechanism). At partial fog the f4 fade above still allows alpha >0.88, so the
+  // half-fogged surface glowed as a bright stripe across the view. Underwater, water (not lava)
+  // never enters the emissive range.
+  if (type != 2 && camera.y < world_pos_.y)
+  {
+    out_color.a = min(out_color.a, 0.85);
   }
 }

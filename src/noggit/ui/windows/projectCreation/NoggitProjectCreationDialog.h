@@ -14,6 +14,8 @@ struct ProjectInformation
     std::string project_path;
     std::string game_client_path;
     std::string game_client_version;
+    // CASC clients: the .build.info product code chosen in the dialog ("" for MPQ clients)
+    std::string casc_product;
 };
 
 class NoggitProjectCreationDialog : public QDialog

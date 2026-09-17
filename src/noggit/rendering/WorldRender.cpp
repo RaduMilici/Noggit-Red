@@ -780,6 +780,13 @@ bool WorldRender::mdiEnsureModelInArena(Model* m)
   std::vector<std::uint16_t> const& indices = m->_indices;
   if (verts.empty() || indices.empty())
   {
+    // [2026-09-05] Do NOT cache this as a permanent failure while the model is still loading.
+    // _vertices/_indices are filled by the async load, so an early query would pin ok=false in
+    // _mdi_slots forever and the model could never be batched -- invisible for the whole session.
+    // Same transient-mistaken-for-permanent class as the texture rejects. Only a model that has
+    // finished loading and STILL has no geometry is genuinely unbatchable.
+    if (!m->finishedLoading() || m->loading_failed())
+      return false;              // retry on a later frame, do not poison the slot
     _mdi_slots.emplace(key, slot); // ok = false
     return false;
   }
@@ -1450,10 +1457,11 @@ void WorldRender::drawPibBatched(std::vector<PibGroup>& groups)
       if (want_cull) gl.enable(GL_CULL_FACE); else gl.disable(GL_CULL_FACE);
       last_cull = want_cull;
     }
-    int const cur_blend = static_cast<int>(gr.key.blend_mode) | (gr.key.classic_alpha ? 0x100 : 0);
+    int const cur_blend = static_cast<int>(gr.key.blend_mode) | (gr.key.classic_alpha ? 0x100 : 0) | (gr.key.modern_alpha ? 0x200 : 0);
     if (cur_blend != last_blend)
     {
       batched.uniform("alpha_key_classic", gr.key.classic_alpha ? 1 : 0);
+      batched.uniform("alpha_key_modern", gr.key.modern_alpha ? 1 : 0);
       switch (static_cast<M2Blend>(gr.key.blend_mode))
       {
         default:
@@ -1620,6 +1628,15 @@ int WorldRender::vkWmoBlpPairIndex(std::string const& a, std::string const& b)
 // original inline draw ran in.
 void WorldRender::drawDeferredGlFallback()
 {
+  // [VULKAN NATIVE PRESENT, 2026-09-03] the swapchain covers the GL widget: these draws could not
+  // be seen. The refusal counters were tallied at the push sites (they feed the GL-M2 report --
+  // the native port's work list); just drop the buckets.
+  if (vk_native)
+  {
+    _vk_gl_deferred.clear();
+    _vk_gl_deferred_pi.clear();
+    return;
+  }
   if ((_vk_gl_deferred.empty() && _vk_gl_deferred_pi.empty()) || !_m2_instanced_program)
     return;
 
@@ -1855,9 +1872,193 @@ int WorldRender::vkM2BlpPairIndex(std::string const& a, std::string const& b)
 void WorldRender::vkM2SnapshotClear()
 {
   _vk_m2_tf.clear(); _vk_m2_interior.clear(); _vk_m2_tex.clear(); _vk_m2_blp_idx.clear();
-  _vk_m2_state.clear(); _vk_m2_bones.clear(); _vk_m2_cmds.clear(); _vk_m2_groups.clear();
+  _vk_m2_state.clear(); _vk_m2_cmds.clear(); _vk_m2_groups.clear();
   _vk_m2_blp_pairs.clear();
   _vk_m2_blp_pair_index.clear();
+  // [CLUTTER PERSISTENT] the first 64 mat4 slots are the species HEADER TABLE (column 0 of slot k =
+  // (bone base, count) for species k, filled by vkClutterAppendBones). Seeding identity keeps the
+  // table harmless when unused; every real bone block starts at base >= 64 automatically because
+  // producers take their base from the current size.
+  _vk_m2_bones.assign(64, glm::mat4x4(1.0f));
+}
+
+// [CLUTTER PERSISTENT 2026-09-03] Build one chunk's registration payload. Mirrors the classic-feed
+// classification exactly (same resolveStaticBatch(for_pib) + pass-skip rules), so a registered
+// chunk draws the same pixels the per-frame path drew.
+bool WorldRender::vkClutterBuildChunk(MapChunk* chunk, VkClutterOut& out)
+{
+  out.tf.clear(); out.interior.clear(); out.tex.clear(); out.state.clear(); out.draws.clear();
+  if (!chunk || !chunk->_detail_doodads_computed)
+    return false;
+  auto const& doodads = chunk->detailDoodads();
+  if (doodads.empty())
+    return true;   // registrable-as-empty: nothing to draw here, but stop re-walking it
+  // [diag] the first few NON-empty chunks report what the classifier decides for them
+  static int s_clb_log = 0;
+  bool const clb_log = s_clb_log < 6;
+  if (clb_log)
+  {
+    ++s_clb_log;
+    LogError << "[VK] clutterBuild: chunk with " << doodads.size() << " blades" << std::endl;
+  }
+
+  // group by species (runs of the same model, like the collection loop)
+  std::map<Model*, std::vector<std::size_t>> by_model;
+  for (std::size_t i = 0; i < doodads.size(); ++i)
+  {
+    Model* m = doodads[i].cached_model;
+    if (!m)
+      return false;              // not all species resolved yet -> retry later
+    if (!m->finishedLoading() || m->loading_failed())
+      return false;
+    by_model[m].push_back(i);
+  }
+
+  extern thread_local int g_last_static_batch_reject;
+  extern thread_local bool g_last_reject_permanent;
+  constexpr int kRejHiddenGeoset = 4;
+
+  for (auto const& bm : by_model)
+  {
+    Model* const m = bm.first;
+  m->renderer()->ensureUploaded();   // same deadlock as the classic feed -- see ensureUploaded()
+    if (!mdiEnsureModelInArena(m))
+      return false;
+    auto const slot_it = _mdi_slots.find(m->file_key().stringRepr());
+    if (slot_it == _mdi_slots.end() || !slot_it->second.ok)
+      return false;
+    MdiArenaSlot const& slot = slot_it->second;
+
+    auto const& passes = m->renderer()->renderPasses();
+    if (passes.empty())
+      continue;                  // particle-only species: nothing to register
+
+    // species bone-header slot (animated species only; static ones ride bind pose = tex.z/w 0)
+    int species_slot = -1;
+    if (m->animBones)
+    {
+      auto sp = vk_clutter_species.find(m);
+      if (sp != vk_clutter_species.end())
+        species_slot = sp->second;
+      else if (vk_clutter_species.size() < 64u)
+      {
+        species_slot = static_cast<int>(vk_clutter_species.size());
+        vk_clutter_species.emplace(m, species_slot);
+      }
+      else
+      {
+        static bool s_overflow_logged = false;
+        if (!s_overflow_logged)
+        {
+          s_overflow_logged = true;
+          LogError << "[VK] clutter species table full (64) -- '" << m->file_key().stringRepr()
+                   << "' stays on the per-frame path" << std::endl;
+        }
+        return false;            // chunk stays per-frame rather than freezing this species
+      }
+    }
+
+    std::uint32_t const first_instance = static_cast<std::uint32_t>(out.tf.size());
+    for (std::size_t di : bm.second)
+    {
+      out.tf.push_back(doodads[di].transform);
+      out.interior.push_back(doodads[di].tint);
+    }
+    std::uint32_t const inst_count = static_cast<std::uint32_t>(bm.second.size());
+
+    bool any_pass = false;
+    for (auto const& pass : passes)
+    {
+      StaticBatchKey k;
+      g_last_static_batch_reject = 0;
+      if (!pass.resolveStaticBatch(m, k, /*for_pib=*/ true))
+      {
+        if (g_last_static_batch_reject == kRejHiddenGeoset)
+          continue;              // hidden submesh -- skipped everywhere
+        if ((g_last_static_batch_reject == 12 || g_last_static_batch_reject == 13)
+            && g_last_reject_permanent)
+          continue;              // permanently unbindable pass -- GL skips it too
+        if (clb_log)
+          LogError << "[VK] clutterBuild: transient rej" << g_last_static_batch_reject
+                   << " on '" << m->file_key().stringRepr() << "' -- chunk retried later" << std::endl;
+        return false;            // transient (texture streaming) -> retry this chunk later
+      }
+      any_pass = true;
+      VkClutterOut::Draw d;
+      d.index_count = pass.index_count;
+      d.first_index = slot.index_base + pass.index_start;
+      d.base_vertex = slot.base_vertex;
+      d.first_instance = first_instance;
+      d.instance_count = inst_count;
+      d.state_key = static_cast<std::int32_t>(k.blend_mode)
+                  | ((k.backface_cull ? 1 : 0) << 4)
+                  | ((k.classic_alpha ? 1 : 0) << 5)
+                  | ((k.modern_alpha ? 1 : 0) << 6);
+      d.blp0 = k.blp0;
+      d.blp1 = k.blp1;
+      d.tex_from = out.tex.size();      // filled below, shared by every pass of the species
+      d.tex_count = 0;
+      out.draws.push_back(std::move(d));
+
+      // per-instance tex/state, ONE entry per instance per species (streams are per-instance, not
+      // per-pass; the last resolving pass's key wins -- clutter species are single-texture, so the
+      // BLPs agree across passes in practice, and state carries the shared flags).
+      if (out.tex.size() < out.tf.size())
+      {
+        glm::ivec4 st = batchStateVec(k);
+        st.y |= 16;                                    // ground clutter shading law
+        int texz = 0, texw = 0;
+        if (species_slot >= 0)
+        {
+          st.y |= 32;                                  // bone base via species header slot
+          texz = species_slot;
+        }
+        for (std::uint32_t i = 0; i < inst_count; ++i)
+        {
+          out.tex.push_back(glm::ivec4(-1, -1, texz, texw));
+          out.state.push_back(st);
+        }
+        out.draws.back().tex_count = inst_count;
+      }
+    }
+    if (!any_pass)
+    {
+      // species contributes no drawable pass: drop its instances again (streams stay aligned)
+      if (clb_log)
+        LogError << "[VK] clutterBuild: NO drawable pass for '" << m->file_key().stringRepr()
+                 << "' (" << inst_count << " blades dropped)" << std::endl;
+      out.tf.resize(first_instance);
+      out.interior.resize(first_instance);
+    }
+  }
+  if (clb_log)
+    LogError << "[VK] clutterBuild: -> " << out.tf.size() << " instances, "
+             << out.draws.size() << " draws" << std::endl;
+  return true;
+}
+
+void WorldRender::vkClutterAppendBones(glm::mat4x4 const& model_view, int animtime)
+{
+  if (vk_clutter_species.empty() || _vk_m2_bones.size() < 64u)
+    return;
+  for (auto const& sp : vk_clutter_species)
+  {
+    Model* const m = sp.first;
+    if (!m || !m->animBones)
+      continue;
+    if (!m->animcalc)
+    {
+      m->animate(model_view, 0, animtime);
+      m->animcalc = true;
+    }
+    if (m->bone_matrices.empty())
+      continue;
+    std::uint32_t const base = static_cast<std::uint32_t>(_vk_m2_bones.size());
+    _vk_m2_bones.insert(_vk_m2_bones.end(), m->bone_matrices.begin(), m->bone_matrices.end());
+    // header: column 0 of the species' slot = (base, count)
+    _vk_m2_bones[static_cast<std::size_t>(sp.second)][0] =
+      glm::vec4(static_cast<float>(base), static_cast<float>(m->bone_matrices.size()), 0.0f, 0.0f);
+  }
 }
 
 // Append whatever is currently in the scratch arrays, rebasing instance and bone indices onto what
@@ -1929,13 +2130,24 @@ bool WorldRender::vkFeedClassicBucket(Model* m, std::vector<glm::mat4x4> const& 
     return false;
   }
 
+  // [2026-09-04] Upload BEFORE classifying: the classifier reads Model::_textures, which only
+  // exists after ModelRender::upload(). GL's draw is gated off when VK owns M2, so without this
+  // the model can never satisfy the classifier and never becomes drawable (see ensureUploaded).
+  // [2026-09-05 DIAG] load state of every model the classic feed sees this frame
+  ++_vk_dbg_models_seen;
+  if (!m->finishedLoading() || m->loading_failed())
+    ++_vk_dbg_models_unloaded;
+
+  m->renderer()->ensureUploaded();
+
   auto const& passes = m->renderer()->renderPasses();
   if (passes.empty())
   {
-    _vk_fb_empty += transforms.size();
-    if (_vk_fb_names.size() < 8)
-      _vk_fb_names.push_back("empty " + m->file_key().stringRepr());
-    return false;
+    // [2026-09-03] a LOADED model with zero render passes is particle/ribbon-only (waterdrop
+    // emitters and the like): its mesh draw renders nothing in GL either, and particles are
+    // collected independently of this bucket. Claim it, so GL stops issuing a no-op draw per
+    // instance and it stops polluting the native GL-only work list as "empty".
+    return true;
   }
 
   // rej code 4 = the pass's geoset is HIDDEN. GL rejects the whole model for that so the individual
@@ -1955,8 +2167,26 @@ bool WorldRender::vkFeedClassicBucket(Model* m, std::vector<glm::mat4x4> const& 
     g_last_static_batch_reject = 0;
     if (!passes[pi].resolveStaticBatch(m, k, /*for_pib=*/ true))
     {
-      if (g_last_static_batch_reject == kRejHiddenGeoset)
-        continue;                         // hidden submesh -- GL skips it too
+      // [2026-09-04] ONLY a genuinely hidden geoset may be skipped here. Code 4 is overloaded and
+      // also covers z_buffered / unfogged-unlit, which GL DRAWS -- skipping those made every pass
+      // of such a model disappear (keys.empty() -> allHidden -> dropped -> invisible in native).
+      {
+        extern thread_local int g_last_rej4_reason;
+        if (g_last_static_batch_reject == kRejHiddenGeoset && g_last_rej4_reason == 1)
+          continue;                       // hidden submesh -- GL skips it too
+      }
+      // [2026-09-03] PERMANENTLY unbindable texture unit (rej 12/13 with tex sub-reason 1/2/3):
+      // GL's bindTexture returns false for the same pass on EVERY frame, i.e. GL never draws it
+      // either -- skip the pass and batch the rest. This was the entire native GL-only work list
+      // (jars, benches, tree facades, flag poles, gun tripods: one authoring-garbage pass each).
+      // Transient failures (still streaming / unresolved special skin) keep the full reject and
+      // heal next frame.
+      {
+        extern thread_local bool g_last_reject_permanent;
+        if ((g_last_static_batch_reject == 12 || g_last_static_batch_reject == 13)
+            && g_last_reject_permanent)
+          continue;
+      }
       _vk_fb_pass += transforms.size();   // TODO: billboards / animated UV / clamp variants
       {
         // One line per distinct model, once: which model still needs GL and WHY. The port is not
@@ -1978,6 +2208,22 @@ bool WorldRender::vkFeedClassicBucket(Model* m, std::vector<glm::mat4x4> const& 
     // them" with no recorded reason. Every pass is a hidden geoset: VK correctly declines, and GL
     // then draws a model whose every submesh it also skips -- work that produces no pixels.
     _vk_fb_hidden += transforms.size();
+    // name the models landing here -- this class is INVISIBLE in native mode, so it is the work
+    // list. Carry the exact gate that skipped the LAST pass: rej code, the overloaded-4 sub-reason
+    // (1 hidden geoset / 2 z_buffered / 3 unfogged-unlit) and the texture sub-reason, so the cause
+    // is read off the log instead of guessed.
+    if (_vk_fb_names.size() < 8)
+    {
+      extern thread_local int g_last_rej4_reason;
+      extern thread_local int g_last_tex_unit_reject;
+      extern thread_local bool g_last_reject_permanent;
+      _vk_fb_names.push_back("allHidden(rej" + std::to_string(g_last_static_batch_reject)
+                             + "/r4=" + std::to_string(g_last_rej4_reason)
+                             + "/tex" + std::to_string(g_last_tex_unit_reject)
+                             + "/perm" + std::to_string(g_last_reject_permanent ? 1 : 0)
+                             + "/passes" + std::to_string(passes.size())
+                             + ") " + m->file_key().stringRepr());
+    }
     // ~98% of the instances GL still draws in VK mode land here (allHidden 135 of 138). It is
     // TEMPTING to skip GL's draw for them on the grounds that every submesh is hidden -- that was
     // tried and is WRONG: it dropped ~226 pixels (static check 3.70% -> 3.720%, stable over repeats).
@@ -2279,10 +2525,11 @@ void WorldRender::drawDynamicBatched(tsl::robin_map<Model*, std::vector<glm::mat
       if (want_cull) gl.enable(GL_CULL_FACE); else gl.disable(GL_CULL_FACE);
       last_cull = want_cull;
     }
-    int const cur_blend = static_cast<int>(gr.key.blend_mode) | (gr.key.classic_alpha ? 0x100 : 0);
+    int const cur_blend = static_cast<int>(gr.key.blend_mode) | (gr.key.classic_alpha ? 0x100 : 0) | (gr.key.modern_alpha ? 0x200 : 0);
     if (cur_blend != last_blend)
     {
       batched.uniform("alpha_key_classic", gr.key.classic_alpha ? 1 : 0);
+      batched.uniform("alpha_key_modern", gr.key.modern_alpha ? 1 : 0);
       switch (static_cast<M2Blend>(gr.key.blend_mode))
       {
         default:
@@ -2600,10 +2847,11 @@ void WorldRender::drawCreaturesBatched(
       if (want_cull) gl.enable(GL_CULL_FACE); else gl.disable(GL_CULL_FACE);
       last_cull = want_cull;
     }
-    int const cur_blend = static_cast<int>(gr.key.blend_mode) | (gr.key.classic_alpha ? 0x100 : 0);
+    int const cur_blend = static_cast<int>(gr.key.blend_mode) | (gr.key.classic_alpha ? 0x100 : 0) | (gr.key.modern_alpha ? 0x200 : 0);
     if (cur_blend != last_blend)
     {
       batched.uniform("alpha_key_classic", gr.key.classic_alpha ? 1 : 0);
+      batched.uniform("alpha_key_modern", gr.key.modern_alpha ? 1 : 0);
       switch (static_cast<M2Blend>(gr.key.blend_mode))
       {
         default:
@@ -2951,10 +3199,11 @@ void WorldRender::drawCreatureBodiesBatched(
       if (want_cull) gl.enable(GL_CULL_FACE); else gl.disable(GL_CULL_FACE);
       last_cull = want_cull;
     }
-    int const cur_blend = static_cast<int>(gr.key.blend_mode) | (gr.key.classic_alpha ? 0x100 : 0);
+    int const cur_blend = static_cast<int>(gr.key.blend_mode) | (gr.key.classic_alpha ? 0x100 : 0) | (gr.key.modern_alpha ? 0x200 : 0);
     if (cur_blend != last_blend)
     {
       batched.uniform("alpha_key_classic", gr.key.classic_alpha ? 1 : 0);
+      batched.uniform("alpha_key_modern", gr.key.modern_alpha ? 1 : 0);
       switch (static_cast<M2Blend>(gr.key.blend_mode))
       {
         default:
@@ -3266,6 +3515,17 @@ void WorldRender::draw (glm::mat4x4 const& model_view
   extern bool g_noggit_harness_silent; // MapView.cpp (set by MapView::muteAudioForHarness)
   _shadow_quality = (minimap_render || g_noggit_harness_silent)
                       ? 0 : QSettings().value("graphics/shadow_quality", 3).toInt();
+  // [2026-09-04 REPRO INSTRUMENT] NOGGIT_FORCE_SHADOW_QUALITY beats the harness zeroing: the
+  // harness always ran shadow 0 while the editor defaults to 3, so any shadow-coupled bug was
+  // structurally invisible to every harness capture. This lets the harness run the editor's config.
+  {
+    static int const s_force_sq = []() {
+      char const* v = std::getenv("NOGGIT_FORCE_SHADOW_QUALITY");
+      return (v && *v) ? std::atoi(v) : -1;
+    }();
+    if (s_force_sq >= 0)
+      _shadow_quality = s_force_sq;
+  }
   if (_shadow_quality < 0 || _shadow_quality > 5) { _shadow_quality = 3; }
   // Hardware gate: the shadow sampler lives on texture unit 16, which only exists when the driver
   // exposes >16 fragment texture units. On a 16-unit driver the sampler uniform is rejected and
@@ -3551,7 +3811,9 @@ void WorldRender::draw (glm::mat4x4 const& model_view
       // [VULKAN phase G] the SKYBOX and STARS are ordinary M2 instances -- hand them to the same VK
       // M2 feed every other doodad uses instead of inventing a second path for them. Skies has no
       // WorldRender pointer, so it records what it drew and we feed it here.
-      for (ModelInstance* sky_m2 : { _skies->vkSkyboxInstance(), _skies->vkStarsInstance() })
+      std::vector<ModelInstance*> sky_m2s(_skies->vkSkyboxInstances()); // every listed skybox, in order
+      sky_m2s.push_back(_skies->vkStarsInstance());
+      for (ModelInstance* sky_m2 : sky_m2s)
       {
         if (!sky_m2)
           continue;
@@ -3726,18 +3988,22 @@ void WorldRender::draw (glm::mat4x4 const& model_view
         // exists); the client's few soft rays are the FFXGlow blooming the bright disc. =====
         // -0.05: keep drawing while any part of the disc is still above the horizon; the shader's
         // per-fragment horizon clip cuts everything below it (the sprite sets BEHIND the fog band).
-        // 3.3.5a: Northrend (sky-type-2 zones) draws NO sun/moon -- the client hard-gates the celestial
-        // draw off (Wow335.exe FUN_004f7020 case 2 zeroes the DAT_00d38ccc gate; the Icecrown apitrace
-        // shows zero celestial draws, any time of day). WotLK Northrend (map 571) only; 1.12 keeps its
-        // sun/moon. See docs/client_re/29 + memory noggit-335a-sun-moon-gate-sky-type2.
-        bool const celestial_off = []{
+        // 3.3.5a (wow335a.exe, RE'd 2026-09-09): the sun/moon are NOT drawn under a full-weight
+        // non-overlay skybox (FUN_007f09b0), and otherwise their brightness is scaled by
+        // (1 - the strongest listed skybox weight) (FUN_007ef6e0) -- which is how Icecrown's citadel
+        // sky hides them and how they fade back in at the zone edge. The old map-571 "sky type 2"
+        // hard gate was ScreenEffect.dbc's ghost effect (FUN_004f7020 case 2), not Northrend. 1.12 keeps
+        // its sun/moon untouched.
+        float const cel_scale = []{
           auto const* p = Noggit::Project::CurrentProject::get();
           return p && p->projectVersion != Noggit::Project::ProjectVersion::CLASSIC;
-        }() && _world->mapIndex._map_id == 571;
+        }() ? (_skies->skyboxCovers() ? 0.f : glm::clamp(1.f - _skies->skyboxCover(), 0.f, 1.f)) : 1.f;
+        bool const celestial_off = cel_scale <= 0.002f;
         {
           static int s_celgate = 0;
           if ((s_celgate++ % 240) == 0)
             LogError << "[VK] celestial gate: off=" << (celestial_off ? 1 : 0)
+                     << " skyboxCover=" << _skies->skyboxCover() << " covers=" << (_skies->skyboxCovers() ? 1 : 0)
                      << " toSun.y=" << to_sun.y << " dayFactor=" << day_factor
                      << " drawSun=" << (_world->_settings->value("render/draw_sun", true).toBool() ? 1 : 0)
                      << " drawMoon=" << (_world->_settings->value("render/draw_moon", true).toBool() ? 1 : 0)
@@ -3767,13 +4033,13 @@ void WorldRender::draw (glm::mat4x4 const& model_view
           // size ramp below stands in for the footprint widening that stacking produces.
           float const glare_op = glm::mix(0.22f, 0.45f, elev_f) * glm::mix(0.3f, 1.0f, grow);
           draw_celestial(*_sun_glare_texture, to_sun, glm::mix(0.16f, 0.48f, grow) * sun_scale, sun_col,
-                         glare_op * day_factor, true);
+                         glare_op * day_factor * cel_scale, true);
 
           // 2) DISC: sunCenter.blp hot bright core, always on. Additive -> blooms via the FFXGlow.
           // The dawn/dusk 2x curve stays on the GLARE only: doubling the DISC in its last ~2.5 deg
           // of elevation read as the sun ballooning to planet size right before it set.
           draw_celestial(*_sun_center_texture, to_sun, 0.04f, sun_col,
-                         1.3f * day_factor, true);
+                         1.3f * day_factor * cel_scale, true);
         }
 
         // ===== MOONS (night): White Lady (moon.blp disc + moonGlare halo) and the smaller Blue Child
@@ -3790,15 +4056,15 @@ void WorldRender::draw (glm::mat4x4 const& model_view
             // decoded from the BLP). To read as a GLOW (brightest at the disc, fading out) rather than a
             // detached ring, size the quad so the ring's PEAK sits at/just inside the disc edge -> only
             // the ring's OUTWARD falloff is visible past the disc. peak = 0.54*glare, so glare ~= disc/0.54.
-            draw_celestial(*_moon_glare_texture, to_moon, glm::mix(0.115f, 0.135f, m_grow), white_col, m_grow * moon_factor, true);
-            draw_celestial(*_moon_texture,       to_moon, disc_half, white_col, moon_factor, false); // disc
+            draw_celestial(*_moon_glare_texture, to_moon, glm::mix(0.115f, 0.135f, m_grow), white_col, m_grow * moon_factor * cel_scale, true);
+            draw_celestial(*_moon_texture,       to_moon, disc_half, white_col, moon_factor * cel_scale, false); // disc
           }
           // Blue Child: rides its OWN client keyframe path (to_moon2 above) -- rises from the
           // horizon with the White Lady at 22:00 but ~90-120 deg around the horizon from her,
           // drifting slowly through the night. Independent; no screen-space relation to the Lady.
           if (to_moon2.y > -0.05f) // shader horizon clip sinks it behind the fog band
           {
-            draw_celestial(*_moon2_texture, to_moon2, 0.042f, glm::vec3(0.55f, 0.74f, 1.0f), moon_factor, false);
+            draw_celestial(*_moon2_texture, to_moon2, 0.042f, glm::vec3(0.55f, 0.74f, 1.0f), moon_factor * cel_scale, false);
           }
         }
         gl.blendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
@@ -3835,14 +4101,9 @@ void WorldRender::draw (glm::mat4x4 const& model_view
   _decal_depth_ready = false; // fresh depth snapshot needed this frame (shadows + selection circles)
   _world_depth_ready = false; // and a fresh world-only one, taken between the WMO and M2 passes
 
-  // Draw verylowres heightmap (distant horizon backdrop). Toggleable live via Settings
-  // ("render_horizon", default on) so it can be disabled to stop fog rendering distant mesh.
-  bool const draw_horizon = _world->_settings->value("render_horizon", false).toBool();
-  if (!_world->mapIndex.hasAGlobalWMO() && draw_fog && draw_terrain && draw_horizon)
-  {
-    ZoneScopedN("World::draw() : Draw horizon");
-    _horizon_render->draw (model_view, projection, &_world->mapIndex, _skies->color_set[FOG_COLOR], _terrain_cull_distance, frustum, camera_pos, display);
-  }
+  // [2026-09-08 WDL HORIZON] The distant low-res backdrop used to be drawn HERE, before the terrain,
+  // with whatever depth state the celestial pass left behind. It moved to the client's slot (after the
+  // WMO pass, before the M2 pass) -- see the block above snapshotWorldDepth().
 
   gl.enable(GL_DEPTH_TEST);
   gl.depthFunc(GL_LEQUAL); // less z-fighting artifacts this way, I think
@@ -4115,6 +4376,16 @@ void WorldRender::draw (glm::mat4x4 const& model_view
     _pib_groups_cache.clear();
     _pib_groups_valid = false;
     _last_wmo_fingerprint = wmo_fingerprint;
+    // ... but DO drop every cached OUTDOOR result (a == 0). A WMO that has just finished loading turns cells
+    // that sampled "no volume" into interior ones, and the async loader flips finishedLoading mid-frame --
+    // after this fingerprint check -- so that WMO's own doodads can be classified against the OLD volume
+    // list in the very frame it appears and stay sun-lit for good (Karazhan Crypts, 2026-09-16: bones and
+    // skulls lit as if outdoors inside a black room; docs/client_re/42 sec 16). Interior results depend
+    // only on their own static WMO and are kept, so the steady-state cost stays zero.
+    for (auto it = _interior_light_cache.begin(); it != _interior_light_cache.end();)
+    {
+      it = (it->second.a == 0.f) ? _interior_light_cache.erase(it) : std::next(it);
+    }
     if (!s_no_interior_object_light)
     {
       _world->collect_interior_volumes(_interior_volumes);
@@ -4129,6 +4400,7 @@ void WorldRender::draw (glm::mat4x4 const& model_view
   // Cold-cache interior computes allowed this frame (see interior_light_at). Kept modest so a streamed
   // WMO's doodads fill in over a few frames while capping the per-frame cost well under the 10ms target.
   _interior_miss_budget = 48;
+  _interior_deferred_this_frame = 0;
 
   // Hard cap on the (now persistent) interior-light cache so a long session can never blow up RAM. Only
   // STATIC objects populate it, so this bounds at a few MB (~40 B/entry); on overflow, drop it and let the
@@ -4220,6 +4492,7 @@ void WorldRender::draw (glm::mat4x4 const& model_view
       // -- they must light every frame. (interior_light_at is only ever called serially -> race-free.)
       if (_interior_miss_budget <= 0)
       {
+        ++_interior_deferred_this_frame;
         return glm::vec4(0.0f); // deferred: not cached, so it retries next frame
       }
       --_interior_miss_budget;
@@ -4299,7 +4572,25 @@ void WorldRender::draw (glm::mat4x4 const& model_view
       {
         if (camera_pos.x >= v.min.x && camera_pos.x <= v.max.x
          && camera_pos.y >= v.min.y && camera_pos.y <= v.max.y
-         && camera_pos.z >= v.min.z && camera_pos.z <= v.max.z) { ++containing; }
+         && camera_pos.z >= v.min.z && camera_pos.z <= v.max.z)
+        {
+          ++containing;
+          if (v.group_index >= 0 && v.group_index < static_cast<int>(v.wmo->groups.size()))
+          {
+            auto const& g = v.wmo->groups[v.group_index];
+            glm::vec3 const local = glm::vec3(v.inv_transform * glm::vec4(camera_pos, 1.f));
+            glm::vec3 sample(0.f);
+            float spill = 0.f, floor_y = 0.f;
+            bool const hit = g.sample_ground_color(local, &sample, &spill, &floor_y);
+            LogError << "[interior-light]   volume group " << v.group_index
+                     << " local=(" << local.x << "," << local.y << "," << local.z << ")"
+                     << " groundColors=" << g.ground_color_count() << " verts=" << g.vertex_count()
+                     << " indices=" << g.index_count() << " matInfos=" << g.material_info_count()
+                     << " gridCell=" << g.collision_grid_cell()
+                     << " sample=" << (hit ? 1 : 0) << " (" << sample.x << "," << sample.y << "," << sample.z
+                     << ") floorY=" << floor_y << std::endl;
+          }
+        }
       }
       LogError << "[interior-light] volumes=" << _interior_volumes.size()
                << " containing_cam=" << containing
@@ -4408,7 +4699,20 @@ void WorldRender::draw (glm::mat4x4 const& model_view
   // _cull_distance — so the bare release exe (no env) showed early tree culling the bat launch
   // didn't. Uniform on every path = both launch modes render identically. The client cull remains
   // available as an opt-IN (render/gv_doodad_cull, now default OFF).
-  bool const use_client_doodad_cull = _world->_settings->value("render/gv_doodad_cull", false).toBool();
+  bool use_client_doodad_cull = _world->_settings->value("render/gv_doodad_cull", false).toBool();
+  // [2026-09-06 HARNESS-ONLY A/B] NOGGIT_DOODAD_CULL_OVERRIDE=0|1 forces the client size-class cull
+  // for a parity run WITHOUT touching the user's persisted setting (never written here). The user's
+  // registry has it ON and their GL session class-dropped ~92% of doodads incl. class 2/3 trees
+  // inside 300 yd -- beyond the client's own 200/750 yd law -- so the cull, not the renderer, may
+  // be what empties their fields. This lets the harness prove it at their exact pose.
+  {
+    static int const s_cull_override = []() {
+      char const* v = std::getenv("NOGGIT_DOODAD_CULL_OVERRIDE");
+      return (v && *v) ? std::atoi(v) : -1;
+    }();
+    if (s_cull_override == 0 || s_cull_override == 1)
+      use_client_doodad_cull = (s_cull_override == 1);
+  }
   // [2026-08-25 DRESSING CLASS-SPLIT — user: "grass too bright / should look brown not green".]
   // The Un'Goro/mountain "grass" is PLACED M2 vegetation (MDDF ferns/shrubs/clumps), and the client
   // hard-culls it by size class: class 0 (<1yd) at 30yd, class 1 (1-4yd) at 100yd. With the Aug-23
@@ -5102,6 +5406,80 @@ void WorldRender::draw (glm::mat4x4 const& model_view
     float const a = 1.0f - (d - (cull_far - band)) / band;
     return a < 0.01f ? 0.0f : a;                   // min-alpha cull floor (_DAT_009f1968)
   };
+  // [2026-09-08 WDL HORIZON BACKDROP -- reverse-engineered from the 3.3.5a client (MapLowDetail.cpp)]
+  // The low-res WDL mesh used to be drawn BEFORE the terrain, with whatever depth state the celestial
+  // pass left behind, for every tile inside the view distance, MAHO ignored. Wherever the coarse mesh
+  // sat above the real terrain it won the depth test and punched fog-coloured "holes" into the ADTs.
+  // The client (CMap::RenderLowDetail, wow335a FUN_00795f80) draws it HERE -- after terrain and WMOs,
+  // before M2s -- with ITS OWN PROJECTION (near = far clip - 50 yd, far = 4 x farclip, so the coarse
+  // mesh starts where the terrain ends; FUN_00791170) through a viewport whose depth range is
+  // [511/512, 1023/1024] (the far 0.1% of the depth buffer; see horizon_vert.glsl / horizon.vert):
+  // depth-tested, so in the 50 yd overlap it only fills the pixels nothing real covered. It does NOT
+  // test "tile loaded at full detail"; the near plane makes that unnecessary. Tile selection is the
+  // client's (selector FUN_007cc0b0 under that frustum), MAHO hole cells are a second range with
+  // depth writes off (RenderTile FUN_007d5e70), the flat colour is the fog colour (fog start 0/end 1).
+  {
+    // [HARNESS-ONLY, strip before commit] NOGGIT_HORIZON_OVERRIDE=0|1 forces the toggle for the parity
+    // rig without ever writing the user's "render_horizon" setting.
+    static int const s_horizon_override = []()
+    { char const* v = std::getenv("NOGGIT_HORIZON_OVERRIDE"); return v ? std::atoi(v) : -1; }();
+    bool const draw_horizon = s_horizon_override >= 0 ? (s_horizon_override != 0)
+                            : _world->_settings->value("render_horizon", false).toBool();
+    // Not tied to the fog toggle any more: the client's showLowDetail is independent of fog (the pass
+    // sets its own fog start 0 / end 1 and paints the zone's fog colour whether or not scene fog is
+    // on), and the old `draw_fog &&` gate made the backdrop vanish with the fog switch.
+    bool const horizon_on = _horizon_render && !_world->mapIndex.hasAGlobalWMO()
+                         && draw_terrain && draw_horizon;
+    if (horizon_on)
+    {
+      ZoneScopedN("World::draw() : Draw horizon");
+      // How far real terrain actually reaches: noggit only keeps the (2r+1)^2 "ADT loading radius" grid
+      // (MapIndex::enterTile) resident, whose edge is at least r tiles from the camera, while the view
+      // distance may be far larger. Starting the mesh at the view distance left a void between the
+      // loaded grid (533-1066 yd at r=1) and the mesh (1550 yd): nothing drawn in the middle distance
+      // and the mesh cut off in mid-air. The client shows its clear colour (= this fog colour) there.
+      int const loading_radius = std::max(0, _world->_settings->value("loading_radius", 1).toInt());
+      float const loaded_reach = std::max(TILESIZE * 0.5f, static_cast<float>(loading_radius) * TILESIZE);
+      float const terrain_reach = std::min(_terrain_cull_distance, loaded_reach);
+      // Settings "Horizon far clip scale" = the client's horizonFarclipScale CVar (stock 4.0, cap 6.0)
+      float const horizon_scale = _world->_settings->value("horizon_farclip_scale", 4.0f).toFloat();
+      _horizon_render->build_frame(terrain_reach, _terrain_cull_distance, horizon_scale,
+                                   projection, model_view, camera_pos);
+      // [HARNESS DIAG, strip before commit] what the selector produced, every 60 frames and whenever
+      // it produced nothing (the "mesh vanishes while flying" report).
+      {
+        static int s_hz_frames = 0;
+        static int s_hz_zero_logged = 0;
+        ++s_hz_frames;
+        bool const empty = _horizon_render->tiles_selected() == 0;
+        if ((s_hz_frames % 60) == 0 || (empty && (s_hz_zero_logged++ % 30) == 0))
+          LogError << "[HZ] frame=" << s_hz_frames << " tiles=" << _horizon_render->tiles_selected()
+                   << " solid=" << _horizon_render->solid_indices().size()
+                   << " holes=" << _horizon_render->hole_indices().size()
+                   << " reach=" << terrain_reach << " far=" << _terrain_cull_distance << " x" << horizon_scale
+                   << " cam=(" << camera_pos.x << "," << camera_pos.y << "," << camera_pos.z << ")"
+                   << " vk=" << (vk_owns_terrain ? 1 : 0) << (empty ? " EMPTY" : "") << std::endl;
+      }
+    }
+    // The client fogs the low-detail pass with the same light+0x8c colour every other pass fogs with.
+    // Here that is the FINAL fog colour of the lighting UBO (zone fog after weather blending, camera
+    // fog spheres, interior fog, underwater params) -- the colour the terrain shader actually fades to
+    // at the far plane. The raw sky band (_skies->color_set[FOG_COLOR]) drifted from it and painted a
+    // darker band beyond the far plane than the fogged terrain in front of it.
+    glm::vec3 const horizon_color (_lighting_ubo_data.FogColor_FogOn);
+    if (vk_owns_terrain)
+    {
+      // VK draws it at the end of its WMO group (after terrain + WMOs, before M2s); null = clear it.
+      if (vk_horizon_feed)
+        vk_horizon_feed(horizon_on ? _horizon_render.get() : nullptr, horizon_color,
+                        horizon_on ? _horizon_render->ld_mvp() : glm::mat4x4(1.f));
+    }
+    else if (horizon_on)
+    {
+      _horizon_render->draw_gl(model_view, horizon_color);
+    }
+  }
+
   // Capture the world-only depth HERE, between the WMO pass and the M2 pass: terrain and buildings
   // are in the depth buffer, nothing model-shaped is yet. The ground decals drawn later (selection
   // circles, patrol routes) need this to tell "the ground at this pixel" apart from "whatever model
@@ -5866,6 +6244,14 @@ void WorldRender::draw (glm::mat4x4 const& model_view
                 }
                 --clutter_compute_budget;
               }
+              // [CLUTTER PERSISTENT 2026-09-03] this chunk's blades live in a per-chunk VK buffer:
+              // skip the whole per-blade re-collection (the dominant per-frame clutter cost). The
+              // set is rebuilt by MapView every frame, so any fallback re-enters this path cleanly.
+              if (vk_native && !vk_clutter_chunks.empty() && vk_clutter_chunks.count(chunk))
+              {
+                ++dbg_chunks;
+                continue;
+              }
               auto const& doodads = chunk->detailDoodads();
               ++dbg_chunks;
               dbg_placed += static_cast<int>(doodads.size());
@@ -6179,14 +6565,32 @@ void WorldRender::draw (glm::mat4x4 const& model_view
           s_still += _vk_gl_still_drew; s_fed += _vk_classic_fed;
           s_pass += _vk_fb_pass; s_arena += _vk_fb_arena; s_empty += _vk_fb_empty;
           s_hidden += _vk_fb_hidden;
-          if (++s_glm2_frames >= 300)
+          // [2026-09-02] Was every 300 frames, and it therefore NEVER printed: VK only becomes the
+          // owner tens of seconds into a session, and the traced runs lasted 120-135 VK frames. This
+          // is the report that names what VK refuses and GL is covering for -- the exact work list
+          // for making the port native -- so it has to fire inside a short session. Divide by the
+          // real window, not a hardcoded 300.
+          if (++s_glm2_frames >= 60)
           {
-            LogError << "[VK] GL-M2/frame: stillDrewByGL=" << (s_still / 300)
-                     << " fedToVK=" << (s_fed / 300)
-                     << " | reject pass=" << (s_pass / 300)
-                     << " arena=" << (s_arena / 300)
-                     << " empty=" << (s_empty / 300)
-                     << " allHidden=" << (s_hidden / 300) << std::endl;
+            int const w = s_glm2_frames;
+            // ONE stream, ONE LogError: every `LogError <<` opens its own record with a timestamp
+            // prefix, so the old multi-statement version interleaved with other threads' logging
+            // and produced unreadable spliced lines.
+            std::ostringstream rep;
+            rep << "[VK] GL-M2/frame: stillDrewByGL=" << (s_still / w)
+                << " fedToVK=" << (s_fed / w)
+                << " | reject pass=" << (s_pass / w)
+                << " arena=" << (s_arena / w)
+                << " empty=" << (s_empty / w)
+                << " allHidden=" << (s_hidden / w)
+                << " | modelsSeen=" << _vk_dbg_models_seen
+                << " stillLoading=" << _vk_dbg_models_unloaded;
+            if (!_vk_fb_names.empty())
+            {
+              rep << " | GL-only models:";
+              for (auto const& n : _vk_fb_names) { rep << " " << n; }
+            }
+            LogError << rep.str() << std::endl;
             s_glm2_frames = 0; s_still = s_fed = s_pass = s_arena = s_empty = s_hidden = 0;
           }
         }
@@ -6194,6 +6598,9 @@ void WorldRender::draw (glm::mat4x4 const& model_view
         _classic_issued = 0;   // [VK-DIFF] per-FRAME count of the GL-only classic doodad path
         _vk_classic_fed = 0;
         _vk_fb_pass = _vk_fb_arena = _vk_fb_empty = _vk_fb_hidden = 0;
+        // [2026-09-05 DIAG] reset with the other per-frame counters, AFTER the report -- the feed
+        // loop below is what fills them, so the report carries the previous frame's tally.
+        _vk_dbg_models_seen = _vk_dbg_models_unloaded = 0;
         _vk_fb_names.clear();
         noggit::perf::Scoped _prof_ddraw(noggit::perf::Phase::DoodadDraw); // M2 spike hunt: instanced doodad buckets only
     SecTimer _sec2(g_vk_sec_ddraw_ms);
@@ -6805,7 +7212,10 @@ void WorldRender::draw (glm::mat4x4 const& model_view
               _pib_groups_cache.push_back(std::move(g));
             }
             _pib_groups_sig = pib_sig;
-            _pib_groups_valid = true;
+            // The snapshot froze whatever interior_light_at returned; a sample the per-frame budget deferred
+            // came back as OUTDOOR (0) and would stay that way until the next WMO-set change. Rebuild next
+            // frame while any sample of this build was deferred (docs/client_re/42 sec 16).
+            _pib_groups_valid = _interior_deferred_this_frame == 0;
           }
           std::vector<PibGroup>& pib_groups = _pib_groups_cache; // downstream bake/draw code unchanged
           for (auto const& g : pib_groups)
@@ -10162,22 +10572,43 @@ void WorldRender::updateLightingUniformBlock(bool draw_fog, glm::vec3 const& cam
   // Weather: every band (fog/diffuse/ambient/sky/water) blends toward the STORM param set by the
   // editor weather intensity (Sky::colorFor / floatParamFor read it).
   Skies::set_weather_intensity(_world->weather_type != 0 ? _world->weather_intensity : 0.0f);
-  _skies->update_sky_colors(camera_pos, daytime);
+  // [client RE 2026-09-09] the zone lights are evaluated at the PLAYER's position (wow335a.exe
+  // FUN_004f8410 stores the player position into the light block; FUN_007f1360 tests the 3-D
+  // distance to each light against its r1/r2; the rows are converted to yards at load, FUN_007eaf60).
+  // A player stands on the ground while the editor camera flies, and Northrend's falloff radii
+  // (250-825 yd) drop out at flight altitude: evaluate at the ground under an airborne camera so the
+  // editor shows the light a player there gets. A camera near the ground (game view, low editing)
+  // keeps its own position.
+  glm::vec3 light_eval_pos = camera_pos;
+  {
+    auto const ground_height = [&](float x, float z) -> std::optional<float>
+    {
+      MapChunk* const chunk = _world->getChunkAt(glm::vec3(x, 0.f, z));
+      if (!chunk)
+      {
+        return std::nullopt;
+      }
+      int const ix = glm::clamp(static_cast<int>((x - chunk->xbase) / UNITSIZE + 0.5f), 0, 8);
+      int const iz = glm::clamp(static_cast<int>((z - chunk->zbase) / UNITSIZE + 0.5f), 0, 8);
+      return chunk->getHeight(ix, iz); // nearest outer-grid vertex: ~2 yd, plenty for a 250+ yd radius
+    };
+    if (auto const ground = ground_height(camera_pos.x, camera_pos.z);
+        ground && camera_pos.y > *ground + 30.0f)
+    {
+      light_eval_pos.y = *ground + 2.0f;
+    }
+  }
+  _skies->update_sky_colors(light_eval_pos, daytime);
   _outdoor_light_stats = _outdoor_lighting->getLightStats(static_cast<int>(_world->time));
 
   glm::vec3 diffuse = _skies->color_set[LIGHT_GLOBAL_DIFFUSE];
   glm::vec3 ambient = _skies->color_set[LIGHT_GLOBAL_AMBIENT];
   glm::vec3 fog_color = _skies->color_set[FOG_COLOR];
-  // NORTHREND FOG = neutral grey, not the DBC band's saturated cyan. The 3.3.5a client forces sky-type-2
-  // zones (Northrend outdoor) to grey; noggit's param-569 FOG band is bright cyan RGB(86,178,211) = the
-  // blue/purple fog. Client trace wow_cap_icecrown_sky: D3DRS_FOGCOLOR = 0xFF808080 = RGB(128,128,128).
-  // Gate on WotLK + Northrend continent (map 571). WotLK/other continents untouched. See docs/client_re/30.
-  {
-    bool const wotlk_fog = []{ auto const* p = Noggit::Project::CurrentProject::get();
-      return p && p->projectVersion != Noggit::Project::ProjectVersion::CLASSIC; }();
-    if (wotlk_fog && _world->mapIndex._map_id == 571)
-      fog_color = glm::vec3(72.0f / 255.0f, 72.0f / 255.0f, 76.0f / 255.0f); // dark neutral grey (gloomy)
-  }
+  // The outdoor fog colour is the blended LightIntBand fog band and nothing else: wow335a.exe
+  // FUN_007f16f0 copies the blend's band-7 colour straight into the fog global (light+0x8c). The grey
+  // (72,72,76) override that sat here for map 571 came from misreading ScreenEffect.dbc's GHOST effect
+  // (FUN_004f7020 case 2: 0x4c4c63, 150 yd fog, celestials off) as a Northrend "sky type"; Icecrown's
+  // citadel light authors (0,47,66) at noon, the dark blue seen in game. Removed 2026-09-09.
   glm::vec3 ocean_color_light = _skies->color_set[OCEAN_COLOR_LIGHT];
   glm::vec3 ocean_color_dark = _skies->color_set[OCEAN_COLOR_DARK];
   glm::vec3 river_color_light = _skies->color_set[RIVER_COLOR_LIGHT];
@@ -10565,7 +10996,7 @@ void WorldRender::updateLightingUniformBlock(bool draw_fog, glm::vec3 const& cam
     // never lights units with MOLT point lights (they convert to linear-falloff directionals that are
     // hard-skipped at d>=attenEnd, i.e. always skipped in classic WMOs with attenEnd=0; RE_notes/15
     // section 5). Doodads/WMO geometry keep them.
-    struct CollectedLight { glm::vec3 pos; glm::vec3 color; float radius; float dist2; bool is_molt = false; };
+    struct CollectedLight { glm::vec3 pos; glm::vec3 color; float radius; float dist2; bool is_molt = false; bool modern = false; };
     std::vector<CollectedLight> collected;
 
     // [PERF 2026-07-21] AABB distance cull for the authored-light walks below. Both walk uncached over ALL
@@ -10672,6 +11103,26 @@ void WorldRender::updateLightingUniformBlock(bool draw_fog, glm::vec3 const& cam
           float const radius = glm::clamp(wl.r, 6.0f, 60.0f); // MOLT attenuation-end radius
           glm::vec3 const d = world - camera_pos;
           collected.push_back({world, col, radius, glm::dot(d, d), /*is_molt*/ true});
+          ++wmo_molt_lights;
+        }
+      }
+      // MNLD lights (modern WMOs, docs/client_re/42 sec 15): same pool, gated on the instance's doodad set.
+      if (wmo.wmo.get() && wmo.wmo->finishedLoading() && !wmo.wmo->new_lights.empty())
+      {
+        has_lights = true;
+        glm::mat4x4 const wmo_transform = wmo.transformMatrix();
+        uint16_t const instance_set = wmo.doodadset();
+        for (auto const& wl : wmo.wmo->new_lights)
+        {
+          if (wl.doodad_set != 0 && wl.doodad_set != instance_set)
+          {
+            continue;
+          }
+          glm::vec3 const world = glm::vec3(wmo_transform * glm::vec4(wl.pos, 1.0f));
+          glm::vec3 const col = glm::vec3(wl.fcolor) * std::max(wl.intensity, 0.0f);
+          float const radius = glm::clamp(wl.r, 1.0f, 60.0f);
+          glm::vec3 const d = world - camera_pos;
+          collected.push_back({world, col, radius, glm::dot(d, d), /*is_molt*/ true, /*modern*/ true});
           ++wmo_molt_lights;
         }
       }
@@ -10861,12 +11312,35 @@ void WorldRender::updateLightingUniformBlock(bool draw_fog, glm::vec3 const& cam
       {
         _lighting_ubo_data.PointLightPos[i] = glm::vec4(collected[i].pos, collected[i].radius);
         // color.w = 1 marks a WMO MOLT light: the m2 shader skips those for UNITS (client rule).
-        _lighting_ubo_data.PointLightColor[i] = glm::vec4(collected[i].color, collected[i].is_molt ? 1.f : 0.f);
+        // color.w: 0 = M2 light, 1 = WMO MOLT (units skip it, interior M2s never see it), 2 = WMO MNLD
+        // (modern rooms: reaches interior M2s and units -- docs/client_re/42 sec 16.2).
+        _lighting_ubo_data.PointLightColor[i] = glm::vec4(collected[i].color,
+                                                          collected[i].modern ? 2.f : (collected[i].is_molt ? 1.f : 0.f));
       }
       else
       {
         _lighting_ubo_data.PointLightPos[i] = glm::vec4(0.f);
         _lighting_ubo_data.PointLightColor[i] = glm::vec4(0.f);
+      }
+    }
+    {
+      // Diagnostic (NOGGIT_LIGHT_DEBUG): the pool the M2 / terrain shaders see this frame, every ~4 s.
+      static bool const s_pool_dbg = std::getenv("NOGGIT_LIGHT_DEBUG") != nullptr;
+      static int s_pool_tick = 0;
+      if (s_pool_dbg && (++s_pool_tick % 80) == 0)
+      {
+        int modern = 0;
+        for (auto const& l : collected) { modern += l.modern ? 1 : 0; }
+        std::ostringstream os;
+        os << "[light-pool] collected=" << collected.size() << " modern=" << modern << " used=" << count
+           << " cam=(" << camera_pos.x << "," << camera_pos.y << "," << camera_pos.z << ")";
+        for (int i = 0; i < count; ++i)
+        {
+          os << " | #" << i << " f=" << (collected[i].modern ? 2 : (collected[i].is_molt ? 1 : 0))
+             << " d=" << std::sqrt(collected[i].dist2) << " r=" << collected[i].radius
+             << " c=(" << collected[i].color.r << "," << collected[i].color.g << "," << collected[i].color.b << ")";
+        }
+        LogError << os.str() << std::endl;
       }
     }
     } // end if (rebuild_point_lights) -- else frames reuse last-built cached point-light UBO set
@@ -10900,8 +11374,9 @@ namespace
       sizeof(glm::vec4) * (1 + 2 * OpenGL::MAX_POINT_LIGHTS);
 }
 
-void WorldRender::setWmoGroupPointLights(WMO const* wmo, std::vector<int16_t> const& light_refs,
-                                         glm::mat4x4 const& transform, glm::vec3 const& camera_pos)
+void WorldRender::setWmoGroupPointLights(WMO const* wmo, std::vector<WMOLight> const& lights,
+                                         std::vector<int16_t> const& light_refs,
+                                         glm::mat4x4 const& transform, glm::vec3 const& camera_pos, uint16_t doodad_set)
 {
   // Per-room lighting (client MOLR semantics): this group's surfaces are lit ONLY by the MOLT
   // lights its MOLR chunk references -- no light bleeding in from the next hall, and dense
@@ -10912,23 +11387,30 @@ void WorldRender::setWmoGroupPointLights(WMO const* wmo, std::vector<int16_t> co
   std::vector<Scoped> scoped;
   scoped.reserve(light_refs.size());
 
+  (void)wmo;
   for (int16_t ref : light_refs)
   {
-    if (ref < 0 || static_cast<std::size_t>(ref) >= wmo->lights.size())
+    if (ref < 0 || static_cast<std::size_t>(ref) >= lights.size())
     {
       continue;
     }
-    auto const& wl = wmo->lights[ref];
+    auto const& wl = lights[ref];
+    if (wl.modern && wl.doodad_set != 0 && wl.doodad_set != doodad_set)
+    {
+      continue; // MNLD light of another doodad set
+    }
     glm::vec3 const world = glm::vec3(transform * glm::vec4(wl.pos, 1.0f));
     glm::vec3 const col = glm::vec3(wl.fcolor) * std::max(wl.intensity, 0.0f);
-    float const radius = glm::clamp(wl.r, 6.0f, 60.0f); // same MOLT radius rule as the global pool
+    // MOLT keeps the 6-unit floor of the WotLK rule; MNLD lights reach exactly their attenEnd (0.7..45
+    // units on the crypt) -- the same (1 - d/r)^2 falloff the WMO shader applies to every point light.
+    float const radius = wl.modern ? glm::clamp(wl.r, 1.0f, 60.0f) : glm::clamp(wl.r, 6.0f, 60.0f);
     if (!std::isfinite(world.x) || !std::isfinite(world.y) || !std::isfinite(world.z)
         || !std::isfinite(radius) || !std::isfinite(col.r) || !std::isfinite(col.g) || !std::isfinite(col.b))
     {
       continue;
     }
     glm::vec3 const d = world - camera_pos;
-    scoped.push_back({glm::vec4(world, radius), glm::vec4(col, 0.f), glm::dot(d, d)});
+    scoped.push_back({glm::vec4(world, radius), glm::vec4(col, wl.modern ? 2.f : 1.f), glm::dot(d, d)});
   }
 
   // Rooms rarely reference more than 16 lights; when they do, keep the nearest to the camera.

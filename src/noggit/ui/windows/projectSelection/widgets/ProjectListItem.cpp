@@ -7,12 +7,21 @@ namespace Noggit::Ui::Widget
     auto layout = QGridLayout();
 
     QIcon icon;
-    if (data.project_version == Project::ProjectVersion::CLASSIC)
-      icon = QIcon(":/icon-classic");
-    else if (data.project_version == Project::ProjectVersion::WOTLK)
-      icon = QIcon(":/icon-wrath");
-    else if (data.project_version == Project::ProjectVersion::SL)
-      icon = QIcon(":/icon-shadow");
+    switch (data.project_version)
+    {
+      case Project::ProjectVersion::CLASSIC:
+      case Project::ProjectVersion::CLASSIC_ERA: icon = QIcon(":/icon-classic"); break; // modern store, vanilla world
+      case Project::ProjectVersion::BC:
+      case Project::ProjectVersion::ANNIVERSARY: icon = QIcon(":/icon-burning"); break; // modern store, TBC world
+      case Project::ProjectVersion::WOTLK:       icon = QIcon(":/icon-wrath"); break;
+      case Project::ProjectVersion::CATA:        icon = QIcon(":/icon-cata"); break;
+      case Project::ProjectVersion::PANDARIA:    icon = QIcon(":/icon-panda"); break;
+      case Project::ProjectVersion::WOD:         icon = QIcon(":/icon-warlords"); break;
+      case Project::ProjectVersion::LEGION:      icon = QIcon(":/icon-legion"); break;
+      case Project::ProjectVersion::BFA:         icon = QIcon(":/icon-battle"); break;
+      case Project::ProjectVersion::SL:          icon = QIcon(":/icon-shadow"); break;
+      default: break;
+    }
     _project_version_icon = new QLabel("", parent);
     _project_version_icon->setPixmap(icon.pixmap(QSize(48, 48)));
     _project_version_icon->setGeometry(0, 5, 64, 48);
@@ -37,12 +46,21 @@ namespace Noggit::Ui::Widget
     _project_directory_label->setAutoFillBackground(true);
 
     QString version;
-    if (data.project_version == Project::ProjectVersion::CLASSIC)
-      version = "Turtle WoW";
-    else if (data.project_version == Project::ProjectVersion::WOTLK)
-      version = "Wrath Of The Lich King";
-    else if (data.project_version == Project::ProjectVersion::SL)
-      version = "Shadowlands";
+    switch (data.project_version)
+    {
+      case Project::ProjectVersion::CLASSIC:     version = "Turtle WoW"; break;
+      case Project::ProjectVersion::CLASSIC_ERA: version = "Classic Era (CASC)"; break;
+      case Project::ProjectVersion::BC:          version = "The Burning Crusade"; break;
+      case Project::ProjectVersion::ANNIVERSARY: version = "Anniversary (CASC)"; break;
+      case Project::ProjectVersion::WOTLK:       version = "Wrath Of The Lich King"; break;
+      case Project::ProjectVersion::CATA:        version = "Cataclysm"; break;
+      case Project::ProjectVersion::PANDARIA:    version = "Mists of Pandaria"; break;
+      case Project::ProjectVersion::WOD:         version = "Warlords of Draenor"; break;
+      case Project::ProjectVersion::LEGION:      version = "Legion"; break;
+      case Project::ProjectVersion::BFA:         version = "Battle for Azeroth"; break;
+      case Project::ProjectVersion::SL:          version = "Shadowlands"; break;
+      default: break;
+    }
 
     _project_version_label = new QLabel(version, parent);
     _project_version_label->setGeometry(48, 35, max_width, 20);

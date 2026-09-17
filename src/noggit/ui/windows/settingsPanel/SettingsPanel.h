@@ -6,6 +6,7 @@
 
 #include <QtCore/QSettings>
 #include <QMainWindow>
+#include <QLineEdit>
 #include <QtWidgets/QCheckBox>
 #include <ui_SettingsPanel.h>
 
@@ -21,6 +22,7 @@ namespace Noggit
     {
       Q_OBJECT
       QSettings* _settings;
+      QLineEdit* _casc_listfile_field = nullptr; // Settings > Paths: CASC listfile (modern clients)
       ::Ui::SettingsPanel* ui;
       // Persistent render-feature toggles shown on the Graphics tab: {settings key, checkbox, default}.
       // Mirror the live View-menu/toolbar switches but survive restarts (applied by MapView at load).

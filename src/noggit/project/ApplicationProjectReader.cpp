@@ -90,6 +90,11 @@ namespace Noggit::Project
               project.ClientPath = project_client_configuration["ClientPath"].toString().toStdString();
             }
 
+            if (project_client_configuration.contains("Product"))
+            {
+              project.ClientProduct = project_client_configuration["Product"].toString().toStdString();
+            }
+
             if (project_client_configuration.contains("ClientVersion"))
             {
               auto client_version = project_client_configuration["ClientVersion"].toString().toStdString();
@@ -108,6 +113,16 @@ namespace Noggit::Project
               if (client_version == std::string("Wrath Of The Lich King"))
               {
                 client_version_enum = Noggit::Project::ProjectVersion::WOTLK;
+              }
+
+              if (client_version == std::string("Classic Era"))
+              {
+                client_version_enum = Noggit::Project::ProjectVersion::CLASSIC_ERA;
+              }
+
+              if (client_version == std::string("Anniversary"))
+              {
+                client_version_enum = Noggit::Project::ProjectVersion::ANNIVERSARY;
               }
 
               project.projectVersion = client_version_enum;

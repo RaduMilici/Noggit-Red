@@ -185,7 +185,19 @@ void LiquidTextureManager::upload()
     }
 
     blp_texture tex(filename + "1.blp", _context);
-    tex.finishLoading();
+    try
+    {
+      tex.finishLoading();
+    }
+    catch (std::exception const& e)
+    {
+      // A texture the client lists but cannot deliver (Forever Beta: encrypted behind a missing TACT key,
+      // docs/client_re/42 sec 17.1) skips its liquid type instead of taking the map load down.
+      gl.deleteTextures(1, &array);
+      LogError << "Skipping liquid type " << liquid_type_id << ": texture '" << filename
+               << "1.blp' cannot be loaded (" << e.what() << ")" << std::endl;
+      continue;
+    }
 
     int width_ = tex.width();
     int height_ = tex.height();
@@ -228,7 +240,17 @@ void LiquidTextureManager::upload()
       }
 
       blp_texture tex_frame(filename + std::to_string(j + 1) + ".blp", _context);
-      tex_frame.finishLoading();
+      try
+      {
+        tex_frame.finishLoading();
+      }
+      catch (std::exception const& e)
+      {
+        LogError << "Liquid type " << liquid_type_id << ": frame " << (j + 1) << " cannot be loaded (" << e.what()
+                 << "); keeping " << j << " frames" << std::endl;
+        n_frames = j;
+        break;
+      }
 
       if (tex_frame.height() != tex.height() || tex_frame.width() != tex.width())
         LogError << "Liquid texture resolution mismatch. Make sure all textures within a liquid type use identical format." << std::endl;

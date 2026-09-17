@@ -125,8 +125,11 @@ namespace OpenGL
     unsigned _pad3;
     unsigned _pad4;
     unsigned _pad5;
-    unsigned _pad6;
-    unsigned _pad7;
+    // 1.60.1 PBR water (LiquidType material 130): the row's own shallow / deep colour as
+    // 0x80RRGGBB / 0x00RRGGBB (bit 31 of the light word = "use these instead of the zone bands").
+    // The beta's new light params author no river/ocean bands, so those rows drew black.
+    unsigned row_color_light;
+    unsigned row_color_dark;
   };
 
   struct M2RenderState

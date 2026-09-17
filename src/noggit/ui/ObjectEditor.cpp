@@ -927,6 +927,8 @@ namespace Noggit
                 ModelInstance* mi = static_cast<ModelInstance*>(obj);
                 if (mi->model.get() && mi->model->file_key().hasFilepath())
                     path = mi->model->file_key().filepath();
+                else if (mi->model.get() && mi->model->file_key().hasFileDataID())
+                    path = "fdid:" + std::to_string(mi->model->file_key().fileDataID()); // modern client, unlisted file
             }
             else if (obj->which() == eWMO)
             {
@@ -936,6 +938,8 @@ namespace Noggit
                 WMOInstance* wi = static_cast<WMOInstance*>(obj);
                 if (wi->wmo.get() && wi->wmo->file_key().hasFilepath())
                     path = wi->wmo->file_key().filepath();
+                else if (wi->wmo.get() && wi->wmo->file_key().hasFileDataID())
+                    path = "fdid:" + std::to_string(wi->wmo->file_key().fileDataID()); // modern client, unlisted file
 
                 QSignalBlocker const doodadsetblocker(_doodadSetSelector);
                 _doodadSetSelector->clear();

@@ -135,9 +135,9 @@ public:
             );
 
   void intersect (math::ray const&, selection_result*, bool do_exterior = true, float max_dist = 0.0f);
-  // [doc 38 footsteps] nearest ground hit: {world distance, the hit face's authored TerrainType
-  // row} via per-triangle MOPY material -> WMOMaterial.ground_type. nullopt = miss.
-  std::optional<std::pair<float, int>> groundHit(math::ray const&, float max_dist);
+  // [client RE 2026-09-09] the ground-type cast against this instance (world ray -> model space;
+  // unscaled WMOs keep distances 1:1), accumulated into io -- see wmo_ground_query.
+  void groundQuery(math::ray const&, float reach, wmo_ground_query& io);
   // [game mode] ray-test this WMO's OWN doodads (fences, crates, rocks placed by the WMO) --
   // per-triangle via ModelInstance::intersect. Separate from intersect() so editor selection
   // behaviour (WMO doodads are not selectable) stays unchanged.

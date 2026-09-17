@@ -21,6 +21,11 @@ public:
   void open(std::shared_ptr<BlizzardArchive::ClientData> clientData);
   void save();
 
+  // Modern (DB2) clients: replace the contents with a table synthesized in the WotLK column layout
+  // (noggit/db2/ModernDBC). records = field_count * 4 bytes per row, string_table starts with '\0'.
+  void loadSynthesized(std::uint32_t field_count, std::vector<unsigned char> records, std::vector<char> string_table);
+  std::string const& getFilename() const { return filename; }
+
   class NotFound : public std::runtime_error
   {
   public:

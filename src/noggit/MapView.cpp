@@ -3,6 +3,7 @@
 #include <noggit/DBC.h>
 #include <noggit/MapChunk.h>
 #include <noggit/MapView.h>
+namespace Noggit { void printStacktrace(); }   // error_handling.cpp (StackWalker on WIN32)
 #include <noggit/Misc.h>
 #include <noggit/ModelManager.h> // ModelManager
 #include <noggit/TextureManager.h> // TextureManager, Texture
@@ -49,6 +50,17 @@ static std::unordered_map<std::string, std::int32_t> s_vk_tex_ids;
 // Anything not ready in time is decoded inline exactly as before, so this can only be a win.
 namespace
 {
+  // [2026-09-05] Last M2 frame counts, so the 60-frame NATIVE HOLES line can carry them. The
+  // M2-frame log fires every 300 frames, which a short session samples at most once -- not enough
+  // to tell a still-streaming scene from a broken one.
+  std::size_t& vkLastM2Draws()     { static std::size_t v = 0; return v; }
+  std::size_t& vkLastM2Instances() { static std::size_t v = 0; return v; }
+  std::size_t& vkLastM2TexPairs()  { static std::size_t v = 0; return v; }
+  std::size_t& vkLastM2Bones()     { static std::size_t v = 0; return v; }
+  // texture pairs that resolved to a NEGATIVE bindless id (BLP not resident): those models draw
+  // untextured/discarded -- invisible -- while the few grass BLPs resolve early and show.
+  std::size_t& vkLastM2UnresolvedPairs() { static std::size_t v = 0; return v; }
+
   struct VkPfDecoded
   {
     bool ok = false, compressed = false;
@@ -156,6 +168,46 @@ namespace
 #include <external/tracy/Tracy.hpp>
 #include <noggit/ui/object_palette.hpp>
 #include <external/glm/gtc/type_ptr.hpp>
+
+#ifdef _WIN32
+#include <QAbstractNativeEventFilter>
+#include <QApplication>
+#include <QWindow>
+
+// [VULKAN NATIVE PRESENT, 2026-09-03] WM_NCHITTEST -> HTTRANSPARENT on the present child window:
+// the OS skips it during hit-testing, so every mouse event lands on the main window and Qt routes
+// it to the widget under the cursor exactly as in GL mode. Keyboard focus never moves (the child
+// is never activated by a click).
+namespace
+{
+  struct VkPresentHitFilter : QAbstractNativeEventFilter
+  {
+    std::unordered_set<void*> hwnds;
+    bool nativeEventFilter(QByteArray const& type, void* message, long* result) override
+    {
+      if (type != "windows_generic_MSG")
+        return false;
+      MSG* const msg = static_cast<MSG*>(message);
+      if (msg->message == WM_NCHITTEST && hwnds.count(reinterpret_cast<void*>(msg->hwnd)))
+      {
+        *result = HTTRANSPARENT;
+        return true;
+      }
+      return false;
+    }
+  };
+  VkPresentHitFilter& vkPresentHitFilter()
+  {
+    static VkPresentHitFilter f;
+    return f;
+  }
+}
+// [VULKAN NATIVE PRESENT] reachable from resizeGL / captureFrameNow, which live outside draw_map's
+// static interop block. Pointer only -- the object is the function-local static backend inside
+// draw_map (it lives to process exit).
+namespace Noggit::Rendering::VK { class VulkanBackend; }
+static Noggit::Rendering::VK::VulkanBackend* g_vk_capture_backend = nullptr;
+#endif
 #include <opengl/types.hpp>
 #include <limits>
 #include <variant>
@@ -5437,9 +5489,28 @@ void MapView::setupViewMenu()
 
   ADD_TOGGLE_NS(view_menu, "Show light zones", _show_minimap_skies);
 
+  // [2026-09-06] Persist this toggle ONLY on the user's own menu click. Its change handler used to
+  // write every value that reached the property -- so any programmatic set(false) (a harness
+  // "clean capture", a mode switch, a startup gate) got PERSISTED and spawns came up off on the
+  // next launch. Find the action ADD_TOGGLE_NS just created and mark user clicks.
+  for (QAction* a : view_menu->actions())
+    if (a->text() == "Creature spawns")
+      connect(a, &QAction::triggered, this, [this](bool) { _creature_spawns_user_click = true; });
   connect(&_draw_creature_spawns, &Noggit::BoolToggleProperty::changed, [this](bool enabled)
   {
     _world->setDrawCreatureSpawns(enabled);
+    // [2026-09-06 DIAG] name every write of this key -- the user's setting keeps flipping to false
+    // with no user action, and this lambda is the only persisting writer in the tree.
+    LogError << "[SPAWN-TOGGLE] view/creature_spawns <- " << (enabled ? "true" : "false") << std::endl;
+    bool const user_click = _creature_spawns_user_click;
+    _creature_spawns_user_click = false;
+    if (!enabled && !user_click)
+    {
+      // Programmatic OFF: honour it for this session's drawing, but NEVER persist it. The user's
+      // saved choice survives whatever a harness or mode switch does at runtime.
+      LogError << "[SPAWN-TOGGLE] programmatic off -- NOT persisted" << std::endl;
+      return;
+    }
     _settings->setValue("view/creature_spawns", enabled);
 
     if (enabled)
@@ -9546,9 +9617,13 @@ void MapView::createGUI()
 
   set_editing_mode (editing_mode::ground);
 
-  _draw_creature_spawns.set(creature_capture_overlay_enabled()
-                              ? _settings->value("view/creature_spawns", false).toBool()
-                              : false);
+  // [2026-09-06] Creature spawns are NEVER forced off. The old form gated the restore on an env
+  // var and fell back to FALSE -- and because the toggle's change handler persists its value, a
+  // forced-off start WROTE false back to the user's settings, so spawns came up off on every
+  // later restart. Restore exactly what the user saved; default ON if the key was never written.
+  LogError << "[SPAWN-TOGGLE] startup restore: saved=" << (_settings->value("view/creature_spawns", true).toBool() ? "true" : "false")
+           << " current=" << (_draw_creature_spawns.get() ? "true" : "false") << std::endl;
+  _draw_creature_spawns.set(_settings->value("view/creature_spawns", true).toBool());
   _settings->setValue("map_view/creature_browser", false);
   _settings->sync();
   _show_creature_browser.set(false);
@@ -10197,6 +10272,23 @@ void MapView::paintGL()
   if (lock)
     return;
 
+  // Live "Character models" fidelity (Settings): the spawns resolve their model + bake through the
+  // value, so re-resolve them when it changes. Polled every 30 frames; the reload runs after this paint.
+  {
+    static int fidelity_seen = -1;
+    static int fidelity_poll = 0;
+    if (++fidelity_poll >= 30)
+    {
+      fidelity_poll = 0;
+      int const fidelity = QSettings().value("render/character_model_fidelity", 0).toInt();
+      if (fidelity_seen != -1 && fidelity != fidelity_seen && _world)
+      {
+        QTimer::singleShot(0, this, [this] { refreshCreatureSpawnOverlay(true); });
+      }
+      fidelity_seen = fidelity;
+    }
+  }
+
   if (!_needs_redraw)
     return;
   else
@@ -10521,6 +10613,16 @@ void MapView::resizeGL (int width, int height)
   OpenGL::context::scoped_setter const _ (::gl, context());
   gl.viewport(0.0f, 0.0f, width, height);
   emit resized();
+#ifdef _WIN32
+  // [VULKAN NATIVE PRESENT] keep the present child window glued to the viewport
+  if (_vk_present_container)
+  {
+    _vk_present_container->setGeometry(rect());
+    raiseViewportOverlayWidgets();   // panels built lazily after the surface must stay on top
+  }
+  if (g_vk_capture_backend)
+    g_vk_capture_backend->notifyPresentResize();
+#endif
   _camera_moved_since_last_draw = true;
   _needs_redraw = true;
 }
@@ -10531,6 +10633,13 @@ MapView::~MapView()
   makeCurrent();
 
   _destroying = true;
+
+#ifdef _WIN32
+  // [VULKAN NATIVE PRESENT] the HWND dies with this widget; a recycled handle value must never
+  // stay hit-test-transparent for some future window
+  if (_vk_present_window)
+    vkPresentHitFilter().hwnds.erase(reinterpret_cast<void*>(_vk_present_window->winId()));
+#endif
 
   // AUDIO TEARDOWN (user 2026-08-27: "water sound gets stuck playing even after changing map").
   // ZoneMusicPlayer is a child widget and stops itself in its destructor, but WaterSoundPlayer is
@@ -13511,6 +13620,15 @@ namespace vk_diff
     static bool const e = (parityCheck() || std::getenv("NOGGIT_VK_DIFF") != nullptr) && vkOn() && !vkFull();
     return e;
   }
+  // [VULKAN NATIVE PRESENT, 2026-09-03] Settings "Vulkan" now means NATIVE: the backend owns a
+  // swapchain on a child window; GL neither composes nor blits the frame. The GL-import compose
+  // survives ONLY as the parity harness's instrument (enabled()) and as the
+  // NOGGIT_VK_NO_PRESENT=1 dev A/B fallback.
+  inline bool nativeView()
+  {
+    static bool const n = vkOn() && !enabled() && std::getenv("NOGGIT_VK_NO_PRESENT") == nullptr;
+    return n;
+  }
   inline double envf(char const* name, double def)
   {
     char const* v = std::getenv(name);
@@ -13610,6 +13728,19 @@ void MapView::draw_map()
   std::string diff_capture_name;
   // (VK readiness is not visible here -- the interop struct lives in the VK block below; the harness
   //  only steps once the backend has produced a textured mesh, which vk_diff::ready() records.)
+  // [HARNESS-ONLY, 2026-09-16] vkReady() is raised by the terrain tile pack; a WMO-only map (Molten
+  // Core) packs no tile, so the camera list below never applied and every capture stood at the
+  // enterMapAt corner outside the dungeon. The global WMO having finished loading is that map's
+  // readiness.
+  if (g_noggit_harness_silent && vk_diff::enabled() && !s_diff_done && !vk_diff::vkReady()
+      && _world->mapIndex.hasAGlobalWMO())
+  {
+    auto global_wmo = _world->getModelInstanceStorage().get_wmo_instance(_world->mWmoEntry.uniqueID);
+    if (global_wmo.has_value() && global_wmo.value()->wmo->finishedLoading())
+    {
+      vk_diff::vkReady() = true;
+    }
+  }
   // HARNESS ONLY. This teleports the camera to the parity camera list, so it must never run in an
   // interactive session -- with render/vk_parity_check on it flung the user out of the world the
   // moment VK reported ready, on whatever map they had open.
@@ -13912,6 +14043,7 @@ void MapView::draw_map()
         Noggit::Rendering::VK::VulkanBackend backend;
         GLuint memobj = 0, tex = 0, fbo = 0, sem_vk_done = 0, sem_gl_done = 0;
         bool tried = false, ok = false, first_frame = true;
+        bool native = false; // [NATIVE PRESENT] backend presents; every GL interop path is skipped
         // [VULKAN phase A] depth import + compose: the VK D32 depth image imported as a GL depth texture;
         // a fullscreen program writes VK colour + gl_FragDepth into the cleared scene target before the
         // GL passes (WorldRender::pre_scene_compose). compose_ok false -> old corner preview only.
@@ -13944,6 +14076,11 @@ void MapView::draw_map()
             id = d.compressed ? s_vk.backend.addTextureCompressed(d.vf, d.w, d.h, d.mips)
                               : s_vk.backend.addTextureMips(d.mips, d.w, d.h);
           s_vk_tex_ids.emplace(name, id);
+          // [2026-09-03 BLACK-MODEL DIAG] a name that resolves to no bindless texture draws its
+          // batches BLACK (-1). The -1 is cached, so this logs exactly once per name.
+          if (id < 0 && !name.empty())
+            LogError << "[VK] BLP unresolved (draws black): '" << name
+                     << "' decode_ok=" << (d.ok ? 1 : 0) << std::endl;
           {
             std::lock_guard<std::mutex> lk(s_pf_mtx);
             s_pf_seen.erase(name);
@@ -13995,8 +14132,14 @@ void MapView::draw_map()
 
       // [phase B] latch the VK image size only after the Qt layout has settled (docks/status bar shrink the
       // viewport during the first frames -> a size mismatch would disable the parity comparison for good)
+      // [NATIVE 2026-09-03] the 30-frame wait existed for the PARITY compare (size latch after the
+      // Qt layout settles). In native mode it meant 30 frames of the PURE-GL world on screen and
+      // then a visible GL->VK handover: full scene -> flash -> everything restreams. Native now
+      // initialises on the FIRST frame -- the GL scene is never shown, the swapchain sizes to the
+      // window on its own, and the offscreen blit scales if the layout still settles afterwards.
       static int s_vk_warmup_frames = 0;
-      if (!s_vk.tried && ++s_vk_warmup_frames > 30)
+      ++s_vk_warmup_frames;
+      if (!s_vk.tried && s_vk_warmup_frames > (vk_diff::nativeView() ? 0 : 30))
       {
         s_vk.tried = true;
         {
@@ -14006,6 +14149,15 @@ void MapView::draw_map()
           {
             VK_W = static_cast<std::uint32_t>(ivp[2]);
             VK_H = static_cast<std::uint32_t>(ivp[3]);
+            // [2026-09-06] NOGGIT_VK_FORCE_SIZE=WxH: the harness window cannot exceed the monitor,
+            // so the user's 2288x1329 offscreen target could never be reproduced by resizing the
+            // window. Force the render-target extent directly (present blit scales to the surface).
+            if (char const* fs = std::getenv("NOGGIT_VK_FORCE_SIZE"))
+            {
+              unsigned fw = 0, fh = 0;
+              if (std::sscanf(fs, "%ux%u", &fw, &fh) == 2 && fw >= 64 && fh >= 64)
+              { VK_W = fw; VK_H = fh; }
+            }
           }
         }
         auto* ctx = QOpenGLContext::currentContext();
@@ -14018,13 +14170,48 @@ void MapView::draw_map()
         s_vk.pWaitSemaphore = reinterpret_cast<decltype(s_vk.pWaitSemaphore)>(gp("glWaitSemaphoreEXT"));
         s_vk.pSignalSemaphore = reinterpret_cast<decltype(s_vk.pSignalSemaphore)>(gp("glSignalSemaphoreEXT"));
 
-        if (!s_vk.pCreateMemoryObjects || !s_vk.pImportMemoryWin32Handle || !s_vk.pTexStorageMem2D
-            || !s_vk.pGenSemaphores || !s_vk.pImportSemaphoreWin32Handle
-            || !s_vk.pWaitSemaphore || !s_vk.pSignalSemaphore)
+        // [VULKAN NATIVE PRESENT, 2026-09-03] Settings "Vulkan" = native: the backend gets its own
+        // swapchain on a child window and GL touches nothing. The GL-import compose below survives
+        // untouched for the parity harness (enabled()) and the NOGGIT_VK_NO_PRESENT dev fallback.
+        s_vk.native = vk_diff::nativeView();
+        // [MSAA] mirror GL's SCENE MSAA -- Settings "render/msaa" (default 4, NOGGIT_MSAA A/B
+        // override), the same source WorldRender reads for its _msaa_fbo. The GL SURFACE has no
+        // samples (SamplesCount 0), so format().samples() would read 0. GL applies it live; VK
+        // applies it at map (re)open, like the Graphics API dropdown itself. Parity/compose = 1.
+        int vk_msaa = _settings->value("render/msaa", 4).toInt();
+        if (char const* msaa_env = std::getenv("NOGGIT_MSAA"))
+          vk_msaa = std::atoi(msaa_env);
+        if (vk_msaa != 2 && vk_msaa != 4 && vk_msaa != 8)
+          vk_msaa = 1;
+        if (s_vk.native && s_vk.backend.init(VK_W, VK_H, static_cast<std::uint32_t>(vk_msaa)))
+        {
+          if (s_vk.backend.presentCapable())
+          {
+            s_vk.ok = true;
+            s_vk.backend.setFrameSemExternallyWaited(false);
+            g_vk_capture_backend = &s_vk.backend;
+            if (!_vk_present_requested)
+            {
+              _vk_present_requested = true;
+              QMetaObject::invokeMethod(this, [this]() { ensureVkPresentSurface(); }, Qt::QueuedConnection);
+            }
+            LogError << "[VK] NATIVE mode: GL interop skipped; present surface requested" << std::endl;
+          }
+          else
+          {
+            // a driver without surface/swapchain support keeps the proven GL-import compose
+            LogError << "[VK] native present unavailable -- falling back to GL compose" << std::endl;
+            s_vk.native = false;
+          }
+        }
+        if (!s_vk.native && !s_vk.ok
+            && (!s_vk.pCreateMemoryObjects || !s_vk.pImportMemoryWin32Handle || !s_vk.pTexStorageMem2D
+                || !s_vk.pGenSemaphores || !s_vk.pImportSemaphoreWin32Handle
+                || !s_vk.pWaitSemaphore || !s_vk.pSignalSemaphore))
         {
           LogError << "[VK] GL_EXT_memory_object_win32 / GL_EXT_semaphore_win32 not available -- interop off" << std::endl;
         }
-        else if (s_vk.backend.init(VK_W, VK_H))
+        else if (!s_vk.native && !s_vk.ok && (s_vk.backend.ready() || s_vk.backend.init(VK_W, VK_H)))
         {
           s_vk.pCreateMemoryObjects(1, &s_vk.memobj);
           s_vk.pImportMemoryWin32Handle(s_vk.memobj, s_vk.backend.imageMemorySize(),
@@ -14135,6 +14322,23 @@ void main()
 
       if (s_vk.ok && s_vk.backend.ready())
       {
+        // [VULKAN NATIVE PRESENT] attach the swapchain as soon as the queued child window exists,
+        // and declare native ownership of every pass to the renderer for this frame.
+        if (s_vk.native)
+        {
+          if (!s_vk.backend.presentActive() && _vk_present_window)
+            s_vk.backend.initPresent(reinterpret_cast<void*>(_vk_present_window->winId()));
+          auto* wrn = _world->renderer();
+          wrn->vk_native = true;
+          wrn->setVkOwnsWmo(true);
+          wrn->setVkOwnsCelestials(true);
+          if (wrn->skies())
+            wrn->skies()->setVkOwnsDome(true);
+        }
+        else
+        {
+          _world->renderer()->vk_native = false;
+        }
         // [VK-1b/1c] feed the REAL terrain to the backend: the nearest tile + its loaded 3x3 neighbourhood
         // (rebuilt when the nearest tile changes). Chunk layout: 145 verts (9x9 outer + 8x8 centre,
         // 17-stride interleave), 4 tris per cell.
@@ -15341,185 +15545,10 @@ void main()
           }
           auto const _w_tail0 = std::chrono::steady_clock::now();
 
-          // [overnight stage 4] DOODADS: unique models' geometry (ModelVertex position+normal) + all their
-          // instances (cpu_transforms) from the neighbourhood's persistent buffers, as per-model draw ranges.
-          static std::vector<float> vk_dverts;
-          static std::vector<std::uint32_t> vk_didx;
-          static std::vector<float> vk_dinst;
-          static std::vector<Noggit::Rendering::VK::VulkanBackend::DoodadDraw> vk_ddraws;
-          // [finding 80] Doodad and WMO GEOMETRY is model-local and never changes, yet both blocks
-          // used to clear these buffers and re-push every vertex and index of the whole
-          // neighbourhood on every rebuild -- a flat ~6 ms tax on every crossing (wmoEmit alone was
-          // 5.2 ms, dead constant across 15 rebuilds). Same "rebuild everything" pattern already
-          // removed from the alpha maps (385 ms) and the water streams (24 ms).
-          //
-          // The buffers are now APPEND-ONLY and each unique model/group keeps a permanent span.
-          // A rebuild walks the cache, not the geometry. Only the instance stream is rebuilt.
-          // src_verts stamps the source size: a Model or WMOGroup can be unloaded and a different
-          // one allocated at the same address, which would otherwise serve stale geometry.
-          struct GeomSpan { std::int32_t base_vertex = 0; std::uint32_t first_index = 0,
-                            index_count = 0; std::size_t src_verts = 0; };
-          static std::map<void const*, GeomSpan> s_dgeom;
-          // Bound the cache: a long flight sees new models forever. Dropping it wholesale costs one
-          // rebuild at the old price, which is far cheaper than a free-list that fragments (the
-          // water allocator already grows on most crossings).
-          static constexpr std::size_t kDGeomVertCap = 16u * 1024u * 1024u;   // floats -> 64 MB
-          if (vk_dverts.size() > kDGeomVertCap)
-          {
-            s_dgeom.clear(); vk_dverts.clear(); vk_didx.clear();
-            LogError << "[VK] doodad/WMO geometry cache reset (cap reached)" << std::endl;
-          }
-          vk_dinst.clear();
-          vk_ddraws.clear();
-          {
-            _w_tail = std::chrono::duration<double, std::milli>(
-                        std::chrono::steady_clock::now() - _w_tail0).count();
-            auto const _dg0 = std::chrono::steady_clock::now();
-            std::map<Model*, std::vector<glm::mat4x4>> by_model;
-            for (MapTile* t : vk_tiles)
-            {
-              for (auto const& kv : t->renderer()->doodadInstanceBuffers())
-              {
-                Model* m = kv.first;
-                if (!m || !m->finishedLoading() || m->loading_failed()
-                    || m->_vertices.empty() || m->_indices.empty() || kv.second.cpu_transforms.empty())
-                  continue;
-                auto& dst = by_model[m];
-                dst.insert(dst.end(), kv.second.cpu_transforms.begin(), kv.second.cpu_transforms.end());
-              }
-            }
-            _rb_dgather = std::chrono::duration<double, std::milli>(
-                            std::chrono::steady_clock::now() - _dg0).count();
-            auto const _de0 = std::chrono::steady_clock::now();
-            for (auto const& bm : by_model)
-            {
-              Model* m = bm.first;
-              auto cached = s_dgeom.find(m);
-              if (cached != s_dgeom.end() && cached->second.src_verts != m->_vertices.size())
-              { s_dgeom.erase(cached); cached = s_dgeom.end(); }   // address reused by another model
-              if (cached == s_dgeom.end())
-              {
-                GeomSpan g;
-                g.src_verts = m->_vertices.size();
-                g.base_vertex = static_cast<std::int32_t>(vk_dverts.size() / 6u);
-                g.first_index = static_cast<std::uint32_t>(vk_didx.size());
-              for (auto const& mv : m->_vertices)
-              {
-                vk_dverts.push_back(mv.position.x); vk_dverts.push_back(mv.position.y); vk_dverts.push_back(mv.position.z);
-                vk_dverts.push_back(mv.normal.x);   vk_dverts.push_back(mv.normal.y);   vk_dverts.push_back(mv.normal.z);
-              }
-              // OPAQUE / ALPHA-KEY passes only: drawing the full index list rendered glow-card sprite planes
-              // as solid clay rectangles on every tree. Transparent/additive passes wait for real texturing.
-              std::size_t emitted = 0;
-              for (auto const& pass : m->renderer()->renderPasses())
-              {
-                if (pass.blend_mode > 1)
-                  continue;
-                std::size_t const end = std::min<std::size_t>(m->_indices.size(),
-                                                              static_cast<std::size_t>(pass.index_start) + pass.index_count);
-                for (std::size_t ii = pass.index_start; ii < end; ++ii)
-                  vk_didx.push_back(m->_indices[ii]);
-                emitted += end > pass.index_start ? end - pass.index_start : 0;
-              }
-                if (!emitted) // no opaque passes (pure-glow model) -> cache the miss, never walk it again
-                  vk_dverts.resize(static_cast<std::size_t>(g.base_vertex) * 6u);
-                g.index_count = static_cast<std::uint32_t>(emitted);
-                cached = s_dgeom.emplace(static_cast<void const*>(m), g).first;
-              }
-              if (!cached->second.index_count)
-                continue;
-              Noggit::Rendering::VK::VulkanBackend::DoodadDraw d;
-              d.base_vertex    = cached->second.base_vertex;
-              d.first_index    = cached->second.first_index;
-              d.index_count    = cached->second.index_count;
-              d.first_instance = static_cast<std::uint32_t>(vk_dinst.size() / 16u);
-              d.instance_count = static_cast<std::uint32_t>(bm.second.size());
-              for (glm::mat4x4 const& im : bm.second)
-              {
-                float const* f = &im[0][0];
-                vk_dinst.insert(vk_dinst.end(), f, f + 16);
-              }
-              vk_ddraws.push_back(d);
-            }
-            _rb_demit = std::chrono::duration<double, std::milli>(
-                          std::chrono::steady_clock::now() - _de0).count();
-          }
-
-          // [overnight stage 5] WMOs through the SAME clay pipeline: per unique WMO the groups' retained CPU
-          // geometry, per placement one instance matrix (instance_count usually 1); all groups of a WMO share
-          // its placement-instance range. Neighbourhood-limited by camera distance.
-          {
-            auto const _we0 = std::chrono::steady_clock::now();
-            // [finding 111] cap first-time group packs per frame; the rest arrive next frame
-            static constexpr int kWmoGroupPacksPerFrame = 8;
-            int wmo_group_packs = 0;
-            std::map<WMO*, std::vector<WMOInstance*>> wmo_by_model;
-            _world->getModelInstanceStorage().for_each_wmo_instance([&](WMOInstance& wi)
-            {
-              if (!wi.finishedLoading() || !wi.wmo.get() || wi.wmo->loading_failed())
-                return;
-              glm::vec3 const p = wi.pos;
-              float const dx = p.x - _camera.position.x;
-              float const dz = p.z - _camera.position.z;
-              if (dx * dx + dz * dz > (3.f * TILESIZE) * (3.f * TILESIZE))
-                return;
-              wmo_by_model[wi.wmo.get()].push_back(&wi);
-            });
-            for (auto const& wm : wmo_by_model)
-            {
-              WMO* w = wm.first;
-              std::uint32_t const first_instance = static_cast<std::uint32_t>(vk_dinst.size() / 16u);
-              for (WMOInstance* wi : wm.second)
-              {
-                float const* f = &wi->transformMatrix()[0][0];
-                vk_dinst.insert(vk_dinst.end(), f, f + 16);
-              }
-              std::uint32_t const inst_count = static_cast<std::uint32_t>(wm.second.size());
-              for (auto const& grp : w->groups)
-              {
-                // [finding 80] the group address is stable while the WMO is loaded, and its
-                // geometry is placement-independent -- so pack it once and reuse the span.
-                auto cached = s_dgeom.find(static_cast<void const*>(&grp));
-                if (cached != s_dgeom.end()
-                    && cached->second.src_verts != grp.vk_vertices().size())
-                { s_dgeom.erase(cached); cached = s_dgeom.end(); }   // address reused by another group
-                if (cached == s_dgeom.end() && wmo_group_packs >= kWmoGroupPacksPerFrame)
-                  continue;   // over budget this frame: not drawn yet, packed on a later frame
-                if (cached == s_dgeom.end())
-                {
-                  ++wmo_group_packs;
-                  auto const& gv = grp.vk_vertices();
-                  auto const& gn = grp.vk_normals();
-                  auto const& gi = grp.vk_indices();
-                  if (gv.empty() || gi.empty() || gn.size() != gv.size())
-                    continue;   // not loaded yet: do NOT cache the miss, it will fill in later
-                  GeomSpan g;
-                  g.src_verts = gv.size();
-                  g.base_vertex = static_cast<std::int32_t>(vk_dverts.size() / 6u);
-                  g.first_index = static_cast<std::uint32_t>(vk_didx.size());
-                  g.index_count = static_cast<std::uint32_t>(gi.size());
-                  for (std::size_t vi = 0; vi < gv.size(); ++vi)
-                  {
-                    vk_dverts.push_back(gv[vi].x); vk_dverts.push_back(gv[vi].y); vk_dverts.push_back(gv[vi].z);
-                    vk_dverts.push_back(gn[vi].x); vk_dverts.push_back(gn[vi].y); vk_dverts.push_back(gn[vi].z);
-                  }
-                  for (std::uint16_t i16 : gi)
-                    vk_didx.push_back(i16);
-                  cached = s_dgeom.emplace(static_cast<void const*>(&grp), g).first;
-                }
-                Noggit::Rendering::VK::VulkanBackend::DoodadDraw d;
-                d.base_vertex    = cached->second.base_vertex;
-                d.first_index    = cached->second.first_index;
-                d.index_count    = cached->second.index_count;
-                d.first_instance = first_instance;
-                d.instance_count = inst_count;
-                vk_ddraws.push_back(d);
-              }
-            }
-            _rb_wmoemit = std::chrono::duration<double, std::milli>(
-                            std::chrono::steady_clock::now() - _we0).count();
-          }
-
+          // [2026-09-03] the clay doodad/WMO geometry build that lived here is REMOVED --
+          // setDoodads (its only consumer) is gone, so it rebuilt and cached ~64 MB of
+          // clay geometry per crossing for nothing. Doodads reach VK through
+          // vkFeedClassicBucket + the textured M2 pipeline; WMOs through the WMO arena.
           s_wv_max = std::max(s_wv_max, vk_wverts.size());
           s_wi_max = std::max(s_wi_max, vk_widx.size());
           _rb_water = std::chrono::duration<double, std::milli>(
@@ -15582,11 +15611,9 @@ void main()
             // [phase A] while VK doodads/WMOs are CLAY (no alpha test), composing them under GL leaks
             // through every alpha-tested leaf/fence texel (blue polygons around trees). Compose mode
             // therefore feeds terrain + water only; doodads/WMOs return when VK renders them textured.
-            if (!s_vk.compose_ok)
-            {
-              s_vk.backend.setDoodads(vk_dverts.data(), vk_dverts.size() / 6, vk_didx.data(), vk_didx.size(),
-                                      vk_dinst.data(), vk_dinst.size() / 16, vk_ddraws.data(), vk_ddraws.size());
-            }
+            // [2026-09-02 NATIVE VK] setDoodads / the clay doodad pass is gone -- it was untextured
+            // scaffolding that compose mode never fed anyway. Tile doodads reach VK through
+            // vkFeedClassicBucket and the textured M2 pipeline, in every mode.
             s_pack_pending = deferred_any;
             if (!deferred_any)
               s_vk_tile = best;
@@ -15763,7 +15790,10 @@ void main()
                 float flags = 1.f;                                   // bit0: this is WMO liquid
                 if (lq->vkUseMaterialColor()) flags += 2.f;
                 if (lq->vkIndoorChannel())    flags += 4.f;
-                glm::vec3 const mat = lq->materialColor();
+                if (lq->vkDbcExterior())      flags += 8.f;           // client flat river-deep (wmo_liquid.hpp)
+                // bit3 rides the material-colour slot: the flat colour IS the WATER param's river-deep
+                // band (the same Skies value GL's wmo_water_river_dark uniform carries)
+                glm::vec3 const mat = lq->vkDbcExterior() ? Skies::water_river_dark() : lq->materialColor();
                 float const at = static_cast<float>(_world->animtime);
 
                 std::uint32_t const base = static_cast<std::uint32_t>(wverts.size() / 17u);
@@ -15915,7 +15945,7 @@ void main()
                          << " vkOwnsDome=" << ((s_vk.backend.skyDomeReady() && !vk_diff::enabled()) ? 1 : 0)
                          << std::endl;
             }
-            skies->setVkOwnsDome(s_vk.backend.skyDomeReady() && !vk_diff::enabled());
+            skies->setVkOwnsDome((s_vk.native || s_vk.backend.skyDomeReady()) && !vk_diff::enabled());
 
             // [phase F] CLOUD DECK. The cap mesh uploads once; the 128x128 deck texture owns one
             // bindless slot that is re-uploaded in place whenever tick_clouds regenerates it (10 Hz),
@@ -16002,7 +16032,7 @@ void main()
                          << (wr->vkCelestials().empty() ? " (sky pass issued none)" : "") << std::endl;
             }
             s_vk.backend.setCelestials(cels);
-            wr->setVkOwnsCelestials(s_vk.backend.celestialsReady() && !vk_diff::enabled());
+            wr->setVkOwnsCelestials((s_vk.native || s_vk.backend.celestialsReady()) && !vk_diff::enabled());
           }
 
           // [phase G] PARTICLES: the emitters mirrored this frame's quads in world space; resolve each
@@ -16245,6 +16275,221 @@ void main()
           }
         }
 
+        // ---- [VULKAN CLUTTER PERSISTENT, 2026-09-03] --------------------------------------------
+        // Ground clutter is static per chunk. Each computed chunk registers ONCE into a per-chunk
+        // VK instance buffer; per frame only the VISIBLE chunks' draw records go over (a few KB),
+        // and the walk skips their per-blade re-collection entirely (wr->vk_clutter_chunks). Active
+        // only in native mode at 100% density -- any other state empties the set and the classic
+        // per-frame path takes over seamlessly next frame.
+        {
+          using ClutterDraw = Noggit::Rendering::VK::VulkanBackend::ClutterDraw;
+          struct ClReg
+          {
+            MapTile* tile; std::size_t tx, tz;   // TileIndex fields are size_t
+            MapChunk const* chunk;
+            glm::vec3 vmin, vmax, center;
+            std::int32_t slot;
+            std::vector<ClutterDraw> draws;
+          };
+          static std::vector<ClReg> s_cl_regs;
+          auto* wr_cl = _world->renderer();
+          float const cl_density = std::clamp(_settings->value("render/ground_clutter_density", 100.0f).toFloat(), 0.0f, 100.0f) / 100.0f;
+          float const cl_dist = _settings->value("render/ground_clutter_distance", 70.0f).toFloat();
+          // [2026-09-04] DEFAULT OFF. This persistent path is one day old, was never validated in a
+          // real grass field, and splits clutter between two render paths at the registration
+          // radius -- the prime suspect for the reported horizontal grass BANDS that track the
+          // camera, and the grass flashing on camera movement. The proven per-frame path is the
+          // default again; NOGGIT_VK_CLUTTER_PERSIST=1 opts back in for testing.
+          static bool const s_cl_persist_ab = []() {
+            char const* v = std::getenv("NOGGIT_VK_CLUTTER_PERSIST");
+            return v && *v == '1';
+          }();
+          bool const cl_active = s_cl_persist_ab && s_vk.native && _draw_ground_clutter.get()
+                              && cl_density >= 0.999f;
+          float const cl_reach = cl_dist + 24.0f;   // chunk half-diagonal slack, like the walk's gate
+          auto const cl_dist2 = [](glm::vec3 const& a, glm::vec3 const& b)
+          { glm::vec3 const d = a - b; return d.x * d.x + d.y * d.y + d.z * d.z; };
+          // engagement diagnostics: why chunks do (not) register, one line per ~300 frames
+          static unsigned s_cl_dbg_tick = 0;
+          unsigned dbg_computed = 0, dbg_reach = 0, dbg_bfail = 0, dbg_pend = 0;
+
+          // SWEEP: release registrations whose tile is gone. Pointer-safe (water-span lesson): the
+          // stored MapTile* is only dereferenced after it is proven to be in the LIVE set, and its
+          // identity is confirmed against the recorded tile coordinates.
+          {
+            static std::unordered_set<MapTile*> s_cl_live;
+            s_cl_live.clear();
+            for (MapTile* t : _world->mapIndex.loaded_tiles())
+              if (t)
+                s_cl_live.insert(t);
+            for (std::size_t i = 0; i < s_cl_regs.size(); )
+            {
+              MapTile* const t = s_cl_regs[i].tile;
+              bool const alive = s_cl_live.count(t)
+                              && t->index.x == s_cl_regs[i].tx && t->index.z == s_cl_regs[i].tz;
+              if (!alive)
+              {
+                s_vk.backend.clutterReleaseChunk(s_cl_regs[i].slot);
+                s_cl_regs[i] = std::move(s_cl_regs.back());
+                s_cl_regs.pop_back();
+              }
+              else
+                ++i;
+            }
+          }
+
+          // registry -> renderer set, REBUILT every frame (fallback safety)
+          wr_cl->vk_clutter_chunks.clear();
+          if (cl_active)
+            for (auto const& r : s_cl_regs)
+              wr_cl->vk_clutter_chunks.insert(r.chunk);
+
+          // REGISTER new computed chunks in range, a few per frame
+          if (cl_active)
+          {
+            int cl_budget = 6;
+            for (MapTile* t : _world->mapIndex.loaded_tiles())
+            {
+              if (cl_budget <= 0)
+                break;
+              if (!t || !t->finishedLoading())
+                continue;
+              for (int ccz = 0; ccz < 16 && cl_budget > 0; ++ccz)
+                for (int ccx = 0; ccx < 16 && cl_budget > 0; ++ccx)
+                {
+                  MapChunk* const ch = t->getChunk(ccx, ccz);
+                  if (!ch || !ch->_detail_doodads_computed)
+                    continue;
+                  ++dbg_computed;
+                  if (wr_cl->vk_clutter_chunks.count(ch))
+                    continue;
+                  if (cl_dist2(_camera.position, ch->vcenter) > cl_reach * cl_reach)
+                    continue;
+                  ++dbg_reach;
+                  Noggit::Rendering::WorldRender::VkClutterOut outp;
+                  if (!wr_cl->vkClutterBuildChunk(ch, outp))
+                  {
+                    ++dbg_bfail;
+                    continue;   // species still streaming / arena slot missing -> retry later
+                  }
+                  --cl_budget;
+                  if (outp.tf.empty())
+                  {
+                    // registrable-as-empty: remember it so the walk stops re-testing the chunk
+                    s_cl_regs.push_back(ClReg{ t, t->index.x, t->index.z, ch,
+                                               ch->vmin, ch->vmax, ch->vcenter, -1, {} });
+                    wr_cl->vk_clutter_chunks.insert(ch);
+                    continue;
+                  }
+                  // BLP names -> bindless ids (non-blocking; a pending decode defers the chunk)
+                  bool cl_pending = false;
+                  for (auto const& d : outp.draws)
+                  {
+                    std::int32_t const i0 = vkResolveBlpEx(d.blp0, false);
+                    std::int32_t const i1 = d.blp1.empty() ? -1 : vkResolveBlpEx(d.blp1, false);
+                    if (i0 == kBlpPending || i1 == kBlpPending)
+                    {
+                      cl_pending = true;
+                      break;
+                    }
+                    for (std::size_t k = 0; k < d.tex_count; ++k)
+                    {
+                      outp.tex[d.tex_from + k].x = i0;
+                      outp.tex[d.tex_from + k].y = i1;
+                    }
+                  }
+                  if (cl_pending)
+                  {
+                    ++dbg_pend;
+                    ++cl_budget;   // decode queued in the background; costs no budget
+                    continue;
+                  }
+                  std::int32_t const cl_slot = s_vk.backend.clutterRegisterChunk(
+                      reinterpret_cast<float const*>(outp.tf.data()),
+                      reinterpret_cast<float const*>(outp.interior.data()),
+                      reinterpret_cast<std::int32_t const*>(outp.tex.data()),
+                      reinterpret_cast<std::int32_t const*>(outp.state.data()),
+                      outp.tf.size());
+                  if (cl_slot < 0)
+                    continue;
+                  ClReg reg{ t, t->index.x, t->index.z, ch, ch->vmin, ch->vmax, ch->vcenter, cl_slot, {} };
+                  reg.draws.reserve(outp.draws.size());
+                  for (auto const& d : outp.draws)
+                  {
+                    ClutterDraw cd;
+                    cd.index_count = d.index_count;
+                    cd.first_index = d.first_index;
+                    cd.base_vertex = d.base_vertex;
+                    cd.first_instance = d.first_instance;
+                    cd.instance_count = d.instance_count;
+                    cd.chunk_slot = cl_slot;
+                    cd.state_key = d.state_key;
+                    reg.draws.push_back(cd);
+                  }
+                  s_cl_regs.push_back(std::move(reg));
+                  wr_cl->vk_clutter_chunks.insert(ch);
+                  static int s_cl_reg_log = 0;
+                  if (s_cl_reg_log++ < 4)
+                    LogError << "[VK] clutter chunk registered: " << outp.tf.size()
+                             << " instances, " << outp.draws.size() << " draws (slot " << cl_slot << ")" << std::endl;
+                }
+            }
+          }
+
+          if ((s_cl_dbg_tick++ % 300u) == 0)
+          {
+            std::size_t dbg_slots = 0, dbg_inst = 0, dbg_draws = 0;
+            for (auto const& r : s_cl_regs)
+              if (r.slot >= 0)
+              {
+                ++dbg_slots;
+                dbg_draws += r.draws.size();
+                if (!r.draws.empty())
+                  dbg_inst += r.draws.front().instance_count;
+              }
+            LogError << "[VK] clutter reg scan: computed=" << dbg_computed
+                     << " inReach=" << dbg_reach << " buildFail=" << dbg_bfail
+                     << " blpPending=" << dbg_pend << " regs=" << s_cl_regs.size()
+                     << " withSlots=" << dbg_slots << " inst~=" << dbg_inst
+                     << " draws=" << dbg_draws
+                     << " active=" << (cl_active ? 1 : 0)
+                     << " density=" << cl_density << std::endl;
+          }
+
+          // FRAME LIST: visible registered chunks, sorted by (pipeline state, chunk)
+          {
+            static std::vector<ClutterDraw> s_cl_frame;
+            s_cl_frame.clear();
+            if (cl_active && !s_cl_regs.empty())
+            {
+              glm::mat4x4 const cl_mvp = projection() * model_view();
+              math::frustum const cl_fr(cl_mvp);
+              for (auto const& r : s_cl_regs)
+              {
+                if (r.slot < 0 || r.draws.empty())
+                  continue;
+                if (cl_dist2(_camera.position, r.center) > cl_reach * cl_reach)
+                  continue;
+                if (!cl_fr.intersects(r.vmax, r.vmin))
+                  continue;
+                s_cl_frame.insert(s_cl_frame.end(), r.draws.begin(), r.draws.end());
+              }
+              std::sort(s_cl_frame.begin(), s_cl_frame.end(),
+                        [](ClutterDraw const& a, ClutterDraw const& b)
+                        {
+                          return a.state_key != b.state_key ? a.state_key < b.state_key
+                                                            : a.chunk_slot < b.chunk_slot;
+                        });
+            }
+            s_vk.backend.setClutterFrame(s_cl_frame.empty() ? nullptr : s_cl_frame.data(),
+                                         s_cl_frame.size());
+          }
+
+          // live sway: species headers + current matrices appended to the snapshot bone stream
+          if (cl_active)
+            wr_cl->vkClutterAppendBones(model_view(), static_cast<int>(_world->model_animtime));
+        }
+
         // [VULKAN phase C] M2 / doodad batches: hand VK the SAME arena + streams GL batched this frame.
         // Transitional: only batches whose textures resolve are drawn by VK; the rest still come from GL
         // (tracked TODO -- the port is not done until nothing falls back).
@@ -16380,6 +16625,15 @@ void main()
                                     wr->vkM2Bones().empty() ? nullptr
                                                              : reinterpret_cast<float const*>(wr->vkM2Bones().data()),
                                     wr->vkM2Bones().size(), vk_draws.data(), vk_draws.size());
+            vkLastM2Draws()     = vk_draws.size();
+            vkLastM2Instances() = tf.size();
+            vkLastM2TexPairs()  = pairs.size();
+            vkLastM2Bones()     = wr->vkM2Bones().size();
+            {
+              std::size_t unres = 0;
+              for (auto const& pi : pair_ids) if (pi.x < 0) ++unres;   // blp1 is legitimately -1 for single-texture passes
+              vkLastM2UnresolvedPairs() = unres;
+            }
             static int s_m2_log = 0;
             if (s_m2_log++ % 300 == 0)
             {
@@ -16396,6 +16650,17 @@ void main()
             // Draw nothing instead: a missing object is a visible, findable bug; a stale one is not.
             s_vk.backend.setM2Frame(nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0.f, 0,
                                     nullptr, 0, nullptr, 0);
+            // [2026-09-04 DIAG] This branch draws NO M2 AT ALL -- every doodad vanishes for the
+            // frame. It was silent, so a DESYNCED feed looked identical to an empty one.
+            static int s_stale_log = 0;
+            if ((s_stale_log++ % 120) == 0)
+            {
+              LogError << "[VK] M2 STALE-GUARD hit (no doodads this frame): tf=" << tf.size()
+                       << " cmds=" << cmds.size()
+                       << " blpidx=" << blpidx.size()
+                       << " state=" << wr->vkM2State().size()
+                       << " -- needs tf!=0, cmds!=0, blpidx==tf, state==tf" << std::endl;
+            }
           }
         }
         // [phase A HARD SYNC] GL->VK: before VK overwrites the shared images, make sure every GL command
@@ -16430,17 +16695,23 @@ void main()
           vk_stat_skcmesh_ms() += ms(t_sk2 - t_sk1).count();
           vk_stat_skctex_ms()  += ms(t_sk3 - t_sk2).count();
         }
-        if (s_vk.backend.renderFrame(vk_t, !s_vk.first_frame, &vk_mvp[0][0]))
+        // [2026-09-04 NATIVE UI COMPOSITE] Upload the overlay Qt painted for us. The GRAB happens
+        // on a timer (grabVkUiOverlay) because QWidget::render() must never run inside paintGL --
+        // it re-enters Qt's painting machinery and one overlay widget lazily constructs the status
+        // bar, which reparents a widget mid-paint and throws. Here we only push bytes to the GPU.
+        if (s_vk.native && _vk_ui_image_dirty && !_vk_ui_image.isNull())
+        {
+          s_vk.backend.setUiOverlay(_vk_ui_image.constBits(),
+                                    static_cast<std::uint32_t>(_vk_ui_image.width()),
+                                    static_cast<std::uint32_t>(_vk_ui_image.height()));
+          _vk_ui_image_dirty = false;
+        }
+        if (s_vk.backend.renderFrame(vk_t, !s_vk.first_frame && !s_vk.native, &vk_mvp[0][0]))
         {
           // [phase H] renderFrame now hands the frame to the SUBMIT THREAD and returns. Everything
           // between there and here overlaps with the GPU; this is the point where GL is about to
           // touch the shared images, so this is where the wait belongs.
           auto const t_compose0 = std::chrono::steady_clock::now();
-          if (!s_vk.backend.waitFrameComplete())
-          {
-            LogError << "[VK] frame submission failed -- backend going inert" << std::endl;
-            s_vk.compose_ok = false;
-          }
           GLenum const layout = GL_LAYOUT_GENERAL_EXT_;
           // [VULKAN phase A] wait on BOTH imported images when depth is composed (layouts must match the VK
           // render pass finalLayouts: colour GENERAL, depth DEPTH_STENCIL_ATTACHMENT). Same pairing as
@@ -16449,10 +16720,21 @@ void main()
           GLuint const wait_texs[2] = { s_vk.tex, s_vk.depth_tex };
           GLenum const wait_layouts[2] = { GL_LAYOUT_GENERAL_EXT_, GL_LAYOUT_GENERAL_EXT_ }; // both colour images (R32F z)
           (void)GL_LAYOUT_DEPTH_STENCIL_ATTACHMENT_EXT_;
+          // [NATIVE PRESENT] no GL interop: the present consumes the frame semaphore, GL reads no
+          // shared image, and the walk below overlaps the GPU instead of waiting on it here.
+          // Submit failures surface at the next renderFrame (it checks the submit result).
+          if (!s_vk.native)
+          {
+          if (!s_vk.backend.waitFrameComplete())
+          {
+            LogError << "[VK] frame submission failed -- backend going inert" << std::endl;
+            s_vk.compose_ok = false;
+          }
           auto const t_sem0 = std::chrono::steady_clock::now();
           s_vk.pWaitSemaphore(s_vk.sem_vk_done, 0, nullptr, s_vk.compose_ok ? 2 : 1, wait_texs, wait_layouts);
           vk_stat_sem_ms() += std::chrono::duration<double, std::milli>(
                                 std::chrono::steady_clock::now() - t_sem0).count();
+          }
 
           // [VULKAN phase A] compose hook: WorldRender::draw calls this right after clearing the scene
           // target -> VK colour + depth become the base layer, then the GL passes depth-test over it.
@@ -16463,9 +16745,19 @@ void main()
           // [phase B] terrain is owned by VK once the textured neighbourhood is uploaded: the GL terrain
           // pass is gated off (WorldRender::vk_owns_terrain) and the compose hook lays VK's terrain
           // colour+depth under the remaining GL passes.
-          unsigned const s_vk_owned_passes = (s_vk.compose_ok && s_vk.backend.terrainTextured() && !vk_diff::enabled()) ? 1u : 0u;
+          // [NATIVE PRESENT] VK presents directly: GL covers nothing, so VK owns every pass
+          // unconditionally (the readiness gates protected the COMPOSE path, where GL still could).
+          unsigned const s_vk_owned_passes = ((s_vk.native || (s_vk.compose_ok && s_vk.backend.terrainTextured())) && !vk_diff::enabled()) ? 1u : 0u;
           s_vk_backend_tt_ready() = s_vk.backend.terrainTextured();
-          _world->renderer()->vk_owns_terrain = (s_vk_owned_passes != 0u);
+          // [2026-09-02] Was `(s_vk_owned_passes != 0u)` with no readiness check -- the same bug
+          // finding 161 fixed for water. VK claimed terrain (gating GL off) on frames where it had
+          // no terrain geometry to draw, leaving the clear colour: "everything flashes blue and all
+          // the doodads go missing". Log evidence: terrain=0 ms with ownsTerrain=1, every frame.
+          // [2026-09-04] The readiness checks are BACK. Native claimed every pass unconditionally
+          // (`s_vk.native || ...`), which re-broke finding 161: a pass owned on a frame VK has no
+          // content for renders NOTHING, and in native GL's copy is invisible under the swapchain.
+          _world->renderer()->vk_owns_terrain =
+            (s_vk_owned_passes != 0u) && s_vk.backend.terrainReady();
           // [phase I] M2 and WATER were never gated, so GL kept drawing every model and every water
           // surface that VK had ALREADY drawn -- the whole scene twice, plus a full CPU sync. Gate
           // them on the same condition as terrain, and (for M2) per bucket, so anything VK rejected
@@ -16481,6 +16773,75 @@ void main()
           // water when it genuinely has a water mesh; otherwise GL keeps drawing it.
           _world->renderer()->vk_owns_water =
             (s_vk_owned_passes != 0u) && _draw_water.get() && s_vk.backend.waterReady();
+          // [2026-09-04 NATIVE HOLE REPORT] In native, anything VK does not draw is INVISIBLE (GL
+          // renders under the covered widget). Say out loud, every 60 frames, what VK is failing to
+          // own and how much content is being dropped -- these numbers ARE the missing pixels the
+          // user sees, and they were previously only inferable.
+          if (s_vk.native)
+          {
+            static int s_hole_frames = 0;
+            static int s_snap_idx = 0;
+            if (++s_hole_frames >= 60)
+            {
+              s_hole_frames = 0;
+              auto* wrh = _world->renderer();
+              bool const water_hole = _draw_water.get() && !s_vk.backend.waterReady();
+              LogError << "[VK] NATIVE HOLES: terrain=" << (wrh->vk_owns_terrain ? "vk" : "NONE")
+                       << " m2=" << (wrh->vk_owns_m2 ? "vk" : "NONE")
+                       << " water=" << (water_hole ? "NONE(no vk mesh)"
+                                                   : (wrh->vk_owns_water ? "vk" : "off"))
+                       << " | classicFedInstances/frame=" << wrh->classicIssued()
+                       << " | cam=(" << _camera.position.x << "," << _camera.position.y << ","
+                       << _camera.position.z << ") yaw=" << _camera.yaw()._
+                       << " pitch=" << _camera.pitch()._
+                       << " present=" << s_vk.backend.presentWidth() << "x"
+                       << s_vk.backend.presentHeight()
+                       << " | M2 draws=" << vkLastM2Draws()
+                       << " inst=" << vkLastM2Instances()
+                       << " texpairs=" << vkLastM2TexPairs()
+                       << " unresolvedPairs=" << vkLastM2UnresolvedPairs()
+                       << " bones=" << vkLastM2Bones()
+                       << " slice=" << wrh->batchSliceDist() << std::endl;
+              // [2026-09-04 SELF-DIAGNOSTIC] Dump the ACTUAL presented swapchain (what the window
+              // shows) alongside each hole report -- first 6, rotating, so a SHORT session captures
+              // the user's real frame at whatever camera they fly to. Their log says trees ARE drawn
+              // (allHidden=0, 508 draws) while they report no change: only their own pixels resolve
+              // that. Fires ~once/second, capped so it can't spam the disk.
+              // [2026-09-06] 3 snaps, 300 frames apart: a 2288x1307 PNG encode on the main thread is
+              // ~hundreds of ms, and six of them inside the first seconds stalled exactly the window
+              // in which models stream in. Still enough to see the user's frame.
+              // This block runs once per 60-frame report, so the gap is counted in TICKS:
+              // 5 ticks = 300 frames between snaps. (It was 300 ticks = 18,000 frames -- snap #1
+              // never fired and the probe below never armed.)
+              static int s_snap_gap = 5;
+              // Arm the M2 footprint probe one tick BEFORE snap #1 fires, so that snap shows
+              // magenta wherever an M2 fragment rasterised -- disarmed right after the capture.
+              // gap==3 here: the check runs BEFORE the ++ below, and the tick that sees gap==4
+              // increments to 5 and fires the snap in the same breath -- arming there gave the
+              // probe zero rendered frames. Arming at 3 leaves it on for the full 60-frame tick.
+              if (s_snap_idx == 1 && s_snap_gap == 3)
+                s_vk.backend.setM2FootprintProbe(true);
+              if (s_snap_idx < 3 && ++s_snap_gap >= 5 && (s_snap_gap = 0, true))
+              {
+                std::vector<std::uint8_t> snap_px;
+                if (s_vk.backend.presentedReadbackAvailable()
+                    && s_vk.backend.readbackPresented(snap_px))
+                {
+                  std::string const snap_path = "native_snap_" + std::to_string(s_snap_idx) + ".png";
+                  vk_diff::savePng(snap_path, snap_px.data(),
+                                   static_cast<int>(s_vk.backend.presentWidth()),
+                                   static_cast<int>(s_vk.backend.presentHeight()));
+                  LogError << "[VK] native snap -> " << snap_path
+                           << " cam=(" << _camera.position.x << "," << _camera.position.y << ","
+                           << _camera.position.z << ") present="
+                           << s_vk.backend.presentWidth() << "x" << s_vk.backend.presentHeight()
+                           << std::endl;
+                  ++s_snap_idx;
+                  s_vk.backend.setM2FootprintProbe(false);
+                }
+              }
+            }
+          }
           {
             // Say out loud which GL passes are actually gated off, and what a frame costs. "It feels
             // slow" is not measurable; this is. Both numbers are what tell you whether VK mode is
@@ -16564,6 +16925,24 @@ void main()
               s_frames = 0;
             }
           }
+          // [2026-09-08 WDL HORIZON] VK owns the terrain here, so WorldRender::draw hands the per-frame
+          // low-res horizon (client CMapLowDetail tile selection + MAHO split) to the backend instead of
+          // drawing it with GL. Captureless on purpose: s_vk is a function-local static.
+          _world->renderer()->vk_horizon_feed =
+            [](Noggit::map_horizon::render const* r, glm::vec3 const& c, glm::mat4x4 const& ld_mvp)
+            {
+              if (!r || r->vertices().empty()
+                  || (r->solid_indices().empty() && r->hole_indices().empty()))
+              {
+                s_vk.backend.setHorizon(nullptr, 0, 0, nullptr, 0, nullptr, 0, nullptr, nullptr);
+                return;
+              }
+              float const rgb[3] = { c.x, c.y, c.z };
+              s_vk.backend.setHorizon(&r->vertices()[0].x, r->vertices().size(), r->vertex_generation(),
+                                      r->solid_indices().data(), r->solid_indices().size(),
+                                      r->hole_indices().data(), r->hole_indices().size(), rgb,
+                                      &ld_mvp[0][0]);
+            };
           if (s_vk.compose_ok && s_vk_owned_passes != 0u)
           {
             _world->renderer()->pre_scene_compose = [&]()
@@ -16839,6 +17218,10 @@ void main()
               }
             }
           }
+          // [NATIVE PRESENT] the swapchain already showed the frame -- no GL blit, no GL->VK
+          // semaphore signal, no read fence. Everything below is compose-mode interop.
+          if (!s_vk.native)
+          {
           gl.bindFramebuffer(GL_READ_FRAMEBUFFER, s_vk.fbo);
           // [VK-1c] NOGGIT_VK_FULL: the VK image IS the viewport (the GL world draw is skipped in this mode);
           // else the 192px bottom-right preview square.
@@ -16865,6 +17248,7 @@ void main()
           {
             s_gl_read_fence = xf->glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
           }
+          }
           s_vk.first_frame = false;
         }
       }
@@ -16875,14 +17259,130 @@ void main()
   if (!gl_scene_drawn)
   {
     _world->renderer()->pre_scene_compose = nullptr; // no VK image this frame -> no base layer
+    _world->renderer()->vk_horizon_feed = nullptr;    // GL draws the WDL horizon itself again
     _world->renderer()->vk_feeding = false;           // no VK consumer -> skip every feed
     _world->renderer()->vk_owns_terrain = false;      // GL draws its own terrain again
     _world->renderer()->vk_owns_m2 = false;
     _world->renderer()->vk_owns_water = false;
+    // [NATIVE PRESENT] a backend gone inert must hand EVERY pass back to GL, not just these three
+    _world->renderer()->vk_native = false;
+    _world->renderer()->setVkOwnsWmo(false);
+    _world->renderer()->setVkOwnsCelestials(false);
+    if (_world->renderer()->skies())
+      _world->renderer()->skies()->setVkOwnsDome(false);
     vk_stat_prevk_ms() += std::chrono::duration<double, std::milli>(
                             std::chrono::steady_clock::now() - t_paint0).count();
     draw_gl_scene();
   }
+}
+
+// [VULKAN NATIVE PRESENT, 2026-09-03] Create the native child window the swapchain presents into.
+// Runs on the event loop (queued from draw_map's init) -- NEVER inside paintGL: creating widgets
+// mid-paint re-enters layout. Input transparency is two-layered: WA_TransparentForMouseEvents on
+// the container (Qt-side) and WM_NCHITTEST -> HTTRANSPARENT on the HWND (OS-side).
+// [2026-09-04 REVERTED -- caused a FULLY BLACK viewport] The first attempt promoted every direct
+// child of the viewport to a native window (WA_NativeWindow) and raised it. That is wrong here:
+// `_viewport_overlay_ui` is a FULL-SIZE child covering the whole viewport, so turning it into a
+// native window made it an opaque surface painted over the entire scene -> everything black.
+//
+// Left as a no-op deliberately, so the call sites stay and the reasoning is recorded. The real fix
+// must promote ONLY the small control widgets (toolbars/buttons), never a full-size transparent
+// overlay -- or avoid the native-child-window approach for presentation altogether.
+void MapView::raiseViewportOverlayWidgets()
+{
+  // [2026-09-04] DISABLED -- this approach cannot work, proven twice on the user's machine.
+  //
+  // The Vulkan surface is a NATIVE child window, so it composites above ordinary Qt siblings and
+  // hides the tool palette. The only way to lift Qt widgets above a native window is to make them
+  // native too. Doing that DOES restore the toolbars -- and turns the viewport BLACK, with or
+  // without lower() on the container. Giving a QOpenGLWidget native children changes how it
+  // composites, and native mode gates off every GL pass, so the widget's empty (black) surface ends
+  // up over the swapchain. Both states are broken:
+  //     promote   -> toolbars visible, world black
+  //     no promote-> world visible, toolbars hidden
+  // One HWND cannot be both a Vulkan swapchain target and a Qt-painted widget surface, so this
+  // needs a presentation-architecture change, not another patch here. Left as a no-op deliberately.
+  //
+  // NOTE for whoever revisits: readbackPresented() reads the SWAPCHAIN IMAGE, not what the OS
+  // composites on screen -- it reported a perfect frame while the window was black. Any fix here
+  // must be verified on the actual window, never by that readback.
+}
+
+// [2026-09-04 NATIVE UI COMPOSITE] Paint the editor overlay into a transparent image for Vulkan.
+// Runs from a TIMER (event loop), never from paintGL -- see the note on _vk_ui_image.
+void MapView::grabVkUiOverlay()
+{
+  if (!_vk_present_container || _destroying)
+    return;
+
+  qreal const dpr = devicePixelRatioF() > 0.0 ? devicePixelRatioF() : 1.0;
+  int const uw = static_cast<int>(width() * dpr);
+  int const uh = static_cast<int>(height() * dpr);
+  if (uw <= 0 || uh <= 0)
+    return;
+
+  if (_vk_ui_image.width() != uw || _vk_ui_image.height() != uh)
+  {
+    _vk_ui_image = QImage(uw, uh, QImage::Format_RGBA8888);  // bytes R,G,B,A == VK RGBA8_UNORM
+    _vk_ui_image.setDevicePixelRatio(dpr);
+  }
+  _vk_ui_image.fill(Qt::transparent);
+
+  bool any = false;
+  for (QObject* o : children())
+  {
+    QWidget* const w = qobject_cast<QWidget*>(o);
+    if (!w || w == _vk_present_container || w->isHidden())
+      continue;
+    w->render(&_vk_ui_image, w->pos(), QRegion(),
+              QWidget::DrawWindowBackground | QWidget::DrawChildren);
+    any = true;
+  }
+  _vk_ui_image_dirty = any;
+}
+
+void MapView::ensureVkPresentSurface()
+{
+#ifdef _WIN32
+  if (_vk_present_container || _destroying)
+    return;
+  _vk_present_window = new QWindow();
+  _vk_present_window->setFlags(_vk_present_window->flags() | Qt::WindowTransparentForInput);
+  _vk_present_window->setSurfaceType(QSurface::VulkanSurface); // no Qt backing store on this HWND
+  _vk_present_container = QWidget::createWindowContainer(_vk_present_window, this);
+  _vk_present_container->setAttribute(Qt::WA_TransparentForMouseEvents, true);
+  _vk_present_container->setFocusPolicy(Qt::NoFocus);
+  _vk_present_container->setGeometry(rect());
+  _vk_present_container->show();
+  static bool s_filter_installed = false;
+  if (!s_filter_installed)
+  {
+    s_filter_installed = true;
+    qApp->installNativeEventFilter(&vkPresentHitFilter());
+  }
+  vkPresentHitFilter().hwnds.insert(reinterpret_cast<void*>(_vk_present_window->winId()));
+
+  // [2026-09-04 UI-COVERED FIX, user report] A window container is a NATIVE child window, and a
+  // native child always composites ABOVE non-native Qt siblings regardless of Qt's own stacking --
+  // so the present surface hid the viewport-overlay UI (tool palette, top buttons, status widgets).
+  // Qt's raise() alone cannot fix that: the sibling has to become native too, then the OS honours
+  // the z-order. Push the present surface to the bottom and promote every other direct child.
+  // NOTE: do NOT lower() this container. It is a native child window; lowering it puts the
+  // swapchain BELOW the QOpenGLWidget's own surface, and in native mode GL draws nothing (every
+  // pass is gated off) -- so the screen showed GL's empty black widget composited over a perfectly
+  // good swapchain. The offscreen/presented readback cannot see that: it reads the swapchain image
+  // directly, so the harness reported a full scene while the window was black. Leave the surface
+  // where it is and lift only the small controls above it.
+  raiseViewportOverlayWidgets();
+  // Drive the overlay grab from the event loop at ~20 Hz. The UI does not change per frame, and
+  // rendering the widget tree is CPU work, so this is deliberately not per-frame.
+  // [2026-09-06] Overlay grab DISABLED. The in-frame composite does not draw (proven down to an
+  // unconditional constant colour), so this 20 Hz QWidget::render() of the ENTIRE editor widget
+  // tree was pure main-thread cost in the user's full-UI session -- and the main thread is what
+  // finishes model loads and uploads. Re-enable only together with a working composite.
+  LogError << "[VK] present surface created (" << width() << "x" << height()
+           << "), overlay controls promoted" << std::endl;
+#endif
 }
 
 void MapView::setCameraForCapture(glm::vec3 const& position, math::degrees yaw, math::degrees pitch)
@@ -16941,6 +17441,51 @@ void MapView::saveHarnessScreenshot(std::string const& path)
 
 void MapView::captureFrameNow(std::string const& path)
 {
+#ifdef _WIN32
+  // [VULKAN NATIVE PRESENT] the frame never reaches the GL widget -- read it back from Vulkan.
+  // Rows arrive bottom-up exactly like glReadPixels, so savePng treats both identically.
+  if (g_vk_capture_backend && g_vk_capture_backend->presentActive())
+  {
+    std::vector<std::uint8_t> px;
+    // Prefer the ACTUAL presented swapchain image (what the window shows) over the offscreen
+    // render target -- the offscreen readback cannot prove the present path. Falls back to the
+    // offscreen image when the surface has no TRANSFER_SRC.
+    bool const from_swapchain =
+        g_vk_capture_backend->presentedReadbackAvailable()
+        && g_vk_capture_backend->readbackPresented(px);
+    if (from_swapchain || g_vk_capture_backend->readbackImage(px))
+    {
+      int const w = static_cast<int>(from_swapchain ? g_vk_capture_backend->presentWidth()
+                                                     : g_vk_capture_backend->width());
+      int const h = static_cast<int>(from_swapchain ? g_vk_capture_backend->presentHeight()
+                                                     : g_vk_capture_backend->height());
+      LogError << "[VK-BENCH] capture source = "
+               << (from_swapchain ? "PRESENTED swapchain" : "offscreen image") << std::endl;
+      vk_diff::savePng(path, px.data(), w, h);
+      double sum = 0.0, sum2 = 0.0;
+      std::size_t const n = static_cast<std::size_t>(w) * h;
+      for (std::size_t i = 0; i < n; ++i)
+      {
+        double const l = (px[i * 4u + 0u] + px[i * 4u + 1u] + px[i * 4u + 2u]) / 3.0;
+        sum += l;
+        sum2 += l * l;
+      }
+      double const mean = n ? sum / n : 0.0;
+      double const var = n ? (sum2 / n - mean * mean) : 0.0;
+      double const sd = var > 0.0 ? std::sqrt(var) : 0.0;
+      LogError << "[VK-BENCH] IMAGE " << path << " mean=" << mean << " stddev=" << sd
+               << (sd < 1.0 ? "  *** FLAT -- camera saw nothing, run is INVALID ***" : "")
+               << " | cam=(" << _camera.position.x << "," << _camera.position.y << ","
+               << _camera.position.z << ") yaw=" << _camera.yaw()._
+               << " pitch=" << _camera.pitch()._
+               << std::endl;
+      LogError << "[VK-BENCH] screenshot " << path << " (" << w << "x" << h
+               << ", native VK readback)" << std::endl;
+      return;
+    }
+    LogError << "[VK] native readback failed -- falling back to GL capture" << std::endl;
+  }
+#endif
   glFinish();
 
   GLint vp[4] = { 0, 0, 0, 0 };

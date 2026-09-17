@@ -84,14 +84,22 @@ float dyn_shadow_factor(vec3 world_pos)
 //    directionals, hard-skipped at d >= attenEnd -- always skipped in classic WMOs where
 //    attenEnd=0). Units pass true; doodads keep MOLT (their group light list includes them).
 //    MOLT lights are flagged with PointLightColor.w == 1.
-vec3 point_lights_impl(vec3 world_pos, vec3 n, bool skip_molt)
+//  - modern_only: ONLY the MNLD lights of Shadowlands-style WMOs (PointLightColor.w == 2). Those rooms have a
+//    black ambient and black MOCV, so their point lights are the whole light of an interior M2 -- the
+//    3.3.5a "zero point lights reach an interior M2" rule stays for MOLT (docs/client_re/42 sec 16.2).
+vec3 point_lights_impl(vec3 world_pos, vec3 n, bool skip_molt, bool modern_only)
 {
   int count = int(PointLightParams.x);
   int   best_i[3] = int[3](-1, -1, -1);
   float best_d[3] = float[3](1e30, 1e30, 1e30);
   for (int i = 0; i < count; ++i)
   {
-    if (skip_molt && PointLightColor[i].w > 0.5)
+    float flag = PointLightColor[i].w; // 0 M2 light, 1 WMO MOLT, 2 WMO MNLD (modern)
+    if (skip_molt && flag > 0.5 && flag < 1.5)
+    {
+      continue;
+    }
+    if (modern_only && flag < 1.5)
     {
       continue;
     }
@@ -118,11 +126,18 @@ vec3 point_lights_impl(vec3 world_pos, vec3 n, bool skip_molt)
 
 vec3 point_lights(vec3 world_pos, vec3 n)
 {
-  return point_lights_impl(world_pos, n, false);
+  return point_lights_impl(world_pos, n, false, false);
+}
+
+vec3 point_lights_modern(vec3 world_pos, vec3 n)
+{
+  return point_lights_impl(world_pos, n, false, true);
 }
 
 uniform vec4 mesh_color;
 uniform int blend_mode;
+uniform int alpha_key_modern;  // 1 = MD21 (Legion+ engine) model: alpha-key reference 128/255 (WoWViewerCpp
+                               // commonM2Material: blendMode 1 discards discardAlpha < 0.50196), docs/client_re/42 sec 3
 uniform int alpha_key_classic; // TWO-ERA alpha-key (doc 40 sec 10): 1 = classic v256 model
 uniform int water_surface_effect; // 1 = fishing-pool wake geoset: grey out + luminance-alpha (see below)
 
@@ -287,7 +302,7 @@ void main()
           // experiment made cloaks SEMI-TRANSPARENT, which is flatly wrong: cloaks are fully
           // opaque in game, never alpha < 1 (user 2026-08-28). Alpha-key must therefore be a
           // hard test with NO blending; the remaining question is only which texels pass it.
-          alpha_test = (224.f / 255.f) * mesh_color.w;
+          alpha_test = (alpha_key_modern == 1 ? (128.f / 255.f) : (224.f / 255.f)) * mesh_color.w;
           fog_mode = 1;
           break;
       }
@@ -521,6 +536,61 @@ void main()
         }
   }
 
+  // ---- Modern (Legion+ s_modelShaderEffect) combiners reachable from the MD21 path (ModelRender.cpp
+  // s_modern_shader_effect, docs/client_re/42 sec 3). Expressions from the client-derived WoWViewerCpp
+  // commonM2Material.slang (matDiffuse / discardAlpha / specular) in this shader's convention: the additive
+  // "specular" term folds into rgb, discardAlpha into alpha. *_Wgt weights (texture weight stream) are not
+  // carried by noggit's passes and are taken as 1.
+  else if (pixel_shader == 23) // Combiners_Mod_AddAlpha: diffuse = mesh * t1; alpha = t1.a; + t2.rgb * t2.a
+  {
+    vec4 texture1 = texture(tex1, vec3(cuv1, tex1_index));
+    vec4 texture2 = texture(tex2, vec3(cuv2, tex2_index));
+    color.rgb = mesh_color.rgb * texture1.rgb + texture2.rgb * texture2.a;
+    color.a = mesh_color.a * texture1.a;
+  }
+  else if (pixel_shader == 24) // Combiners_Mod_AddAlpha_Alpha
+  {
+    vec4 texture1 = texture(tex1, vec3(cuv1, tex1_index));
+    vec4 texture2 = texture(tex2, vec3(cuv2, tex2_index));
+    color.rgb = mesh_color.rgb * texture1.rgb + texture2.rgb * texture2.a * (1.0 - texture1.a);
+    color.a = mesh_color.a * (texture1.a + texture2.a * dot(texture2.rgb, vec3(0.3, 0.59, 0.11)));
+  }
+  else if (pixel_shader == 25) // Combiners_Opaque_Alpha_Alpha
+  {
+    vec4 texture1 = texture(tex1, vec3(cuv1, tex1_index));
+    vec4 texture2 = texture(tex2, vec3(cuv2, tex2_index));
+    color.rgb = mesh_color.rgb * mix(mix(texture1.rgb, texture2.rgb, vec3(texture2.a)), texture1.rgb, vec3(texture1.a));
+    color.a = mesh_color.a;
+  }
+  else if (pixel_shader == 26) // Combiners_Opaque_ModNA_Alpha
+  {
+    vec4 texture1 = texture(tex1, vec3(cuv1, tex1_index));
+    vec4 texture2 = texture(tex2, vec3(cuv2, tex2_index));
+    color.rgb = mesh_color.rgb * mix(texture1.rgb * texture2.rgb, texture1.rgb, vec3(texture1.a));
+    color.a = mesh_color.a;
+  }
+  else if (pixel_shader == 27) // Combiners_Mod_Add_Alpha
+  {
+    vec4 texture1 = texture(tex1, vec3(cuv1, tex1_index));
+    vec4 texture2 = texture(tex2, vec3(cuv2, tex2_index));
+    color.rgb = mesh_color.rgb * texture1.rgb + texture2.rgb * (1.0 - texture1.a);
+    color.a = mesh_color.a * (texture1.a + texture2.a);
+  }
+  else if (pixel_shader == 28) // Combiners_Opaque_Alpha
+  {
+    vec4 texture1 = texture(tex1, vec3(cuv1, tex1_index));
+    vec4 texture2 = texture(tex2, vec3(cuv2, tex2_index));
+    color.rgb = mesh_color.rgb * mix(texture1.rgb, texture2.rgb, vec3(texture2.a));
+    color.a = mesh_color.a;
+  }
+  else if (pixel_shader == 29) // Combiners_Opaque_Mod_Add_Wgt (weight taken as 1)
+  {
+    vec4 texture1 = texture(tex1, vec3(cuv1, tex1_index));
+    vec4 texture2 = texture(tex2, vec3(cuv2, tex2_index));
+    color.rgb = mesh_color.rgb * mix(texture1.rgb, texture2.rgb, vec3(texture2.a)) + texture1.rgb * texture1.a;
+    color.a = mesh_color.a;
+  }
+
   // FISHING-POOL WAKE (foam ring / bubbles / sparkles): the effect texture is a near-black field with
   // bright wisps and no usable alpha. Drawn opaque it bloomed white; alpha-blended it painted a solid
   // blue veil; additive glowed too bright. Make it read like the murky water it floats on: desaturate
@@ -654,9 +724,13 @@ void main()
       // shaded mountainsides); the 335a ndl+0.70-floor law read up to ~3x brighter there
       // (user 2026-08-25: "grass standing out too bright, not matching the terrain under them").
       // Dynamic (editor) shadows fold into the same shade term like the MCSH bit they emulate.
+      //
+      // [2026-09-02] SUNLIT brightness lowered 0.75 -> 0.55 on request ("grass sitting in the sun
+      // has too much brightness ... the ones in the shade look fine"). This is a LOOK TWEAK, not a
+      // client-matched value: only the lit end of the band moved. Shadowed blades keep 0.25.
       float dyn01 = clamp((dyn_shadow_factor(m2_world_pos) - ShadowParams.y)
                           / max(1.0 - ShadowParams.y, 1e-4), 0.0, 1.0);
-      float shade = mix(0.25, 0.75, min(blade_shadow, dyn01));
+      float shade = mix(0.25, 0.55, min(blade_shadow, dyn01));
       currColor = min(AmbientColor_FogEnd.xyz + DiffuseColor_FogStart.xyz * shade, vec3(1.0))
                 * blade_tint;
       lDiffuse = vec3(0.0);
@@ -692,6 +766,10 @@ void main()
           interior_diffuse = mix(interior_diffuse, DiffuseColor_FogStart.xyz, spill);
           currColor = interior_ambient;
           lDiffuse = interior_diffuse * clamp(dot(normalize(norm), L), 0.0, 1.0);
+          // Modern (MNLD) WMO lights are the only light of a Shadowlands-style interior (Karazhan Crypts:
+          // black MOHD ambient, MOCV ~2/255, 283 MNLD lights) -- without them every prop and unit inside
+          // is a black silhouette while the walls glow. MOLT lights keep the 3.3.5a rule above.
+          lDiffuse += point_lights_modern(m2_world_pos, normalize(norm));
       }
       else
       {

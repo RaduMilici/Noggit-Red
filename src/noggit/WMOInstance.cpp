@@ -135,6 +135,7 @@ void WMOInstance::draw ( OpenGL::Scoped::use_program& wmo_shader
               , !draw_exterior
               , world_renderer
               , &portal_group_visibility
+              , _doodadset
               );
   }
 
@@ -172,20 +173,18 @@ void WMOInstance::intersect (math::ray const& ray, selection_result* results, bo
   }
 }
 
-std::optional<std::pair<float, int>> WMOInstance::groundHit(math::ray const& ray, float max_dist)
+void WMOInstance::groundQuery(math::ray const& ray, float reach, wmo_ground_query& io)
 {
-  // [doc 38 footsteps] world-ray -> model space like intersect(); unscaled instances keep
-  // distances 1:1. Returns {world distance, the hit face's authored TerrainType row}.
   if (!ray.intersect_bounds (extents[0], extents[1]))
   {
-    return std::nullopt;
+    return;
   }
   if (!wmo->finishedLoading() || wmo->loading_failed())
   {
-    return std::nullopt;
+    return;
   }
-  math::ray subray(_transform_mat_inverted, ray);
-  return wmo->groundHit(subray, max_dist);
+  math::ray const subray(_transform_mat_inverted, ray);
+  wmo->groundQuery(subray, reach, io);
 }
 
 std::optional<float> WMOInstance::liquidHeightAt (glm::vec3 const& world_pos, int* out_liquid_id)

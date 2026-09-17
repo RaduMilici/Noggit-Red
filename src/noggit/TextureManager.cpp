@@ -1,5 +1,6 @@
 // This file is part of Noggit3, licensed under GNU General Public License (version 3).
 #include <noggit/TextureManager.h>
+#include <cstdlib>
 #include <atomic> // [TEXARRAYDBG] temporary
 #include <noggit/Log.h> // LogDebug
 #include <noggit/frame_profiler.hpp>
@@ -132,6 +133,20 @@ namespace
 
     filename = BlizzardArchive::ClientData::normalizeFilenameInternal(std::move(filename));
     return is_null_texture_reference(filename) ? fallback_texture_filename : std::move(filename);
+  }
+
+  // "fdid:<n>" -> key by fileDataID; anything else -> key by path
+  BlizzardArchive::Listfile::FileKey texture_file_key(std::string const& filename)
+  {
+    if (filename.rfind("fdid:", 0) == 0)
+    {
+      std::uint32_t const fdid = static_cast<std::uint32_t>(std::strtoul(filename.c_str() + 5, nullptr, 10));
+      if (fdid)
+      {
+        return BlizzardArchive::Listfile::FileKey(fdid);
+      }
+    }
+    return BlizzardArchive::Listfile::FileKey(filename);
   }
 
   BlizzardArchive::Listfile::FileKey safe_texture_file_key(BlizzardArchive::Listfile::FileKey const& file_key)
@@ -774,7 +789,7 @@ void blp_texture::finishLoading()
     return;
   }
 
-  bool exists = Noggit::Application::NoggitApplication::instance()->clientData()->exists(texture_filename);
+  bool exists = Noggit::Application::NoggitApplication::instance()->clientData()->exists(texture_file_key(texture_filename));
   if (!exists)
   {
     LogError << "file not found: '" <<  _file_key.stringRepr() << "'" << std::endl;
@@ -796,10 +811,12 @@ void blp_texture::finishLoading()
     }
   }
 
+  // "fdid:<n>" names a texture by fileDataID (modern CASC clients: MDID / TXID / MOMT ids the listfile
+  // does not know). Every cache in here stays keyed by that string; only the archive open changes.
   BlizzardArchive::ClientFile f(
-      exists ? (has_specular ? spec_filename : texture_filename) : "textures/shanecube.blp"
+      texture_file_key(exists ? (has_specular ? spec_filename : texture_filename) : "textures/shanecube.blp")
       , Noggit::Application::NoggitApplication::instance()->clientData());
-  if (f.isEof())
+  if (f.isEof() || f.getSize() < sizeof(BLPHeader))
   {
     finished = true;
     throw std::runtime_error ("File " + _file_key.stringRepr() + " does not exist");
@@ -890,8 +907,21 @@ namespace Noggit
 
     gl.activeTexture(GL_TEXTURE0);
     blp_texture texture(blp_filename, Noggit::NoggitRenderContext::BLP_RENDERER);
-    texture.finishLoading();
-    texture.upload();
+    try
+    {
+      texture.finishLoading();
+      texture.upload();
+    }
+    catch (std::exception const& e)
+    {
+      // The texture (or the fallback the loader substitutes) cannot be read from this client -- the
+      // Forever Beta ships a partial store with TACT-keyed content (docs/client_re/42 sec 17.1). The
+      // painter's preview swatch used to take the whole map view down with an uncaught exception here.
+      LogError << "BLPRenderer: '" << blp_filename << "' cannot be rendered (" << e.what() << "); black swatch" << std::endl;
+      QPixmap blank(width == -1 ? 128 : width, height == -1 ? 128 : height);
+      blank.fill(Qt::black);
+      return &(_cache[curEntry] = std::move(blank));
+    }
 
     width = width == -1 ? texture.width() : width;
     height = height == -1 ? texture.height() : height;
