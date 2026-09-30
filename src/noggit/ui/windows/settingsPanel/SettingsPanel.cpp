@@ -20,9 +20,18 @@
 #include <QtWidgets/QSlider>
 #include <QtWidgets/QCheckBox>
 #include <QtWidgets/QGroupBox>
+#include <QtWidgets/QSpinBox>
 #include <QtWidgets/QVBoxLayout>
+#include <QtCore/QPointer>
+#include <QtCore/QTimer>
 #include <QDir>
 #include <QApplication>
+
+#include <noggit/ssh/SshHostKeyPrompt.hpp>
+#include <noggit/ssh/SshTunnelManager.hpp>
+
+#include <memory>
+#include <thread>
 
 #ifdef USE_MYSQL_UID_STORAGE
 #include <mysql/mysql.h>
@@ -649,14 +658,9 @@ namespace Noggit
               }
       );
 
-      connect(ui->mysql_connect_test, &QPushButton::clicked, [this]
-          {
-              save_changes();
-              #ifdef USE_MYSQL_UID_STORAGE
-              mysql::testConnection();
-              #endif
-          }
-      );
+      connect(ui->mysql_connect_test, &QPushButton::clicked, this, [this] { test_mysql_connection(); });
+
+      build_ssh_section();
 
       // Split the graphics settings out of "Preferences" into a dedicated "Graphics" tab and add the
       // persistent render-feature toggles. Done before discard_changes() so the toggle checkboxes exist.
@@ -894,6 +898,22 @@ namespace Noggit
       ui->_mysql_pwd_field->setText (pwd_str);
       ui->_mysql_db_field->setText (db_str);
       ui->_mysql_port_field->setValue (port_int);
+
+      // SSH tunnel (per project, see ssh/SshTunnelConfig.hpp). Read the raw toggle, not
+      // TunnelConfig::enabled (which also requires MySQL itself to be enabled).
+      {
+        auto const tunnel = Noggit::Ssh::TunnelConfig::fromProjectSettings();
+        _ssh_box->setChecked(Noggit::mysqlSetting(Noggit::Ssh::Keys::enabled(), false).toBool());
+        _ssh_host->setText(tunnel.ssh_host);
+        _ssh_port->setValue(tunnel.ssh_port);
+        _ssh_user->setText(tunnel.ssh_user);
+        _ssh_key->setText(tunnel.key_path);
+        _ssh_remote_host->setText(tunnel.remote_db_host);
+        _ssh_remote_port->setValue(tunnel.remote_db_port);
+        _ssh_fingerprint->setText(tunnel.expected_fingerprint);
+        update_direct_fields_enabled();
+        update_ssh_status();
+      }
 #endif
 
       int wireframe_type = _settings->value("wireframe/type", 0).toInt();
@@ -943,6 +963,33 @@ namespace Noggit
       _settings->setValue (Noggit::mysqlSettingKey("pwd"), ui->_mysql_pwd_field->text());
       _settings->setValue (Noggit::mysqlSettingKey("db"), ui->_mysql_db_field->text());
       _settings->setValue (Noggit::mysqlSettingKey("port"), ui->_mysql_port_field->text());
+
+      {
+        namespace Keys = Noggit::Ssh::Keys;
+        QString const key_path = Noggit::Ssh::expandKeyPath(_ssh_key->text());
+        QString const pin = Noggit::Ssh::normalizeFingerprint(_ssh_fingerprint->text());
+        _ssh_key->setText(key_path);
+        if (!pin.isEmpty())
+        {
+          _ssh_fingerprint->setText(pin);
+        }
+        _settings->setValue(Noggit::mysqlSettingKey(Keys::enabled()), _ssh_box->isChecked());
+        _settings->setValue(Noggit::mysqlSettingKey(Keys::host()), _ssh_host->text().trimmed());
+        _settings->setValue(Noggit::mysqlSettingKey(Keys::port()), _ssh_port->value());
+        _settings->setValue(Noggit::mysqlSettingKey(Keys::user()), _ssh_user->text().trimmed());
+        _settings->setValue(Noggit::mysqlSettingKey(Keys::keyPath()), key_path);
+        _settings->setValue(Noggit::mysqlSettingKey(Keys::remoteDbHost()), _ssh_remote_host->text().trimmed());
+        _settings->setValue(Noggit::mysqlSettingKey(Keys::remoteDbPort()), _ssh_remote_port->value());
+        _settings->setValue(Noggit::mysqlSettingKey(Keys::fingerprint()), _ssh_fingerprint->text().trimmed());
+        _settings->sync();
+
+        // Settings changed while this project is open: restart (or stop) its tunnel to match.
+        auto& tunnel = Noggit::Ssh::SshTunnelManager::instance();
+        if (!tunnel.openProjectId().isEmpty() && tunnel.openProjectId() == Noggit::projectKeyId())
+        {
+          tunnel.applyConfig(Noggit::Ssh::TunnelConfig::fromProjectSettings());
+        }
+      }
 #endif
 
       _settings->setValue("wireframe/type", ui->radio_wire_cursor->isChecked());
@@ -967,6 +1014,354 @@ namespace Noggit
       _settings->sync();
 
       emit saved();
+    }
+      void settings::build_ssh_section()
+    {
+      using Noggit::Ssh::SshTunnelManager;
+
+      _ssh_box = new QGroupBox("SSH tunnel (connect to a remote database securely)", this);
+      _ssh_box->setCheckable(true);
+      _ssh_box->setChecked(false);
+      _ssh_box->setToolTip("Noggit starts a private SSH tunnel to the server and connects to MySQL through it, so the "
+                           "database port never has to be open to the internet. Saved per project.");
+
+      auto* layout = new QVBoxLayout(_ssh_box);
+      auto* form = new QFormLayout();
+      layout->addLayout(form);
+
+      _ssh_host = new QLineEdit(_ssh_box);
+      _ssh_host->setPlaceholderText("server IP or host name, e.g. 203.0.113.10");
+      form->addRow("SSH host", _ssh_host);
+
+      _ssh_port = new QSpinBox(_ssh_box);
+      _ssh_port->setRange(1, 65535);
+      _ssh_port->setValue(22);
+      form->addRow("SSH port", _ssh_port);
+
+      _ssh_user = new QLineEdit(_ssh_box);
+      _ssh_user->setPlaceholderText("the SSH username your administrator gave you");
+      form->addRow("SSH user", _ssh_user);
+
+      auto* key_row = new QHBoxLayout();
+      _ssh_key = new QLineEdit(_ssh_box);
+      _ssh_key->setPlaceholderText("your PRIVATE key file (not the .pub file)");
+      auto* browse = new QPushButton("Browse...", _ssh_box);
+      key_row->addWidget(_ssh_key);
+      key_row->addWidget(browse);
+      form->addRow("Private key", key_row);
+      connect(browse, &QPushButton::clicked, this, [this]
+      {
+        QString start = _ssh_key->text().isEmpty() ? QDir::homePath() + "/.ssh" : QFileInfo(_ssh_key->text()).absolutePath();
+        QString const file = QFileDialog::getOpenFileName(this, "Select your SSH private key", start);
+        if (!file.isEmpty())
+        {
+          _ssh_key->setText(file);
+        }
+      });
+
+      auto* agent_note = new QLabel(
+        "Keys protected by a passphrase must be unlocked in ssh-agent first (run: ssh-add &lt;key file&gt;). "
+        "Noggit never asks for, stores or sends passphrases.", _ssh_box);
+      agent_note->setWordWrap(true);
+      agent_note->setTextFormat(Qt::RichText);
+      agent_note->setStyleSheet("color: gray;");
+      layout->addWidget(agent_note);
+
+      auto* advanced = new QGroupBox("Advanced (the defaults are usually right)", _ssh_box);
+      auto* advanced_form = new QFormLayout(advanced);
+      _ssh_remote_host = new QLineEdit(advanced);
+      _ssh_remote_host->setPlaceholderText("127.0.0.1");
+      _ssh_remote_host->setToolTip("Where MySQL runs, as seen FROM the SSH server. 127.0.0.1 = on the same server.");
+      advanced_form->addRow("Database host on server", _ssh_remote_host);
+      _ssh_remote_port = new QSpinBox(advanced);
+      _ssh_remote_port->setRange(1, 65535);
+      _ssh_remote_port->setValue(3306);
+      advanced_form->addRow("Database port on server", _ssh_remote_port);
+      _ssh_fingerprint = new QLineEdit(advanced);
+      _ssh_fingerprint->setPlaceholderText("optional, e.g. SHA256:abc123...  (from your administrator)");
+      _ssh_fingerprint->setToolTip("If set, Noggit only connects when the server's host key has exactly this "
+                                   "fingerprint. If empty, you confirm the fingerprint the first time you connect.");
+      advanced_form->addRow("Expected host key", _ssh_fingerprint);
+      layout->addWidget(advanced);
+
+      _ssh_status = new QLabel(_ssh_box);
+      _ssh_status->setWordWrap(true);
+      _ssh_status->setTextInteractionFlags(Qt::TextSelectableByMouse);
+      layout->addWidget(_ssh_status);
+
+      auto* buttons = new QHBoxLayout();
+      buttons->addStretch();
+      _ssh_forget = new QPushButton("Forget trusted host key", _ssh_box);
+      _ssh_forget->setToolTip("Only use this when your administrator confirms the server's key was changed "
+                              "(e.g. the server was rebuilt).");
+      _ssh_test = new QPushButton("Test SSH tunnel", _ssh_box);
+      buttons->addWidget(_ssh_forget);
+      buttons->addWidget(_ssh_test);
+      layout->addLayout(buttons);
+
+      // Under the MySQL fields, above the "built without MySQL" note and the MySQL test button.
+      ui->verticalLayout_37->insertWidget(ui->verticalLayout_37->indexOf(ui->mysql_warning), _ssh_box);
+
+#ifdef USE_MYSQL_UID_STORAGE
+      // Don't show the database password in clear text.
+      ui->_mysql_pwd_field->setEchoMode(QLineEdit::Password);
+
+      connect(_ssh_box, &QGroupBox::toggled, this, [this] { update_direct_fields_enabled(); });
+      connect(_ssh_test, &QPushButton::clicked, this, [this] { test_ssh_tunnel(); });
+      connect(_ssh_forget, &QPushButton::clicked, this, [this]
+      {
+        save_changes();
+        auto const config = Noggit::Ssh::TunnelConfig::fromProjectSettings();
+        if (QMessageBox::warning(this, "Forget trusted host key",
+              QString("Remove the trusted SSH host key for %1?\n\nOnly do this if your administrator confirmed that "
+                      "the server's key changed. You will have to verify the new fingerprint.").arg(config.ssh_host),
+              QMessageBox::Yes | QMessageBox::Cancel, QMessageBox::Cancel) != QMessageBox::Yes)
+        {
+          return;
+        }
+        QString error;
+        auto& tunnel = SshTunnelManager::instance();
+        if (tunnel.config().project_id == config.project_id)
+        {
+          tunnel.stop();
+        }
+        if (!tunnel.forgetHostKeys(config, &error))
+        {
+          QMessageBox::critical(this, "Forget trusted host key", error);
+        }
+        update_ssh_status();
+      });
+      connect(&SshTunnelManager::instance(), &SshTunnelManager::stateChanged, this, [this] { update_ssh_status(); });
+#else
+      _ssh_box->setEnabled(false);
+#endif
+    }
+
+    void settings::update_direct_fields_enabled()
+    {
+      // In tunnel mode the database is reached through the tunnel; the direct Server/Port are unused.
+      bool const direct = !_ssh_box->isChecked();
+      ui->_mysql_server_field->setEnabled(direct);
+      ui->_mysql_port_field->setEnabled(direct);
+      QString const tip = direct ? QString() : QString("Not used while the SSH tunnel is enabled (see \"Database host/port on server\").");
+      ui->_mysql_server_field->setToolTip(tip);
+      ui->_mysql_port_field->setToolTip(tip);
+    }
+
+    void settings::update_ssh_status()
+    {
+#ifdef USE_MYSQL_UID_STORAGE
+      auto& tunnel = Noggit::Ssh::SshTunnelManager::instance();
+      bool const ours = tunnel.config().project_id == Noggit::projectKeyId();
+      _ssh_status->setText(ours ? tunnel.statusText() : QString("SSH tunnel: not running"));
+#endif
+    }
+
+    void settings::set_db_test_running(bool running)
+    {
+      _db_test_running = running;
+      ui->mysql_connect_test->setEnabled(!running);
+      _ssh_test->setEnabled(!running);
+      _ssh_forget->setEnabled(!running);
+    }
+
+    void settings::with_tunnel(bool explicit_restart, std::function<void()> on_connected)
+    {
+#ifdef USE_MYSQL_UID_STORAGE
+      using Noggit::Ssh::SshTunnelManager;
+      using State = SshTunnelManager::State;
+      auto& tunnel = SshTunnelManager::instance();
+      auto const config = Noggit::Ssh::TunnelConfig::fromProjectSettings();
+
+      if (!config.enabled)
+      {
+        set_db_test_running(false);
+        QMessageBox::information(this, "SSH tunnel", "Enable MySQL and the SSH tunnel for this project first.");
+        return;
+      }
+
+      auto connection = std::make_shared<QMetaObject::Connection>();
+      // Returns true once the attempt is over (connected, failed, or cancelled).
+      auto handle = [this, &tunnel, config, on_connected, connection](State state) -> bool
+      {
+        switch (state)
+        {
+          case State::Starting:
+          case State::Reconnecting:
+            return false;
+          case State::Connected:
+            QObject::disconnect(*connection);
+            on_connected();
+            return true;
+          case State::Disabled:
+            QObject::disconnect(*connection);
+            set_db_test_running(false);
+            return true;
+          case State::Failed:
+            break;
+        }
+
+        QObject::disconnect(*connection);
+        if (tunnel.lastError() == Noggit::Ssh::ErrorKind::HostKeyUnknown && !tunnel.pendingHostKeys().isEmpty())
+        {
+          if (Noggit::Ssh::promptTrustHostKey(this, config, tunnel.pendingHostKeys()))
+          {
+            QString error;
+            if (tunnel.trustPendingHostKeys(&error))
+            {
+              // Retry outside this signal handler.
+              QTimer::singleShot(0, this, [this, on_connected] { with_tunnel(true, on_connected); });
+              return true;
+            }
+            QMessageBox::critical(this, "SSH tunnel", error);
+          }
+          set_db_test_running(false);
+          return true;
+        }
+
+        set_db_test_running(false);
+        QMessageBox box(this);
+        box.setIcon(QMessageBox::Warning);
+        box.setWindowTitle("SSH tunnel failed");
+        box.setText(tunnel.lastErrorMessage());
+        if (!tunnel.lastErrorDetails().isEmpty())
+        {
+          box.setDetailedText(tunnel.lastErrorDetails());
+        }
+        box.exec();
+        return true;
+      };
+
+      set_db_test_running(true);
+      if (explicit_restart)
+      {
+        tunnel.restart(config);
+      }
+      else
+      {
+        tunnel.start(config); // no-op if this project's tunnel is already up
+      }
+      if (!handle(tunnel.state()))
+      {
+        *connection = connect(&tunnel, &SshTunnelManager::stateChanged, this, [handle](State s) { handle(s); });
+      }
+#else
+      Q_UNUSED(explicit_restart);
+      Q_UNUSED(on_connected);
+#endif
+    }
+
+    void settings::test_ssh_tunnel()
+    {
+      if (_db_test_running)
+      {
+        return;
+      }
+      save_changes();
+      with_tunnel(true, [this]
+      {
+        set_db_test_running(false);
+        QMessageBox::information(this, "SSH tunnel",
+          "The SSH tunnel is working.\n\n" + Noggit::Ssh::SshTunnelManager::instance().statusText()
+          + "\n\nUse \"Test MySQL connection\" to check the database login.");
+      });
+    }
+
+    void settings::test_mysql_connection()
+    {
+      if (_db_test_running)
+      {
+        return;
+      }
+      save_changes();
+#ifdef USE_MYSQL_UID_STORAGE
+      if (!Noggit::mysqlSetting("enabled", false).toBool())
+      {
+        QMessageBox::information(this, "MySQL", "MySQL is disabled for this project. Tick the MySQL box first.");
+        return;
+      }
+
+      bool const via_tunnel = Noggit::mysqlSetting(Noggit::Ssh::Keys::enabled(), false).toBool();
+      auto run_probe = [this, via_tunnel]
+      {
+        auto& tunnel = Noggit::Ssh::SshTunnelManager::instance();
+        mysql::ConnectionTarget target = mysql::currentConnectionTarget();
+        if (via_tunnel)
+        {
+          target.host = "127.0.0.1";
+          target.port = tunnel.localPort();
+        }
+        set_db_test_running(true);
+        mysql::initClientLibrary();
+
+        // mysql_real_connect blocks (up to its 5 s timeouts): run it off the UI thread.
+        QPointer<settings> self(this);
+        std::thread([self, target, via_tunnel]
+        {
+          mysql::ProbeResult const result = mysql::probeConnection(target);
+          QMetaObject::invokeMethod(qApp, [self, result, via_tunnel, schema = target.schema]
+          {
+            if (!self)
+            {
+              return;
+            }
+            self->set_db_test_running(false);
+            auto& tunnel = Noggit::Ssh::SshTunnelManager::instance();
+            QString const detail = QString::fromStdString(result.error);
+            QString text;
+            switch (result.status)
+            {
+              case mysql::ProbeStatus::Ok:
+                QMessageBox::information(self, "MySQL", QString("Successfully connected to the MySQL database%1.")
+                                           .arg(via_tunnel ? " through the SSH tunnel" : ""));
+                return;
+              case mysql::ProbeStatus::Unreachable:
+                if (via_tunnel)
+                {
+                  auto const config = tunnel.config();
+                  text = QString("The SSH tunnel is working, but MySQL could not be reached at %1:%2 on the server. "
+                                 "Check \"Database host/port on server\" and that MySQL is running there.")
+                           .arg(config.remote_db_host).arg(config.remote_db_port);
+                  if (tunnel.remoteForwardRefused())
+                  {
+                    text += "\n\nThe SSH server reported that it could not open that address (or is not allowed to).";
+                  }
+                }
+                else
+                {
+                  text = "Could not reach the MySQL server. Check the server address and port, and that MySQL accepts connections from this computer.";
+                }
+                break;
+              case mysql::ProbeStatus::AuthFailed:
+                text = "The MySQL server rejected the login. Check the MySQL user and password.";
+                break;
+              case mysql::ProbeStatus::SchemaFailed:
+                text = QString("Logged in to MySQL, but the World DB '%1' could not be opened or prepared. Check the "
+                               "name and that the MySQL user has access to it.").arg(QString::fromStdString(schema));
+                break;
+              case mysql::ProbeStatus::Failed:
+                text = "Connecting to MySQL failed.";
+                break;
+            }
+            QMessageBox box(self);
+            box.setIcon(QMessageBox::Warning);
+            box.setWindowTitle("MySQL connection failed");
+            box.setText(text);
+            box.setInformativeText(detail); // MySQL's own message; never contains the password
+            box.exec();
+          }, Qt::QueuedConnection);
+        }).detach();
+      };
+
+      if (via_tunnel)
+      {
+        with_tunnel(false, run_probe);
+      }
+      else
+      {
+        run_probe();
+      }
+#endif
     }
   }
 }
