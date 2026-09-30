@@ -411,9 +411,12 @@ namespace Noggit::Ui::Windows
 
     _world.reset();
 
-    // Modern CASC projects serve Map through gMapDB (synthesized from Map.db2); the DatabaseLib route
-    // below cannot read WDC5 and would hand back an empty table.
-    if (!Project::usesSynthesizedDbc(_project->projectVersion))
+    // Classic/Turtle map rows are already parsed by the layout-aware gMapDB path used to build the
+    // map list. Their custom Map.dbc layouts are not reliably described by the stock 1.12 DBD: the
+    // generic reader can treat an integer as a string-table offset and throw std::out_of_range here.
+    // Modern CASC projects also serve Map through gMapDB (synthesized from Map.db2).
+    if (_project->projectVersion != Project::ProjectVersion::CLASSIC
+        && !Project::usesSynthesizedDbc(_project->projectVersion))
     {
       auto table = _project->ClientDatabase->LoadTable("Map", readFileAsIMemStream);
       auto record = table.Record(map_id);
@@ -477,8 +480,8 @@ namespace Noggit::Ui::Windows
     }();
     if (!bench_frames)
       MapView::setVkParityForced(cams_file.toStdString());
-    _putenv_s("NOGGIT_VK_DIFF_DIR", out_dir.toStdString().c_str());
-    _putenv_s("NOGGIT_VK_DIFF_SETTLE", "150");
+    qputenv("NOGGIT_VK_DIFF_DIR", out_dir.toUtf8());
+    qputenv("NOGGIT_VK_DIFF_SETTLE", "150");
     // AF-off diagnostic runs: py -3 vk_parity_run.py after setting NOGGIT_PARITY_NO_AF=1 in the env
 
     setAnimated(false);

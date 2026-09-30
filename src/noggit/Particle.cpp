@@ -1,6 +1,7 @@
 // This file is part of Noggit3, licensed under GNU General Public License (version 3).
 
 #include <noggit/rendering/vulkan/VkParticleFeed.hpp>
+#include <noggit/rendering/RenderDiagnostics.hpp>
 #include <noggit/Misc.h>
 #include <noggit/Particle.h>
 #include <noggit/Log.h>
@@ -1803,7 +1804,7 @@ void ParticleSystem::draw( glm::mat4x4 const& model_view
   // [PIPELINE scope] counted AFTER the gate: this is a real GL emitter draw. Counting at
   // ModelRender::drawParticles' entry instead reported 20-35/frame for emitters Vulkan owns and
   // never drew -- the same call-vs-draw error as the WMO counter (finding 65).
-  { extern unsigned g_gl_draw_particles; ++g_gl_draw_particles; }
+  ++Noggit::Rendering::g_gl_draw_particles;
   gl.bufferData<GL_ARRAY_BUFFER, glm::vec3>(_vertices_vbo, vertices, GL_STREAM_DRAW);
   gl.bufferData<GL_ARRAY_BUFFER, glm::vec4>(_colors_vbo, colors_data, GL_STREAM_DRAW);
   gl.bufferData<GL_ARRAY_BUFFER, glm::vec2>(_texcoord_vbo, texcoords, GL_STREAM_DRAW);

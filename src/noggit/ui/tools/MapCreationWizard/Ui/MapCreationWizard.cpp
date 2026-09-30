@@ -115,14 +115,21 @@ MapCreationWizard::MapCreationWizard(std::shared_ptr<Project::NoggitProject> pro
 
   // Fill selector combo
 
-  if (Project::usesSynthesizedDbc(_project->projectVersion))
+  if (_project->projectVersion == Project::ProjectVersion::CLASSIC
+      || Project::usesSynthesizedDbc(_project->projectVersion))
   {
-    // modern CASC: Map comes from gMapDB (synthesized from Map.db2)
+    // Classic/Turtle uses its legacy Map.dbc layout directly; modern CASC uses
+    // the Map.db2 data synthesized into gMapDB. Neither is safe to parse with
+    // the generic stock-DBD reader below.
+    bool const classic = _project->projectVersion == Project::ProjectVersion::CLASSIC;
+    std::size_t const name_field = classic ? MapDB::Name - 1 : MapDB::Name;
     int count = 0;
     for (DBCFile::Iterator it = gMapDB.begin(); it != gMapDB.end(); ++it)
     {
       int const map_id = static_cast<int>(it->getUInt(MapDB::MapID));
-      std::string name = it->getLocalizedString(MapDB::Name);
+      std::string name = it->getLocalizedString(name_field, 0);
+      if (name.empty())
+        name = it->getLocalizedString(name_field);
       if (name.empty())
         name = it->getString(MapDB::InternalName);
       if (name.empty())
@@ -474,10 +481,13 @@ void MapCreationWizard::selectMap(int map_id)
 {
   _is_new_record = false;
 
-  if (Project::usesSynthesizedDbc(_project->projectVersion))
+  if (_project->projectVersion == Project::ProjectVersion::CLASSIC
+      || Project::usesSynthesizedDbc(_project->projectVersion))
   {
-    // Modern CASC projects: Map is served through gMapDB (there is no DB2 writer yet), so the tile grid
-    // is available for editing terrain while the Map.dbc fields stay read-only.
+    // Classic/Turtle and modern CASC both use the already loaded, bounds-checked gMapDB path. The
+    // Classic Map.dbc has the legacy 66-field layout; modern data uses the WotLK-shaped synthesized
+    // layout. Keep their column positions separate.
+    bool const classic = _project->projectVersion == Project::ProjectVersion::CLASSIC;
     _cur_map_id = map_id;
     if (_world)
     {
@@ -497,15 +507,43 @@ void MapCreationWizard::selectMap(int map_id)
       _is_big_alpha->setEnabled(false);
       _sort_by_size_cat->setChecked(_world->mapIndex.sort_models_by_size_class());
       _instance_type->setCurrentIndex(std::min(rec.getInt(MapDB::AreaType), _instance_type->count() - 1));
-      _map_name->fill(rec, MapDB::Name);
-      _area_table_id->setValue(rec.getInt(22));
-      _loading_screen->setValue(rec.getInt(MapDB::LoadingScreen));
-      _minimap_icon_scale->setValue(rec.getFloat(58));
-      _time_of_day_override->setValue(rec.getInt(MapDB::TimeOfDayOverride));
-      if (gMapDB.getFieldCount() > MapDB::ExpansionID)
-        _expansion_id->setCurrentIndex(std::min(rec.getInt(MapDB::ExpansionID), _expansion_id->count() - 1));
-      _raid_offset->setValue(rec.getInt(64));
-      _max_players->setValue(rec.getInt(65));
+      if (classic)
+      {
+        // 1.12 Map.dbc: name=4, maxPlayers=23, descriptions=28/45,
+        // loadingScreen=62, raidOffset=63. The other WotLK UI fields do not exist.
+        _map_name->fill(rec, 4);
+        _map_desc_horde->fill(rec, 28);
+        _map_desc_alliance->fill(rec, 45);
+        _area_table_id->setValue(0);
+        _area_table_id->setEnabled(false);
+        _loading_screen->setValue(rec.getInt(62));
+        _minimap_icon_scale->setValue(1.0);
+        _minimap_icon_scale->setEnabled(false);
+        _corpse_map_id->setCurrentIndex(0);
+        _corpse_map_id->setEnabled(false);
+        _corpse_x->setValue(0.0);
+        _corpse_x->setEnabled(false);
+        _corpse_y->setValue(0.0);
+        _corpse_y->setEnabled(false);
+        _time_of_day_override->setValue(-1);
+        _time_of_day_override->setEnabled(false);
+        _expansion_id->setCurrentIndex(0);
+        _expansion_id->setEnabled(false);
+        _raid_offset->setValue(rec.getInt(63));
+        _max_players->setValue(rec.getInt(23));
+      }
+      else
+      {
+        _map_name->fill(rec, MapDB::Name);
+        _area_table_id->setValue(rec.getInt(22));
+        _loading_screen->setValue(rec.getInt(MapDB::LoadingScreen));
+        _minimap_icon_scale->setValue(rec.getFloat(58));
+        _time_of_day_override->setValue(rec.getInt(MapDB::TimeOfDayOverride));
+        if (gMapDB.getFieldCount() > MapDB::ExpansionID)
+          _expansion_id->setCurrentIndex(std::min(rec.getInt(MapDB::ExpansionID), _expansion_id->count() - 1));
+        _raid_offset->setValue(rec.getInt(64));
+        _max_players->setValue(rec.getInt(65));
+      }
     }
     catch (DBCFile::NotFound const&)
     {
@@ -774,6 +812,24 @@ void MapCreationWizard::saveCurrentEntry()
   record.writeString(1, _directory->text().toStdString());
 
   record.write(2, _instance_type->itemData(_instance_type->currentIndex()).toInt());
+
+  if (_project->projectVersion == Project::ProjectVersion::CLASSIC)
+  {
+    // Preserve the Vanilla 1.12 Map.dbc schema. Writing the WotLK indices below would overwrite
+    // unrelated Classic columns and corrupt the row.
+    _map_name->toRecord(record, 4);
+    record.write(23, _max_players->value());
+    _map_desc_horde->toRecord(record, 28);
+    _map_desc_alliance->toRecord(record, 45);
+    record.write(62, _loading_screen->value());
+    record.write(63, _raid_offset->value());
+
+    gMapDB.save();
+    emit map_dbc_updated();
+    _is_new_record = false;
+    return;
+  }
+
   record.write(3, _sort_by_size_cat->isChecked() ? 16 : 0 );
   _map_name->toRecord(record, 5);
 
@@ -1048,6 +1104,5 @@ void LocaleDBCEntry::clear()
 
   _flags->setValue(0);
 }
-
 
 

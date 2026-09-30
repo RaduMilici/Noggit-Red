@@ -1,6 +1,7 @@
 // This file is part of Noggit3, licensed under GNU General Public License (version 3).
 
 #include "WMOGroupRender.hpp"
+#include <noggit/rendering/RenderDiagnostics.hpp>
 #include <atomic> // [TEXARRAYDBG] temporary
 #include <sstream> // [TEXARRAYDBG] temporary
 #include <vector>
@@ -459,15 +460,15 @@ void WMOGroupRender::setupVao(OpenGL::Scoped::use_program& wmo_shader)
 }
 
 // [VK-DIFF phase D] draw calls GL issued for WMO groups this frame; WorldRender resets it.
-unsigned g_gl_wmo_draw_calls = 0;
+unsigned Noggit::Rendering::g_gl_wmo_draw_calls = 0;
 // Bumped once per frame by WorldRender::vkResetWmoFrame(); stamps each group's run capture so
 // the VK feed can tell "GL drew this group this frame" from "this record is stale".
-unsigned g_wmo_frame_stamp = 0;
-unsigned g_gl_draw_wmo_group = 0;
+unsigned Noggit::Rendering::g_wmo_frame_stamp = 0;
+unsigned Noggit::Rendering::g_gl_draw_wmo_group = 0;
 // Set by WorldRender each frame: when Vulkan owns the WMO pass, this group draw still computes and
 // RECORDS its visible runs (the VK feed replays them) but does not issue the GL draw, because the
 // VK compose has already put those pixels in the framebuffer.
-bool g_vk_owns_wmo = false;
+bool Noggit::Rendering::g_vk_owns_wmo = false;
 
 void WMOGroupRender::draw(OpenGL::Scoped::use_program& wmo_shader
     , math::frustum const& frustum

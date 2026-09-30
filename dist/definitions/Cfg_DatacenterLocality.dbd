@@ -1,0 +1,10 @@
+COLUMNS
+locstring Name_lang?
+int ID
+int RegionID? // matches Cfg_Regions::Region_ID
+
+LAYOUT 69972F80
+BUILD 1.60.1.69876, 1.60.1.69893
+Name_lang
+$id$ID<32>
+RegionID<32>

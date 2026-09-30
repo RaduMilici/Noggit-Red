@@ -984,10 +984,12 @@ private:
 
   // SQL apply / reset tooling (see setupAssistMenu): apply pending spawn changes or a .sql file to
   // the project's connected database, or rebuild the database from folders of base .sql dumps.
+#ifdef USE_MYSQL_UID_STORAGE
   void applyDirtyCreatureSpawnsToDb();
   void applyDirtyGameObjectSpawnsToDb();
   void applySqlFileToDb();
   void resetDatabaseFromSqlFolders();
+#endif
 
   QWidget* _overlay_widget;
 };

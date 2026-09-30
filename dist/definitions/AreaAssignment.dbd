@@ -1,0 +1,24 @@
+COLUMNS
+int ID
+int<Map::ID> MapID
+int<AreaTable::ID> AreaID
+int ChunkX
+int ChunkY
+
+BUILD 6.0.1.18179
+BUILD 4.0.0.11792
+BUILD 6.0.1.18125-6.1.2.19865
+BUILD 5.0.1.15464-5.4.8.18414
+BUILD 4.0.0.11927-4.3.4.15595
+$id$ID<32>
+MapID<32>
+AreaID<32>
+ChunkX<32>
+ChunkY<32>
+
+LAYOUT EFCCC3B3, 7E05F1F3, 19DBFBEB, 2E617DD3, 5A2FDE03, 309EFC13
+$noninline,id$ID<32>
+MapID<u16>
+AreaID<u16>
+ChunkX<u8>
+ChunkY<u8>

@@ -1,5 +1,6 @@
 // This file is part of Noggit3, licensed under GNU General Public License (version 3).
 #include <noggit/rendering/vulkan/VkParticleFeed.hpp>
+#include <noggit/rendering/RenderDiagnostics.hpp>
 #include <noggit/DBC.h>
 #include <noggit/MapChunk.h>
 #include <noggit/MapView.h>
@@ -32,8 +33,9 @@ namespace Noggit { void printStacktrace(); }   // error_handling.cpp (StackWalke
 #include <noggit/ui/WaterSoundPlayer.hpp>
 
 // [VULKAN harness] silences every audio path during off-screen parity runs (set in muteAudioForHarness)
-bool g_noggit_harness_silent = false;
+bool Noggit::Rendering::g_noggit_harness_silent = false;
 
+#ifdef _WIN32
 // [VULKAN] BLP path -> bindless texture index, shared by the terrain tilesets and the M2 batches.
 static std::unordered_map<std::string, std::int32_t> s_vk_tex_ids;
 
@@ -136,6 +138,8 @@ namespace
     }
   }
 }
+#endif
+
 #include <noggit/ui/CreatureInfoPanel.hpp>
 #include <noggit/ui/Toolbar.h> // Noggit::Ui::toolbar
 #include <noggit/ui/Water.h>
@@ -4689,12 +4693,14 @@ void MapView::setupAssistMenu()
   assist_menu->addSeparator();
   assist_menu->addAction(createTextSeparator("Database"));
   assist_menu->addSeparator();
+#ifdef USE_MYSQL_UID_STORAGE
   // Push flows: everything targets the PROJECT's configured connection (Settings -> MySQL), so a
   // Turtle project only ever writes to its own tw_world-style schema.
   ADD_ACTION_NS (assist_menu, "Apply pending creature changes to database", [this] { applyDirtyCreatureSpawnsToDb(); });
   ADD_ACTION_NS (assist_menu, "Apply pending gameobject changes to database", [this] { applyDirtyGameObjectSpawnsToDb(); });
   ADD_ACTION_NS (assist_menu, "Apply SQL file to database...", [this] { applySqlFileToDb(); });
   ADD_ACTION_NS (assist_menu, "Reset database from SQL folders...", [this] { resetDatabaseFromSqlFolders(); });
+#endif
 
   assist_menu->addSeparator();
   assist_menu->addAction(createTextSeparator("Model"));
@@ -8680,6 +8686,7 @@ void MapView::saveDirtyGameObjectSpawns()
 // style schema and never into some other server's database.
 // ---------------------------------------------------------------------------
 
+#ifdef USE_MYSQL_UID_STORAGE
 namespace
 {
   // Shared confirmation for anything that WRITES to the database: shows the exact target
@@ -9048,6 +9055,7 @@ void MapView::resetDatabaseFromSqlFolders()
                            QString("Ran %1 SQL file(s) against %2.").arg(files.size()).arg(schema));
   refreshCreatureSpawnOverlay(true);
 }
+#endif
 
 void MapView::jumpToGameObjectListItem(QListWidgetItem* item)
 {
@@ -12900,7 +12908,7 @@ void MapView::tick (float dt)
     // change, with the client's "Underwater (DONOTRENAME)" override while the camera is
     // submerged. Same frozen-day convention as the music above.
     bool const listener_submerged = _world->renderer()->camera_underwater();
-    if (!g_noggit_harness_silent) _zone_music_player->update_ambience(_world->getZoneAmbience(_camera.position), is_day,
+    if (!Noggit::Rendering::g_noggit_harness_silent) _zone_music_player->update_ambience(_world->getZoneAmbience(_camera.position), is_day,
                                         listener_submerged);
     // Submerged-listener duck (doc 38): the client's underwater SoundProviderPreferences EAX
     // muffle, approximated (labeled) as a volume duck on music + one-shots.
@@ -12937,7 +12945,7 @@ void MapView::tick (float dt)
             ++count;
           }
         }
-        if (!g_noggit_harness_silent) Noggit::Ui::WaterSoundPlayer::instance().update(
+        if (!Noggit::Rendering::g_noggit_harness_silent) Noggit::Ui::WaterSoundPlayer::instance().update(
           sources, count, listener_submerged, _zone_music_player->ambience_volume(), true);
       }
     }
@@ -13732,7 +13740,7 @@ void MapView::draw_map()
   // Core) packs no tile, so the camera list below never applied and every capture stood at the
   // enterMapAt corner outside the dungeon. The global WMO having finished loading is that map's
   // readiness.
-  if (g_noggit_harness_silent && vk_diff::enabled() && !s_diff_done && !vk_diff::vkReady()
+  if (Noggit::Rendering::g_noggit_harness_silent && vk_diff::enabled() && !s_diff_done && !vk_diff::vkReady()
       && _world->mapIndex.hasAGlobalWMO())
   {
     auto global_wmo = _world->getModelInstanceStorage().get_wmo_instance(_world->mWmoEntry.uniqueID);
@@ -13744,7 +13752,7 @@ void MapView::draw_map()
   // HARNESS ONLY. This teleports the camera to the parity camera list, so it must never run in an
   // interactive session -- with render/vk_parity_check on it flung the user out of the world the
   // moment VK reported ready, on whatever map they had open.
-  if (g_noggit_harness_silent && vk_diff::enabled() && !s_diff_done && vk_diff::vkReady())
+  if (Noggit::Rendering::g_noggit_harness_silent && vk_diff::enabled() && !s_diff_done && vk_diff::vkReady())
   {
     int const settle_frames = static_cast<int>(vk_diff::envf("NOGGIT_VK_DIFF_SETTLE", 90.0));
     vk_diff::Cam const& c = s_diff_cams[s_diff_cam_i];
@@ -17411,7 +17419,7 @@ bool MapView::vkParityFinished()
 
 void MapView::muteAudioForHarness()
 {
-  g_noggit_harness_silent = true;
+  Noggit::Rendering::g_noggit_harness_silent = true;
   Noggit::Ui::WaterSoundPlayer::instance().stop_all();
   if (_zone_music_player)
   {
@@ -17634,16 +17642,14 @@ void MapView::renderFrameForHarness()
                << " glFinish=" << (s_finish / s_n) << " ms/frame" << std::endl;
       {
         // [PIPELINE scope] GL draws still issued by the traversal, per frame, in THIS api.
-        extern unsigned g_gl_draw_instanced, g_gl_draw_single, g_gl_draw_persistent;
-        extern unsigned g_gl_draw_particles, g_gl_draw_ribbons, g_gl_draw_wmo_group;
-        LogError << "[VK] GL DRAWS/frame(any api): instanced=" << (g_gl_draw_instanced / s_n)
-                 << " single=" << (g_gl_draw_single / s_n)
-                 << " persistent=" << (g_gl_draw_persistent / s_n)
-                 << " particles=" << (g_gl_draw_particles / s_n)
-                 << " ribbons=" << (g_gl_draw_ribbons / s_n)
-                 << " wmoGroup=" << (g_gl_draw_wmo_group / s_n) << std::endl;
-        g_gl_draw_instanced = g_gl_draw_single = g_gl_draw_persistent = 0;
-        g_gl_draw_particles = g_gl_draw_ribbons = g_gl_draw_wmo_group = 0;
+        LogError << "[VK] GL DRAWS/frame(any api): instanced=" << (Noggit::Rendering::g_gl_draw_instanced / s_n)
+                 << " single=" << (Noggit::Rendering::g_gl_draw_single / s_n)
+                 << " persistent=" << (Noggit::Rendering::g_gl_draw_persistent / s_n)
+                 << " particles=" << (Noggit::Rendering::g_gl_draw_particles / s_n)
+                 << " ribbons=" << (Noggit::Rendering::g_gl_draw_ribbons / s_n)
+                 << " wmoGroup=" << (Noggit::Rendering::g_gl_draw_wmo_group / s_n) << std::endl;
+        Noggit::Rendering::g_gl_draw_instanced = Noggit::Rendering::g_gl_draw_single = Noggit::Rendering::g_gl_draw_persistent = 0;
+        Noggit::Rendering::g_gl_draw_particles = Noggit::Rendering::g_gl_draw_ribbons = Noggit::Rendering::g_gl_draw_wmo_group = 0;
       }
       LogError << "[VK] PAINTGL SPLIT(any api): preDrawMap=" << (vk_stat_pg_pre_ms() / s_n)
                << " drawMap=" << (vk_stat_pg_map_ms() / s_n)

@@ -1,0 +1,12 @@
+COLUMNS
+int ID
+int<AvailableSuperDistrict::ID> SourceAvailableSuperDistrictID?
+int<AvailableSuperDistrict::ID> DestAvailableSuperDistrictID?
+int TransferType?
+
+LAYOUT 42D01E57
+BUILD 1.60.1.69876, 1.60.1.69893
+$noninline,id$ID<32>
+SourceAvailableSuperDistrictID<32>
+DestAvailableSuperDistrictID<32>
+$noninline,relation$TransferType<u32>

@@ -1,0 +1,14 @@
+COLUMNS
+int ID
+int ContentSetID?
+int AttackingPetType?
+int DefendingPetType?
+float Modifier?
+
+LAYOUT 3982B8A0
+BUILD 1.60.1.69876, 1.60.1.69893
+$noninline,id$ID<32>
+ContentSetID<32>
+AttackingPetType<8>
+DefendingPetType<8>
+Modifier

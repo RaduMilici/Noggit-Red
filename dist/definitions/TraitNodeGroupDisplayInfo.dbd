@@ -1,0 +1,14 @@
+COLUMNS
+int ID
+int<TraitNodeGroup::ID> TraitNodeGroupID?
+int<SkillLine::ID> SkillLineID?
+int OrderIndex?
+int<TraitTree::ID> TraitTreeID?
+
+LAYOUT 75AEB7FD
+BUILD 1.60.1.69876, 1.60.1.69893
+$noninline,id$ID<32>
+TraitNodeGroupID<32>
+SkillLineID<32>
+OrderIndex<32>
+$noninline,relation$TraitTreeID<32>

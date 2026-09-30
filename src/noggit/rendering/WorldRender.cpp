@@ -1,6 +1,7 @@
 // This file is part of Noggit3, licensed under GNU General Public License (version 3).
 
 #include <noggit/rendering/vulkan/VkParticleFeed.hpp>
+#include <noggit/rendering/RenderDiagnostics.hpp>
 #include "WorldRender.hpp"
 #include <external/tracy/Tracy.hpp>
 #include <math/frustum.hpp>

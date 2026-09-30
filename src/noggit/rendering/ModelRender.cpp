@@ -1,6 +1,7 @@
 // This file is part of Noggit3, licensed under GNU General Public License (version 3).
 
 #include <noggit/rendering/vulkan/VkParticleFeed.hpp>
+#include <noggit/rendering/RenderDiagnostics.hpp>
 #include "ModelRender.hpp"
 #include <noggit/Model.h>
 #include <noggit/ModelInstance.h>
@@ -350,8 +351,11 @@ void ModelRender::unload()
 
 // [PIPELINE scope] How many GL draws the traversal STILL issues in VK mode. The record/replay
 // project's size is the number of sites that actually fire, not the number that exist in source.
-unsigned g_gl_draw_instanced = 0, g_gl_draw_single = 0, g_gl_draw_persistent = 0;
-unsigned g_gl_draw_particles = 0, g_gl_draw_ribbons = 0;
+namespace Noggit::Rendering
+{
+  unsigned g_gl_draw_instanced = 0, g_gl_draw_single = 0, g_gl_draw_persistent = 0;
+  unsigned g_gl_draw_particles = 0, g_gl_draw_ribbons = 0;
+}
 void ModelRender::draw(glm::mat4x4 const& model_view
     , ModelInstance& instance
     , OpenGL::Scoped::use_program& m2_shader
@@ -3092,20 +3096,20 @@ bool ModelRenderPass::bindTexture(size_t index, Model* m, ModelInstance const* i
 
 // [CRE-BODY-DIAG 2026-08-19] the last rej() code, read by WorldRender::drawCreatureBodiesBatched to attribute
 // creature-group batch failures to a specific gate (the shared s_rej histogram mixes doodads + creatures).
-thread_local int g_last_static_batch_reject = 0;
+thread_local int Noggit::Rendering::g_last_static_batch_reject = 0;
 // [VK] sub-reason for reject 12 (texture unit 0 unresolved) -- which branch of resolve_unit bailed.
-thread_local int g_last_tex_unit_reject = 0;
+thread_local int Noggit::Rendering::g_last_tex_unit_reject = 0;
 // [2026-09-03] true when the texture rejection is PERMANENT (lookup out of range / no backing
 // texture entry): GL's own bindTexture returns false for that pass on every frame, so GL never
 // draws it either. The VK classic feed uses this to skip just the pass (like a hidden geoset)
 // instead of dropping the whole model to the -- in native mode invisible -- GL fallback.
-thread_local bool g_last_reject_permanent = false;
+thread_local bool Noggit::Rendering::g_last_reject_permanent = false;
 // [2026-09-04] Sub-reason for reject code 4, which is OVERLOADED (hidden geoset / z_buffered /
 // unfogged-unlit). vkFeedClassicBucket skipped the pass for ALL of them on the grounds that "GL
 // skips it too" -- true only for a genuinely hidden geoset. GL draws z_buffered passes normally,
 // so that blanket skip made every pass of such a model vanish (keys.empty() -> allHidden ->
 // dropped -> invisible in native). 1 = hidden geoset, 2 = z_buffered, 3 = unfogged/unlit.
-thread_local int g_last_rej4_reason = 0;
+thread_local int Noggit::Rendering::g_last_rej4_reason = 0;
 
 bool ModelRenderPass::resolveStaticBatch(Model* m, StaticBatchKey& out, bool for_pib, ModelInstance const* rep) const
 {

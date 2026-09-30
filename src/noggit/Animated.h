@@ -469,7 +469,7 @@ namespace Animation
         }
 
         const TimestampType* timestamps = ext ?
-          ext->get<TimestampType>(timestampHeaders[j].ofsEntries) :
+          ext->template get<TimestampType>(timestampHeaders[j].ofsEntries) :
           file.get<TimestampType>(timestampHeaders[j].ofsEntries);
 
         for (std::uint32_t i = 0; i < timestampHeaders[j].nEntries; ++i)
@@ -487,7 +487,7 @@ namespace Animation
         }
 
         const DataType* keys = ext ?
-          ext->get<DataType>(keyHeaders[j].ofsEntries) :
+          ext->template get<DataType>(keyHeaders[j].ofsEntries) :
           file.get<DataType>(keyHeaders[j].ofsEntries);
 
         switch (_interpolationType)

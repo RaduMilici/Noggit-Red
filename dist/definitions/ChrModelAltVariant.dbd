@@ -1,0 +1,10 @@
+COLUMNS
+int ID
+int<ChrModel::ID> SourceChrModelID?
+int<ChrModel::ID> VariantChrModelID?
+
+LAYOUT 3562BFF9
+BUILD 1.60.1.69876, 1.60.1.69893
+$id$ID<32>
+SourceChrModelID<32>
+VariantChrModelID<32>

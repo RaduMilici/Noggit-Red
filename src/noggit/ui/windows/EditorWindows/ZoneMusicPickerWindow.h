@@ -8,8 +8,8 @@
 #include <QtWidgets/QTreeWidget>
 #include <QtWidgets/QDoubleSpinBox>
 #include <QtWidgets/QSlider>
-#include <QtWidgets/QCheckBox.h>
-#include <QtWidgets/QComboBox.h>
+#include <QtWidgets/QCheckBox>
+#include <QtWidgets/QComboBox>
 #include <QtWidgets/QLabel>
 #include <QtWidgets/QListWidget>
 #include <QtWidgets/QListView>
@@ -50,4 +50,3 @@ namespace Noggit
         };
     }
 }
-
