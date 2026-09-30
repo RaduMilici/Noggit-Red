@@ -876,10 +876,12 @@ namespace Noggit
 
       // Per-project MySQL settings (see MySqlSettings.hpp) so each project keeps its own connection.
       auto server_str = Noggit::mysqlSetting("server", "127.0.0.1").toString();
-      auto user_str = Noggit::mysqlSetting("user", "127.0.0.1").toString();
-      auto pwd_str = Noggit::mysqlSetting("pwd", "127.0.0.1").toString();
-      auto db_str = Noggit::mysqlSetting("db", "127.0.0.1").toString();
-      auto port_int = Noggit::mysqlSetting("port", "127.0.0.1").toInt();
+      // Same defaults as the connection code (mysql.cpp loadConnectionDetails); these used to fall back
+      // to "127.0.0.1" for every field, so an unsaved World DB showed up as "127.0.0.1".
+      auto user_str = Noggit::mysqlSetting("user", "root").toString();
+      auto pwd_str = Noggit::mysqlSetting("pwd", "mangos").toString();
+      auto db_str = Noggit::mysqlSetting("db", "tw_world").toString();
+      auto port_int = Noggit::mysqlSetting("port", 3306).toInt();
 
       // set some default
       if (server_str.isEmpty())

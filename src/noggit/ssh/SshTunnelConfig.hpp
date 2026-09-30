@@ -113,6 +113,9 @@ namespace Noggit
     // Full settings validation (fields + key). Returns ErrorKind::None when the tunnel may start.
     ErrorKind validateConfig(TunnelConfig const& config, bool agent_available, bool* key_encrypted = nullptr);
 
+    // Which field makes the settings invalid, in plain words (empty when the fields are fine).
+    QString invalidSettingsReason(TunnelConfig const& config);
+
     // --- ssh output / host keys -------------------------------------------------------------------
 
     // Maps OpenSSH client stderr to an ErrorKind (ErrorKind::Unknown when nothing matched).

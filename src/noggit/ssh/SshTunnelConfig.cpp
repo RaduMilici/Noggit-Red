@@ -377,6 +377,47 @@ namespace Noggit
       return key.error;
     }
 
+    QString invalidSettingsReason(TunnelConfig const& c)
+    {
+      if (c.ssh_host.isEmpty())
+      {
+        return QStringLiteral("Enter the SSH host (the server's public IP address or host name).");
+      }
+      if (!isValidHostname(c.ssh_host))
+      {
+        return QStringLiteral("The SSH host '%1' is not a valid IP address or host name.").arg(c.ssh_host);
+      }
+      if (!isValidPort(c.ssh_port))
+      {
+        return QStringLiteral("The SSH port must be between 1 and 65535.");
+      }
+      if (c.ssh_user.isEmpty())
+      {
+        return QStringLiteral("Enter the SSH user.");
+      }
+      if (!isValidUsername(c.ssh_user))
+      {
+        return QStringLiteral("The SSH user '%1' may only contain letters, digits, '.', '-' and '_'.").arg(c.ssh_user);
+      }
+      if (!isValidHostname(c.remote_db_host))
+      {
+        return QStringLiteral("\"Database host on server\" is not a valid IP address or host name (usually 127.0.0.1).");
+      }
+      if (!isValidPort(c.remote_db_port))
+      {
+        return QStringLiteral("\"Database port on server\" must be between 1 and 65535 (usually 3306).");
+      }
+      if (!c.expected_fingerprint.isEmpty() && normalizeFingerprint(c.expected_fingerprint).isEmpty())
+      {
+        return QStringLiteral("\"Expected host key\" must look like SHA256:... (43 characters after the colon), or be left empty.");
+      }
+      if (!c.key_path.isEmpty() && escapeSshIdentityPath(c.key_path).isEmpty())
+      {
+        return QStringLiteral("The private key path contains characters SSH cannot use (\"${\" or control characters).");
+      }
+      return QString();
+    }
+
     ErrorKind classifySshStderr(QString const& text)
     {
       auto has = [&](char const* needle) { return text.contains(QLatin1String(needle), Qt::CaseInsensitive); };

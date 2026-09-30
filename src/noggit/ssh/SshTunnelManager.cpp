@@ -109,6 +109,10 @@ namespace Noggit
 
     QString SshTunnelManager::lastErrorMessage() const
     {
+      if (_error == ErrorKind::InvalidSettings && !_error_details.isEmpty())
+      {
+        return _error_details; // names the offending field
+      }
       QString message = describeError(_error, _config);
       if (_error == ErrorKind::KeyRejected && _key_encrypted)
       {
@@ -304,7 +308,7 @@ namespace Noggit
       ErrorKind const invalid = validateConfig(config, agentAvailable(), &_key_encrypted);
       if (invalid != ErrorKind::None)
       {
-        fail(invalid);
+        fail(invalid, invalid == ErrorKind::InvalidSettings ? invalidSettingsReason(config) : QString());
         return;
       }
 

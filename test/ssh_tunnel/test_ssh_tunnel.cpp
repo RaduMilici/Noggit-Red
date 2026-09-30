@@ -293,6 +293,18 @@ private slots:
     QCOMPARE(validateConfig(config(), false), ErrorKind::None);
   }
 
+  void explainsInvalidSettings()
+  {
+    TunnelConfig c = config();
+    c.ssh_host.clear();
+    QVERIFY(invalidSettingsReason(c).contains("SSH host"));
+    SshTunnelManager m(options());
+    m.start(c);
+    QCOMPARE(m.lastError(), ErrorKind::InvalidSettings);
+    QVERIFY(m.lastErrorMessage().contains("Enter the SSH host"));
+    QVERIFY(invalidSettingsReason(config()).isEmpty());
+  }
+
   // --- private key checks -------------------------------------------------------------------------
 
   void inspectsPrivateKeys()
