@@ -79,6 +79,12 @@ namespace Noggit
       // Explicit user action ("Test SSH tunnel"): always starts over, clearing a declined host-key prompt.
       void restart(TunnelConfig const& config);
 
+      // Project lifecycle. projectClosed only stops the tunnel if it belongs to that project: when a
+      // project window is replaced, the new window is created before the old one is destroyed.
+      void projectOpened(TunnelConfig const& config);
+      void projectClosed(QString const& project_id);
+      QString openProjectId() const { return _open_project_id; }
+
       // Makes sure the tunnel for `config` is Connected, waiting up to `timeout_ms`. On success fills
       // `local_port`. When `interactive`, an unknown host key triggers the host-key prompt. Must be
       // called on the GUI thread; from other threads it only reports an already connected tunnel.
@@ -137,6 +143,7 @@ namespace Noggit
 
       Options _options;
       TunnelConfig _config;
+      QString _open_project_id;
       State _state = State::Disabled;
       ErrorKind _error = ErrorKind::None;
       QString _error_details;

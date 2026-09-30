@@ -47,8 +47,9 @@ namespace Noggit
       QString expected_fingerprint; // optional "SHA256:..." pin
       QString project_id;           // Noggit::projectKeyId() of the owning project
 
-      // Reads the ACTIVE project's settings (MySqlSettings.hpp). GUI thread only (QSettings is
-      // reentrant, but the "active project" is a GUI-side notion).
+      // Reads the ACTIVE project's settings (MySqlSettings.hpp). `enabled` is true only when BOTH MySQL
+      // and the SSH tunnel are enabled for the project. GUI thread only (QSettings is reentrant, but the
+      // "active project" is a GUI-side notion).
       static TunnelConfig fromProjectSettings();
 
       bool operator==(TunnelConfig const& o) const;

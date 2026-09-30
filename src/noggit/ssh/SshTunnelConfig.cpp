@@ -23,7 +23,9 @@ namespace Noggit
     TunnelConfig TunnelConfig::fromProjectSettings()
     {
       TunnelConfig config;
-      config.enabled = Noggit::mysqlSetting(Keys::enabled(), false).toBool();
+      // The tunnel only runs for projects that use MySQL at all.
+      config.enabled = Noggit::mysqlSetting(QStringLiteral("enabled"), false).toBool()
+                    && Noggit::mysqlSetting(Keys::enabled(), false).toBool();
       config.ssh_host = Noggit::mysqlSetting(Keys::host(), QString()).toString().trimmed();
       config.ssh_port = Noggit::mysqlSetting(Keys::port(), 22).toInt();
       config.ssh_user = Noggit::mysqlSetting(Keys::user(), QString()).toString().trimmed();

@@ -6,9 +6,12 @@
 #include <mysql/mysql.h>
 #include <mysql.h>
 
+#include <QtCore/QCoreApplication>
 #include <QtCore/QSettings>
+#include <QtCore/QThread>
 #include <QMessageBox>
 #include <noggit/MySqlSettings.hpp>
+#include <noggit/ssh/SshTunnelManager.hpp>
 
 #include <algorithm>
 #include <cstdlib>
@@ -69,26 +72,32 @@ namespace
 		}
 	};
 
-	std::unique_ptr<MYSQL, ConnectionCloser> connect(std::string* error = nullptr)
+	enum class ConnectStage
 	{
-		// Honor the per-project "MySQL enabled" toggle. Without this, every DB call (e.g. the creature/
-		// gameobject model pickers built on map open) connects regardless of the toggle -- so a project
-		// with MySQL DISABLED but a stale/unreachable host (e.g. Ascension: enabled=false, server=
-		// 192.168.1.28) blocks the main thread in mysql_real_connect on every map open and freezes the
-		// editor. If the user turned MySQL off for this project, do not connect at all.
-		// DEFAULT FALSE: MySQL stays OFF unless the project has EXPLICITLY enabled it. Every other call site
-		// (MapView, map_index, NoggitWindow) already defaults to false; this one defaulted to TRUE, so a
-		// project that never configured MySQL would try to connect (and freeze / break the user's setup).
-		if (!Noggit::mysqlSetting("enabled", false).toBool())
+		Connect,
+		Schema,
+	};
+
+	// The actual MySQL handshake + schema/UIDs setup against an explicit endpoint. Shared by connect()
+	// (GUI thread, per query) and probeConnection() (Test Connection, worker thread).
+	std::unique_ptr<MYSQL, ConnectionCloser> openConnection(ConnectionDetails const& details,
+	                                                        std::string* error = nullptr,
+	                                                        unsigned int* error_code = nullptr,
+	                                                        ConnectStage* stage = nullptr)
+	{
+		// The schema name is spliced into a statement below; a backtick would break out of the quoting.
+		if (details.schema.find('`') != std::string::npos)
 		{
 			if (error)
 			{
-				*error = "MySQL is disabled for this project.";
+				*error = "The World DB name contains an invalid character (`).";
+			}
+			if (stage)
+			{
+				*stage = ConnectStage::Schema;
 			}
 			return nullptr;
 		}
-
-		auto details = loadConnectionDetails();
 
 		MYSQL* connection = mysql_init(nullptr);
 		if (!connection)
@@ -105,6 +114,10 @@ namespace
 		mysql_options(connection, MYSQL_OPT_READ_TIMEOUT, &timeout_seconds);
 		mysql_options(connection, MYSQL_OPT_WRITE_TIMEOUT, &timeout_seconds);
 
+		if (stage)
+		{
+			*stage = ConnectStage::Connect;
+		}
 		if (!mysql_real_connect(connection,
 														details.host.c_str(),
 														details.user.c_str(),
@@ -118,11 +131,19 @@ namespace
 			{
 				*error = mysql_error(connection);
 			}
+			if (error_code)
+			{
+				*error_code = mysql_errno(connection);
+			}
 			mysql_close(connection);
 			return nullptr;
 		}
 
 		mysql_set_character_set(connection, "utf8");
+		if (stage)
+		{
+			*stage = ConnectStage::Schema;
+		}
 
 		std::string create_database = "CREATE DATABASE IF NOT EXISTS `" + details.schema + "`";
 		if (!executeStatement(connection, create_database, error))
@@ -154,6 +175,58 @@ namespace
 		}
 
 		return std::unique_ptr<MYSQL, ConnectionCloser>(connection);
+	}
+
+	// SSH tunnel mode: the saved server/port are replaced -- for THIS connection only -- by the local
+	// end of the project's tunnel. Returns false (with a user-facing error) when the tunnel is not up.
+	bool applyTunnelEndpoint(ConnectionDetails& details, std::string* error)
+	{
+		if (!Noggit::mysqlSetting(Noggit::Ssh::Keys::enabled(), false).toBool())
+		{
+			return true; // direct connection: details untouched
+		}
+		quint16 port = 0;
+		QString tunnel_error;
+		auto& tunnel = Noggit::Ssh::SshTunnelManager::instance();
+		if (!tunnel.ensureReady(Noggit::Ssh::TunnelConfig::fromProjectSettings(), 30000, &port, &tunnel_error))
+		{
+			if (error)
+			{
+				*error = "SSH tunnel: " + tunnel_error.toStdString();
+			}
+			return false;
+		}
+		details.host = "127.0.0.1";
+		details.port = port;
+		return true;
+	}
+
+	std::unique_ptr<MYSQL, ConnectionCloser> connect(std::string* error = nullptr)
+	{
+		// Honor the per-project "MySQL enabled" toggle. Without this, every DB call (e.g. the creature/
+		// gameobject model pickers built on map open) connects regardless of the toggle -- so a project
+		// with MySQL DISABLED but a stale/unreachable host (e.g. Ascension: enabled=false, server=
+		// 192.168.1.28) blocks the main thread in mysql_real_connect on every map open and freezes the
+		// editor. If the user turned MySQL off for this project, do not connect at all.
+		// DEFAULT FALSE: MySQL stays OFF unless the project has EXPLICITLY enabled it. Every other call site
+		// (MapView, map_index, NoggitWindow) already defaults to false; this one defaulted to TRUE, so a
+		// project that never configured MySQL would try to connect (and freeze / break the user's setup).
+		if (!Noggit::mysqlSetting("enabled", false).toBool())
+		{
+			if (error)
+			{
+				*error = "MySQL is disabled for this project.";
+			}
+			return nullptr;
+		}
+
+		auto details = loadConnectionDetails();
+		if (!applyTunnelEndpoint(details, error))
+		{
+			return nullptr;
+		}
+
+		return openConnection(details, error);
 	}
 
 	std::uint32_t parseUnsigned(char const* value)
@@ -681,7 +754,108 @@ namespace mysql
   std::string connectionDescription()
   {
     auto const details = loadConnectionDetails();
+    if (Noggit::mysqlSetting(Noggit::Ssh::Keys::enabled(), false).toBool())
+    {
+      auto const tunnel = Noggit::Ssh::TunnelConfig::fromProjectSettings();
+      return details.user + "@" + tunnel.remote_db_host.toStdString() + ":" + std::to_string(tunnel.remote_db_port)
+           + "/" + details.schema + " via SSH " + tunnel.displayName().toStdString();
+    }
     return details.user + "@" + details.host + ":" + std::to_string(details.port) + "/" + details.schema;
+  }
+
+  bool resolveEndpoint(std::string& host, unsigned int& port, std::string* error)
+  {
+    auto details = loadConnectionDetails();
+    if (!applyTunnelEndpoint(details, error))
+    {
+      return false;
+    }
+    host = details.host;
+    port = details.port;
+    return true;
+  }
+
+  ConnectionTarget currentConnectionTarget()
+  {
+    auto const details = loadConnectionDetails();
+    ConnectionTarget target;
+    target.host = details.host;
+    target.user = details.user;
+    target.password = details.password;
+    target.schema = details.schema;
+    target.port = details.port;
+    return target;
+  }
+
+  void initClientLibrary()
+  {
+    // Not thread-safe itself; must run on the main thread before a worker thread uses the client.
+    static bool const initialized = mysql_library_init(0, nullptr, nullptr) == 0;
+    (void)initialized;
+  }
+
+  ProbeResult probeConnection(ConnectionTarget const& target)
+  {
+    bool const worker_thread = QCoreApplication::instance()
+                             && QThread::currentThread() != QCoreApplication::instance()->thread();
+    if (worker_thread)
+    {
+      mysql_thread_init();
+    }
+
+    ConnectionDetails details;
+    details.host = target.host;
+    details.user = target.user;
+    details.password = target.password;
+    details.schema = target.schema;
+    details.port = target.port;
+
+    ProbeResult result;
+    ConnectStage stage = ConnectStage::Connect;
+    auto connection = openConnection(details, &result.error, &result.error_code, &stage);
+    if (connection)
+    {
+      result.status = ProbeStatus::Ok;
+    }
+    else if (stage == ConnectStage::Schema)
+    {
+      result.status = ProbeStatus::SchemaFailed;
+    }
+    else
+    {
+      switch (result.error_code)
+      {
+        case 1044: // ER_DBACCESS_DENIED_ERROR
+        case 1049: // ER_BAD_DB_ERROR
+          result.status = ProbeStatus::SchemaFailed;
+          break;
+        case 1045: // ER_ACCESS_DENIED_ERROR
+        case 1129: // ER_HOST_IS_BLOCKED
+        case 1130: // ER_HOST_NOT_PRIVILEGED
+        case 1251: // ER_NOT_SUPPORTED_AUTH_MODE
+        case 1698: // ER_ACCESS_DENIED_NO_PASSWORD_ERROR
+        case 2059: // CR_AUTH_PLUGIN_CANNOT_LOAD
+          result.status = ProbeStatus::AuthFailed;
+          break;
+        case 2002: // CR_CONNECTION_ERROR
+        case 2003: // CR_CONN_HOST_ERROR
+        case 2005: // CR_UNKNOWN_HOST
+        case 2006: // CR_SERVER_GONE_ERROR
+        case 2013: // CR_SERVER_LOST
+          result.status = ProbeStatus::Unreachable;
+          break;
+        default:
+          result.status = ProbeStatus::Failed;
+          break;
+      }
+    }
+    connection.reset();
+
+    if (worker_thread)
+    {
+      mysql_thread_end();
+    }
+    return result;
   }
 
   bool testConnection(bool report_only_err)

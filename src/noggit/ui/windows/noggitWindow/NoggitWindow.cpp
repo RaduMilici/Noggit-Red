@@ -54,6 +54,8 @@
 
 #ifdef USE_MYSQL_UID_STORAGE
 #include <mysql/mysql.h>
+#include <noggit/MySqlSettings.hpp>
+#include <noggit/ssh/SshTunnelManager.hpp>
 
 #include <QtCore/QSettings>
 #endif
@@ -201,6 +203,16 @@ namespace Noggit::Ui::Windows
     title << "Noggit - " << STRPRODUCTVER;
     setWindowTitle(QString::fromStdString(title.str()));
     setWindowIcon(QIcon(":/icon"));
+
+#ifdef USE_MYSQL_UID_STORAGE
+    // Bring up this project's SSH tunnel (if it uses one) in the background, so it is normally ready
+    // before the first database call; it is stopped again when this project window goes away.
+    {
+      auto& tunnel = Noggit::Ssh::SshTunnelManager::instance();
+      tunnel.projectOpened(Noggit::Ssh::TunnelConfig::fromProjectSettings());
+      connect(this, &QObject::destroyed, &tunnel, [&tunnel, id = Noggit::projectKeyId()] { tunnel.projectClosed(id); });
+    }
+#endif
 
     if (project->projectVersion == Project::ProjectVersion::CLASSIC
         || project->projectVersion == Project::ProjectVersion::WOTLK

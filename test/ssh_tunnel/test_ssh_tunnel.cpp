@@ -669,6 +669,28 @@ private slots:
     QCOMPARE(m.state(), State::Disabled);
   }
 
+  void projectLifecycle()
+  {
+    trustTestHost();
+    setPlan({"ok"});
+    SshTunnelManager m(options());
+    TunnelConfig a = config();
+    m.projectOpened(a);
+    QVERIFY(waitForState(m, State::Connected));
+
+    // Window replacement order: project B opens before project A's window is destroyed.
+    TunnelConfig b = config();
+    b.project_id = "p2";
+    b.remote_db_port = 3310;
+    m.projectOpened(b);
+    m.projectClosed(a.project_id);
+    QVERIFY(waitForState(m, State::Connected));
+    QCOMPARE(m.config().project_id, QString("p2"));
+
+    m.projectClosed(b.project_id);
+    QCOMPARE(m.state(), State::Disabled);
+  }
+
   void missingSshExecutable()
   {
     TunnelOptions o = options();
@@ -726,6 +748,7 @@ private slots:
     QSettings settings;
     settings.clear();
     settings.setValue("project/current_path", "/projects/turtle");
+    settings.setValue(Noggit::mysqlSettingKey("enabled"), true);
     settings.setValue(Noggit::mysqlSettingKey(Keys::enabled()), true);
     settings.setValue(Noggit::mysqlSettingKey(Keys::host()), "203.0.113.10");
     settings.setValue(Noggit::mysqlSettingKey(Keys::user()), "alice");
@@ -733,6 +756,7 @@ private slots:
     settings.setValue(Noggit::mysqlSettingKey("server"), "10.0.0.5");
 
     settings.setValue("project/current_path", "/projects/wotlk");
+    settings.setValue(Noggit::mysqlSettingKey(Keys::enabled()), true); // but MySQL itself is off here
     settings.setValue(Noggit::mysqlSettingKey(Keys::host()), "198.51.100.20");
     settings.setValue(Noggit::mysqlSettingKey(Keys::port()), 2200);
     settings.sync();
@@ -755,6 +779,7 @@ private slots:
     QCOMPARE(Noggit::mysqlSetting("server", "127.0.0.1").toString(), QString("10.0.0.5"));
 
     // The legacy global group never switches the tunnel on for a project.
+    settings.setValue("project/mysql/enabled", true);
     settings.setValue("project/mysql/ssh_enabled", true);
     settings.setValue("project/current_path", "/projects/fresh");
     QVERIFY(!TunnelConfig::fromProjectSettings().enabled);

@@ -223,6 +223,7 @@ static Noggit::Rendering::VK::VulkanBackend* g_vk_capture_backend = nullptr;
 
 #include <QtCore/QSettings>
 #include <noggit/MySqlSettings.hpp>
+#include <noggit/ssh/SshTunnelManager.hpp>
 #endif
 
 #include <noggit/scripting/scripting_tool.hpp>
@@ -5726,9 +5727,21 @@ void MapView::updateDatabaseStatus()
 
   if (Noggit::mysqlSetting("enabled", false).toBool())
   {
-    parts << QString("MySQL %1:%2")
-                 .arg(Noggit::mysqlSetting("server", "127.0.0.1").toString())
-                 .arg(Noggit::mysqlSetting("port", 3306).toString());
+    if (Noggit::mysqlSetting(Noggit::Ssh::Keys::enabled(), false).toBool())
+    {
+      auto const tunnel = Noggit::Ssh::TunnelConfig::fromProjectSettings();
+      parts << QString("MySQL %1:%2 via SSH %3 (%4)")
+                   .arg(tunnel.remote_db_host)
+                   .arg(tunnel.remote_db_port)
+                   .arg(tunnel.ssh_host)
+                   .arg(Noggit::Ssh::SshTunnelManager::stateName(Noggit::Ssh::SshTunnelManager::instance().state()));
+    }
+    else
+    {
+      parts << QString("MySQL %1:%2")
+                   .arg(Noggit::mysqlSetting("server", "127.0.0.1").toString())
+                   .arg(Noggit::mysqlSetting("port", 3306).toString());
+    }
   }
 
   if (_draw_creature_spawns.get())
@@ -8985,10 +8998,19 @@ void MapView::resetDatabaseFromSqlFolders()
 
   // Stream each file into the mysql CLIENT (stdin), which handles arbitrarily large dumps and the
   // full statement syntax. Sequential, abort on the first failure.
-  QString const host = Noggit::mysqlSetting("server", "127.0.0.1").toString();
+  // Direct mode: the saved server/port. SSH tunnel mode: the tunnel's local 127.0.0.1 endpoint.
+  std::string endpoint_host;
+  unsigned int endpoint_port = 0;
+  std::string endpoint_error;
+  if (!mysql::resolveEndpoint(endpoint_host, endpoint_port, &endpoint_error))
+  {
+    QMessageBox::critical(this, "Reset failed", QString::fromStdString(endpoint_error));
+    return;
+  }
+  QString const host = QString::fromStdString(endpoint_host);
   QString const user = Noggit::mysqlSetting("user", "root").toString();
   QString const pwd = Noggit::mysqlSetting("pwd", "mangos").toString();
-  QString const port = QString::number(Noggit::mysqlSetting("port", 3306).toUInt());
+  QString const port = QString::number(endpoint_port);
 
   QProgressDialog progress(QString("Running %1 SQL file(s) against %2...").arg(files.size()).arg(schema),
                            "Abort", 0, files.size(), this);

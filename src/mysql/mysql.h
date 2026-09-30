@@ -228,8 +228,46 @@ namespace mysql
   // spawn exports are pure DML so the all-or-nothing guarantee holds for them).
   SqlScriptResult executeSqlScript(std::string const& script);
 
-  // "user@host:port/schema" of the project connection, for confirmation dialogs.
+  // "user@host:port/schema" of the project connection (plus "via SSH user@host:port" in tunnel mode),
+  // for confirmation dialogs.
   std::string connectionDescription();
+
+  // Where MySQL connections go right now: the saved server/port, or 127.0.0.1:<local tunnel port> when
+  // the project uses an SSH tunnel (waits for / starts the tunnel; GUI thread). For external tools such
+  // as the mysql command line client.
+  bool resolveEndpoint(std::string& host, unsigned int& port, std::string* error = nullptr);
+
+  // Saved credentials of the active project (GUI thread). host/port are the SAVED direct-connection
+  // values; tunnel mode callers substitute the tunnel endpoint themselves.
+  struct ConnectionTarget
+  {
+    std::string host;
+    std::string user;
+    std::string password;
+    std::string schema;
+    unsigned int port = 3306;
+  };
+  ConnectionTarget currentConnectionTarget();
+
+  enum class ProbeStatus
+  {
+    Ok,
+    Unreachable,  // TCP connect / handshake failed
+    AuthFailed,   // server answered, credentials rejected
+    SchemaFailed, // logged in, but the World DB could not be created/selected/prepared
+    Failed,
+  };
+  struct ProbeResult
+  {
+    ProbeStatus status = ProbeStatus::Failed;
+    unsigned int error_code = 0;
+    std::string error;
+  };
+  // Must be called once on the main thread before probeConnection runs on a worker thread.
+  void initClientLibrary();
+  // Runs exactly the steps every database call performs (connect, schema, UIDs table) against
+  // `target`, without touching settings or the tunnel -- safe on a worker thread.
+  ProbeResult probeConnection(ConnectionTarget const& target);
 
   bool testConnection(bool report_only_err = false);
   bool hasMaxUIDStoredDB(std::size_t mapID);

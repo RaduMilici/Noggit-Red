@@ -240,6 +240,25 @@ namespace Noggit
 
     }
 
+    void SshTunnelManager::projectOpened(TunnelConfig const& config)
+    {
+      _open_project_id = config.project_id;
+      applyConfig(config);
+    }
+
+    void SshTunnelManager::projectClosed(QString const& project_id)
+    {
+      if (project_id != _open_project_id)
+      {
+        return;
+      }
+      _open_project_id.clear();
+      if (_config.project_id == project_id)
+      {
+        stop();
+      }
+    }
+
     void SshTunnelManager::restart(TunnelConfig const& config)
     {
       _host_key_declined = false;
