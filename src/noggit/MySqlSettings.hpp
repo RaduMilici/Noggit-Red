@@ -58,7 +58,8 @@ namespace Noggit
     // "enabled" NEVER seeds from the legacy global key: a stale global enabled=true would silently
     // turn MySQL ON for every project that hasn't saved its own toggle yet. Connection params
     // (server/user/pwd/db/port) still migrate; the on/off switch stays per-project, default OFF.
-    if (suffix == QStringLiteral("enabled"))
+    // Same for the SSH tunnel switch ("ssh_enabled", see ssh/SshTunnelConfig.hpp).
+    if (suffix == QStringLiteral("enabled") || suffix == QStringLiteral("ssh_enabled"))
     {
       return settings.value(mysqlSettingKey(suffix), def);
     }
