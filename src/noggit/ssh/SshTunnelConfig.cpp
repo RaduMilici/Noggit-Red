@@ -504,7 +504,7 @@ namespace Noggit
         {
           continue;
         }
-        QStringList const fields = line.split(QRegularExpression(QStringLiteral("\\s+")), QString::SkipEmptyParts);
+        QStringList const fields = line.simplified().split(QLatin1Char(' '));
         if (fields.size() < 3 || !type_re.match(fields[1]).hasMatch() || !blob_re.match(fields[2]).hasMatch())
         {
           continue;
