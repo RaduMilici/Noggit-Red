@@ -1,6 +1,10 @@
 /**
+# Re-include every directory, so the !/src/** style rules below also reach NEW files (git cannot
+# re-include a file whose parent directory is ignored). Files stay ignored unless a rule below allows them.
+!*/
 !/bin/**
 !/cmake/**
+!/docs/**
 !/etc/**
 !/include/**
 !/media/**
@@ -16,3 +20,6 @@
 !README.md
 !todo_1.4.md
 !uid_fix_concept.md
+
+# Build trees (the !*/ rule above would otherwise expose files like build/_deps/**/README.md).
+/build*/

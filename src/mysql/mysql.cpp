@@ -11,6 +11,7 @@
 #include <QtCore/QThread>
 #include <QMessageBox>
 #include <noggit/MySqlSettings.hpp>
+#include <mysql/mysql_internal.hpp>
 #include <noggit/ssh/SshTunnelManager.hpp>
 
 #include <algorithm>
@@ -2215,4 +2216,26 @@ namespace mysql
 
 		return mysql_affected_rows(connection.get()) >= 0;
 	}
+
+  namespace detail
+  {
+    void ConnectionCloser::operator()(MYSQL* connection) const
+    {
+      if (connection)
+      {
+        mysql_close(connection);
+      }
+    }
+
+    Connection connect(std::string* error)
+    {
+      // The file-local connect() honours the project's MySQL toggle and SSH tunnel.
+      return Connection(::connect(error).release());
+    }
+
+    bool execute(MYSQL* connection, std::string const& statement, std::string* error)
+    {
+      return executeStatement(connection, statement, error);
+    }
+  }
 }

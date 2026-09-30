@@ -220,6 +220,13 @@ static Noggit::Rendering::VK::VulkanBackend* g_vk_capture_backend = nullptr;
 
 #ifdef USE_MYSQL_UID_STORAGE
 #include <mysql/mysql.h>
+#include <noggit/ui/content/ContentSession.hpp>
+#include <noggit/ui/npc/NpcWorkflow.hpp>
+#include <noggit/ui/quest/QuestBrowserDialog.hpp>
+#include <noggit/ui/content/SqlApply.hpp>
+
+using Noggit::Ui::confirmSqlApply;
+using Noggit::Ui::reportSqlResult;
 
 #include <QtCore/QSettings>
 #include <noggit/MySqlSettings.hpp>
@@ -512,6 +519,8 @@ namespace vk_diff
 #include <condition_variable>
 #include <atomic>
 #include <memory>
+#include <optional>
+#include <utility>
 
 #include <vector>
 #include <random>
@@ -635,6 +644,8 @@ namespace
     }
 
     std::function<void()> on_double_click;
+    // The NPC editor's look (display ID, scale) waiting for the GL context.
+    std::optional<std::pair<std::uint32_t, float>> pending_look;
 
     void setModel(std::string const& filename) override
     {
@@ -2477,6 +2488,26 @@ void MapView::setupCreatureModelPickerUi()
   _creature_model_tree->setMinimumWidth(360);
   list_column_layout->addWidget(_creature_model_tree, 1);
 
+  // Create / edit NPC (creature_template) -- see NpcEditorDialog.
+  auto* npc_buttons = new QHBoxLayout();
+  npc_buttons->setSpacing(4);
+  auto* new_npc_button = new QPushButton("New NPC from selected...", list_column);
+  new_npc_button->setToolTip("Create a new NPC that starts as a copy of the selected one, then change its\n"
+                             "name, looks, faction and jobs. It is written to the database right away.");
+  auto* edit_npc_button = new QPushButton("Edit NPC...", list_column);
+  new_npc_button->setEnabled(false);
+  edit_npc_button->setEnabled(false);
+  auto* delete_npc_button = new QPushButton("Delete NPC...", list_column);
+  delete_npc_button->setEnabled(false);
+  auto* quests_button = new QPushButton("Quests...", list_column);
+  quests_button->setToolTip("Browse, create and edit quests. With an NPC selected, shows that NPC's quests.");
+  quests_button->setEnabled(false);
+  npc_buttons->addWidget(new_npc_button);
+  npc_buttons->addWidget(edit_npc_button);
+  npc_buttons->addWidget(delete_npc_button);
+  npc_buttons->addWidget(quests_button);
+  list_column_layout->addLayout(npc_buttons);
+
   auto preview = new CreaturePreviewModelViewer(splitter);
   preview->setMinimumSize(360, 220);
 
@@ -2833,6 +2864,12 @@ void MapView::setupCreatureModelPickerUi()
 #ifdef USE_MYSQL_UID_STORAGE
   std::string template_error;
   auto records = mysql::getCreatureTemplates(25000, &template_error);
+  if (!records.empty())
+  {
+    // Opening the content database picks the editors' ID range for this schema (vmangos 90000+,
+    // Turtle / tortoise-wow 6000000+), which decides below which NPCs count as the user's own.
+    mysql::content::Database::open();
+  }
   template_entries->reserve(records.size());
   for (auto const& record : records)
   {
@@ -3014,6 +3051,20 @@ void MapView::setupCreatureModelPickerUi()
     display_field->text().toUInt(&display_ok);
     add_button->setEnabled(guid_ok && entry_ok && display_ok && selected_template && selected_template->has_value()
                            && !selected_template->value().path.empty());
+
+    bool const has_selection = selected_template && selected_template->has_value();
+    bool const is_custom = has_selection && Noggit::Content::isCustom(selected_template->value().entry);
+#ifdef USE_MYSQL_UID_STORAGE
+    new_npc_button->setEnabled(has_selection);
+    edit_npc_button->setEnabled(is_custom);
+    delete_npc_button->setEnabled(is_custom);
+    delete_npc_button->setToolTip(is_custom ? QString("Delete this NPC, its spawns and its dialogue.")
+                                            : QString("Only NPCs made with \"New NPC from selected\" can be deleted."));
+#endif
+    edit_npc_button->setToolTip(is_custom || !has_selection
+      ? QString("Change the selected custom NPC.")
+      : QString("Only NPCs made with \"New NPC from selected\" (ID %1 and up) can be edited, so the game's\n"
+                "own NPCs stay intact. Make a copy of this one instead.").arg(Noggit::Content::customIds().entry_start));
   };
 
   auto select_template_entry = [=](std::uint32_t entry_id)
@@ -3196,6 +3247,183 @@ void MapView::setupCreatureModelPickerUi()
             }
             select_template_entry(static_cast<std::uint32_t>(item->data(0, Qt::UserRole).toULongLong()));
           });
+
+#ifdef USE_MYSQL_UID_STORAGE
+  // The content editors (NPCs, quests, items) run on a ContentSession -- an open database plus the pick lists.
+  // The map view gives it what only it knows: the cursor position, the 3D preview, reloading the spawns.
+  auto const apply_npc_look = [=](CreaturePreviewModelViewer* preview, std::uint32_t display_id, float scale)
+  {
+    World::CreatureSpawnOverlay spawn;
+    spawn.display_id = display_id;
+    float display_scale = 1.0f;
+    std::uint32_t model_id = 0;
+    if (!resolve_display_model(display_id, model_id, spawn.model_path, spawn.model_scale, display_scale))
+    {
+      LogError << "NPC editor preview: display " << display_id << " has no model" << std::endl;
+      return;
+    }
+    spawn.template_scale = scale > 0.0f ? scale : display_scale;
+    spawn.is_character_model = spawn.model_path.rfind("character/", 0) == 0;
+    try
+    {
+      preview->setCreatureSpawnPreview(*_world, spawn);
+    }
+    catch (std::exception const& e)
+    {
+      LogError << "NPC editor preview: " << spawn.model_path << " failed: " << e.what() << std::endl;
+    }
+  };
+  auto const open_session = [=]() -> std::unique_ptr<Noggit::Ui::Content::ContentSession>
+  {
+    auto session = Noggit::Ui::Content::ContentSession::open(this);
+    if (!session)
+    {
+      return nullptr;
+    }
+    session->cursor_position = [this]() -> std::optional<Noggit::Ui::Content::WorldPosition>
+    {
+      bool const global_wmo = _world->mapIndex.hasAGlobalWMO();
+      auto const server = client_to_server_creature_position(_cursor_pos, global_wmo);
+      return Noggit::Ui::Content::WorldPosition{static_cast<std::uint32_t>(_world->getMapID()), server.x, server.y,
+                                                server.z, client_to_server_creature_orientation(_camera.yaw()._)};
+    };
+    session->make_npc_preview = [=]
+    {
+      auto* preview = new CreaturePreviewModelViewer();
+      // initializeGL emits resized(): apply the look held back until then -- on the next event-loop pass,
+      // not from inside initializeGL.
+      QObject::connect(preview, &Noggit::Ui::Tools::AssetBrowser::ModelViewer::resized, preview, [=]
+      {
+        if (preview->pending_look)
+        {
+          QTimer::singleShot(0, preview, [=]
+          {
+            if (auto const look = std::exchange(preview->pending_look, std::nullopt))
+            {
+              apply_npc_look(preview, look->first, look->second);
+            }
+          });
+        }
+      });
+      return preview;
+    };
+    session->show_npc_look = [=](QWidget* widget, std::uint32_t display_id, float scale)
+    {
+      // A QOpenGLWidget has no GL context until it is first painted: loading a model before that
+      // dereferences null, so hold the look until the widget is initialized.
+      auto* preview = static_cast<CreaturePreviewModelViewer*>(widget);
+      if (!preview->context() || !preview->context()->isValid())
+      {
+        preview->pending_look = std::make_pair(display_id, scale);
+        return;
+      }
+      preview->pending_look.reset();
+      apply_npc_look(preview, display_id, scale);
+    };
+    session->on_world_changed = [this] { refreshCreatureSpawnOverlay(true); };
+    return session;
+  };
+
+  // Shows a new / changed NPC in the picker list without re-reading every template.
+  auto const show_saved_npc = [=](TemplatePickerEntry const& source, Noggit::Ui::Npc::NpcSaved const& saved)
+  {
+    auto const& fields = saved.content.fields;
+    TemplatePickerEntry updated = source;
+    updated.entry = saved.entry;
+    updated.name = fields.name.value_or(source.name);
+    updated.faction = fields.faction.value_or(source.faction);
+    updated.npc_flags = fields.npc_flags.value_or(source.npc_flags);
+    updated.rank = fields.rank.value_or(source.rank);
+    if (fields.display_id || fields.scale)
+    {
+      updated.display_id = fields.display_id.value_or(source.display_id);
+      float display_scale = 1.0f;
+      resolve_display_model(updated.display_id, updated.model_id, updated.path, updated.model_scale, display_scale);
+      float const scale = fields.scale.value_or(saved.before.scale.value_or(0.0f));
+      updated.template_scale = scale > 0.0f ? scale : display_scale;
+    }
+    template_entries->erase(std::remove_if(template_entries->begin(), template_entries->end(),
+                                           [&](TemplatePickerEntry const& e) { return e.entry == saved.entry; }),
+                            template_entries->end());
+    template_entries->push_back(updated);
+    _creature_template_filter_info[saved.entry] =
+      CreatureFilterInfo{updated.creature_type, updated.rank, updated.type_flags, updated.flags_extra, updated.npc_flags};
+    search_box->setText(QString::number(saved.entry)); // rebuilds the list down to this NPC
+    select_template_entry(saved.entry);
+    if (_creature_model_tree->topLevelItemCount() > 0)
+    {
+      _creature_model_tree->setCurrentItem(_creature_model_tree->topLevelItem(0));
+    }
+  };
+
+  auto const run_npc_editor = [=](bool editing)
+  {
+    if (!selected_template || !selected_template->has_value())
+    {
+      return;
+    }
+    TemplatePickerEntry const source = selected_template->value();
+    if (auto session = open_session())
+    {
+      if (auto const saved = Noggit::Ui::Npc::editNpc(*session, this, editing, source.entry))
+      {
+        show_saved_npc(source, *saved);
+      }
+    }
+  };
+  connect(new_npc_button, &QPushButton::clicked, [=] { run_npc_editor(false); });
+  connect(edit_npc_button, &QPushButton::clicked, [=] { run_npc_editor(true); });
+
+  connect(delete_npc_button, &QPushButton::clicked, [=]
+  {
+    if (!selected_template || !selected_template->has_value())
+    {
+      return;
+    }
+    std::uint32_t const entry = selected_template->value().entry;
+    auto session = open_session();
+    if (!session || !Noggit::Ui::Npc::deleteNpc(*session, this, entry))
+    {
+      return;
+    }
+    template_entries->erase(std::remove_if(template_entries->begin(), template_entries->end(),
+                                           [entry](TemplatePickerEntry const& e) { return e.entry == entry; }),
+                            template_entries->end());
+    _creature_template_filter_info.erase(entry);
+    selected_template->reset();
+    search_box->clear();
+    rebuild_template_tree();
+    update_add_button();
+  });
+
+  // Quest browser / editor, focused on the selected NPC when there is one.
+  quests_button->setEnabled(true);
+  connect(quests_button, &QPushButton::clicked, [=]
+  {
+    auto session = open_session();
+    if (!session)
+    {
+      return;
+    }
+    std::uint32_t const focus = selected_template && selected_template->has_value() ? selected_template->value().entry : 0;
+    Noggit::Ui::Quest::QuestBrowserDialog browser(*session, focus, this);
+    browser.exec();
+    // NPCs that became quest givers: keep the picker's filters in step.
+    auto const& creatures = *session->lookups().creatures;
+    for (auto& entry : *template_entries)
+    {
+      auto const flags = creatures.kindOf(entry.entry);
+      if ((flags & Noggit::Quest::QUEST_GIVER_FLAG) && !(entry.npc_flags & Noggit::Quest::QUEST_GIVER_FLAG))
+      {
+        entry.npc_flags |= Noggit::Quest::QUEST_GIVER_FLAG;
+        if (auto found = _creature_template_filter_info.find(entry.entry); found != _creature_template_filter_info.end())
+        {
+          found->second.npc_flags = entry.npc_flags;
+        }
+      }
+    }
+  });
+#endif
 
   connect(guid_field, &QLineEdit::textChanged, update_add_button);
   connect(entry_field, &QLineEdit::textChanged, update_add_button);
@@ -8700,51 +8928,6 @@ void MapView::saveDirtyGameObjectSpawns()
 // ---------------------------------------------------------------------------
 
 #ifdef USE_MYSQL_UID_STORAGE
-namespace
-{
-  // Shared confirmation for anything that WRITES to the database: shows the exact target
-  // connection and a preview of what is about to run.
-  bool confirmSqlApply(QWidget* parent, QString const& title, QString const& summary, QString const& sql)
-  {
-    QMessageBox box(parent);
-    box.setWindowTitle(title);
-    box.setIcon(QMessageBox::Warning);
-    box.setText(summary + "\n\nTarget database: "
-                + QString::fromStdString(mysql::connectionDescription()));
-    QString preview = sql;
-    if (preview.size() > 4000)
-    {
-      preview = preview.left(4000) + "\n[... truncated ...]";
-    }
-    box.setDetailedText(preview);
-    box.setStandardButtons(QMessageBox::Apply | QMessageBox::Cancel);
-    box.setDefaultButton(QMessageBox::Cancel);
-    return box.exec() == QMessageBox::Apply;
-  }
-
-  void reportSqlResult(QWidget* parent, mysql::SqlScriptResult const& result, QString const& what)
-  {
-    if (result.ok)
-    {
-      QMessageBox::information(parent, "SQL applied",
-        QString("%1: %2 statement(s) applied to %3.")
-          .arg(what)
-          .arg(result.statements_executed)
-          .arg(QString::fromStdString(mysql::connectionDescription())));
-    }
-    else
-    {
-      QMessageBox::critical(parent, "SQL apply failed",
-        QString("%1 failed and was rolled back.\n\nError: %2%3")
-          .arg(what)
-          .arg(QString::fromStdString(result.error))
-          .arg(result.failed_statement.empty()
-                 ? QString()
-                 : QString("\n\nFailed statement:\n%1").arg(QString::fromStdString(result.failed_statement))));
-    }
-  }
-}
-
 void MapView::applyDirtyCreatureSpawnsToDb()
 {
   auto dirty_count = _world->dirtyCreatureSpawnCount();
