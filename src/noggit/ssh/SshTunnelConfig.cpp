@@ -612,16 +612,14 @@ namespace Noggit
       }
     }
 
-    QStringList buildSshArguments(TunnelConfig const& c, quint16 local_port, QString const& known_hosts_path,
-                                  QString const& host_key_algorithms)
+    QStringList hardenedSshOptions(QString const& known_hosts_path, QString const& host_key_algorithms)
     {
       QString const known_hosts = quoteSshOptionPath(known_hosts_path);
 
       QStringList args;
-      args << QStringLiteral("-N") << QStringLiteral("-T")
-           // Ignore ~/.ssh/config and /etc/ssh/ssh_config: a ProxyCommand/LocalCommand/ControlMaster set
-           // there must not change what this tunnel does.
-           << QStringLiteral("-F") << QStringLiteral("none")
+      // Ignore ~/.ssh/config and /etc/ssh/ssh_config: a ProxyCommand/LocalCommand/ControlMaster set
+      // there must not change what this connection does.
+      args << QStringLiteral("-F") << QStringLiteral("none")
            << QStringLiteral("-o") << QStringLiteral("BatchMode=yes")
            << QStringLiteral("-o") << QStringLiteral("ExitOnForwardFailure=yes")
            << QStringLiteral("-o") << QStringLiteral("ServerAliveInterval=30")
@@ -648,8 +646,16 @@ namespace Noggit
         // Pinned fingerprint: only negotiate the pinned key's type, so ssh verifies exactly that key.
         args << QStringLiteral("-o") << (QStringLiteral("HostKeyAlgorithms=") + host_key_algorithms);
       }
+      return args;
+    }
 
-      args << QStringLiteral("-i") << escapeSshIdentityPath(c.key_path)
+    QStringList buildSshArguments(TunnelConfig const& c, quint16 local_port, QString const& known_hosts_path,
+                                  QString const& host_key_algorithms)
+    {
+      QStringList args;
+      args << QStringLiteral("-N") << QStringLiteral("-T")
+           << hardenedSshOptions(known_hosts_path, host_key_algorithms)
+           << QStringLiteral("-i") << escapeSshIdentityPath(c.key_path)
            << QStringLiteral("-p") << QString::number(c.ssh_port)
            << QStringLiteral("-l") << c.ssh_user
            << QStringLiteral("-L")

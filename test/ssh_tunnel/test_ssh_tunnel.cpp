@@ -6,11 +6,13 @@
 // with ssh-keygen into a temporary directory at runtime.
 
 #include <noggit/MySqlSettings.hpp>
+#include <noggit/ssh/SshRemote.hpp>
 #include <noggit/ssh/SshTunnelConfig.hpp>
 #include <noggit/ssh/SshTunnelManager.hpp>
 
 #include <QtCore/QCoreApplication>
 #include <QtCore/QDir>
+#include <QtCore/QElapsedTimer>
 #include <QtCore/QFile>
 #include <QtCore/QJsonArray>
 #include <QtCore/QJsonDocument>
@@ -795,6 +797,171 @@ private slots:
     settings.setValue("project/mysql/ssh_enabled", true);
     settings.setValue("project/current_path", "/projects/fresh");
     QVERIFY(!TunnelConfig::fromProjectSettings().enabled);
+  }
+
+  // --- server-side helpers (SshRemote.hpp) ------------------------------------------------------
+
+  void normalizesRemoteDirs()
+  {
+    QCOMPARE(normalizeRemoteDir("tortoise-deploy"), QString("tortoise-deploy"));
+    QCOMPARE(normalizeRemoteDir("  ~/tortoise-deploy/ "), QString("tortoise-deploy"));
+    QCOMPARE(normalizeRemoteDir("/srv/tortoise_deploy.v2"), QString("/srv/tortoise_deploy.v2"));
+    for (QString const bad : {"", "/", "~", "../etc", "a/../b", "./a", "-rf", "a/-x", "a b", "a;rm -rf ~",
+                              "a'b", "$(id)", "`id`", "a\nb", "a|b", "a&b"})
+    {
+      QVERIFY2(normalizeRemoteDir(bad).isEmpty(), qPrintable(bad));
+    }
+  }
+
+  void buildsRemoteCommandsOnlyFromValidatedPaths()
+  {
+    QVERIFY(buildMirrorCommand("tortoise-deploy").contains("'tortoise-deploy/storage/database/custom-sql'"));
+    QCOMPARE(buildRestartCommand("tortoise-deploy"), QString("cd -- 'tortoise-deploy' && docker compose restart mangosd"));
+    QVERIFY(buildMirrorCommand("x';id;'").isEmpty());
+    QVERIFY(buildRestartCommand("~/tortoise-deploy").isEmpty()); // must be normalized first
+    QVERIFY(buildRestartCommand("").isEmpty());
+  }
+
+  void buildsHardenedRemoteCommandArguments()
+  {
+    QStringList const args = buildRemoteCommandArguments(config(), "/k h/known_hosts", QString(), "echo hi");
+    for (QString const& required : {"BatchMode=yes", "StrictHostKeyChecking=yes", "IdentitiesOnly=yes",
+                                    "ForwardAgent=no", "PasswordAuthentication=no"})
+    {
+      QVERIFY2(args.contains(required), qPrintable(required));
+    }
+    QVERIFY(args.contains("UserKnownHostsFile=\"/k h/known_hosts\""));
+    QVERIFY(!args.contains("-N"));
+    QVERIFY(!args.contains("-L"));
+    QCOMPARE(args.at(args.size() - 3), QString("--"));
+    QCOMPARE(args.at(args.size() - 2), config().ssh_host);
+    QCOMPARE(args.last(), QString("echo hi"));
+    // The tunnel keeps exactly its previous arguments after sharing the option list.
+    QStringList const tunnel = buildSshArguments(config(), 40000, "/k");
+    QCOMPARE(tunnel.mid(0, 2), QStringList({"-N", "-T"}));
+    QCOMPARE(tunnel.mid(2, hardenedSshOptions("/k").size()), hardenedSshOptions("/k"));
+  }
+
+  void makesSpawnInsertsReplayable()
+  {
+    QByteArray const in =
+      "DELETE FROM creature WHERE guid=1;\n"
+      "INSERT INTO creature (guid, id) VALUES (1, 2);\n"
+      "INSERT INTO `gameobject` (guid) VALUES (3);\n"
+      "INSERT INTO creature_spawn_entry (guid, entry) VALUES (1, 2);\n"
+      "INSERT INTO `creature_template` (`entry`) VALUES (5);\n"
+      "INSERT INTO creature_addon (guid) VALUES (1);\n";
+    QByteArray const out = makeReplayable(in);
+    QVERIFY(out.contains("REPLACE INTO creature (guid, id)"));
+    QVERIFY(out.contains("REPLACE INTO `gameobject` (guid)"));
+    QVERIFY(out.contains("REPLACE INTO creature_spawn_entry (guid, entry)"));
+    QVERIFY(out.contains("INSERT INTO `creature_template`"));
+    QVERIFY(out.contains("INSERT INTO creature_addon"));
+    QVERIFY(out.contains("DELETE FROM creature WHERE guid=1;"));
+  }
+
+  void tarArchiveExtractsWithSystemTar()
+  {
+    QString const tar = QStandardPaths::findExecutable("tar");
+    if (tar.isEmpty())
+    {
+      QSKIP("tar not installed");
+    }
+    QString const long_dir = QString("d").repeated(120);
+    QVector<QPair<QString, QByteArray>> files{
+      {"npcs/npc_1.sql", "SELECT 1;\n"},
+      {"top.sql", QByteArray(1000, 'x')},
+      {long_dir + "/f.sql", "long\n"},
+      {QString("n").repeated(200) + ".sql", "too long, no '/' to split at"},
+    };
+    QStringList skipped;
+    QByteArray const archive = buildTarArchive(files, &skipped);
+    QCOMPARE(skipped, QStringList({QString("n").repeated(200) + ".sql"}));
+    QCOMPARE(archive.size() % 512, 0);
+
+    QTemporaryDir dir;
+    QFile file(dir.filePath("a.tar"));
+    QVERIFY(file.open(QIODevice::WriteOnly));
+    file.write(archive);
+    file.close();
+    QDir(dir.path()).mkdir("out");
+    QCOMPARE(QProcess::execute(tar, {"-xf", file.fileName(), "-C", dir.filePath("out")}), 0);
+
+    auto read = [&](QString const& rel)
+    {
+      QFile f(dir.filePath("out/" + rel));
+      return f.open(QIODevice::ReadOnly) ? f.readAll() : QByteArray("<missing>");
+    };
+    QCOMPARE(read("npcs/npc_1.sql"), QByteArray("SELECT 1;\n"));
+    QCOMPARE(read("top.sql"), QByteArray(1000, 'x'));
+    QCOMPARE(read(long_dir + "/f.sql"), QByteArray("long\n"));
+  }
+
+  // Runs the real mirror command through a fake "ssh" that executes the remote command locally in
+  // $FAKE_HOME, so the server-side shell script is exercised end to end.
+  void mirrorsExportsIntoCustomSqlFolder()
+  {
+    if (QStandardPaths::findExecutable("tar").isEmpty() || QStandardPaths::findExecutable("sh").isEmpty())
+    {
+      QSKIP("needs sh and tar");
+    }
+    QTemporaryDir home;
+    QString const fake_ssh = home.filePath("fake-ssh");
+    {
+      QFile f(fake_ssh);
+      QVERIFY(f.open(QIODevice::WriteOnly));
+      f.write("#!/bin/sh\nfor last; do :; done\ncd \"$FAKE_HOME\" && exec sh -c \"$last\"\n");
+      f.close();
+      f.setPermissions(QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner);
+    }
+    qputenv("FAKE_HOME", home.path().toLocal8Bit());
+
+    RemoteTarget target;
+    target.config = config();
+    target.ssh_executable = fake_ssh;
+    target.known_hosts_path = home.filePath("known_hosts");
+
+    auto run = [&](QString const& command, QByteArray const& input) -> RemoteResult
+    {
+      RemoteResult result;
+      result.message = "callback never ran";
+      bool done = false;
+      runRemoteCommand(this, target, command, input, 10000, [&](RemoteResult r) { result = r; done = true; });
+      QElapsedTimer waited;
+      waited.start();
+      while (!done && waited.elapsed() < 15000)
+      {
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 50);
+      }
+      return result;
+    };
+
+    // No tortoise-deploy folder: refused with exit code 3, nothing created.
+    RemoteResult missing = run(buildMirrorCommand("tortoise-deploy"), buildTarArchive({{"a.sql", "x"}}));
+    QVERIFY(!missing.ok);
+    QCOMPARE(missing.exit_code, 3);
+    QVERIFY(!QDir(home.filePath("tortoise-deploy")).exists());
+
+    QString const custom = home.filePath("tortoise-deploy/storage/database/custom-sql");
+    QVERIFY(QDir().mkpath(custom + "/noggit/quests"));
+    QFile stale(custom + "/noggit/quests/deleted_quest.sql");
+    QVERIFY(stale.open(QIODevice::WriteOnly));
+    stale.close();
+    QFile own(custom + "/my_own.sql"); // the user's own custom SQL next to the mirror is never touched
+    QVERIFY(own.open(QIODevice::WriteOnly));
+    own.close();
+
+    RemoteResult ok = run(buildMirrorCommand("tortoise-deploy"),
+                          buildTarArchive({{"npcs/npc_1.sql", "SELECT 1;\n"}, {"creature_spawns/s.sql", "x"}}));
+    QVERIFY2(ok.ok, qPrintable(ok.message + "\n" + ok.output));
+    QVERIFY(QFile::exists(custom + "/noggit/npcs/npc_1.sql"));
+    QVERIFY(QFile::exists(custom + "/noggit/creature_spawns/s.sql"));
+    QVERIFY(!QFile::exists(custom + "/noggit/quests/deleted_quest.sql"));
+    QVERIFY(!QDir(custom + "/.noggit-upload").exists());
+    QVERIFY(QFile::exists(custom + "/my_own.sql"));
+
+    RemoteResult no_command = run(QString(), QByteArray());
+    QCOMPARE(no_command.error, ErrorKind::InvalidSettings);
   }
 };
 

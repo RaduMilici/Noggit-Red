@@ -224,6 +224,7 @@ static Noggit::Rendering::VK::VulkanBackend* g_vk_capture_backend = nullptr;
 #include <noggit/ui/npc/NpcWorkflow.hpp>
 #include <noggit/ui/quest/QuestBrowserDialog.hpp>
 #include <noggit/ui/content/SqlApply.hpp>
+#include <noggit/ui/content/ServerSync.hpp>
 
 using Noggit::Ui::confirmSqlApply;
 using Noggit::Ui::reportSqlResult;
@@ -4929,6 +4930,13 @@ void MapView::setupAssistMenu()
   ADD_ACTION_NS (assist_menu, "Apply pending gameobject changes to database", [this] { applyDirtyGameObjectSpawnsToDb(); });
   ADD_ACTION_NS (assist_menu, "Apply SQL file to database...", [this] { applySqlFileToDb(); });
   ADD_ACTION_NS (assist_menu, "Reset database from SQL folders...", [this] { resetDatabaseFromSqlFolders(); });
+
+  assist_menu->addSeparator();
+  assist_menu->addAction(createTextSeparator("Server"));
+  assist_menu->addSeparator();
+  // Through the project's SSH tunnel settings; see ui/content/ServerSync.hpp.
+  ADD_ACTION_NS (assist_menu, "Copy SQL exports to server", [this] { Noggit::Ui::syncExportsToServerNow(this); });
+  ADD_ACTION_NS (assist_menu, "Restart world server...", [this] { Noggit::Ui::restartWorldServer(this); });
 #endif
 
   assist_menu->addSeparator();
@@ -7701,6 +7709,13 @@ QString MapView::buildDirtyCreatureSpawnSql(bool rebase_state)
       add_col(cols.visibility_col, fnum(spawn.ext.visibility_mod));
       add_col(cols.spawn_mask_col, QString::number(spawn.ext.spawn_mask ? spawn.ext.spawn_mask : 1u));
       add_col(cols.phase_mask_col, QString::number(spawn.ext.phase_mask ? spawn.ext.phase_mask : 1u));
+      // Delete first so the file can be replayed (e.g. from the server's custom-sql folder after the
+      // world database is re-created) without a duplicate-key error, like the NPC and quest exports.
+      stream << "DELETE FROM creature WHERE guid=" << spawn.guid << ";\n";
+      if (spawn_entry_mode)
+      {
+        stream << "DELETE FROM creature_spawn_entry WHERE guid = " << spawn.guid << ";\n";
+      }
       stream << "INSERT INTO creature (" << names.join(", ") << ")\n"
              << "VALUES (" << values.join(", ") << ");\n";
       if (use_spawn_entry_rows)
@@ -8846,6 +8861,8 @@ QString MapView::buildDirtyGameObjectSpawnSql(bool rebase_state)
     if (spawn.pending_create)
     {
       stream << "-- Preview display ID: " << spawn.display_id << "\n";
+      // Delete first so the file can be replayed without a duplicate-key error (see the creature export).
+      stream << "DELETE FROM gameobject WHERE guid=" << spawn.guid << ";\n";
       stream << "INSERT INTO gameobject (guid, id, map, position_x, position_y, position_z, orientation)\n"
              << "VALUES (" << spawn.guid << ", "
              << spawn.entry << ", "
@@ -8958,6 +8975,7 @@ void MapView::applyDirtyCreatureSpawnsToDb()
   // the export file). Applied DELETEs are then dropped from the overlay outright -- they no longer
   // exist in the database.
   saveDirtyCreatureSpawns();
+  Noggit::Ui::scheduleServerExportSync();
   try
   {
     makeCurrent();
@@ -9004,6 +9022,7 @@ void MapView::applyDirtyGameObjectSpawnsToDb()
   }
 
   saveDirtyGameObjectSpawns();
+  Noggit::Ui::scheduleServerExportSync();
   try
   {
     makeCurrent();

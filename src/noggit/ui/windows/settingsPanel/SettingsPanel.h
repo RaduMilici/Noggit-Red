@@ -47,6 +47,8 @@ namespace Noggit
       QLineEdit* _ssh_remote_host = nullptr;
       QSpinBox* _ssh_remote_port = nullptr;
       QLineEdit* _ssh_fingerprint = nullptr;
+      QCheckBox* _ssh_server_sync = nullptr;  // mirror sql_exports/ to the server after database writes
+      QLineEdit* _ssh_deploy_dir = nullptr;   // tortoise-deploy folder on the server
       QLabel* _ssh_status = nullptr;
       QPushButton* _ssh_test = nullptr;
       QPushButton* _ssh_forget = nullptr;

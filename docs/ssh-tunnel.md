@@ -61,6 +61,26 @@ ssh-add ~/.ssh/your_key
 Trusted host keys are kept in Noggit's own `known_hosts` file (under the application data folder,
 `ssh/known_hosts`), not in `~/.ssh/known_hosts`. Noggit ignores `~/.ssh/config` for this tunnel.
 
+### Server helpers (tortoise-deploy)
+
+For a server run with [tortoise-deploy](https://github.com/mserajnik/tortoise-deploy), Noggit can use
+the same SSH connection for two more things. They run shell commands on the server, so they need a key
+with shell access (the server owner's); the restricted per-user keys below only allow the tunnel.
+
+- **Settings -> MySQL -> SSH tunnel -> Server (tortoise-deploy):** *tortoise-deploy folder on server* is
+  the folder with `compose.yaml`, relative to the SSH user's home (default `tortoise-deploy`) or absolute.
+- **Copy SQL exports to the server.** Every database write (spawns, NPCs, quests, items) keeps a copy in
+  the project's `sql_exports/`. With *After saving to the database, copy sql_exports/ to the server*
+  ticked, Noggit mirrors that whole folder to `<tortoise-deploy>/storage/database/custom-sql/noggit/`
+  after each write; *Assist -> Copy SQL exports to server* does it on demand. tortoise-deploy replays
+  that folder on every database start, so your changes survive the world database being re-created
+  during an update. The folder is mirrored: a deleted NPC's file disappears on the server too. Your own
+  files directly in `custom-sql/` are never touched. Files written by *Export SQL* without applying them
+  are mirrored as well, so delete exports you do not want applied.
+- **Assist -> Restart world server...** runs `docker compose restart mangosd` in the tortoise-deploy
+  folder. The world server only loads spawns at startup, so new spawns appear after this. Everyone
+  online is disconnected for about 2-3 minutes.
+
 ## For administrators
 
 **Issue one SSH key per user**, and restrict it so it can do nothing except forward to MySQL.
@@ -116,7 +136,12 @@ Never commit private keys to this (or any) repository.
 
 - Code: `src/noggit/ssh/` (`SshTunnelConfig` = settings, validation, stderr classification,
   fingerprints; `SshTunnelManager` = the QProcess state machine; `SshTunnelGlobal.cpp` = app instance
-  and host-key dialog). MySQL integration: `connect()` / `probeConnection()` in `src/mysql/mysql.cpp`.
+  and host-key dialog; `SshRemote` = one-shot remote commands, tar builder). MySQL integration:
+  `connect()` / `probeConnection()` in `src/mysql/mysql.cpp`. Server helpers UI:
+  `src/noggit/ui/content/ServerSync.cpp`.
+- Remote commands go through the remote shell, unlike the local argument list: every path placed in
+  one is validated by `normalizeRemoteDir` (letters, digits, `._-/`, no `..`, no leading `-`) and
+  single-quoted. The export files travel as a tar stream on stdin, never on the command line.
 - ssh is started with an argument list (no shell); hosts/users are validated so they cannot be parsed
   as ssh options, and the destination follows `--`. `StrictHostKeyChecking=yes` against the dedicated
   `known_hosts`; `BatchMode=yes` so ssh never prompts.

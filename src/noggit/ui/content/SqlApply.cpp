@@ -3,6 +3,7 @@
 #ifdef USE_MYSQL_UID_STORAGE
 
 #include <noggit/ui/content/SqlApply.hpp>
+#include <noggit/ui/content/ServerSync.hpp>
 
 #include <mysql/content_db.h>
 
@@ -72,6 +73,8 @@ namespace Noggit::Ui
       return QString("Could not save a copy to %1: %2").arg(QDir::toNativeSeparators(path), file.errorString());
     }
     file.write(QByteArray::fromStdString(sql));
+    file.close();
+    scheduleServerExportSync();
     return QString("A copy of its definition was saved to\n%1").arg(QDir::toNativeSeparators(path));
   }
 
@@ -80,6 +83,7 @@ namespace Noggit::Ui
     if (auto const* project = Noggit::Project::CurrentProject::get())
     {
       QFile::remove(QDir(QString::fromStdString(project->ProjectPath)).filePath("sql_exports/" + relative_path));
+      scheduleServerExportSync(); // the mirror drops the server's copy too
     }
   }
 

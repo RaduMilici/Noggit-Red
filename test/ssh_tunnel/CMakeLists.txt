@@ -19,6 +19,7 @@ set(NOGGIT_SRC "${CMAKE_CURRENT_LIST_DIR}/../../src")
 add_executable(ssh_tunnel_tests
   test_ssh_tunnel.cpp
   ${NOGGIT_SRC}/noggit/ssh/SshTunnelConfig.cpp
+  ${NOGGIT_SRC}/noggit/ssh/SshRemote.cpp
   ${NOGGIT_SRC}/noggit/ssh/SshTunnelManager.cpp
   ${NOGGIT_SRC}/noggit/ssh/SshTunnelManager.hpp
   ${NOGGIT_SRC}/noggit/Log.cpp

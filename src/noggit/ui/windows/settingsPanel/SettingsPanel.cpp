@@ -29,6 +29,7 @@
 
 #include <noggit/ssh/SshHostKeyPrompt.hpp>
 #include <noggit/ssh/SshTunnelManager.hpp>
+#include <noggit/ssh/SshRemote.hpp>
 
 #include <memory>
 #include <thread>
@@ -913,6 +914,9 @@ namespace Noggit
         _ssh_remote_host->setText(tunnel.remote_db_host);
         _ssh_remote_port->setValue(tunnel.remote_db_port);
         _ssh_fingerprint->setText(tunnel.expected_fingerprint);
+        _ssh_deploy_dir->setText(Noggit::mysqlSetting(Noggit::Ssh::Keys::serverDeployDir(),
+                                                      Noggit::Ssh::defaultDeployDir()).toString());
+        _ssh_server_sync->setChecked(Noggit::mysqlSetting(Noggit::Ssh::Keys::serverSync(), false).toBool());
         update_direct_fields_enabled();
         update_ssh_status();
       }
@@ -983,6 +987,10 @@ namespace Noggit
         _settings->setValue(Noggit::mysqlSettingKey(Keys::remoteDbHost()), _ssh_remote_host->text().trimmed());
         _settings->setValue(Noggit::mysqlSettingKey(Keys::remoteDbPort()), _ssh_remote_port->value());
         _settings->setValue(Noggit::mysqlSettingKey(Keys::fingerprint()), _ssh_fingerprint->text().trimmed());
+        QString const deploy_dir = _ssh_deploy_dir->text().trimmed();
+        _settings->setValue(Noggit::mysqlSettingKey(Keys::serverDeployDir()),
+                            deploy_dir.isEmpty() ? Noggit::Ssh::defaultDeployDir() : deploy_dir);
+        _settings->setValue(Noggit::mysqlSettingKey(Keys::serverSync()), _ssh_server_sync->isChecked());
         _settings->sync();
 
         // Settings changed while this project is open: restart (or stop) its tunnel to match.
@@ -1085,6 +1093,23 @@ namespace Noggit
                                    "fingerprint. If empty, you confirm the fingerprint the first time you connect.");
       advanced_form->addRow("Expected host key", _ssh_fingerprint);
       layout->addWidget(advanced);
+
+      // Server-side helpers over the same SSH connection (ui/content/ServerSync.hpp).
+      auto* server = new QGroupBox("Server (tortoise-deploy)", _ssh_box);
+      auto* server_form = new QFormLayout(server);
+      _ssh_deploy_dir = new QLineEdit(server);
+      _ssh_deploy_dir->setPlaceholderText(Noggit::Ssh::defaultDeployDir());
+      _ssh_deploy_dir->setToolTip("The tortoise-deploy folder on the server (the one with compose.yaml), relative "
+                                  "to the SSH user's home folder or absolute. Used by Assist -> Copy SQL exports "
+                                  "to server and Assist -> Restart world server.");
+      server_form->addRow("tortoise-deploy folder on server", _ssh_deploy_dir);
+      _ssh_server_sync = new QCheckBox("After saving to the database, copy sql_exports/ to the server", server);
+      _ssh_server_sync->setToolTip("Mirrors this project's sql_exports/ folder to <tortoise-deploy folder>/storage/"
+                                   "database/custom-sql/noggit/ after every database write. tortoise-deploy replays "
+                                   "that folder on every database start, so your spawns, NPCs and quests survive "
+                                   "the world database being re-created during an update.");
+      server_form->addRow(_ssh_server_sync);
+      layout->addWidget(server);
 
       _ssh_status = new QLabel(_ssh_box);
       _ssh_status->setWordWrap(true);

@@ -33,6 +33,10 @@ namespace Noggit
       inline QString remoteDbHost() { return QStringLiteral("ssh_remote_db_host"); }
       inline QString remoteDbPort() { return QStringLiteral("ssh_remote_db_port"); }
       inline QString fingerprint() { return QStringLiteral("ssh_host_fingerprint"); }
+      // Server-side helpers (SshRemote.hpp): mirror sql_exports/ after database writes, and the
+      // tortoise-deploy folder on the server that holds compose.yaml and the custom SQL folder.
+      inline QString serverSync() { return QStringLiteral("ssh_server_sync"); }
+      inline QString serverDeployDir() { return QStringLiteral("ssh_server_deploy_dir"); }
     }
 
     struct TunnelConfig
@@ -151,6 +155,10 @@ namespace Noggit
     QString quoteSshOptionPath(QString const& path);
     // Escapes '%' for -i (ssh percent-expands identity paths). Empty when unsafe.
     QString escapeSshIdentityPath(QString const& path);
+
+    // The -F/-o options every Noggit ssh connection uses: no user config, batch mode, strict host keys
+    // against `known_hosts_path` only, public key auth only, no forwarding of agent/X11, no multiplexing.
+    QStringList hardenedSshOptions(QString const& known_hosts_path, QString const& host_key_algorithms = QString());
 
     // Builds the full ssh argument list. Separate entries, never joined into a command string.
     // `host_key_algorithms` (from hostKeyAlgorithmsFor) restricts negotiation when a fingerprint is pinned.
