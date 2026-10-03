@@ -1,4 +1,5 @@
 #include "AuthoringDialogs.hpp"
+#include "CreatorPreviews.hpp"
 #include "Database.hpp"
 #include <noggit/DBC.h>
 #include <noggit/World.h>
@@ -45,20 +46,6 @@ std::optional<Choice> choose(QWidget* parent,QString title,std::function<QVector
   QObject::connect(buttons,&QDialogButtonBox::rejected,&dialog,&QDialog::reject); refresh();
   if(dialog.exec()!=QDialog::Accepted||list->currentRow()<0) return {}; return results[list->currentRow()];
 }
-class ObjectPreview final : public Ui::Tools::AssetBrowser::ModelViewer {
-  QString _path;
-public:
-  explicit ObjectPreview(QWidget* parent):ModelViewer(parent,Noggit::ASSET_BROWSER_PREVIEW) { setMinimumSize(220,200); }
-  void display(Id id) {
-    try {
-      _path=QString::fromStdString(gGameObjectDisplayInfoDB.getByID(id).getString(GameObjectDisplayInfoDB::ModelName)).toLower();
-      _path.replace('\\','/');
-      if(_path.endsWith(".mdx")||_path.endsWith(".mdl")) _path=_path.left(_path.size()-4)+".m2";
-    } catch(DBCFile::NotFound const&) { _path.clear(); }
-  }
-protected:
-  void draw() override { if(!_path.isEmpty()) { auto path=_path; _path.clear(); setModel(path.toStdString()); } PreviewRenderer::draw(); }
-};
 class AppearancePreview : public Ui::Tools::AssetBrowser::ModelViewer {
   World* _world; World::CreatureSpawnOverlay _spawn; bool _pending=false; QString _requested;
 public:

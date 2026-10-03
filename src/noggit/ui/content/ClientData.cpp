@@ -7,6 +7,7 @@
 #include <noggit/project/CurrentProject.hpp>
 
 #include <algorithm>
+#include <map>
 
 namespace Noggit::Ui::Content::ClientData
 {

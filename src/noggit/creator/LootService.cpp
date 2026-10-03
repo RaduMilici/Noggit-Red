@@ -27,13 +27,15 @@ Fields toFields(LootRow const& r, Id entry) {
           {"mincountOrRef", r.reference ? -qint64(r.reference) : qint64(r.minCount)}, {"maxcount", r.maxCount}, {"condition_id", r.condition}};
 }
 }
-QVector<Choice> LootService::owners(QString const& text, LootOwner::Kind kind) {
+QVector<Choice> LootService::owners(QString const& text, LootOwner::Kind kind, bool own) {
   Database db;
   QVector<Choice> out;
   auto like = db.quote('%' + text + '%');
   auto rows = kind == LootOwner::Kind::Npc
-    ? db.query("SELECT entry,name,CONCAT('Level ',level_min,'–',level_max) AS detail FROM creature_template WHERE loot_id>0 AND name LIKE " + like + " ORDER BY name LIMIT 250")
-    : db.query("SELECT entry,name,IF(type=3,'Chest','Fishing hole') AS detail FROM gameobject_template WHERE type IN (3,25) AND data1>0 AND name LIKE " + like + " ORDER BY name LIMIT 250");
+    ? db.query("SELECT entry,name,CONCAT('Level ',level_min,'–',level_max) AS detail FROM creature_template WHERE "
+               + QString(own ? "entry IN (SELECT entry FROM creator_content WHERE kind='npc')" : "loot_id>0") + " AND name LIKE " + like + " ORDER BY name LIMIT 250")
+    : db.query("SELECT entry,name,IF(type=3,'Chest','Fishing hole') AS detail FROM gameobject_template WHERE type IN (3,25) AND "
+               + QString(own ? "entry IN (SELECT entry FROM creator_content WHERE kind='gameobject')" : "data1>0") + " AND name LIKE " + like + " ORDER BY name LIMIT 250");
   for (auto const& r : rows) out.push_back({r["entry"].toUInt(), r["name"].toString(), r["detail"].toString()});
   return out;
 }

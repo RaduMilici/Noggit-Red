@@ -41,6 +41,16 @@ QVector<Choice> CreatureService::search(QString const& text, bool ownedOnly) {
   return choices(db.query("SELECT entry,name,CONCAT('Level ',level_min,'–',level_max,' · ',CASE type WHEN 1 THEN 'Beast' WHEN 2 THEN 'Dragonkin' WHEN 3 THEN 'Demon' WHEN 4 THEN 'Elemental' WHEN 6 THEN 'Undead' WHEN 7 THEN 'Humanoid' ELSE 'Creature' END) AS detail FROM creature_template WHERE name LIKE "+db.quote('%'+text+'%')+(ownedOnly?" AND entry IN (SELECT entry FROM creator_content WHERE kind='npc')":"")+" ORDER BY name LIMIT 250"));
 }
 bool CreatureService::owned(Id entry) { Database db; return db.owned("npc",entry); }
+NpcLook CreatureService::look(Id entry) {
+  Database db; auto row=one(db,"creature_template",entry); NpcLook look;
+  look.display=row["display_id1"].toUInt(); look.scale=row["scale"].toDouble(); look.name=row["name"].toString();
+  if(auto equipment=row["equipment_id"].toUInt()) {
+    auto rows=db.query("SELECT e.equipentry1,e.equipentry2,e.equipentry3,i1.display_id AS d1,i2.display_id AS d2,i2.inventory_type AS t2,i3.display_id AS d3 FROM creature_equip_template e "
+                       "LEFT JOIN item_template i1 ON i1.entry=e.equipentry1 LEFT JOIN item_template i2 ON i2.entry=e.equipentry2 LEFT JOIN item_template i3 ON i3.entry=e.equipentry3 WHERE e.entry="+n(equipment));
+    if(!rows.isEmpty()) { look.mainhand=rows[0]["d1"].toUInt(); look.offhand=rows[0]["d2"].toUInt(); look.offhandType=rows[0]["t2"].toInt(); look.ranged=rows[0]["d3"].toUInt(); }
+  }
+  return look;
+}
 QSet<Id> CreatureService::ownedEntries() {
   Database db; QSet<Id> result;
   for(auto const& row:db.query("SELECT entry FROM creator_content WHERE kind='npc'")) result.insert(row["entry"].toUInt());

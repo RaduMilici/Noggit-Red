@@ -27,6 +27,8 @@ struct Npc {
   bool appearance = true, stats = true, allegiance = true, weapons = true, combat = true, motion = true;
   bool loot = false, vendor = false, trainer = false, gossip = false, quests = false;
 };
+// What an NPC preview draws: its look, size and visible weapons (item display IDs).
+struct NpcLook { Id display = 0; double scale = 0; QString name; Id mainhand = 0, offhand = 0, ranged = 0; int offhandType = 0; };
 struct SpawnEdit { Id guid = 0, entry = 0; Position position; int respawn = 120; bool remove = false, create = false; };
 struct GameObject {
   Id entry = 0, source = 0, display = 0, faction = 0, quest = 0;
@@ -58,6 +60,7 @@ public:
   static QSet<Id> ownedEntries(); // NPCs made in Noggit
   static void remove(Id entry); // Creator NPCs only, with all their placements
   static bool owned(Id entry);
+  static NpcLook look(Id entry);
 };
 class SpawnService {
 public:

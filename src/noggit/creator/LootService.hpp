@@ -38,7 +38,8 @@ struct LootSimulation {
 // an NPC or chest still using a shared table (copied from what it was cloned from) gets its own on save.
 class LootService {
 public:
-  static QVector<Choice> owners(QString const& text, LootOwner::Kind);
+  // NPCs or chests by name: with loot (to copy from), or your own (to copy to).
+  static QVector<Choice> owners(QString const& text, LootOwner::Kind, bool own = false);
   static LootTable load(LootOwner const&);
   static void save(LootTable const&);
   static QVector<RowProblem> validate(LootTable const&);

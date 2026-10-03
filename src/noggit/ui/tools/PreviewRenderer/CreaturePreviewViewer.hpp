@@ -62,7 +62,7 @@ inline ModelAttachmentDef const* preview_find_attachment_def(Model const* model,
 // along the pole, and every new model auto-frames as close as the near plane and the frustum
 // allow. The base class's free-fly camera (WASD + look) is fully disabled here; the asset
 // browser keeps it.
-class CreaturePreviewModelViewer final : public Noggit::Ui::Tools::AssetBrowser::ModelViewer
+class CreaturePreviewModelViewer : public Noggit::Ui::Tools::AssetBrowser::ModelViewer
 {
 public:
   explicit CreaturePreviewModelViewer(QWidget* parent = nullptr)
