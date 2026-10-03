@@ -1,5 +1,8 @@
 #include "LocalChangesPanel.hpp"
 #include "ChangeExport.hpp"
+#include "ProductionDialogs.hpp"
+#include "ProductionProfile.hpp"
+#include "TestSessionService.hpp"
 #include <noggit/runtime/RuntimeManager.hpp>
 #include <QCoreApplication>
 #include <QDesktopServices>
@@ -90,15 +93,24 @@ void addLocalChangesPanel(QMainWindow* window) {
   auto tracker = ChangeTracker::instance();
   if (!tracker || window->findChild<QToolButton*>("localChangesButton")) return;
   auto button = new QToolButton(window); button->setObjectName("localChangesButton"); button->setAutoRaise(true);
-  auto panel = new QDialog(window, Qt::Tool); panel->setWindowTitle("Local Changes"); panel->resize(420, 460);
+  auto panel = new QDialog(window, Qt::Tool); panel->setWindowTitle("Local Changes"); panel->resize(420, 520);
   auto layout = new QVBoxLayout(panel);
   layout->addWidget(new QLabel("LOCAL CHANGES", panel));
   auto warning = new QLabel(panel); warning->setWordWrap(true); warning->setTextFormat(Qt::PlainText); layout->addWidget(warning);
   auto list = new QListWidget(panel); list->setSelectionMode(QAbstractItemView::ExtendedSelection); layout->addWidget(list, 1);
   auto empty = new QLabel("No local changes yet. NPCs, placements and quests you save appear here.", panel);
   empty->setWordWrap(true); layout->addWidget(empty);
+  auto testLocal = new QPushButton("Test Locally", panel);
+  testLocal->setToolTip("Restart the local server with these changes and play them in WoW");
+  auto sync = new QPushButton("Sync to Production", panel);
+  sync->setToolTip("Send these changes to the production server: backed up first, put back if anything fails");
+  sync->setStyleSheet("font-weight: bold;");
+  auto production = new QToolButton(panel); production->setText("Server…"); production->setToolTip("Production server settings");
+  auto syncRow = new QHBoxLayout; syncRow->addWidget(sync, 1); syncRow->addWidget(production);
+  auto target = new QLabel(panel); target->setStyleSheet("color: gray;"); target->setTextFormat(Qt::PlainText);
   auto clear = new QPushButton("Clear Selected", panel), exportButton = new QPushButton("Export Changes", panel);
-  layout->addWidget(clear); layout->addWidget(exportButton);
+  auto fileRow = new QHBoxLayout; fileRow->addWidget(clear); fileRow->addWidget(exportButton);
+  layout->addWidget(testLocal); layout->addLayout(syncRow); layout->addWidget(target); layout->addLayout(fileRow);
   auto refresh = [=] {
     auto const& changes = tracker->changes();
     list->clear();
@@ -109,9 +121,11 @@ void addLocalChangesPanel(QMainWindow* window) {
     }
     warning->setText(tracker->warning()); warning->setVisible(!tracker->warning().isEmpty());
     empty->setVisible(changes.isEmpty()); list->setVisible(!changes.isEmpty());
-    exportButton->setEnabled(!changes.isEmpty()); clear->setEnabled(false);
+    exportButton->setEnabled(!changes.isEmpty()); sync->setEnabled(!changes.isEmpty()); clear->setEnabled(false);
+    auto profile = ProductionProfile::load();
+    target->setText(profile.configured() ? "Production: " + profile.describe() : "Production server not set up yet");
     button->setText(QString("Local changes: %1").arg(changes.size()));
-    button->setToolTip("Show what you changed locally and export it as a package");
+    button->setToolTip("Show what you changed locally: test it, sync it to production or export it");
   };
   QObject::connect(list, &QListWidget::itemSelectionChanged, panel, [=] { clear->setEnabled(!list->selectedItems().isEmpty()); });
   QObject::connect(clear, &QPushButton::clicked, panel, [=] {
@@ -119,6 +133,11 @@ void addLocalChangesPanel(QMainWindow* window) {
     if (!selected.isEmpty() && confirmClear(panel, selected.size())) clearEntries(panel, selected);
   });
   QObject::connect(exportButton, &QPushButton::clicked, panel, [panel] { exportChanges(panel); });
+  QObject::connect(sync, &QPushButton::clicked, panel, [=] { syncToProduction(panel); refresh(); });
+  QObject::connect(production, &QToolButton::clicked, panel, [=] { if (editProductionProfile(panel)) refresh(); });
+  QObject::connect(testLocal, &QPushButton::clicked, panel, [window] {
+    if (auto session = TestSessionService::instance()) session->testLocal(window);
+  });
   QObject::connect(button, &QToolButton::clicked, panel, [panel] { panel->show(); panel->raise(); panel->activateWindow(); });
   QObject::connect(tracker, &ChangeTracker::changed, panel, refresh);
   refresh();

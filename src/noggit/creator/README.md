@@ -29,6 +29,9 @@ gives that NPC the quest-giver role.
 7. Select the WoW executable once. Its relative path is remembered. The launcher
    backs up `realmlist.wtf` once and points the client at the local realm.
 
+8. When it works in game: **Local changes** (status bar) → **Sync to Production**. See
+   [Sync to Production](#sync-to-production).
+
 Log in with a local account: **Client Profiles… → Create Local Account…**, or accept the
 prompt Test Local shows when no account exists. Accounts are created with the server's
 own hash (`AccountService`, `AccountDialog.*`) and only exist in the local database.
@@ -50,6 +53,11 @@ own hash (`AccountService`, `AccountDialog.*`) and only exist in the local datab
 - `ChangeTracker.hpp/.cpp`: Local Changes list, persistence, net-change merging, SQL generation.
 - `ChangeExport.hpp/.cpp`: change package export (`manifest.json`, `changes.sql`).
 - `LocalChangesPanel.hpp/.cpp`: status-bar "Local changes" button and panel.
+- `SqlConnection.hpp/.cpp`: the MySQL client connection shared by the local database and the sync.
+- `Ssh.hpp/.cpp`: system OpenSSH client: hardened arguments, tunnel, remote command, host keys.
+- `ProductionProfile.hpp/.cpp`: production server settings and the database password store.
+- `ProductionSync.hpp/.cpp`: Sync to Production (backup, apply, rollback, restart) and Test Connection.
+- `ProductionDialogs.hpp/.cpp`: production settings, host-key check, sync confirmation and progress.
 - `AuthoringDialogs.hpp/.cpp`: named selectors, humanoid/creature/clone flows,
   body preview, three weapon slots, outfits, combat settings.
 - `../MapView.h/.cpp`: click placement, world editing and save integration. Reuses
@@ -152,6 +160,87 @@ Values are exported as the server formats them, so float columns (positions) kee
 MariaDB's display precision. Changes made outside Noggit, or before this tracker
 existed, are not listed. Native world tables are MyISAM, so applying a package is
 not transactional.
+
+## Sync to Production
+
+Design locally → Test locally → **Sync to Production**. Production only changes when you
+click Sync; normal editing never touches it.
+
+**Setup (once):** Local changes → **Server…**. Enter the SSH host, port, user and private
+key, the world database as the server sees it (host, port, name — `tw_world` for
+tortoise-deploy — and user), how the database password is kept, and optionally the
+command that restarts the world server. **Test Connection** logs in over SSH and to the
+database and only reads: it shows the database version, the world's size, what was synced
+before, and warns when production's content version differs from yours, when the
+database user has broad rights, or lacks ones a sync needs. The first time, it shows the
+server's host-key fingerprints: compare them with your administrator's (on the server:
+`ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub`) before trusting them.
+
+Settings live in `Workspace/runtime.ini` (`[production]`), never the password. The
+password is asked for when syncing and remembered until Noggit closes, or saved in the
+system keyring (Linux: `secret-tool`, from `libsecret-tools`). Trusted host keys go to
+`Workspace/ssh/known_hosts`; keys already in your `~/.ssh/known_hosts` are honoured too.
+
+**Sync:** lists the pending changes (and the Creator NPCs, items and quests they rely on,
+which are sent too) and the target, and asks to confirm. Then:
+
+1. Connect: `ssh` (batch mode, strict host-key checking, `-F none`) forwards a random
+   loopback port to the database on the server; nothing else is opened. A server-side
+   lock stops two syncs from overlapping.
+2. Backup: every production row the sync can change is read and saved (see below).
+   IDs production already uses for content that did not come from Noggit stop the sync
+   here, with nothing changed.
+3. Apply: the package's statements run one by one in a transaction.
+4. Restart: the restart command runs over SSH, if set. Without one, restart the world
+   server yourself; it loads NPCs and quests at startup.
+5. Only then are the synced entries removed from Local Changes. An entry edited again
+   meanwhile stays listed.
+
+If any step fails, nothing is marked as synced, the error and the server's output are
+shown, and production is put back: the transaction is rolled back and the backup is
+restored (on a fresh connection if the old one died). Restore failure is reported loudly
+with the way to finish it by hand. The Tortoise world tables are MyISAM, which ignores
+transactions, so the backup is the real rollback. It covers `ChangeTracker::footprint`:
+the rows `changes.sql` can change, selected by key columns the script never updates, so
+deleting what matches and putting the saved rows back restores them exactly (verified by
+table checksums in the integration test). A failed restart also restores the database.
+
+Each sync keeps a folder `Workspace/sync/<date-time>/`: `manifest.json` (with the
+destination), `changes.sql`, `backup.json`, `restore.sql` (puts the backed-up rows back),
+`sync.log` and `result.json` (`synced`, `failed`, `rolled-back` or `rollback-failed`).
+
+### Server setup (administrator)
+
+Give each designer their own SSH key and a database user limited to the world database.
+Nothing needs root, and the database port stays closed to the internet.
+
+1. Make the database reachable from the server itself only. With tortoise-deploy, add to the
+   `database` service in `compose.yaml`: `ports: ["127.0.0.1:3306:3306"]`.
+2. Create the database user (in the database container, as root):
+
+   ```sql
+   CREATE USER 'noggit_sync'@'%' IDENTIFIED BY 'a long random password';
+   GRANT SELECT, INSERT, UPDATE, DELETE, CREATE ON tw_world.* TO 'noggit_sync'@'%';
+   ```
+
+   `CREATE` is only needed for the first sync, which creates the `creator_content` table.
+3. Add the designer's public key to a dedicated, unprivileged account's
+   `~/.ssh/authorized_keys`, restricted to the database forward and, optionally, a
+   restart script as its only command:
+
+   ```
+   restrict,port-forwarding,permitopen="127.0.0.1:3306",command="/home/noggit-sync/restart-world" ssh-ed25519 AAAA... designer
+   ```
+
+   The tunnel (`ssh -N`) never runs the command. Sync's restart step runs it whatever
+   command is configured in Noggit. Without `command=`, use `command="/usr/sbin/nologin"`
+   and leave the restart command empty. A restart script for tortoise-deploy needs Docker
+   access, e.g. a `sudo` rule for exactly `docker compose restart mangosd` in that folder.
+
+Out of scope: several designers syncing to one server, merge conflicts, ID remapping,
+staging servers, terrain/client files and DBC deployment. tortoise-deploy re-creates the
+world database when an upstream migration is edited, which drops synced content. Keep
+the `Workspace/sync` folders: their `changes.sql` files can be applied again, oldest first.
 
 ## Supported appearance and combat
 
@@ -262,9 +351,12 @@ drops and items):
 
 ```bash
 cmake -S test/creator -B build-creator-tests
-cmake --build build-creator-tests --target change_tracker_tests
-./build-creator-tests/change_tracker_tests
+cmake --build build-creator-tests --target change_tracker_tests ssh_tests
+ctest --test-dir build-creator-tests --output-on-failure
 ```
+
+`ssh_tests` covers SSH target validation, argument hardening, error classification,
+host-key fingerprints and forgetting, and that names cannot break the generated SQL.
 
 Real database integration checks require a disposable, stopped copy of the bundle.
 The test leaves test content in that copy, starts all three services, checks ID
@@ -272,6 +364,7 @@ uniqueness, source preservation, names, placement movement/deletion, respawn edi
 quests (events, a quest drop giving a creature its own loot table, a refused self-link,
 a follow-up chain), items (create, edit, delete protection), MyISAM rollback, Local
 Changes entries, package export (and replaying its `changes.sql` on the live schema),
+the sync backup restoring every row a package changed (table checksums) and ID conflicts,
 NPC/quest/item deletion and local accounts, then stops.
 Do not copy a running MariaDB data directory. Do not run beside another local server.
 The copy needs about 7 GB; `/tmp` is often too small, so pick a roomier parent folder.

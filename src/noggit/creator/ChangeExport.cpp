@@ -5,6 +5,7 @@
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QDateTime>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QRegularExpression>
@@ -66,6 +67,60 @@ QJsonObject sourceVersion(Database& db) {
 QString ExportService::folderName(QString const& packageName) {
   return packageName.trimmed().replace(QRegularExpression("[^\\p{L}\\p{N}_]+"), "-").remove(QRegularExpression("^-+|-+$"));
 }
+ChangePackage ExportService::build(QVector<TrackedChange> const& changes) {
+  require(!changes.isEmpty(), "There are no local changes.");
+  ChangePackage package; package.changes = changes; package.tracked = changes.size();
+  auto& all = package.changes;
+  Database db;
+  // Creator content the changes refer to travels with the package (and what that refers to, in turn);
+  // the game's own content exists on every compatible database.
+  QSet<QPair<int, Id>> known;
+  for (auto const& c : changes) known.insert({int(c.type), c.entity});
+  for (int i = 0; i < all.size(); ++i) {
+    for (auto const& [type, id] : references(all[i])) {
+      if (!id || known.contains({int(type), id})) continue;
+      known.insert({int(type), id});
+      if (!db.owned(toString(type), id)) continue;
+      TrackedChange d; d.type = type; d.entity = id; d.action = ChangeAction::Create;
+      d.after = ChangeTracker::capture([&db](QString const& sql) { return db.query(sql); }, type, id, &d.label);
+      if (!d.after.isEmpty()) all.push_back(d);
+    }
+  }
+  for (auto const& c : all) package.owned.push_back(db.owned(toString(c.type), c.entity));
+  package.source = sourceVersion(db);
+  package.sql = ChangeTracker::sql(all);
+  return package;
+}
+QJsonObject ExportService::localSource() { Database db; return sourceVersion(db); }
+QJsonObject ChangePackage::manifest(QString const& name, QString const& author) const {
+  QJsonArray entities;
+  for (int i = 0; i < changes.size(); ++i) {
+    auto const& c = changes[i];
+    entities.append(QJsonObject{{"type", toString(c.type)}, {"id", double(c.entity)}, {"action", toString(c.action)},
+                                {"name", c.label}, {"includedAsDependency", i >= tracked}});
+  }
+  return {
+    {"format", 1}, {"generator", "Noggit Creator"}, {"name", name.trimmed()}, {"author", author.trimmed()},
+    {"created", QDateTime::currentDateTimeUtc().toString(Qt::ISODate)}, {"source", source}, {"entities", entities},
+    {"files", QJsonObject{{"changes.sql", QJsonObject{{"sha256", QString(QCryptographicHash::hash(sql.toUtf8(), QCryptographicHash::Sha256).toHex())}}}}}};
+}
+void ExportService::write(ChangePackage const& package, QString const& name, QString const& author, QString const& target,
+                          QJsonObject const& manifestExtra, QMap<QString, QByteArray> const& extra) {
+  require(!QFileInfo::exists(target), "A package named \"" + QFileInfo(target).fileName() + "\" already exists in that folder. Choose another name or folder.");
+  auto manifest = package.manifest(name, author);
+  for (auto it = manifestExtra.begin(); it != manifestExtra.end(); ++it) manifest[it.key()] = it.value();
+  // Build beside the target and rename, so a failed write never leaves a half-written package.
+  QFileInfo info(target);
+  auto partial = info.dir().filePath("." + info.fileName() + ".partial");
+  QDir(partial).removeRecursively();
+  try {
+    require(QDir().mkpath(partial), "Cannot create the package folder.");
+    writeFile(partial + "/manifest.json", QJsonDocument(manifest).toJson());
+    writeFile(partial + "/changes.sql", package.sql.toUtf8());
+    for (auto it = extra.begin(); it != extra.end(); ++it) writeFile(partial + "/" + it.key(), it.value());
+    require(QDir().rename(partial, target), "Cannot create the package folder.");
+  } catch (...) { QDir(partial).removeRecursively(); throw; }
+}
 ExportResult ExportService::exportChanges(QString const& name, QString const& author, QString const& folder, QVector<TrackedChange> const& changes) {
   require(!changes.isEmpty(), "There are no local changes to export.");
   auto title = name.trimmed();
@@ -75,48 +130,8 @@ ExportResult ExportService::exportChanges(QString const& name, QString const& au
   require(QFileInfo(folder).isDir(), "Choose an existing folder for the package.");
   auto target = QDir(folder).filePath(directory);
   require(!QFileInfo::exists(target), "A package named \"" + directory + "\" already exists in that folder. Choose another name or folder.");
-
-  auto all = changes; QJsonObject source;
-  {
-    Database db;
-    // Creator content the changes refer to travels with the package (and what that refers to, in turn);
-    // the game's own content exists on every compatible database.
-    QSet<QPair<int, Id>> known;
-    for (auto const& c : changes) known.insert({int(c.type), c.entity});
-    for (int i = 0; i < all.size(); ++i) {
-      for (auto const& [type, id] : references(all[i])) {
-        if (!id || known.contains({int(type), id})) continue;
-        known.insert({int(type), id});
-        if (!db.owned(toString(type), id)) continue;
-        TrackedChange d; d.type = type; d.entity = id; d.action = ChangeAction::Create;
-        d.after = ChangeTracker::capture([&db](QString const& sql) { return db.query(sql); }, type, id, &d.label);
-        if (!d.after.isEmpty()) all.push_back(d);
-      }
-    }
-    source = sourceVersion(db);
-  }
-
-  auto sql = ChangeTracker::sql(all).toUtf8();
-  QJsonArray entities;
-  for (int i = 0; i < all.size(); ++i) {
-    auto const& c = all[i]; bool dependency = i >= changes.size();
-    entities.append(QJsonObject{{"type", toString(c.type)}, {"id", double(c.entity)}, {"action", toString(c.action)},
-                                {"name", c.label}, {"includedAsDependency", dependency}});
-  }
-  QJsonObject manifest{
-    {"format", 1}, {"generator", "Noggit Creator"}, {"name", title}, {"author", author.trimmed()},
-    {"created", QDateTime::currentDateTimeUtc().toString(Qt::ISODate)}, {"source", source}, {"entities", entities},
-    {"files", QJsonObject{{"changes.sql", QJsonObject{{"sha256", QString(QCryptographicHash::hash(sql, QCryptographicHash::Sha256).toHex())}}}}}};
-
-  // Build beside the target and rename, so a failed export never leaves a half-written package.
-  auto partial = QDir(folder).filePath("." + directory + ".partial");
-  QDir(partial).removeRecursively();
-  try {
-    require(QDir().mkpath(partial), "Cannot create the package folder.");
-    writeFile(partial + "/manifest.json", QJsonDocument(manifest).toJson());
-    writeFile(partial + "/changes.sql", sql);
-    require(QDir().rename(partial, target), "Cannot create the package folder.");
-  } catch (...) { QDir(partial).removeRecursively(); throw; }
-  return {target, changes.size(), all.size() - changes.size()};
+  auto package = build(changes);
+  write(package, title, author, target);
+  return {target, package.tracked, int(package.changes.size()) - package.tracked};
 }
 }

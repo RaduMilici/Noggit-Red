@@ -2,7 +2,9 @@
 #include "Services.hpp"
 #include <QObject>
 #include <QDateTime>
+#include <QJsonArray>
 #include <QJsonObject>
+#include <QPair>
 #include <QStringList>
 #include <functional>
 #include <optional>
@@ -39,11 +41,20 @@ public:
   void promote();
   void discard();
   void clear(QStringList const& ids);
+  // Removes entries that reached production. An entry edited again since `synced` was taken stays listed.
+  void markSynced(QVector<TrackedChange> const& synced);
   static void merge(QVector<TrackedChange>& list, TrackedChange change);
   static std::optional<ChangeAction> derive(EntityType, QJsonObject const& before, QJsonObject const& after);
   static QJsonObject capture(QueryFunction const& query, EntityType, Id, QString* label = nullptr);
   // Statements that reproduce the tracked after-states on another compatible world database.
   static QString sql(QVector<TrackedChange> const& changes);
+  // Every row sql(changes) can change on `target`, as (table, where) on columns the script never updates,
+  // so the same rows match before and after it runs. `target` is read for its current state of the entities.
+  static QVector<QPair<QString, QString>> footprint(QVector<TrackedChange> const& changes, QueryFunction const& target);
+  // REPLACE statements for rows as capture() returns them.
+  static QString upsert(QString const& table, QJsonArray const& rows);
+  // The statements of sql(): one per line, since values escape line breaks and comments are single lines.
+  static QStringList statements(QString const& sql);
 signals:
   void changed();
 private:

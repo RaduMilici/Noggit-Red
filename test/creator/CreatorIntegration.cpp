@@ -2,6 +2,7 @@
 #include <noggit/creator/Database.hpp>
 #include <noggit/creator/ChangeExport.hpp>
 #include <noggit/creator/ContentStore.hpp>
+#include <noggit/creator/ProductionSync.hpp>
 #include <noggit/runtime/RuntimeManager.hpp>
 #include <QCoreApplication>
 #include <QFileInfo>
@@ -141,6 +142,44 @@ void runChecks() {
   check(query("SELECT * FROM creature_template WHERE entry="+QString::number(entry))==beforeExport,"Replaying the package changed the NPC");
   check(query("SELECT Title FROM quest_template WHERE entry="+QString::number(questId))[0]["Title"].toString()=="Creator integration quest (edited)","Replaying the package lost the quest");
   check(query("SELECT COUNT(*) AS n FROM quest_start_scripts WHERE id="+QString::number(questId))[0]["n"].toInt()==1,"Replaying the package duplicated the quest's events");
+
+  // Sync to Production's rollback: back up the footprint, apply a package that deletes, moves and creates
+  // across every kind, then restore. The checksums cover every table the generated SQL can write, so a
+  // row changed outside the footprint shows up too.
+  {
+    auto q=[](QString const& sql){ return query(sql); };
+    auto state=[&](EntityType type,Id id){ return ChangeTracker::capture(q,type,id); };
+    auto edited=[](QJsonObject rows,QString const& table,QString const& column,QString const& value){
+      auto list=rows[table].toArray(); auto row=list[0].toObject(); row[column]=value; list[0]=row; rows[table]=list; return rows;
+    };
+    QVector<TrackedChange> scenario;
+    auto add=[&](EntityType type,Id id,QJsonObject const& before,QJsonObject const& after){
+      TrackedChange c; c.type=type; c.entity=id; c.before=before; c.after=after; c.label="Sync test"; c.action=*ChangeTracker::derive(type,before,after);
+      scenario.push_back(c);
+    };
+    add(EntityType::Quest,questId,state(EntityType::Quest,questId),{});
+    add(EntityType::Item,itemId,state(EntityType::Item,itemId),{});
+    add(EntityType::Spawn,guid,state(EntityType::Spawn,guid),edited(state(EntityType::Spawn,guid),"creature","position_x","1234"));
+    add(EntityType::Npc,copyEntry,state(EntityType::Npc,copyEntry),{});
+    add(EntityType::Npc,1999999,{},edited(state(EntityType::Npc,entry),"creature_template","entry","1999999"));
+    QString const tables="creature_template,creature_equip_template,npc_vendor,npc_trainer,creature_questrelation,creature_involvedrelation,"
+      "gameobject_questrelation,gameobject_involvedrelation,areatrigger_involvedrelation,creature,item_template,quest_template,"
+      "quest_start_scripts,quest_end_scripts,broadcast_text,creature_loot_template,gameobject_loot_template,gameobject_template,creator_content";
+    auto checksum=[&]{ return query("CHECKSUM TABLE "+tables); };
+    auto pristine=checksum();
+    auto backup=ProductionBackup::take(ChangeTracker::footprint(scenario,q),q);
+    { Database db; for (auto const& s : ChangeTracker::statements(ChangeTracker::sql(scenario))) db.execute(s.toStdString()); }
+    check(checksum()!=pristine&&query("SELECT entry FROM quest_template WHERE entry="+QString::number(questId)).isEmpty()
+          &&!query("SELECT entry FROM creature_template WHERE entry=1999999").isEmpty(),"The sync test package changed nothing");
+    { Database db; for (auto const& s : backup.restoreStatements()) db.execute(s.toStdString()); }
+    check(checksum()==pristine,"Restoring the sync backup did not put every row back");
+    // An ID production uses for content it did not get from Noggit is refused; content synced before is not.
+    ChangePackage clash; TrackedChange c; c.type=EntityType::Npc; c.action=ChangeAction::Update; c.label="Mine";
+    c.entity=sources[0]["entry"].toUInt(); clash.changes={c}; clash.tracked=1; clash.owned={true};
+    check(ProductionSync::conflicts(clash,q).size()==1,"A game NPC with the same ID was not reported");
+    clash.changes[0].entity=entry;
+    check(ProductionSync::conflicts(clash,q).isEmpty(),"Content synced before was reported as a conflict");
+  }
 
   // Deletions.
   bool blocked=false;

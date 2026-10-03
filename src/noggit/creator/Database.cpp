@@ -1,4 +1,5 @@
 #include "Database.hpp"
+#include "SqlConnection.hpp"
 #include <QCoreApplication>
 #include <QFile>
 #include <QSaveFile>
@@ -6,32 +7,16 @@
 #include <QJsonObject>
 #include <noggit/runtime/RuntimeManager.hpp>
 #include <stdexcept>
-#ifdef USE_MYSQL_UID_STORAGE
-#include <mysql.h>
-#endif
 namespace Noggit::Creator {
 namespace { void fail(QString const& s) { throw std::runtime_error(s.toStdString()); }
 QString identifier(QString const& s) { for (auto c : s) if (!c.isLetterOrNumber() && c != '_') fail("Invalid internal database identifier."); return '`' + s + '`'; }
 }
-struct Database::Impl {
-#ifdef USE_MYSQL_UID_STORAGE
-  MYSQL* connection = nullptr;
-  ~Impl() { if (connection) mysql_close(connection); }
-#endif
-};
+struct Database::Impl { std::optional<SqlConnection> connection; };
 Database::Database() : _impl(std::make_unique<Impl>()) {
   auto runtime = Runtime::RuntimeManager::instance();
   if (!runtime || !qApp->property("creatorDatabaseReady").toBool()) fail("Start the local database in LOCAL SERVER before editing content.");
-#ifdef USE_MYSQL_UID_STORAGE
-  _impl->connection = mysql_init(nullptr);
-  if (!_impl->connection) fail("Cannot initialize the local database connection.");
-  unsigned timeout = 3;
-  mysql_options(_impl->connection, MYSQL_OPT_CONNECT_TIMEOUT, &timeout);
-  mysql_options(_impl->connection, MYSQL_OPT_READ_TIMEOUT, &timeout);
-  mysql_options(_impl->connection, MYSQL_OPT_WRITE_TIMEOUT, &timeout);
-  if (!mysql_real_connect(_impl->connection, "127.0.0.1", "creator", "creator-local", "mangos", 13306, nullptr, 0))
-    fail("Local database is unavailable. Check LOCAL SERVER.");
-  mysql_set_character_set(_impl->connection, "utf8mb4");
+  try { _impl->connection.emplace(Endpoint{"127.0.0.1", 13306, "creator", "creator-local", "mangos"}, "Local database"); }
+  catch (std::exception const&) { fail("Local database is unavailable. Check LOCAL SERVER."); }
   auto locked = query("SELECT GET_LOCK('noggit_creator_authoring',3) AS locked");
   if (locked.isEmpty() || locked[0]["locked"].toInt() != 1) fail("Another local save is in progress. Please try again.");
   exec("CREATE TABLE IF NOT EXISTS creator_content (kind VARCHAR(20) NOT NULL, entry INT UNSIGNED NOT NULL, PRIMARY KEY(kind,entry)) ENGINE=InnoDB");
@@ -48,71 +33,17 @@ Database::Database() : _impl(std::make_unique<Impl>()) {
     if (tracker) tracker->discard();
     if (!QFile::remove(_journal)) fail("Cannot finish recovery of the interrupted save.");
   }
-#else
-  fail("This Noggit build does not include local database support.");
-#endif
 }
 Database::~Database() {
   if (!_committed && !_undo.isEmpty()) {
     try { restore(_undo); QFile::remove(_journal); } catch (...) { /* retained for recovery on next connection */ }
   }
 }
-QString Database::quote(QVariant const& value) const {
-  if (value.isNull()) return "NULL";
-#ifdef USE_MYSQL_UID_STORAGE
-  QByteArray bytes = value.toString().toUtf8(), escaped(bytes.size()*2+1, '\0');
-  auto size = mysql_real_escape_string(_impl->connection, escaped.data(), bytes.constData(), bytes.size());
-  escaped.resize(size); return "'" + QString::fromUtf8(escaped) + "'";
-#else
-  return {};
-#endif
-}
-QVector<Fields> Database::query(QString const& sql) {
-  QVector<Fields> rows;
-#ifdef USE_MYSQL_UID_STORAGE
-  auto bytes = sql.toUtf8();
-  if (mysql_real_query(_impl->connection, bytes.constData(), bytes.size()))
-    fail("Local content save failed: " + QString::fromUtf8(mysql_error(_impl->connection)));
-  MYSQL_RES* result = mysql_store_result(_impl->connection);
-  if (!result) { if (mysql_field_count(_impl->connection)) fail("Cannot read local content."); return rows; }
-  auto fields = mysql_fetch_fields(result); unsigned count = mysql_num_fields(result);
-  while (auto row = mysql_fetch_row(result)) {
-    Fields values; auto lengths = mysql_fetch_lengths(result);
-    for (unsigned i=0;i<count;++i) values[QString::fromUtf8(fields[i].name)] = row[i] ? QVariant(QString::fromUtf8(row[i], lengths[i])) : QVariant();
-    rows.push_back(values);
-  }
-  mysql_free_result(result);
-#endif
-  return rows;
-}
+QString Database::quote(QVariant const& value) const { return _impl->connection->quote(value); }
+QVector<Fields> Database::query(QString const& sql) { return _impl->connection->query(sql); }
 void Database::exec(QString const& sql) { query(sql); }
-std::vector<std::vector<std::optional<std::string>>> Database::rows(std::string const& sql) {
-  std::vector<std::vector<std::optional<std::string>>> rows;
-#ifdef USE_MYSQL_UID_STORAGE
-  if (mysql_real_query(_impl->connection, sql.data(), sql.size()))
-    fail("Reading local content failed: " + QString::fromUtf8(mysql_error(_impl->connection)));
-  MYSQL_RES* result = mysql_store_result(_impl->connection);
-  if (!result) { if (mysql_field_count(_impl->connection)) fail("Cannot read local content."); return rows; }
-  unsigned count = mysql_num_fields(result);
-  while (auto row = mysql_fetch_row(result)) {
-    auto lengths = mysql_fetch_lengths(result); std::vector<std::optional<std::string>> values;
-    for (unsigned i=0;i<count;++i) values.push_back(row[i] ? std::optional<std::string>(std::string(row[i], lengths[i])) : std::nullopt);
-    rows.push_back(std::move(values));
-  }
-  mysql_free_result(result);
-#endif
-  return rows;
-}
-std::uint64_t Database::execute(std::string const& sql) {
-#ifdef USE_MYSQL_UID_STORAGE
-  if (mysql_real_query(_impl->connection, sql.data(), sql.size()))
-    fail("Local content save failed: " + QString::fromUtf8(mysql_error(_impl->connection)));
-  if (auto result = mysql_store_result(_impl->connection)) mysql_free_result(result);
-  return mysql_affected_rows(_impl->connection);
-#else
-  return 0;
-#endif
-}
+std::vector<std::vector<std::optional<std::string>>> Database::rows(std::string const& sql) { return _impl->connection->rows(sql); }
+std::uint64_t Database::execute(std::string const& sql) { return _impl->connection->execute(sql); }
 void Database::insert(QString const& table, Fields const& fields) {
   QStringList keys, values;
   for (auto it=fields.begin();it!=fields.end();++it) { keys << identifier(it.key()); values << quote(it.value()); }

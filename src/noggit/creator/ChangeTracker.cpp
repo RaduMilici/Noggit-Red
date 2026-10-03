@@ -6,6 +6,7 @@
 #include <QSaveFile>
 #include <QJsonArray>
 #include <QJsonDocument>
+#include <QRegularExpression>
 #include <QUuid>
 #include <algorithm>
 #include <stdexcept>
@@ -46,6 +47,8 @@ QString literal(QJsonValue const& value) {
   }
   return '\'' + escaped + '\'';
 }
+// Names go into "--" comments: a line break would turn the rest of the name into a statement.
+QString oneLine(QString text) { return text.replace(QRegularExpression("[\\r\\n\\x{2028}\\x{2029}]+"), " "); }
 QString identifier(QString name) { return '`' + name.replace('`', "``") + '`'; }
 QString replaceRows(QString const& table, QJsonArray const& rows) {
   QString out;
@@ -172,6 +175,13 @@ void ChangeTracker::clear(QStringList const& ids) {
   write(_file, kept); _changes = kept;
   emit changed();
 }
+void ChangeTracker::markSynced(QVector<TrackedChange> const& synced) {
+  QStringList done;
+  for (auto const& c : _changes)
+    if (std::any_of(synced.begin(), synced.end(), [&](TrackedChange const& s) { return s.id == c.id && s.timestamp == c.timestamp && s.after == c.after; }))
+      done << c.id;
+  clear(done);
+}
 std::optional<ChangeAction> ChangeTracker::derive(EntityType type, QJsonObject const& before, QJsonObject const& after) {
   if (before.isEmpty() && after.isEmpty()) return {};
   if (before.isEmpty()) return ChangeAction::Create;
@@ -270,7 +280,7 @@ QString ChangeTracker::sql(QVector<TrackedChange> const& changes) {
   // Remove dependents before their NPCs, then recreate NPCs before what refers to them.
   for (auto const& c : ordered(EntityType::Quest, true)) {
     auto id = n(c.entity);
-    out += "\n-- Delete quest: " + c.label + " (#" + id + ")\n" + ownedGuard("quest", c.entity);
+    out += "\n-- Delete quest: " + oneLine(c.label) + " (#" + id + ")\n" + ownedGuard("quest", c.entity);
     for (auto const& table : questLinks) out += "DELETE FROM " + table + " WHERE quest=" + id + " AND @owned>0;\n";
     auto quest = firstRow(c.before, "quest_template");
     for (int i = 0; i < 2; ++i)
@@ -285,20 +295,20 @@ QString ChangeTracker::sql(QVector<TrackedChange> const& changes) {
   }
   for (auto const& c : ordered(EntityType::Item, true)) {
     auto id = n(c.entity);
-    out += "\n-- Delete item: " + c.label + " (#" + id + ")\n" + ownedGuard("item", c.entity);
+    out += "\n-- Delete item: " + oneLine(c.label) + " (#" + id + ")\n" + ownedGuard("item", c.entity);
     for (auto const& table : QStringList{"creature_loot_template", "gameobject_loot_template", "npc_vendor"})
       out += "DELETE FROM " + table + " WHERE item=" + id + " AND @owned>0;\n";
     out += "DELETE FROM item_template WHERE entry=" + id + " AND @owned>0;\n";
     out += "DELETE FROM creator_content WHERE kind='item' AND entry=" + id + ";\n";
   }
   for (auto const& c : ordered(EntityType::Spawn, true)) {
-    out += "\n-- Remove placement: " + c.label + " (#" + n(c.entity) + ")\n" + ownedGuard("spawn", c.entity);
+    out += "\n-- Remove placement: " + oneLine(c.label) + " (#" + n(c.entity) + ")\n" + ownedGuard("spawn", c.entity);
     out += "DELETE FROM creature WHERE guid=" + n(c.entity) + " AND @owned>0;\n";
     out += "DELETE FROM creator_content WHERE kind='spawn' AND entry=" + n(c.entity) + ";\n";
   }
   for (auto const& c : ordered(EntityType::Npc, true)) {
     auto id = n(c.entity);
-    out += "\n-- Delete NPC: " + c.label + " (#" + id + ")\n" + ownedGuard("npc", c.entity);
+    out += "\n-- Delete NPC: " + oneLine(c.label) + " (#" + id + ")\n" + ownedGuard("npc", c.entity);
     out += "DELETE FROM creator_content WHERE kind='spawn' AND @owned>0 AND entry IN (SELECT guid FROM creature WHERE id=" + id + ");\n";
     out += "DELETE FROM creature WHERE id=" + id + " AND @owned>0;\n";
     out += "DELETE FROM npc_vendor WHERE entry=" + id + " AND @owned>0;\n";
@@ -311,7 +321,7 @@ QString ChangeTracker::sql(QVector<TrackedChange> const& changes) {
   }
   for (auto const& c : ordered(EntityType::Npc, false)) {
     auto id = n(c.entity);
-    out += "\n-- NPC: " + c.label + " (#" + id + ")\n";
+    out += "\n-- NPC: " + oneLine(c.label) + " (#" + id + ")\n";
     out += "DELETE FROM npc_vendor WHERE entry=" + id + ";\nDELETE FROM npc_trainer WHERE entry=" + id + ";\n";
     for (auto const& table : relations) out += "DELETE FROM " + table + " WHERE id=" + id + creatorOnlyQuests() + ";\n";
     for (auto const& table : {"creature_equip_template", "creature_template", "npc_vendor", "npc_trainer", "creature_questrelation", "creature_involvedrelation"})
@@ -319,16 +329,16 @@ QString ChangeTracker::sql(QVector<TrackedChange> const& changes) {
     out += "INSERT IGNORE INTO creator_content(kind,entry) VALUES('npc'," + id + ");\n";
   }
   for (auto const& c : ordered(EntityType::Item, false)) {
-    out += "\n-- Item: " + c.label + " (#" + n(c.entity) + ")\n" + replaceRows("item_template", c.after["item_template"].toArray());
+    out += "\n-- Item: " + oneLine(c.label) + " (#" + n(c.entity) + ")\n" + replaceRows("item_template", c.after["item_template"].toArray());
     out += "INSERT IGNORE INTO creator_content(kind,entry) VALUES('item'," + n(c.entity) + ");\n";
   }
   for (auto const& c : ordered(EntityType::Spawn, false)) {
-    out += "\n-- Placement: " + c.label + " (#" + n(c.entity) + ")\n" + replaceRows("creature", c.after["creature"].toArray());
+    out += "\n-- Placement: " + oneLine(c.label) + " (#" + n(c.entity) + ")\n" + replaceRows("creature", c.after["creature"].toArray());
     out += "INSERT IGNORE INTO creator_content(kind,entry) VALUES('spawn'," + n(c.entity) + ");\n";
   }
   for (auto const& c : ordered(EntityType::Quest, false)) {
     auto id = n(c.entity);
-    out += "\n-- Quest: " + c.label + " (#" + id + ")\n";
+    out += "\n-- Quest: " + oneLine(c.label) + " (#" + id + ")\n";
     for (auto const& table : questLinks) out += "DELETE FROM " + table + " WHERE quest=" + id + ";\n";
     // Scripts are replaced whole; spoken lines, drops and the start item the edit dropped are removed.
     QStringList scripts[2];
@@ -366,5 +376,68 @@ QString ChangeTracker::sql(QVector<TrackedChange> const& changes) {
     out += "INSERT IGNORE INTO creator_content(kind,entry) VALUES('quest'," + id + ");\n";
   }
   return out;
+}
+QString ChangeTracker::upsert(QString const& table, QJsonArray const& rows) { return replaceRows(table, rows); }
+QVector<QPair<QString, QString>> ChangeTracker::footprint(QVector<TrackedChange> const& changes, QueryFunction const& target) {
+  QVector<QPair<QString, QString>> scopes;
+  auto add = [&](QString const& table, QString const& column, QStringList ids) {
+    ids.removeDuplicates(); ids.removeAll("0");
+    if (ids.isEmpty()) return;
+    QPair<QString, QString> scope{table, column + (ids.size() == 1 ? "=" + ids[0] : " IN (" + ids.join(',') + ")")};
+    if (!scopes.contains(scope)) scopes.push_back(scope);
+  };
+  auto owned = [&](QString const& kind, QStringList const& ids) { add("creator_content", "kind='" + kind + "' AND entry", ids); };
+  for (auto const& c : changes) {
+    auto id = n(c.entity);
+    QJsonObject const states[] = {c.before, c.after, capture(target, c.type, c.entity)};
+    auto values = [&](QString const& table, QString const& column) {
+      QStringList result;
+      for (auto const& state : states) for (auto const& row : state[table].toArray()) result << n(field(row.toObject(), column));
+      return result;
+    };
+    owned(typeNames[int(c.type)], {id});
+    if (c.type == EntityType::Npc) {
+      add("creature_template", "entry", {id});
+      add("creature_equip_template", "entry", values("creature_template", "equipment_id"));
+      add("npc_vendor", "entry", {id});
+      add("npc_trainer", "entry", {id});
+      for (auto const& table : relations) add(table, "id", {id});
+      if (c.action == ChangeAction::Delete) {
+        QStringList guids;
+        for (auto const& row : target("SELECT guid FROM creature WHERE id=" + id)) guids << row["guid"].toString();
+        add("creature", "guid", guids);
+        owned("spawn", guids);
+      }
+    } else if (c.type == EntityType::Spawn) {
+      add("creature", "guid", {id});
+    } else if (c.type == EntityType::Item) {
+      add("item_template", "entry", {id});
+      if (c.action == ChangeAction::Delete)
+        for (auto const& table : QStringList{"creature_loot_template", "gameobject_loot_template", "npc_vendor"}) add(table, "item", {id});
+    } else {
+      add("quest_template", "entry", {id});
+      for (auto const& table : questLinks) add(table, "quest", {id});
+      for (int i = 0; i < 2; ++i) add(scriptTables[i], "id", values("quest_template", scriptColumns[i]));
+      add("broadcast_text", "entry", values("broadcast_text", "entry"));
+      QStringList items;
+      for (int i = 1; i <= 4; ++i) items << values("quest_template", "ReqItemId" + n(i));
+      for (auto const& table : lootTables) add(table, "item", items);
+      // Loot links and the giver flag are set on these templates.
+      QStringList creatures = values("creature_loot_link", "entry");
+      for (auto const& table : relations) creatures << values(table, "id");
+      add("creature_template", "entry", creatures);
+      add("gameobject_template", "entry", values("gameobject_loot_link", "entry"));
+      add("item_template", "entry", values("item_start_link", "entry"));
+    }
+  }
+  return scopes;
+}
+QStringList ChangeTracker::statements(QString const& sql) {
+  QStringList result;
+  for (auto const& line : sql.split('\n')) {
+    auto statement = line.trimmed();
+    if (!statement.isEmpty() && !statement.startsWith("--")) result << statement;
+  }
+  return result;
 }
 }

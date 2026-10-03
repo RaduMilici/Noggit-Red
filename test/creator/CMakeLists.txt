@@ -9,6 +9,10 @@ file(GLOB CONTENT_SOURCES CONFIGURE_DEPENDS
   ../../src/noggit/content/*.cpp ../../src/noggit/quest/*.cpp ../../src/noggit/item/*.cpp)
 add_executable(creator_integration CreatorIntegration.cpp ${CONTENT_SOURCES}
   ../../src/noggit/creator/Database.cpp
+  ../../src/noggit/creator/SqlConnection.cpp
+  ../../src/noggit/creator/Ssh.cpp
+  ../../src/noggit/creator/ProductionProfile.cpp
+  ../../src/noggit/creator/ProductionSync.cpp
   ../../src/noggit/creator/Services.cpp
   ../../src/noggit/creator/ChangeTracker.cpp
   ../../src/noggit/creator/ChangeExport.cpp
@@ -26,3 +30,12 @@ add_executable(change_tracker_tests ChangeTrackerTests.cpp
 target_include_directories(change_tracker_tests PRIVATE ../../src)
 target_link_libraries(change_tracker_tests PRIVATE Qt5::Core Qt5::Network)
 add_test(NAME change_tracker COMMAND change_tracker_tests)
+
+# SSH command building, error classification, host keys, and SQL comment safety; no server needed.
+add_executable(ssh_tests SshTests.cpp
+  ../../src/noggit/creator/Ssh.cpp
+  ../../src/noggit/creator/ChangeTracker.cpp
+  ../../src/noggit/runtime/RuntimeManager.cpp)
+target_include_directories(ssh_tests PRIVATE ../../src)
+target_link_libraries(ssh_tests PRIVATE Qt5::Core Qt5::Network)
+add_test(NAME ssh COMMAND ssh_tests)
