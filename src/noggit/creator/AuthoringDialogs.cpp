@@ -1,3 +1,6 @@
+#include "TestSessionService.hpp"
+#include <QPointer>
+#include <QCoreApplication>
 #include "AuthoringDialogs.hpp"
 #include <noggit/World.h>
 #include <noggit/ui/tools/AssetBrowser/ModelView.hpp>
@@ -165,6 +168,13 @@ bool npcDialog(QWidget* parent,World* world,Position position,Npc draft,int mode
   tabs->addTab(combatPage,"Combat / Role");
   auto buttons=new QDialogButtonBox(QDialogButtonBox::Save|QDialogButtonBox::Cancel);layout->addWidget(buttons);
   QObject::connect(buttons,&QDialogButtonBox::rejected,&dialog,&QDialog::reject);
+  if(draft.entry) {
+    auto remove=buttons->addButton("Delete NPC…",QDialogButtonBox::DestructiveRole);
+    QObject::connect(remove,&QPushButton::clicked,&dialog,[&]{
+      if(QMessageBox::question(&dialog,"Delete NPC","Delete \""+draft.name+"\" and all of its placements from your local world?",QMessageBox::Yes|QMessageBox::No,QMessageBox::No)!=QMessageBox::Yes)return;
+      try{CreatureService::remove(draft.entry);dialog.accept();}catch(std::exception const& e){error(&dialog,e);}
+    });
+  }
   QObject::connect(buttons,&QDialogButtonBox::accepted,&dialog,[&]{try {
     draft.name=name->text();draft.level=level->value();draft.health=health->value();draft.mana=mana->isEnabled()?mana->value():0;draft.armor=armor->value();draft.attackMs=attack->value();draft.damageMin=damageMin->value();draft.damageMax=damageMax->value();draft.faction=faction->currentData().toUInt();draft.rank=rank->currentIndex();draft.role=role->currentIndex();draft.type=type->currentIndex();draft.respawn=respawn->value();draft.movement=movement->currentIndex();
     CreatureService::save(draft,position,spawn);dialog.accept();
@@ -242,7 +252,20 @@ bool editQuest(QWidget* parent,Id npc) {
     }
     layout->addWidget(note("Talk quests use normal quest turn-in: select one Talk objective and its NPC becomes the ender. Collect quests require items already obtainable in the game; this editor does not create loot drops.",&dialog));
     auto buttons=new QDialogButtonBox(QDialogButtonBox::Save|QDialogButtonBox::Cancel);layout->addWidget(buttons);QObject::connect(buttons,&QDialogButtonBox::rejected,&dialog,&QDialog::reject);
-    QObject::connect(buttons,&QDialogButtonBox::accepted,&dialog,[&]{try{q.title=title->text();q.description=description->toPlainText();q.completion=completion->toPlainText();q.requiredLevel=required->value();q.level=level->value();q.xp=xp->value();q.money=gold->value()*10000+silver->value()*100+copper->value();q.objectives.clear();for(auto const& row:rows)if(row.enabled->isChecked())q.objectives.push_back({Objective::Type(row.type->currentIndex()),row.id,row.count->value(),row.target->text()});QuestService::save(q);dialog.accept();}catch(std::exception const& e){error(&dialog,e);}});
+    auto saveQuest=[&]() -> bool {try{q.title=title->text();q.description=description->toPlainText();q.completion=completion->toPlainText();q.requiredLevel=required->value();q.level=level->value();q.xp=xp->value();q.money=gold->value()*10000+silver->value()*100+copper->value();q.objectives.clear();for(auto const& row:rows)if(row.enabled->isChecked())q.objectives.push_back({Objective::Type(row.type->currentIndex()),row.id,row.count->value(),row.target->text()});q.entry=QuestService::save(q);return true;}catch(std::exception const& e){error(&dialog,e);return false;}};
+    QObject::connect(buttons,&QDialogButtonBox::accepted,&dialog,[&]{if(saveQuest())dialog.accept();});
+    if(q.entry) {
+      auto remove=buttons->addButton("Delete Quest…",QDialogButtonBox::DestructiveRole);
+      QObject::connect(remove,&QPushButton::clicked,&dialog,[&]{
+        if(QMessageBox::question(&dialog,"Delete Quest","Delete the quest \""+q.title+"\" from your local world?",QMessageBox::Yes|QMessageBox::No,QMessageBox::No)!=QMessageBox::Yes)return;
+        try{QuestService::remove(q.entry);dialog.accept();}catch(std::exception const& e){error(&dialog,e);}
+      });
+    }
+    auto test=new QPushButton("Test Quest");buttons->addButton(test,QDialogButtonBox::ActionRole);
+    QObject::connect(test,&QPushButton::clicked,&dialog,[&]{if(!saveQuest())return;
+      auto entry=q.entry;QPointer<QWidget> owner=parent;dialog.accept();
+      QTimer::singleShot(0,qApp,[owner,entry]{if(auto session=TestSessionService::instance())session->testQuest(owner,entry);});
+    });
     return dialog.exec()==QDialog::Accepted;
   }catch(std::exception const& e){error(parent,e);return false;}
 }

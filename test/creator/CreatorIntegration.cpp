@@ -1,8 +1,12 @@
 #include <noggit/creator/Services.hpp>
 #include <noggit/creator/Database.hpp>
+#include <noggit/creator/ChangeExport.hpp>
 #include <noggit/runtime/RuntimeManager.hpp>
 #include <QCoreApplication>
 #include <QFileInfo>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QTemporaryDir>
 #include <QTextStream>
 #include <QTimer>
 #include <stdexcept>
@@ -10,7 +14,13 @@ using namespace Noggit::Creator;
 namespace {
 void check(bool condition, char const* message) { if(!condition) throw std::runtime_error(message); }
 QVector<Fields> query(QString const& sql) { Database db; return db.query(sql); }
+TrackedChange const* tracked(EntityType type, Id id) {
+  for (auto const& c : ChangeTracker::instance()->changes()) if (c.type==type && c.entity==id) return &c;
+  return nullptr;
+}
+void clearTracked() { QStringList ids; for (auto const& c : ChangeTracker::instance()->changes()) ids << c.id; ChangeTracker::instance()->clear(ids); }
 void runChecks() {
+  clearTracked();
   auto sources=query("SELECT * FROM creature_template WHERE display_id1>0 AND type=7 AND scale>0 ORDER BY entry LIMIT 1");
   check(!sources.isEmpty(),"Seed has no NPCs"); auto original=sources[0];
   Npc npc; npc.name="Creator test: O'Brien — Militia"; npc.display=original["display_id1"].toUInt(); npc.role=1; npc.source=original["entry"].toUInt(); npc.stats=false; npc.combat=false; npc.motion=false;
@@ -52,6 +62,53 @@ void runChecks() {
   check(CreatureService::load(entry).name==npc.name,"Recovery journal failed to restore an unfinished save");
   SpawnService::save({{secondGuid,second,position,120,true,false}});
   check(query("SELECT guid FROM creature WHERE guid="+QString::number(secondGuid)).isEmpty(),"Placement deletion failed");
+
+  // Local Changes: net results of everything above, without the rolled-back save.
+  check(tracked(EntityType::Npc,entry)&&tracked(EntityType::Npc,entry)->action==ChangeAction::Create,"NPC creation not tracked");
+  check(tracked(EntityType::Npc,entry)->after["creature_template"].toArray()[0].toObject()["name"].toString()==npc.name,"Tracked NPC is not its latest state");
+  check(tracked(EntityType::Spawn,guid)&&tracked(EntityType::Spawn,guid)->action==ChangeAction::Create,"Moved new placement is not a creation");
+  check(!tracked(EntityType::Spawn,secondGuid),"Created-then-deleted placement still listed");
+  check(tracked(EntityType::Quest,questId)&&tracked(EntityType::Quest,questId)->action==ChangeAction::Create,"Quest creation not tracked");
+  clearTracked();
+  position.x+=3; SpawnService::save({{guid,entry,position,321,false,false}});
+  check(tracked(EntityType::Spawn,guid)&&tracked(EntityType::Spawn,guid)->action==ChangeAction::Move,"Placement movement is not a move");
+  check(ChangeTracker::instance()->changes().size()==1,"Unrelated entries tracked");
+  loaded=QuestService::load(questId); loaded.title="Creator integration quest (edited)"; QuestService::save(loaded);
+  check(tracked(EntityType::Quest,questId)->action==ChangeAction::Update,"Quest edit is not an update");
+
+  // Export: the spawn's and quest's Creator NPCs travel with the package.
+  QTemporaryDir out; check(out.isValid(),"No export folder");
+  auto beforeExport=query("SELECT * FROM creature_template WHERE entry="+QString::number(entry));
+  auto result=ExportService::exportChanges("Haunted Mill","Integration",out.path(),ChangeTracker::instance()->changes());
+  check(result.folder==out.path()+"/Haunted-Mill"&&result.changes==2&&result.dependencies>=2,"Unexpected export result");
+  QFile manifestFile(result.folder+"/manifest.json"),sqlFile(result.folder+"/changes.sql");
+  check(manifestFile.open(QIODevice::ReadOnly)&&sqlFile.open(QIODevice::ReadOnly),"Package files missing");
+  auto manifest=QJsonDocument::fromJson(manifestFile.readAll()).object();
+  check(manifest["name"]=="Haunted Mill"&&manifest["author"]=="Integration"&&manifest["entities"].toArray().size()==2+result.dependencies,"Manifest incomplete");
+  auto script=QString::fromUtf8(sqlFile.readAll());
+  check(!script.contains("characters")&&script.contains("REPLACE INTO `quest_template`"),"Package is not limited to the changes");
+  bool duplicateExport=false;
+  try { ExportService::exportChanges("Haunted Mill","Integration",out.path(),ChangeTracker::instance()->changes()); } catch(std::exception const&) { duplicateExport=true; }
+  check(duplicateExport,"Existing package was overwritten");
+  // Replaying the package on the database it came from must succeed and change nothing.
+  {
+    Database db;
+    for (auto const& line : script.split('\n')) if (!line.isEmpty() && !line.startsWith("--")) db.exec(line);
+  }
+  check(query("SELECT * FROM creature_template WHERE entry="+QString::number(entry))==beforeExport,"Replaying the package changed the NPC");
+  check(query("SELECT Title FROM quest_template WHERE entry="+QString::number(questId))[0]["Title"].toString()==loaded.title,"Replaying the package lost the quest");
+
+  // Deletions.
+  bool blocked=false;
+  try { CreatureService::remove(entry); } catch(std::exception const&) { blocked=true; }
+  check(blocked&&!query("SELECT entry FROM creature_template WHERE entry="+QString::number(entry)).isEmpty(),"NPC used by a quest was deleted");
+  QuestService::remove(questId);
+  check(query("SELECT entry FROM quest_template WHERE entry="+QString::number(questId)).isEmpty(),"Quest deletion failed");
+  check(tracked(EntityType::Quest,questId)->action==ChangeAction::Delete,"Quest deletion not tracked");
+  CreatureService::remove(entry);
+  check(query("SELECT guid FROM creature WHERE id="+QString::number(entry)).isEmpty()&&query("SELECT entry FROM creature_template WHERE entry="+QString::number(entry)).isEmpty(),"NPC deletion failed");
+  check(tracked(EntityType::Npc,entry)->action==ChangeAction::Delete&&tracked(EntityType::Spawn,guid)->action==ChangeAction::Delete,"NPC deletion not tracked");
+  check(!ChangeTracker::sql(ChangeTracker::instance()->changes()).isEmpty(),"Deletion export failed");
 }
 }
 int main(int argc,char** argv) {

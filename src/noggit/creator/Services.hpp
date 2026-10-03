@@ -36,6 +36,7 @@ public:
   static QVector<Choice> search(QString const& text, bool ownedOnly = false);
   static Npc load(Id entry);
   static Id save(Npc const&, Position const&, Id* spawn = nullptr);
+  static void remove(Id entry); // Creator NPCs only, with all their placements
   static bool owned(Id entry);
 };
 class SpawnService {
@@ -54,6 +55,7 @@ public:
   static QVector<Choice> search(QString const& text);
   static Quest load(Id entry);
   static Id save(Quest const&);
+  static void remove(Id entry); // Creator quests only
 };
 struct Appearance {
   Id display = 0; QString name, model; int race = 0, sex = 0;

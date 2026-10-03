@@ -1,6 +1,7 @@
 #pragma once
 #include <QObject>
 #include <QProcess>
+#include "RuntimeProcess.hpp"
 #include <QTimer>
 #include <QElapsedTimer>
 #include <QLockFile>
@@ -21,6 +22,7 @@ public:
   QString error() const { return _error; }
   bool active() const { return _active; }
   bool stopping() const { return _stopping >= 0; }
+  bool saveForTest();
   QString root() const { return _root; }
 public slots:
   void start();
@@ -30,6 +32,7 @@ public slots:
   void testLocally();
 signals:
   void changed();
+  void aboutToShutdown();
   void beforeLocalTest(bool* proceed);
 private:
   QString path(QString const& relative) const;
@@ -41,9 +44,9 @@ private:
   void stopNext();
   void state(int index, QString const& value);
   QString _root, _error;
-  std::array<QProcess, 3> _processes;
+  std::array<RuntimeProcess, 3> _processes;
   std::array<QString, 3> _status{{"Stopped", "Stopped", "Stopped"}};
-  QProcess _probe;
+  RuntimeProcess _probe;
   QTimer _timer;
   QElapsedTimer _deadline;
   std::unique_ptr<QLockFile> _lock;

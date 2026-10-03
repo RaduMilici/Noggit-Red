@@ -92,6 +92,11 @@ void RuntimeManager::state(int i, QString const& value) {
 }
 bool RuntimeManager::prepare()
 {
+  if (!_probe.containmentReady() || !_processes[0].containmentReady()
+      || !_processes[1].containmentReady() || !_processes[2].containmentReady()) {
+    _error = "Cannot enable Windows runtime process protection. Windows 10 or newer is required.";
+    return false;
+  }
   for (auto const& program : programs)
     if (!QFileInfo(executable(program)).isExecutable()) { _error = "Runtime bundle is missing: " + program; return false; }
   if (!QFileInfo(executable("Runtime/MariaDB/bin/mariadb")).isExecutable()) {
@@ -134,6 +139,10 @@ bool RuntimeManager::prepare()
             || !QFile::copy(moduleDefaults.filePath(file), destination))
           throw std::runtime_error("Cannot initialize bundled module configuration");
       }
+    }
+    if (QFileInfo::exists(path("Runtime/mangosd/modules/mod-creator-test.conf.dist"))) {
+      QDir().mkpath(path("Workspace/modules"));
+      put("Workspace/modules/mod-creator-test.conf", "[ModuleConf]\nCreatorTest.Enable = 1\n");
     }
     for (QString name : {QString("realmd"), QString("mangosd")}) {
       QFile source(path("Runtime/" + name + '/' + name + ".conf.dist"));
@@ -238,6 +247,7 @@ void RuntimeManager::stopNext()
     } else p.terminate();
   }
 }
+bool RuntimeManager::saveForTest() { bool proceed=true; emit beforeLocalTest(&proceed); return proceed; }
 void RuntimeManager::testLocally() {
   if (_shuttingDown || stopping()) return;
   if (!qApp->property("creatorDatabaseReady").toBool()) {
@@ -245,14 +255,13 @@ void RuntimeManager::testLocally() {
     if (!_active) _testWhenRunning = false;
     return;
   }
-  bool proceed = true;
-  emit beforeLocalTest(&proceed);
-  if (proceed) restart();
+  if (saveForTest()) restart();
 }
 void RuntimeManager::restart() { if (_shuttingDown) return; stop(); _restart = true; }
 void RuntimeManager::shutdown()
 {
   if (_shuttingDown) return;
+  emit aboutToShutdown();
   _shuttingDown = true; _restart = false; _testWhenRunning = false;
   _starting = -1; // A pending database probe must not launch realmd during shutdown.
   _timer.stop();

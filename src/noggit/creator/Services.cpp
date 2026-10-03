@@ -7,6 +7,8 @@
 #include <QFile>
 #include <QSaveFile>
 #include <cmath>
+#include <initializer_list>
+#include <utility>
 #include <stdexcept>
 namespace Noggit::Creator {
 namespace {
@@ -57,6 +59,7 @@ Id CreatureService::save(Npc const& d, Position const& pos, Id* spawn) {
   Database db; if(d.entry) require(db.owned("npc",d.entry),"Original NPCs are read-only here. Clone this NPC to make changes.");
   equipmentValid(db,d.equipment);
   Id entry=d.entry?d.entry:db.allocate("creature_template","entry",0x7fffff); Fields values;
+  db.track(EntityType::Npc,entry);
   if(d.source && !d.entry) {
     auto source=one(db,"creature_template",d.source);
     auto copy=[&](bool enabled, QStringList const& keys){ if(enabled) for(auto const& key:keys) if(source.contains(key)) values[key]=source[key]; };
@@ -93,6 +96,7 @@ Id CreatureService::save(Npc const& d, Position const& pos, Id* spawn) {
       if(!enabled)return;
       db.snapshot(table,key,entry);
       for(auto row:db.query("SELECT * FROM "+table+" WHERE "+key+"="+n(d.source))) {
+        if(row.contains("quest")&&db.owned("quest",row["quest"].toUInt())) db.track(EntityType::Quest,row["quest"].toUInt());
         row[key]=entry; db.insert(table,row);
       }
     };
@@ -103,17 +107,41 @@ Id CreatureService::save(Npc const& d, Position const& pos, Id* spawn) {
   }
   db.snapshot("creator_content","entry",entry); db.mark("npc",entry);
   if(!d.entry) {
-    auto guid=db.allocate("creature","guid",0xfffffffe); db.snapshot("creature","guid",guid);
+    auto guid=db.allocate("creature","guid",0xfffffffe); db.track(EntityType::Spawn,guid); db.snapshot("creature","guid",guid);
     db.insert("creature",{{"guid",guid},{"id",entry},{"map",pos.map},{"position_x",pos.x},{"position_y",pos.y},{"position_z",pos.z},{"orientation",pos.orientation},{"spawntimesecsmin",d.respawn},{"spawntimesecsmax",d.respawn},{"movement_type",d.movement},{"wander_distance",d.movement==1?5:0}});
     db.snapshot("creator_content","entry",guid); db.mark("spawn",guid); if(spawn) *spawn=guid;
   }
   if(d.entry) {
     for(auto const& row:db.query("SELECT guid FROM creature WHERE id="+n(entry))) {
-      auto guid=row["guid"].toUInt(); db.snapshot("creature","guid",guid);
+      auto guid=row["guid"].toUInt(); db.track(EntityType::Spawn,guid); db.snapshot("creature","guid",guid);
       update(db,"creature","guid",guid,{{"spawntimesecsmin",d.respawn},{"spawntimesecsmax",d.respawn},{"movement_type",d.movement},{"wander_distance",d.movement==1?5:0}});
     }
   }
   db.commit(); return entry;
+}
+void CreatureService::remove(Id entry) {
+  Database db; require(db.owned("npc",entry),"Only Creator NPCs can be deleted. Original NPCs are never removed.");
+  auto row=one(db,"creature_template",entry); auto id=n(entry);
+  // A quest without its giver, ender or kill target could no longer be completed.
+  auto quests=db.query("SELECT Title FROM quest_template WHERE entry IN (SELECT entry FROM creator_content WHERE kind='quest') AND (entry IN (SELECT quest FROM creature_questrelation WHERE id="+id+") OR entry IN (SELECT quest FROM creature_involvedrelation WHERE id="+id+") OR "+id+" IN (ReqCreatureOrGOId1,ReqCreatureOrGOId2,ReqCreatureOrGOId3,ReqCreatureOrGOId4)) LIMIT 1");
+  require(quests.isEmpty(),"This NPC is used by the quest \""+(quests.isEmpty()?QString():quests[0]["Title"].toString())+"\". Edit or delete that quest first.");
+  db.track(EntityType::Npc,entry);
+  for(auto const& spawn:db.query("SELECT guid FROM creature WHERE id="+id)) {
+    auto guid=spawn["guid"].toUInt(); db.track(EntityType::Spawn,guid);
+    db.snapshot("creature","guid",guid); db.snapshot("creator_content","entry",guid);
+    db.exec("DELETE FROM creature WHERE guid="+n(guid)); db.exec("DELETE FROM creator_content WHERE kind='spawn' AND entry="+n(guid));
+  }
+  for(auto [table,key]:std::initializer_list<std::pair<char const*,char const*>>{{"npc_vendor","entry"},{"npc_trainer","entry"},{"creature_questrelation","id"},{"creature_involvedrelation","id"}}) {
+    db.snapshot(table,key,entry); db.exec("DELETE FROM "+QString(table)+" WHERE "+key+"="+id);
+  }
+  // Creator allocates a private equipment row per save; shared original rows are left alone.
+  auto equipment=row["equipment_id"].toUInt();
+  if(equipment>=1000000&&db.query("SELECT entry FROM creature_template WHERE equipment_id="+n(equipment)+" AND entry<>"+id+" LIMIT 1").isEmpty()) {
+    db.snapshot("creature_equip_template","entry",equipment); db.exec("DELETE FROM creature_equip_template WHERE entry="+n(equipment));
+  }
+  db.snapshot("creature_template","entry",entry); db.exec("DELETE FROM creature_template WHERE entry="+id);
+  db.snapshot("creator_content","entry",entry); db.exec("DELETE FROM creator_content WHERE kind='npc' AND entry="+id);
+  db.commit();
 }
 QVector<Id> SpawnService::save(QVector<SpawnEdit> const& edits) {
   Database db; QVector<Id> saved;
@@ -125,7 +153,7 @@ QVector<Id> SpawnService::save(QVector<SpawnEdit> const& edits) {
     if(d.create&&d.remove) continue;
     Id guid=d.create?db.allocate("creature","guid",0xfffffffe):d.guid;
     if(!d.create) { auto old=one(db,"creature",guid,"guid"); require(old["id"].toUInt()==d.entry,"The NPC placement changed. Refresh before saving."); }
-    db.snapshot("creature","guid",guid);
+    db.track(EntityType::Spawn,guid); db.snapshot("creature","guid",guid);
     if(d.remove) db.exec("DELETE FROM creature WHERE guid="+n(guid));
     else {
       Fields values{{"id",d.entry},{"map",d.position.map},{"position_x",d.position.x},{"position_y",d.position.y},{"position_z",d.position.z},{"orientation",d.position.orientation},{"spawntimesecsmin",d.respawn},{"spawntimesecsmax",d.respawn}};
@@ -185,7 +213,7 @@ Id QuestService::save(Quest const& q) {
     values["ObjectiveText"+k]=label; objectives<<label;
   }
   values["Objectives"]=objectives.join('\n');
-  auto entry=q.entry?q.entry:db.allocate("quest_template","entry"); db.snapshot("quest_template","entry",entry);
+  auto entry=q.entry?q.entry:db.allocate("quest_template","entry"); db.track(EntityType::Quest,entry); db.snapshot("quest_template","entry",entry);
   if(q.entry) update(db,"quest_template","entry",entry,values); else { values["entry"]=entry; db.insert("quest_template",values); }
   for(auto table:{"creature_questrelation","creature_involvedrelation"}) {
     db.snapshot(table,"quest",entry); db.exec("DELETE FROM "+QString(table)+" WHERE quest="+n(entry));
@@ -193,5 +221,13 @@ Id QuestService::save(Quest const& q) {
   }
   for(auto npc:{q.giver,q.ender}) { db.snapshot("creature_template","entry",npc); db.exec("UPDATE creature_template SET npc_flags=npc_flags|2 WHERE entry="+n(npc)); }
   db.snapshot("creator_content","entry",entry); db.mark("quest",entry); db.commit(); return entry;
+}
+void QuestService::remove(Id entry) {
+  Database db; require(db.owned("quest",entry),"Only Creator quests can be deleted."); one(db,"quest_template",entry);
+  db.track(EntityType::Quest,entry);
+  for(auto table:{"creature_questrelation","creature_involvedrelation"}) { db.snapshot(table,"quest",entry); db.exec("DELETE FROM "+QString(table)+" WHERE quest="+n(entry)); }
+  db.snapshot("quest_template","entry",entry); db.exec("DELETE FROM quest_template WHERE entry="+n(entry));
+  db.snapshot("creator_content","entry",entry); db.exec("DELETE FROM creator_content WHERE kind='quest' AND entry="+n(entry));
+  db.commit();
 }
 }

@@ -1,5 +1,6 @@
 #pragma once
 #include "Services.hpp"
+#include "ChangeTracker.hpp"
 #include <QJsonArray>
 #include <memory>
 namespace Noggit::Creator {
@@ -17,10 +18,14 @@ public:
   bool owned(QString const& kind, Id id);
   void mark(QString const& kind, Id id);
   void snapshot(QString const& table, QString const& key, Id id);
+  // Record an entity in Local Changes. Call before modifying it; the after-state is captured on commit.
+  void track(EntityType type, Id id);
   void commit();
 private:
   struct Impl;
   std::unique_ptr<Impl> _impl;
+  struct Tracked { EntityType type; Id id; QJsonObject before; QString label; };
+  QVector<Tracked> _tracked;
   QJsonArray _undo;
   QString _journal;
   bool _committed = false;

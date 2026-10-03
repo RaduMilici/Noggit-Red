@@ -18,6 +18,7 @@
 #include <string_view>
 #include <QtCore/QSettings>
 #include <QtCore/QDir>
+#include <QtCore/QFileInfo>
 #include <qcommandlineparser.h>
 #include <qcommandlineoption.h>
 #include <QtWidgets/QApplication>
@@ -681,8 +682,13 @@ int main(int argc, char *argv[])
   }
 
   // Runtime ownership is scoped to QApplication, after command-line probes have returned.
-  auto runtime = new Noggit::Runtime::RuntimeManager(
-      QDir(QCoreApplication::applicationDirPath()).absoluteFilePath(".."), &q_application);
+  // Installed layout is Creator/Noggit/noggit; a development build (build/bin/noggit) uses the
+  // prepared bundle in build/Creator when it has no Runtime of its own.
+  QString runtime_root = QDir(QCoreApplication::applicationDirPath()).absoluteFilePath("..");
+  if (!QFileInfo::exists(runtime_root + "/Runtime/creator-runtime.json")
+      && QFileInfo::exists(runtime_root + "/Creator/Runtime/creator-runtime.json"))
+    runtime_root += "/Creator";
+  auto runtime = new Noggit::Runtime::RuntimeManager(runtime_root, &q_application);
   QObject::connect(&q_application, &QCoreApplication::aboutToQuit,
                    runtime, &Noggit::Runtime::RuntimeManager::shutdown);
   if (QSettings(runtime->root() + "/Workspace/runtime.ini", QSettings::IniFormat)

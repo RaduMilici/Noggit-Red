@@ -36,6 +36,8 @@ Database::Database() : _impl(std::make_unique<Impl>()) {
   if (locked.isEmpty() || locked[0]["locked"].toInt() != 1) fail("Another local save is in progress. Please try again.");
   exec("CREATE TABLE IF NOT EXISTS creator_content (kind VARCHAR(20) NOT NULL, entry INT UNSIGNED NOT NULL, PRIMARY KEY(kind,entry)) ENGINE=InnoDB");
   _journal = runtime->root() + "/Workspace/creator-recovery.json";
+  // Loading the tracker first lets it drop a change list staged by a save that is about to be rolled back.
+  auto tracker = ChangeTracker::instance();
   QFile journal(_journal);
   if (journal.exists()) {
     if (!journal.open(QIODevice::ReadOnly)) fail("Cannot read the interrupted-save recovery file.");
@@ -43,6 +45,7 @@ Database::Database() : _impl(std::make_unique<Impl>()) {
     auto doc = QJsonDocument::fromJson(journal.readAll(), &error); journal.close();
     if (error.error != QJsonParseError::NoError || !doc.isArray()) fail("The interrupted-save recovery file is invalid.");
     restore(doc.array());
+    if (tracker) tracker->discard();
     if (!QFile::remove(_journal)) fail("Cannot finish recovery of the interrupted save.");
   }
 #else
@@ -113,5 +116,28 @@ void Database::restore(QJsonArray const& undo) {
     for (auto const& row : object["rows"].toArray()) insert(table, row.toObject().toVariantMap());
   }
 }
-void Database::commit() { if (!_undo.isEmpty() && !QFile::remove(_journal)) fail("Cannot finish the local save."); _committed=true; }
+void Database::track(EntityType type, Id id) {
+  for (auto const& t : _tracked) if (t.type==type && t.id==id) return;
+  Tracked t{type,id,{},{}};
+  t.before=ChangeTracker::capture([this](QString const& sql){return query(sql);},type,id,&t.label);
+  _tracked.push_back(t);
+}
+// The recovery journal is the commit marker: the change list is staged before it is removed
+// and published after, so Local Changes never lists a save that was rolled back.
+void Database::commit() {
+  auto tracker=ChangeTracker::instance();
+  if (tracker && !_tracked.isEmpty()) {
+    QVector<TrackedChange> changes;
+    for (auto const& t : _tracked) {
+      TrackedChange c; c.type=t.type; c.entity=t.id; c.before=t.before;
+      c.after=ChangeTracker::capture([this](QString const& sql){return query(sql);},t.type,t.id,&c.label);
+      if (c.label.isEmpty()) c.label=t.label;
+      changes.push_back(c);
+    }
+    tracker->stage(changes);
+  }
+  if (!_undo.isEmpty() && !QFile::remove(_journal)) { if (tracker) tracker->discard(); fail("Cannot finish the local save."); }
+  _committed=true;
+  if (tracker) tracker->promote();
+}
 }

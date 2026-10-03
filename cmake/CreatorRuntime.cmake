@@ -8,7 +8,7 @@ if(CREATOR_RUNTIME_BUNDLE)
   foreach(required creator-runtime.json MariaDB/bin/mariadbd${CMAKE_EXECUTABLE_SUFFIX}
       MariaDB/bin/mariadb${CMAKE_EXECUTABLE_SUFFIX} realmd/realmd${CMAKE_EXECUTABLE_SUFFIX}
       mangosd/mangosd${CMAKE_EXECUTABLE_SUFFIX} realmd/realmd.conf.dist
-      mangosd/mangosd.conf.dist DatabaseSeed/mysql mangosd/data/maps mangosd/data/dbc
+      mangosd/mangosd.conf.dist mangosd/modules/mod-creator-test.conf.dist DatabaseSeed/mysql mangosd/data/maps mangosd/data/dbc
       mangosd/data/vmaps mangosd/data/mmaps)
     if(NOT EXISTS "${CREATOR_RUNTIME_BUNDLE}/${required}")
       message(FATAL_ERROR "Incomplete Creator runtime: ${required}")

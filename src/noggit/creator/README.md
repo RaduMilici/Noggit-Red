@@ -1,5 +1,8 @@
 # Stage 2: local NPC and quest authoring
 
+For the current Test Here / Test NPC / Test Quest workflow, see
+[one-click local testing](../../../etc/creator-test/README.md).
+
 This code targets the bundled Tortoise/VMaNGOS schema, not arbitrary remote or
 Wrath databases. Open a Classic/Vanilla project inside the managed Creator bundle.
 NPC and quest saves go directly to the local database. Original NPC templates are
@@ -31,6 +34,9 @@ Use the local account provided by the prepared runtime and travel to the NPC.
 - `AppearanceService.cpp`: named factions and valid looks from loaded client DBCs.
 - `Database.hpp/.cpp`: dedicated loopback connection, advisory allocation lock,
   Creator ownership metadata, durable before-image recovery journal.
+- `ChangeTracker.hpp/.cpp`: Local Changes list, persistence, net-change merging, SQL generation.
+- `ChangeExport.hpp/.cpp`: change package export (`manifest.json`, `changes.sql`).
+- `LocalChangesPanel.hpp/.cpp`: status-bar "Local changes" button and panel.
 - `AuthoringDialogs.hpp/.cpp`: named selectors, humanoid/creature/clone flows,
   body preview, three weapon slots, outfits, combat settings, quest editor.
 - `../MapView.h/.cpp`: click placement, world editing and save integration. Reuses
@@ -59,6 +65,66 @@ not misleading SQL transactions. `Workspace/creator-recovery.json` restores an
 interrupted save on the next Creator database operation. Keep this file with its
 matching database. The worldserver reads new content after restart. This journal
 is not a general migration or backup system.
+
+## Local changes and export
+
+The status bar shows **Local changes: N**; click it to see what was changed locally:
+
+```
++ NPC: Restless Miller          (created)
+~ NPC: Farmer John              (edited)
++ Quest: Beneath the Mill
+~ Spawn: Restless Miller moved
+- Spawn: Old Farmer placement removed
+```
+
+Tracked: NPC create/update/delete, placement create/move/update/delete, quest
+create/update/delete, saved through Noggit's Creator services. NPCs and quests can be
+deleted from their editors (**Delete NPC…** removes all its placements; an NPC used by
+a Creator quest must be freed first). Original content is never deletable.
+
+Each entry holds the entity type and ID, action (CREATE, UPDATE, DELETE, MOVE), the
+before-state (rows at the first tracked change) and after-state (rows now), and a UTC
+timestamp. Entries are net changes: edits after creation stay CREATE, creating then
+deleting removes the entry, reverting to the original removes it, and a placement edit
+that only changes position/orientation is a MOVE. Rows per entity:
+
+- NPC: `creature_template`, its `creature_equip_template`, `npc_vendor`, `npc_trainer`,
+  and quest relations to original quests (relations to Creator quests belong to the quest).
+- Placement: `creature`.
+- Quest: `quest_template`, `creature_questrelation`, `creature_involvedrelation`.
+
+The list lives in `Workspace/creator-changes.json`, never in the world database. It
+is written in two phases around the recovery journal (`creator-changes.pending.json`
+is promoted only once the database save has committed), so after a crash the list
+matches the database. An unreadable list is set aside as `creator-changes.json.invalid-*`
+and reported in the panel. **Clear Selected** asks for confirmation and only removes
+list entries; the content stays in the local world.
+
+**Export Changes** asks for a package name, author and folder, and creates e.g.
+`Haunted-Mill/` with:
+
+- `manifest.json`: package name, author, creation date (UTC), generator, source runtime
+  (server, MariaDB version, platform) and content version (latest Tortoise world
+  `migrations` row), every affected entity, and the SHA-256 of `changes.sql`.
+- `changes.sql`: only the exported changes, never a dump. Upserts use `REPLACE INTO`
+  with full rows; deletions are guarded so they only remove rows that the target
+  database also marks as Creator content. Statements are ordered by dependency and
+  replaying a package is idempotent. Creator NPCs that exported placements or quests
+  refer to (giver, ender, kill target, spawned NPC) are included automatically and
+  flagged `includedAsDependency`; original content is assumed present on the target.
+
+Export needs the local database running (to find those NPCs and the content version).
+An existing package folder is never overwritten. After exporting, the exported entries
+can be cleared (with confirmation).
+
+Limits: IDs are kept as allocated locally (1,000,000+), so a target that already holds
+different Creator content with the same IDs would be overwritten; there is no ID
+remapping, import UI, remote collaboration, Git, or terrain/client file export yet.
+Values are exported as the server formats them, so float columns (positions) keep
+MariaDB's display precision. Changes made outside Noggit, or before this tracker
+existed, are not listed. Native world tables are MyISAM, so applying a package is
+not transactional.
 
 ## Supported appearance and combat
 
@@ -122,10 +188,21 @@ cmake --build build-runtime-tests -j2
 ctest --test-dir build-runtime-tests --output-on-failure
 ```
 
+Local change tracking unit test (no database; covers merging, restart persistence,
+crash recovery around the journal, clearing, and SQL escaping/order):
+
+```bash
+cmake -S test/creator -B build-creator-tests
+cmake --build build-creator-tests --target change_tracker_tests
+./build-creator-tests/change_tracker_tests
+```
+
 Real database integration checks require a disposable, stopped copy of the bundle.
 The test leaves test content in that copy, starts all three services, checks ID
 uniqueness, source preservation, names, placement movement/deletion, respawn edits,
-kill/collect/talk quest round-trips, invalid inputs and MyISAM rollback, then stops.
+kill/collect/talk quest round-trips, invalid inputs and MyISAM rollback, Local Changes
+entries, package export (and replaying its `changes.sql` on the live schema), and
+NPC/quest deletion, then stops.
 Do not copy a running MariaDB data directory. Do not run beside another local server.
 
 ```bash

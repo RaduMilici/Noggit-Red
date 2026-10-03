@@ -1,3 +1,4 @@
+#include <noggit/creator/TestSessionService.hpp>
 #include <noggit/creator/AuthoringDialogs.hpp>
 #include <noggit/runtime/RuntimeManager.hpp>
 // This file is part of Noggit3, licensed under GNU General Public License (version 3).
@@ -7058,6 +7059,7 @@ void MapView::showSelectedCreatureSpawnMenu(QPoint const& global_pos)
     menu.addAction(QString::fromStdString(spawn->name))->setEnabled(false);
     auto edit = menu.addAction("Edit NPC properties");
     auto quest = menu.addAction("Create / Edit Quest");
+    auto testNpc = menu.addAction("Test NPC");
     auto duplicate = menu.addAction("Duplicate placement");
     auto remove = menu.addAction("Delete placement");
     auto locate = menu.addAction("Locate NPC");
@@ -7069,6 +7071,7 @@ void MapView::showSelectedCreatureSpawnMenu(QPoint const& global_pos)
     Noggit::Creator::Position server{static_cast<unsigned>(_world->getMapID()),p.x,p.y,p.z,client_to_server_creature_orientation(spawn->orientation)};
     auto chosen=menu.exec(global_pos);
     if(chosen==locate) focus_camera_on_target(position);
+    else if(chosen==testNpc) { if(auto session=Noggit::Creator::TestSessionService::instance()) session->testNpc(this,server); }
     else if(chosen==save) saveDirtyCreatureSpawns();
     else if(chosen==remove) { deleteSelectedCreatureSpawns(); }
     else if(chosen==edit && prepareCreatorChange()) {
@@ -7626,7 +7629,10 @@ void MapView::reloadCreatorContent(std::optional<std::uint32_t> select)
   _world->reloadCreatureSpawns();
   _world->setDrawCreatureSpawns(true);
   rebuildCreatureBrowserList(false);
-  if (select) setSelectedCreatureSpawn(select);
+  // The selected NPC may just have been deleted.
+  auto const& spawns = _world->creatureSpawns();
+  if (select && std::any_of(spawns.begin(), spawns.end(), [&](auto const& spawn) { return spawn.guid == *select; }))
+    setSelectedCreatureSpawn(select);
   updateDatabaseStatus();
   _needs_redraw = true;
 }
@@ -19288,7 +19294,22 @@ void MapView::ShowContextMenu(QPoint pos)
 
     if (Noggit::Project::CurrentProject::get()->projectVersion == Noggit::Project::ProjectVersion::CLASSIC)
     {
-      auto hit = surface_pos_under_cursor();
+      // Picking animates M2s, which uploads bone matrices: this slot runs outside paintGL,
+      // so the GL context must be made current here or the pick throws.
+      std::optional<glm::vec3> hit;
+      {
+        makeCurrent();
+        OpenGL::context::scoped_setter const _(::gl, context());
+        hit = surface_pos_under_cursor();
+      }
+      auto testHere = menu->addAction("Test Here");
+      testHere->setEnabled(hit.has_value() && qApp->property("creatorRuntimeManaged").toBool());
+      connect(testHere,&QAction::triggered,this,[this,hit] {
+        if(!hit)return;
+        auto p=client_to_server_creature_position(*hit,_world->mapIndex.hasAGlobalWMO());
+        if(auto session=Noggit::Creator::TestSessionService::instance())
+          session->testHere(this,{static_cast<unsigned>(_world->getMapID()),p.x,p.y,p.z,client_to_server_creature_orientation(_camera.yaw()._)});
+      });
       auto create = menu->addMenu("Create");
       auto npc = create->addAction("NPC");
       npc->setEnabled(hit.has_value());

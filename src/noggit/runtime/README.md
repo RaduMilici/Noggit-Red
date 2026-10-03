@@ -43,7 +43,7 @@ still a release packaging requirement. Windows bundles include matching DLLs.
 The database listens on loopback port 13306, realm on 13724 and world on 18085.
 First run copies the seed through a staging directory and an atomic rename.
 An installation lock protects the data directory. Configs are regenerated from
-matching server templates. Persist only the autostart preference in runtime.ini;
+matching server templates. Persist autostart and client-profile preferences in runtime.ini;
 no absolute installation paths are stored in generated configs. Existing Noggit
 project DB settings are preserved; the managed local connection is session-only.
 Readiness requires a successful authenticated SQL query, then realm/world listener
@@ -91,3 +91,29 @@ copy using Tortoise's native updater, checks world initialization and clean shut
 then promotes the prepared data and seed while retaining the originals. Failure
 leaves the original databases unchanged and preserves the preparation log. This
 can take several minutes and is never launched automatically by Noggit.
+
+One-click Test Here / Test NPC / Test Quest, client profiles, module build commands,
+and current verification limits are documented in [local testing](../../../etc/creator-test/README.md).
+
+On Linux, RuntimeProcess uses PR_SET_PDEATHSIG with SIGTERM for each child,
+including readiness probes. This also requests server cleanup when Noggit is
+force-terminated or crashes, bypassing Qt shutdown. Children remain foreground
+processes. The parent-death test uses only dummy processes and no runtime ports.
+
+On Windows 10 / Server 2016 and newer, each RuntimeProcess uses a non-inheritable
+kill-on-close Job Object. Qt's CreateProcess modifier attaches the job atomically
+through PROC_THREAD_ATTRIBUTE_JOB_LIST before child code can run. The OS terminates
+job children when Noggit dies; normal window closing still uses graceful ordered
+shutdown. If protection cannot be configured, runtime startup fails closed. Build
+with a Windows 10 SDK. Windows behavior must be verified on Windows; the Linux
+regression test does not validate Windows APIs.
+
+The parent_death_test target now exercises forced parent termination on Windows
+as well as Linux, without starting real servers or using their ports.
+API reference: https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-updateprocthreadattribute
+
+The persistent LOCAL SERVER dock is replaced by three small status-bar lights
+(database, realm, world from left to right). Green means Running, amber means a
+transition, gray means Stopped; a red outline indicates a runtime error. Hover for
+text status, or click to open the controls, client profiles and test progress.
+The controls popup stays closed until requested and takes no editor side space.

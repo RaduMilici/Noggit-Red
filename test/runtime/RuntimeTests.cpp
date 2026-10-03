@@ -5,6 +5,8 @@
 #include <QDir>
 #include <QMainWindow>
 #include <QDockWidget>
+#include <QToolButton>
+#include <QMenu>
 #include <QTcpServer>
 #include <QTest>
 using Noggit::Runtime::RuntimeManager;
@@ -58,10 +60,14 @@ private slots:
     QTemporaryDir dir(QDir::tempPath()+"/creator space-XXXXXX"); bundle(dir.path());
     RuntimeManager m(dir.path(), qApp);
     QMainWindow window; Noggit::Runtime::addLocalServerPanel(&window);
-    QVERIFY(!window.findChildren<QDockWidget*>().isEmpty());
+    auto indicator=window.findChild<QToolButton*>("localServerIndicator");
+    QVERIFY(indicator);QVERIFY(indicator->menu());QVERIFY(!indicator->menu()->isVisible());
+    QVERIFY(!window.findChild<QDockWidget*>("localServerDock"));
+    QVERIFY(indicator->toolTip().contains("Database: Stopped"));
     m.start(); m.start();
     QTRY_COMPARE_WITH_TIMEOUT(m.status(2), QString("Running"), 10000);
     QVERIFY(qApp->property("creatorDatabaseReady").toBool());
+    QVERIFY(indicator->toolTip().contains("World Server: Running"));
     put(dir.path()+"/Database/data/designer-work", "preserve");
     m.restart();
     QTRY_COMPARE_WITH_TIMEOUT(m.status(2), QString("Running"), 10000);

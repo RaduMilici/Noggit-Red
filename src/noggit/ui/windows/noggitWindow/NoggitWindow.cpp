@@ -1,5 +1,6 @@
 #include <noggit/runtime/RuntimeManager.hpp>
 #include <noggit/runtime/LocalServerPanel.hpp>
+#include <noggit/creator/LocalChangesPanel.hpp>
 #include <QtCore/QCoreApplication>
 #include <noggit/ui/windows/about/About.h>
 #include <cmath>
@@ -214,6 +215,7 @@ namespace Noggit::Ui::Windows
 
     setCentralWidget(_null_widget);
   Noggit::Runtime::addLocalServerPanel(this);
+  Noggit::Creator::addLocalChangesPanel(this);
 
     // The default value is AnimatedDocks | AllowTabbedDocks.
     setDockOptions(AnimatedDocks | AllowNestedDocks | AllowTabbedDocks | GroupedDragging);
