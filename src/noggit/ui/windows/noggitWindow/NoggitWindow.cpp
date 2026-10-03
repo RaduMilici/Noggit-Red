@@ -1,3 +1,4 @@
+#include <noggit/runtime/LocalServerPanel.hpp>
 #include <QtCore/QCoreApplication>
 #include <noggit/ui/windows/about/About.h>
 #include <cmath>
@@ -211,6 +212,7 @@ namespace Noggit::Ui::Windows
     LogDebug << "NoggitWindow ctor after OpenDBs" << std::endl;
 
     setCentralWidget(_null_widget);
+  Noggit::Runtime::addLocalServerPanel(this);
 
     // The default value is AnimatedDocks | AllowTabbedDocks.
     setDockOptions(AnimatedDocks | AllowNestedDocks | AllowTabbedDocks | GroupedDragging);

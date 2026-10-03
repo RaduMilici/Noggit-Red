@@ -2,6 +2,7 @@
 #pragma once
 
 #include <QtCore/QSettings>
+#include <QCoreApplication>
 #include <QtCore/QString>
 #include <QtCore/QByteArray>
 #include <QtCore/QVariant>
@@ -54,6 +55,16 @@ namespace Noggit
   // first time it's opened), else the hardcoded default.
   inline QVariant mysqlSetting(QString const& suffix, QVariant const& def)
   {
+    // Session-only local connection: never overwrite saved project connections.
+    if (qApp && qApp->property("creatorRuntimeManaged").toBool())
+    {
+      if (suffix == "enabled") return qApp->property("creatorDatabaseReady").toBool();
+      if (suffix == "server") return QStringLiteral("127.0.0.1");
+      if (suffix == "port") return 13306;
+      if (suffix == "user") return QStringLiteral("creator");
+      if (suffix == "pwd") return QStringLiteral("creator-local");
+      if (suffix == "db") return QStringLiteral("mangos");
+    }
     QSettings settings;
     // "enabled" NEVER seeds from the legacy global key: a stale global enabled=true would silently
     // turn MySQL ON for every project that hasn't saved its own toggle yet. Connection params

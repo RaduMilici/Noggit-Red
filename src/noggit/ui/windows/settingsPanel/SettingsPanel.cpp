@@ -869,6 +869,10 @@ namespace Noggit
   // load the STORED per-project toggle -- this was hardcoded setChecked(true), so ANY settings
   // visit that ended in save silently re-enabled MySQL no matter how often it was turned off
   ui->MySQL_box->setChecked(Noggit::mysqlSetting("enabled", false).toBool());
+  bool const managedDatabase = qApp->property("creatorRuntimeManaged").toBool();
+  ui->MySQL_box->setEnabled(!managedDatabase);
+  if (managedDatabase)
+    ui->MySQL_box->setToolTip(tr("Managed by LOCAL SERVER. Saved project connections are preserved."));
 
       // Per-project MySQL settings (see MySqlSettings.hpp) so each project keeps its own connection.
       auto server_str = Noggit::mysqlSetting("server", "127.0.0.1").toString();
@@ -937,12 +941,15 @@ namespace Noggit
 #ifdef USE_MYSQL_UID_STORAGE
       // Save under the per-project keys (see MySqlSettings.hpp) so each project keeps its own MySQL
       // connection instead of all projects sharing one global set.
-      _settings->setValue (Noggit::mysqlSettingKey("enabled"), ui->MySQL_box->isChecked());
-      _settings->setValue (Noggit::mysqlSettingKey("server"), ui->_mysql_server_field->text());
-      _settings->setValue (Noggit::mysqlSettingKey("user"), ui->_mysql_user_field->text());
-      _settings->setValue (Noggit::mysqlSettingKey("pwd"), ui->_mysql_pwd_field->text());
-      _settings->setValue (Noggit::mysqlSettingKey("db"), ui->_mysql_db_field->text());
-      _settings->setValue (Noggit::mysqlSettingKey("port"), ui->_mysql_port_field->text());
+      if (!qApp->property("creatorRuntimeManaged").toBool())
+      {
+        _settings->setValue (Noggit::mysqlSettingKey("enabled"), ui->MySQL_box->isChecked());
+        _settings->setValue (Noggit::mysqlSettingKey("server"), ui->_mysql_server_field->text());
+        _settings->setValue (Noggit::mysqlSettingKey("user"), ui->_mysql_user_field->text());
+        _settings->setValue (Noggit::mysqlSettingKey("pwd"), ui->_mysql_pwd_field->text());
+        _settings->setValue (Noggit::mysqlSettingKey("db"), ui->_mysql_db_field->text());
+        _settings->setValue (Noggit::mysqlSettingKey("port"), ui->_mysql_port_field->text());
+      }
 #endif
 
       _settings->setValue("wireframe/type", ui->radio_wire_cursor->isChecked());

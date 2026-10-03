@@ -1,3 +1,4 @@
+#include <noggit/runtime/LocalServerPanel.hpp>
 #include <noggit/ui/windows/projectSelection/NoggitProjectSelectionWindow.hpp>
 #include <noggit/ui/windows/projectSelection/components/RecentProjectsComponent.hpp>
 #include <noggit/ui/windows/projectSelection/components/CreateProjectComponent.hpp>
@@ -27,6 +28,7 @@ NoggitProjectSelectionWindow::NoggitProjectSelectionWindow(Noggit::Application::
   setWindowFlags(Qt::Window | Qt::MSWindowsFixedSizeDialogHint);
 
   _ui->setupUi(this);
+  Noggit::Runtime::addLocalServerPanel(this);
 
   _ui->label->setObjectName("title");
   _ui->label->setStyleSheet("QLabel#title { font-size: 18px; padding: 0px; }");

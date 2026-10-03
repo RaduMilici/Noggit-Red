@@ -1,3 +1,4 @@
+#include <noggit/runtime/RuntimeManager.hpp>
 // This file is part of Noggit3, licensed under GNU General Public License (version 3).
 #include <noggit/application/NoggitApplication.hpp>
 #include <noggit/AsyncLoader.h>
@@ -678,6 +679,15 @@ int main(int argc, char *argv[])
     std::fflush(nullptr);
     std::_Exit(ok ? 0 : 3);
   }
+
+  // Runtime ownership is scoped to QApplication, after command-line probes have returned.
+  auto runtime = new Noggit::Runtime::RuntimeManager(
+      QDir(QCoreApplication::applicationDirPath()).absoluteFilePath(".."), &q_application);
+  QObject::connect(&q_application, &QCoreApplication::aboutToQuit,
+                   runtime, &Noggit::Runtime::RuntimeManager::shutdown);
+  if (QSettings(runtime->root() + "/Workspace/runtime.ini", QSettings::IniFormat)
+        .value("autostart", true).toBool())
+    QTimer::singleShot(0, runtime, &Noggit::Runtime::RuntimeManager::start);
 
   auto project_selection = new Noggit::Ui::Windows::NoggitProjectSelectionWindow(noggit);
   // Always open on the PRIMARY display (Qt's default places new windows on whichever screen holds

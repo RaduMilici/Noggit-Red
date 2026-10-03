@@ -570,3 +570,5 @@ if(${FAST_BUILD_NOGGIT_JUMBO})
   set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/src/external/imguizmo/ImSequencer.cpp" PROPERTIES SKIP_UNITY_BUILD_INCLUSION TRUE)
   set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/src/noggit/rendering/WorldRender.cpp" PROPERTIES SKIP_UNITY_BUILD_INCLUSION TRUE)
 endif()
+# Optional self-contained Creator release layout; normal Noggit builds remain supported.
+include(cmake/CreatorRuntime.cmake)
