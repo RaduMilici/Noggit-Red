@@ -83,7 +83,13 @@ QString RuntimeManager::executable(QString const& relative) const {
   return path(relative);
 #endif
 }
-void RuntimeManager::state(int i, QString const& value) { _status[i] = value; emit changed(); }
+void RuntimeManager::state(int i, QString const& value) {
+  _status[i] = value; emit changed();
+  if (i == 2 && value == "Running" && _testWhenRunning) {
+    _testWhenRunning = false;
+    QTimer::singleShot(0, this, [this] { if (_active && _status[2] == "Running") testLocally(); });
+  }
+}
 bool RuntimeManager::prepare()
 {
   for (auto const& program : programs)
@@ -206,6 +212,7 @@ void RuntimeManager::poll()
 void RuntimeManager::fail(QString const& message) { _error = message; _restart = false; stop(); }
 void RuntimeManager::stop()
 {
+  _testWhenRunning = false;
   _restart = false;
   if (_stopping >= 0) return;
   qApp->setProperty("creatorDatabaseReady", false);
@@ -231,10 +238,24 @@ void RuntimeManager::stopNext()
     } else p.terminate();
   }
 }
+void RuntimeManager::testLocally() {
+  if (_shuttingDown || stopping()) return;
+  if (!qApp->property("creatorDatabaseReady").toBool()) {
+    _testWhenRunning = true; start();
+    if (!_active) _testWhenRunning = false;
+    return;
+  }
+  bool proceed = true;
+  emit beforeLocalTest(&proceed);
+  if (proceed) restart();
+}
 void RuntimeManager::restart() { if (_shuttingDown) return; stop(); _restart = true; }
 void RuntimeManager::shutdown()
 {
-  _shuttingDown = true; _restart = false; _timer.stop();
+  if (_shuttingDown) return;
+  _shuttingDown = true; _restart = false; _testWhenRunning = false;
+  _starting = -1; // A pending database probe must not launch realmd during shutdown.
+  _timer.stop();
   if (qApp) qApp->setProperty("creatorDatabaseReady", false);
   _probe.kill(); _probe.waitForFinished(1000);
   for (int i = 2; i >= 0; --i) {

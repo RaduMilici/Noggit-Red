@@ -27,8 +27,10 @@ public slots:
   void stop();
   void restart();
   void shutdown();
+  void testLocally();
 signals:
   void changed();
+  void beforeLocalTest(bool* proceed);
 private:
   QString path(QString const& relative) const;
   QString executable(QString const& relative) const;
@@ -46,6 +48,7 @@ private:
   QElapsedTimer _deadline;
   std::unique_ptr<QLockFile> _lock;
   int _starting = -1, _stopping = -1;
+  bool _testWhenRunning = false;
   bool _active = false, _restart = false, _shuttingDown = false;
 };
 }

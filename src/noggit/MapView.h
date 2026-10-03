@@ -919,6 +919,8 @@ private:
   QString buildDirtyCreatureSpawnSql(bool rebase_state);
   QString buildDirtyGameObjectSpawnSql(bool rebase_state);
   void saveDirtyCreatureSpawns();
+  bool prepareCreatorChange();
+  void reloadCreatorContent(std::optional<std::uint32_t> select = std::nullopt);
   void jumpToCreatureListItem(QListWidgetItem* item);
   // Delete (Del) the selected creature spawn(s): marks them pending_delete (DELETE on SQL export,
   // hidden from view/browser) and records them so Ctrl+Z restores the most recent batch.

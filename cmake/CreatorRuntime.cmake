@@ -2,6 +2,9 @@
 # End users do not install a database, shell, Git, Docker, or build tools.
 set(CREATOR_RUNTIME_BUNDLE "" CACHE PATH "Prepared Runtime directory to include in Creator installation")
 if(CREATOR_RUNTIME_BUNDLE)
+  if(NOT MYSQL_LIBRARY OR NOT MYSQL_INCLUDE_DIR)
+    message(FATAL_ERROR "Creator authoring requires the MariaDB/MySQL client development library when building Noggit.")
+  endif()
   foreach(required creator-runtime.json MariaDB/bin/mariadbd${CMAKE_EXECUTABLE_SUFFIX}
       MariaDB/bin/mariadb${CMAKE_EXECUTABLE_SUFFIX} realmd/realmd${CMAKE_EXECUTABLE_SUFFIX}
       mangosd/mangosd${CMAKE_EXECUTABLE_SUFFIX} realmd/realmd.conf.dist

@@ -75,6 +75,20 @@ private slots:
     m.shutdown();
     for (int port : {13306,13724,18085}) { QTcpServer server; QVERIFY(server.listen(QHostAddress::LocalHost,port)); }
   }
+  void testLocallySavesAfterColdStartAndCanCancel() {
+    QTemporaryDir dir; bundle(dir.path()); RuntimeManager m(dir.path());
+    int saves=0; bool allow=false;
+    connect(&m,&RuntimeManager::beforeLocalTest,this,[&](bool* proceed) {
+      ++saves; QVERIFY(qApp->property("creatorDatabaseReady").toBool()); *proceed=allow;
+    });
+    m.testLocally();
+    QTRY_COMPARE_WITH_TIMEOUT(saves,1,10000);
+    QCOMPARE(m.status(2),QString("Running")); QVERIFY(!m.stopping());
+    allow=true;m.testLocally();QCOMPARE(saves,2);
+    QTRY_COMPARE_WITH_TIMEOUT(m.status(2),QString("Running"),10000);
+    m.stop();QTRY_VERIFY_WITH_TIMEOUT(!m.stopping(),10000);
+    QCOMPARE(m.status(0),QString("Stopped"));
+  }
   void lockedInstallation() {
     QTemporaryDir dir; bundle(dir.path());
     QVERIFY(QDir().mkpath(dir.path()+"/Database"));
@@ -90,6 +104,17 @@ private slots:
     QTRY_VERIFY_WITH_TIMEOUT(!m.stopping(), 10000);
     QCOMPARE(m.status(0), QString("Stopped")); QCOMPARE(m.status(1), QString("Stopped"));
     QVERIFY(!qApp->property("creatorDatabaseReady").toBool());
+  }
+  void shutdownDuringStartupIsFinal() {
+    QTemporaryDir dir; bundle(dir.path()); RuntimeManager m(dir.path());
+    m.start();
+    QTRY_COMPARE_WITH_TIMEOUT(m.status(0), QString("Running"), 10000);
+    m.shutdown(); m.shutdown(); // Explicit window cleanup plus destructor is safe.
+    QTest::qWait(500);
+    for (int port : {13306,13724,18085}) { QTcpServer server; QVERIFY(server.listen(QHostAddress::LocalHost,port)); }
+    m.start(); // A queued startup cannot resurrect a shutting-down runtime.
+    QTest::qWait(300);
+    for (int port : {13306,13724,18085}) { QTcpServer server; QVERIFY(server.listen(QHostAddress::LocalHost,port)); }
   }
   void stopDuringStartup() {
     QTemporaryDir dir; bundle(dir.path()); RuntimeManager m(dir.path());

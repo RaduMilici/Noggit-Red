@@ -4,6 +4,9 @@
 is a view shared by the chooser and editor. `ApplicationEntry` constructs the
 manager after command-line probes, schedules autostart, and connects aboutToQuit
 to bounded shutdown. Its destructor is a second cleanup path.
+NoggitWindow::forceQuit explicitly calls shutdown before its existing hard exit,
+which otherwise bypasses both cleanup paths. Shutdown cancels pending startup
+probes and is safe to call repeatedly.
 
 Installation layout (all paths are resolved from the executable, not the shell):
 

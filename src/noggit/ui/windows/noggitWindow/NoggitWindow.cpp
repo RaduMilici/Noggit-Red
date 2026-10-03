@@ -1,3 +1,4 @@
+#include <noggit/runtime/RuntimeManager.hpp>
 #include <noggit/runtime/LocalServerPanel.hpp>
 #include <QtCore/QCoreApplication>
 #include <noggit/ui/windows/about/About.h>
@@ -1197,6 +1198,11 @@ namespace Noggit::Ui::Windows
     // Flush user settings (volume, window state, etc.) to disk while we still can. QSettings normally
     // syncs on destruction, which the hard exit below skips.
     QSettings().sync();
+
+    // The hard exit below skips aboutToQuit and all QObject destructors.
+    // Explicitly stop our world, realm and database children before using it.
+    if (auto runtime = Noggit::Runtime::RuntimeManager::instance())
+      runtime->shutdown();
 
     // Terminate immediately. This kills the render-loop timer, the AsyncLoader worker threads, and the
     // QMediaPlayer DirectShow/WMF audio thread all at once -- none of them can keep the process alive or

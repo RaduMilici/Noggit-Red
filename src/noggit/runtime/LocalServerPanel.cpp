@@ -1,5 +1,6 @@
 #include "LocalServerPanel.hpp"
 #include "RuntimeManager.hpp"
+#include "LocalClientLauncher.hpp"
 #include <QDockWidget>
 #include <QMainWindow>
 #include <QLabel>
@@ -33,6 +34,11 @@ void addLocalServerPanel(QMainWindow* window)
   QObject::connect(start, &QPushButton::clicked, manager, &RuntimeManager::start);
   QObject::connect(stop, &QPushButton::clicked, manager, &RuntimeManager::stop);
   QObject::connect(restart, &QPushButton::clicked, manager, &RuntimeManager::restart);
+  auto test = new QPushButton(QObject::tr("Test Locally"), panel);
+  auto client = new QPushButton(QObject::tr("Launch Local Client"), panel);
+  layout->addWidget(test); layout->addWidget(client);
+  QObject::connect(test, &QPushButton::clicked, manager, &RuntimeManager::testLocally);
+  QObject::connect(client, &QPushButton::clicked, panel, [panel] { launchLocalClient(panel); });
   auto autostart = new QCheckBox(QObject::tr("Start with Noggit"), panel);
   QString settingsPath = manager->root() + "/Workspace/runtime.ini";
   autostart->setChecked(QSettings(settingsPath, QSettings::IniFormat).value("autostart", true).toBool());

@@ -1,3 +1,5 @@
+#include <noggit/creator/AuthoringDialogs.hpp>
+#include <noggit/runtime/RuntimeManager.hpp>
 // This file is part of Noggit3, licensed under GNU General Public License (version 3).
 #include <noggit/rendering/vulkan/VkParticleFeed.hpp>
 #include <noggit/rendering/RenderDiagnostics.hpp>
@@ -2292,10 +2294,10 @@ void MapView::setupCreatureActionsUi()
   layout->setSpacing(5);
 
   auto reload_button = new QPushButton("Reload Spawns", _creature_actions_overlay);
-  auto save_button = new QPushButton("Export SQL", _creature_actions_overlay);
+  auto save_button = new QPushButton(qApp->property("creatorRuntimeManaged").toBool() ? "Save NPC placements" : "Export SQL", _creature_actions_overlay);
   auto revert_button = new QPushButton("Discard Pending", _creature_actions_overlay);
   auto pending_button = new QPushButton("Pending \xE2\x96\xBE", _creature_actions_overlay);
-  pending_button->setToolTip("Show the list of pending creature updates waiting for SQL export.");
+  pending_button->setToolTip("Show pending NPC placement changes.");
   layout->addWidget(reload_button);
   layout->addWidget(save_button);
   layout->addWidget(revert_button);
@@ -2352,7 +2354,7 @@ void MapView::setupCreatureActionsUi()
       }
       QString const name = QString::fromStdString(spawn.name.empty() ? std::string("<unnamed>") : spawn.name);
       _creature_pending_list->addItem(
-        QString("[%1] guid %2  entry %3  %4").arg(action).arg(spawn.guid).arg(spawn.entry).arg(name));
+        qApp->property("creatorRuntimeManaged").toBool() ? QString("[%1] %2").arg(action,name) : QString("[%1] guid %2  entry %3  %4").arg(action).arg(spawn.guid).arg(spawn.entry).arg(name));
       ++count;
     }
     if (count == 0)
@@ -2417,6 +2419,10 @@ void MapView::setupCreatureActionsUi()
 void MapView::setupCreatureModelPickerUi()
 {
   _creature_model_picker_dock = new QDockWidget("NPC Model Picker", _main_window);
+  // Creator authors through the named-look dialog; the legacy picker exposes raw identifiers.
+  connect(_creature_model_picker_dock, &QDockWidget::visibilityChanged, this, [this](bool visible) {
+    if (visible && qApp->property("creatorRuntimeManaged").toBool()) _creature_model_picker_dock->hide();
+  });
   _creature_model_picker_dock->setFeatures(QDockWidget::DockWidgetMovable
                                            | QDockWidget::DockWidgetFloatable
                                            | QDockWidget::DockWidgetClosable);
@@ -5794,6 +5800,7 @@ QString MapView::creature_spawn_item_text(World::CreatureSpawnOverlay const& spa
   }
 
   auto const name = QString::fromStdString(spawn.name.empty() ? std::string("<unnamed>") : spawn.name);
+  if (qApp->property("creatorRuntimeManaged").toBool()) return prefix + name;
   return QString("%1%2 [entry %3] guid %4").arg(prefix).arg(name).arg(spawn.entry).arg(spawn.guid);
 }
 
@@ -6461,6 +6468,7 @@ void MapView::updateCreatureSpawnHover(QPoint const& global_pos)
   }
 
   QString name = QString::fromStdString(spawn->name.empty() ? std::string("<unnamed>") : spawn->name);
+  if (qApp->property("creatorRuntimeManaged").toBool()) { QToolTip::showText(global_pos, name, this); return; }
   QToolTip::showText(global_pos, QString("%1\nGUID: %2\nEntry: %3")
                                .arg(name)
                                .arg(spawn->guid)
@@ -6508,7 +6516,7 @@ bool MapView::tryStartCreatureSpawnDrag()
   }
 
   _dragging_creature_spawn = true;
-  _main_window->statusBar()->showMessage(QString("Dragging %1 creature spawn(s). Release mouse, then use Export SQL.")
+  _main_window->statusBar()->showMessage(QString("Dragging %1 creature spawn(s). Release mouse, then save placements.")
                                            .arg(_creature_drag_initial_positions.size()), 4000);
   return true;
 }
@@ -7044,6 +7052,38 @@ void MapView::showSelectedCreatureSpawnMenu(QPoint const& global_pos)
     return;
   }
 
+  if (qApp->property("creatorRuntimeManaged").toBool())
+  {
+    QMenu menu(this);
+    menu.addAction(QString::fromStdString(spawn->name))->setEnabled(false);
+    auto edit = menu.addAction("Edit NPC properties");
+    auto quest = menu.addAction("Create / Edit Quest");
+    auto duplicate = menu.addAction("Duplicate placement");
+    auto remove = menu.addAction("Delete placement");
+    auto locate = menu.addAction("Locate NPC");
+    auto save = menu.addAction("Save NPC placements");
+    // Copy before any service operation refreshes the world's spawn vector.
+    auto guid=spawn->guid, entry=spawn->entry;
+    auto position=spawn->pos;
+    auto p=client_to_server_creature_position(position, _world->mapIndex.hasAGlobalWMO());
+    Noggit::Creator::Position server{static_cast<unsigned>(_world->getMapID()),p.x,p.y,p.z,client_to_server_creature_orientation(spawn->orientation)};
+    auto chosen=menu.exec(global_pos);
+    if(chosen==locate) focus_camera_on_target(position);
+    else if(chosen==save) saveDirtyCreatureSpawns();
+    else if(chosen==remove) { deleteSelectedCreatureSpawns(); }
+    else if(chosen==edit && prepareCreatorChange()) {
+      if(Noggit::Creator::editNpc(this,_world.get(),entry,server)) reloadCreatorContent(guid);
+    }
+    else if(chosen==quest && prepareCreatorChange()) {
+      if(Noggit::Creator::editQuest(this,entry)) reloadCreatorContent(guid);
+    }
+    else if(chosen==duplicate && prepareCreatorChange()) {
+      try { auto ids=Noggit::Creator::SpawnService::save({{0,entry,server,120,false,true}});reloadCreatorContent(ids[0]); }
+      catch(std::exception const& e) { QMessageBox::warning(this,"Duplicate NPC",e.what()); }
+    }
+    return;
+  }
+
   QMenu menu(this);
   menu.addAction(QString("NPC: %1").arg(QString::fromStdString(spawn->name.empty() ? std::string("<unnamed>") : spawn->name)))->setEnabled(false);
   menu.addAction(QString("Unique ID: %1").arg(spawn->guid))->setEnabled(false);
@@ -7561,8 +7601,64 @@ QString MapView::buildDirtyCreatureSpawnSql(bool rebase_state)
   return sql;
 }
 
+bool MapView::prepareCreatorChange()
+{
+  if (Noggit::Project::CurrentProject::get()->projectVersion != Noggit::Project::ProjectVersion::CLASSIC)
+  {
+    QMessageBox::information(this, "Creator", "Open a Vanilla / Tortoise project to author local content.");
+    return false;
+  }
+  if (_world->dirtyGameObjectSpawnCount())
+  {
+    QMessageBox::information(this, "Creator", "Save or discard pending gameobject placements before refreshing NPC content.");
+    return false;
+  }
+  if (_world->dirtyCreatureSpawnCount()) saveDirtyCreatureSpawns();
+  return !_world->dirtyCreatureSpawnCount();
+}
+
+void MapView::reloadCreatorContent(std::optional<std::uint32_t> select)
+{
+  makeCurrent();
+  OpenGL::context::scoped_setter const guard(::gl, context());
+  _selected_creature_spawn_guid.reset();
+  _creature_undo_ops.clear();
+  _world->reloadCreatureSpawns();
+  _world->setDrawCreatureSpawns(true);
+  rebuildCreatureBrowserList(false);
+  if (select) setSelectedCreatureSpawn(select);
+  updateDatabaseStatus();
+  _needs_redraw = true;
+}
+
 void MapView::saveDirtyCreatureSpawns()
 {
+  if (qApp->property("creatorRuntimeManaged").toBool())
+  {
+    try
+    {
+      if (_world->dirtyGameObjectSpawnCount())
+        throw std::runtime_error("Save or discard pending gameobject placements before saving NPC placements.");
+      QVector<Noggit::Creator::SpawnEdit> edits;
+      for (auto const& spawn : _world->creatureSpawns())
+      {
+        if (!spawn.dirty) continue;
+        auto p = client_to_server_creature_position(spawn.pos, _world->mapIndex.hasAGlobalWMO());
+        edits.push_back({spawn.guid, spawn.entry,
+          {static_cast<unsigned>(_world->getMapID()), p.x, p.y, p.z, client_to_server_creature_orientation(spawn.orientation)},
+          static_cast<int>(spawn.ext.spawntimesecs_min), spawn.pending_delete, spawn.pending_create});
+      }
+      if (!edits.isEmpty())
+      {
+        Noggit::Creator::SpawnService::save(edits);
+        reloadCreatorContent();
+        _main_window->statusBar()->showMessage("NPC placements saved locally. Use Test Locally to see changes in game.", 6000);
+      }
+    }
+    catch (std::exception const& e) { QMessageBox::warning(this, "Save NPC placements", e.what()); }
+    return;
+  }
+
   auto dirty_count = _world->dirtyCreatureSpawnCount();
   if (dirty_count == 0)
   {
@@ -9756,6 +9852,13 @@ MapView::MapView( math::degrees camera_yaw0
   );
 
   setContextMenuPolicy(Qt::CustomContextMenu);
+
+  if (auto runtime = Noggit::Runtime::RuntimeManager::instance())
+    connect(runtime, &Noggit::Runtime::RuntimeManager::beforeLocalTest, this, [this](bool* proceed)
+    {
+      if (_world->dirtyCreatureSpawnCount()) saveDirtyCreatureSpawns();
+      if (_world->dirtyCreatureSpawnCount()) *proceed = false;
+    }, Qt::DirectConnection);
 
   connect(this, SIGNAL(customContextMenuRequested(const QPoint&)),
       this, SLOT(ShowContextMenu(const QPoint&)));
@@ -19182,6 +19285,29 @@ void MapView::ShowContextMenu(QPoint pos)
     // TODO : build the menu only once, store it and instead use setVisible ?
 
     QMenu* menu = new QMenu(this);
+
+    if (Noggit::Project::CurrentProject::get()->projectVersion == Noggit::Project::ProjectVersion::CLASSIC)
+    {
+      auto hit = surface_pos_under_cursor();
+      auto create = menu->addMenu("Create");
+      auto npc = create->addAction("NPC");
+      npc->setEnabled(hit.has_value());
+      connect(npc, &QAction::triggered, this, [this, hit]
+      {
+        if (!hit || !prepareCreatorChange()) return;
+        auto p = client_to_server_creature_position(*hit, _world->mapIndex.hasAGlobalWMO());
+        Noggit::Creator::Id guid = 0;
+        if (Noggit::Creator::createNpc(this, _world.get(),
+            {static_cast<unsigned>(_world->getMapID()), p.x, p.y, p.z, 0.f}, &guid))
+        {
+          set_editing_mode(editing_mode::creature);
+          reloadCreatorContent(guid);
+        }
+      });
+      connect(create->addAction("Quest"), &QAction::triggered, this, [this]
+      { if (prepareCreatorChange() && Noggit::Creator::editQuest(this)) reloadCreatorContent(); });
+      menu->addSeparator();
+    }
 
     // Undo
     QAction action_undo("Undo", this);
