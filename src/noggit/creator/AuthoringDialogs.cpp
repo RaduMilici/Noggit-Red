@@ -1,6 +1,3 @@
-#include "TestSessionService.hpp"
-#include <QPointer>
-#include <QCoreApplication>
 #include "AuthoringDialogs.hpp"
 #include <noggit/World.h>
 #include <noggit/ui/tools/AssetBrowser/ModelView.hpp>
@@ -12,7 +9,6 @@
 #include <QGridLayout>
 #include <QLabel>
 #include <QLineEdit>
-#include <QTextEdit>
 #include <QListWidget>
 #include <QComboBox>
 #include <QSpinBox>
@@ -64,7 +60,7 @@ protected:
   }
 };
 
-bool npcDialog(QWidget* parent,World* world,Position position,Npc draft,int mode,Id* spawn) {
+bool npcDialog(QWidget* parent,World* world,Npc draft,int mode,Id* saved) {
   QDialog dialog(parent); dialog.setWindowTitle(draft.entry?"Edit NPC":"Create NPC"); dialog.resize(850,740);
   auto layout=new QVBoxLayout(&dialog); auto name=new QLineEdit(draft.name); name->setPlaceholderText("NPC name"); layout->addWidget(name);
   auto tabs=new QTabWidget; layout->addWidget(tabs);
@@ -177,20 +173,17 @@ bool npcDialog(QWidget* parent,World* world,Position position,Npc draft,int mode
   }
   QObject::connect(buttons,&QDialogButtonBox::accepted,&dialog,[&]{try {
     draft.name=name->text();draft.level=level->value();draft.health=health->value();draft.mana=mana->isEnabled()?mana->value():0;draft.armor=armor->value();draft.attackMs=attack->value();draft.damageMin=damageMin->value();draft.damageMax=damageMax->value();draft.faction=faction->currentData().toUInt();draft.rank=rank->currentIndex();draft.role=role->currentIndex();draft.type=type->currentIndex();draft.respawn=respawn->value();draft.movement=movement->currentIndex();
-    CreatureService::save(draft,position,spawn);dialog.accept();
+    auto entry=CreatureService::save(draft);if(saved)*saved=entry;dialog.accept();
   }catch(std::exception const& e){error(&dialog,e);}});
   return dialog.exec()==QDialog::Accepted;
 }
 }
-bool createNpc(QWidget* parent,World* world,Position const& position,Id* spawn) {
+std::optional<Id> createNpc(QWidget* parent,World* world,NpcKind kind,Id source) {
   try {
-    QDialog path(parent);path.setWindowTitle("Create NPC");auto layout=new QVBoxLayout(&path);int mode=-1;
-    QStringList names{"Clone Existing NPC","Create Humanoid NPC","Create Creature / Monster"};
-    for(int i=0;i<3;++i){auto button=new QPushButton(names[i]);layout->addWidget(button);QObject::connect(button,&QPushButton::clicked,&path,[&,i]{mode=i;path.accept();});}
-    if(path.exec()!=QDialog::Accepted)return false;Npc draft; if(mode==2)draft.type=1;
-    if(mode==0) {
-      auto source=choose(parent,"Clone Existing NPC",[](QString text){return CreatureService::search(text);});if(!source)return false;
-      auto original=CreatureService::load(source->id);
+    int mode=int(kind);Npc draft; if(kind==NpcKind::Creature)draft.type=1;
+    if(kind==NpcKind::Clone) {
+      if(!source){auto chosen=choose(parent,"Clone Existing NPC",[](QString text){return CreatureService::search(text);});if(!chosen)return {};source=chosen->id;}
+      auto original=CreatureService::load(source);
       QDialog options(parent);options.setWindowTitle("Clone "+original.name);auto form=new QVBoxLayout(&options);
       form->addWidget(note("The original NPC will remain unchanged. Choose what to copy:",&options));
       std::array<QCheckBox*,6> copy;QStringList groups{"Appearance","Base stats","Faction","Equipment","Basic combat configuration","Movement defaults"};
@@ -209,8 +202,8 @@ bool createNpc(QWidget* parent,World* world,Position const& position,Id* spawn) 
       QObject::connect(only,&QPushButton::clicked,&options,[&]{for(int i=0;i<6;++i)copy[i]->setChecked(i==0||i==3);for(auto r:relations)r->setChecked(false);options.accept();});
       auto buttons=new QDialogButtonBox(QDialogButtonBox::Ok|QDialogButtonBox::Cancel);form->addWidget(buttons);
       QObject::connect(buttons,&QDialogButtonBox::accepted,&options,&QDialog::accept);QObject::connect(buttons,&QDialogButtonBox::rejected,&options,&QDialog::reject);
-      if(options.exec()!=QDialog::Accepted)return false;
-      draft.source=source->id;draft.name=original.name+" Copy";
+      if(options.exec()!=QDialog::Accepted)return {};
+      draft.source=source;draft.name=original.name+" Copy";
       draft.appearance=copy[0]->isChecked();draft.stats=copy[1]->isChecked();draft.allegiance=copy[2]->isChecked();draft.weapons=copy[3]->isChecked();draft.combat=copy[4]->isChecked();draft.motion=copy[5]->isChecked();
       draft.loot=relations[0]->isChecked();draft.vendor=relations[1]->isChecked();draft.trainer=relations[2]->isChecked();draft.gossip=relations[3]->isChecked();draft.quests=relations[4]->isChecked();
       if(draft.appearance){draft.display=original.display;draft.type=original.type;}
@@ -221,52 +214,13 @@ bool createNpc(QWidget* parent,World* world,Position const& position,Id* spawn) 
       if(draft.motion)draft.movement=original.movement==1?1:0;
       mode=original.type==7?1:2;
     }
-    return npcDialog(parent,world,position,draft,mode,spawn);
-  }catch(std::exception const& e){error(parent,e);return false;}
+    Id entry=0;
+    if(!npcDialog(parent,world,draft,mode,&entry))return {};
+    return entry;
+  }catch(std::exception const& e){error(parent,e);return {};}
 }
-bool editNpc(QWidget* parent,World* world,Id entry,Position const& position) {
-  try { if(!CreatureService::owned(entry)){QMessageBox::information(parent,"NPC properties","This is an original NPC. Use Create → NPC → Clone Existing NPC to make your own version.");return false;}auto npc=CreatureService::load(entry);return npcDialog(parent,world,position,npc,npc.type==7?1:2,nullptr); }
+bool editNpc(QWidget* parent,World* world,Id entry) {
+  try { if(!CreatureService::owned(entry)){QMessageBox::information(parent,"NPC properties","This is an original NPC. Clone it to make your own version.");return false;}auto npc=CreatureService::load(entry);return npcDialog(parent,world,npc,npc.type==7?1:2,nullptr); }
   catch(std::exception const& e){error(parent,e);return false;}
-}
-bool editQuest(QWidget* parent,Id npc) {
-  try {
-    Quest q; q.giver=npc;q.ender=npc;
-    QDialog start(parent);start.setWindowTitle("Quests");auto startLayout=new QVBoxLayout(&start);auto fresh=new QPushButton("Create Quest"),existing=new QPushButton("Edit Creator Quest");startLayout->addWidget(fresh);startLayout->addWidget(existing);
-    QObject::connect(fresh,&QPushButton::clicked,&start,&QDialog::accept);
-    QObject::connect(existing,&QPushButton::clicked,&start,[&]{auto selected=choose(&start,"Find quest",[](QString t){return QuestService::search(t);});if(selected){try{q=QuestService::load(selected->id);start.accept();}catch(std::exception const& e){error(&start,e);}}});
-    if(start.exec()!=QDialog::Accepted)return false;
-    QDialog dialog(parent);dialog.setWindowTitle("Quest Editor");dialog.resize(740,720);auto layout=new QVBoxLayout(&dialog);auto form=new QFormLayout;layout->addLayout(form);
-    auto title=new QLineEdit(q.title);form->addRow("Title",title);auto required=spin(form,"Required level",q.requiredLevel,1,63);auto level=spin(form,"Quest level",q.level,1,63);
-    auto giver=new QPushButton(q.giver?CreatureService::load(q.giver).name:"Choose NPC…"),ender=new QPushButton(q.ender?CreatureService::load(q.ender).name:"Choose NPC…");form->addRow("Quest giver",giver);form->addRow("Quest ender",ender);
-    QObject::connect(giver,&QPushButton::clicked,&dialog,[&]{auto c=choose(&dialog,"Quest giver",[](QString t){return CreatureService::search(t);});if(c){q.giver=c->id;giver->setText(c->name);}});
-    QObject::connect(ender,&QPushButton::clicked,&dialog,[&]{auto c=choose(&dialog,"Quest ender",[](QString t){return CreatureService::search(t);});if(c){q.ender=c->id;ender->setText(c->name);}});
-    auto both=new QPushButton("Use quest giver as ender too");form->addRow(both);QObject::connect(both,&QPushButton::clicked,&dialog,[&]{q.ender=q.giver;ender->setText(giver->text());});
-    auto description=new QTextEdit(q.description),completion=new QTextEdit(q.completion);description->setAcceptRichText(false);completion->setAcceptRichText(false);description->setMaximumHeight(100);completion->setMaximumHeight(80);form->addRow("Description",description);form->addRow("Completion text",completion);
-    auto xp=spin(form,"XP reward",q.xp,0,16777215);auto money=new QWidget;auto coins=new QHBoxLayout(money);auto gold=new QSpinBox,silver=new QSpinBox,copper=new QSpinBox;gold->setRange(0,200000);silver->setRange(0,99);copper->setRange(0,99);gold->setSuffix(" gold");silver->setSuffix(" silver");copper->setSuffix(" copper");gold->setValue(q.money/10000);silver->setValue(q.money/100%100);copper->setValue(q.money%100);for(auto c:{gold,silver,copper})coins->addWidget(c);form->addRow("Money reward",money);
-    auto objectives=new QGroupBox("Objectives");auto objectiveLayout=new QVBoxLayout(objectives);layout->addWidget(objectives);
-    struct Row {QCheckBox* enabled;QComboBox* type;QPushButton* target;QSpinBox* count;Id id=0;};std::array<Row,4> rows;
-    for(int i=0;i<4;++i){auto& r=rows[i];auto line=new QHBoxLayout;r.enabled=new QCheckBox;r.type=new QComboBox;r.type->addItems({"Kill NPC","Collect Item","Talk to NPC"});r.target=new QPushButton("Choose target…");r.count=new QSpinBox;r.count->setRange(1,i<q.objectives.size()&&q.objectives[i].type==Objective::Collect?65535:63);line->addWidget(r.enabled);line->addWidget(r.type);line->addWidget(r.target,1);line->addWidget(r.count);objectiveLayout->addLayout(line);
-      if(i<q.objectives.size()){auto const& o=q.objectives[i];r.enabled->setChecked(true);r.type->setCurrentIndex(o.type);r.id=o.target;r.count->setValue(o.count);r.target->setText(o.type==Objective::Collect?EquipmentService::name(o.target):CreatureService::load(o.target).name);}else r.enabled->setChecked(i==0);
-      QObject::connect(r.type,QOverload<int>::of(&QComboBox::currentIndexChanged),&dialog,[&,i]{rows[i].id=0;rows[i].target->setText("Choose target…");rows[i].count->setRange(1,rows[i].type->currentIndex()==1?65535:rows[i].type->currentIndex()==2?1:63);rows[i].count->setEnabled(rows[i].type->currentIndex()!=2);});
-      QObject::connect(r.target,&QPushButton::clicked,&dialog,[&,i]{auto& row=rows[i];auto c=choose(&dialog,"Objective target",[&](QString t){return row.type->currentIndex()==1?EquipmentService::search(t,-1):CreatureService::search(t);});if(c){row.id=c->id;row.target->setText(c->name);if(row.type->currentIndex()==2){q.ender=c->id;ender->setText(c->name);row.count->setValue(1);}}});
-    }
-    layout->addWidget(note("Talk quests use normal quest turn-in: select one Talk objective and its NPC becomes the ender. Collect quests require items already obtainable in the game; this editor does not create loot drops.",&dialog));
-    auto buttons=new QDialogButtonBox(QDialogButtonBox::Save|QDialogButtonBox::Cancel);layout->addWidget(buttons);QObject::connect(buttons,&QDialogButtonBox::rejected,&dialog,&QDialog::reject);
-    auto saveQuest=[&]() -> bool {try{q.title=title->text();q.description=description->toPlainText();q.completion=completion->toPlainText();q.requiredLevel=required->value();q.level=level->value();q.xp=xp->value();q.money=gold->value()*10000+silver->value()*100+copper->value();q.objectives.clear();for(auto const& row:rows)if(row.enabled->isChecked())q.objectives.push_back({Objective::Type(row.type->currentIndex()),row.id,row.count->value(),row.target->text()});q.entry=QuestService::save(q);return true;}catch(std::exception const& e){error(&dialog,e);return false;}};
-    QObject::connect(buttons,&QDialogButtonBox::accepted,&dialog,[&]{if(saveQuest())dialog.accept();});
-    if(q.entry) {
-      auto remove=buttons->addButton("Delete Quest…",QDialogButtonBox::DestructiveRole);
-      QObject::connect(remove,&QPushButton::clicked,&dialog,[&]{
-        if(QMessageBox::question(&dialog,"Delete Quest","Delete the quest \""+q.title+"\" from your local world?",QMessageBox::Yes|QMessageBox::No,QMessageBox::No)!=QMessageBox::Yes)return;
-        try{QuestService::remove(q.entry);dialog.accept();}catch(std::exception const& e){error(&dialog,e);}
-      });
-    }
-    auto test=new QPushButton("Test Quest");buttons->addButton(test,QDialogButtonBox::ActionRole);
-    QObject::connect(test,&QPushButton::clicked,&dialog,[&]{if(!saveQuest())return;
-      auto entry=q.entry;QPointer<QWidget> owner=parent;dialog.accept();
-      QTimer::singleShot(0,qApp,[owner,entry]{if(auto session=TestSessionService::instance())session->testQuest(owner,entry);});
-    });
-    return dialog.exec()==QDialog::Accepted;
-  }catch(std::exception const& e){error(parent,e);return false;}
 }
 }

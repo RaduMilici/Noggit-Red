@@ -5,22 +5,27 @@ For the current Test Here / Test NPC / Test Quest workflow, see
 
 This code targets the bundled Tortoise/VMaNGOS schema, not arbitrary remote or
 Wrath databases. Open a Classic/Vanilla project inside the managed Creator bundle.
-NPC and quest saves go directly to the local database. Original NPC templates are
-read-only in the properties editor; explicit quest assignment can add quest-giver
-flags and relations to an original NPC.
+NPC, quest and item saves go directly to the local database. Original NPCs, quests and
+items are never changed: clone or copy them instead. Linking a quest to an original NPC
+gives that NPC the quest-giver role.
 
 ## Designer workflow
 
 1. Start Noggit from `Creator/Noggit`; wait for LOCAL SERVER to show Running.
-2. Right-click terrain: **Create → NPC**. Choose clone, humanoid, or creature.
-3. Choose an existing look, edit appearance and combat separately, and save.
-4. In NPC mode, drag to move. While dragging, scroll to rotate (Shift: larger
-   steps, Ctrl: 45-degree steps). Right-click a selected NPC to edit,
-   duplicate, delete, locate, or save placements. Duplicates share the NPC's
-   properties; clone instead when a separate NPC definition is wanted.
-5. Right-click an NPC → **Create / Edit Quest**, or **Create → Quest** on terrain.
-6. **Test Locally** saves pending NPC placements and restarts the local runtime.
-   Wait for all services to reach Running, then **Launch Local Client**.
+2. Enter the creature editor. The bottom panel (NPC Model Picker) lists every NPC with a
+   3D preview; **Only my NPCs** filters to yours (shown in bold). Its NPC card on the
+   right holds every action, so no right-click is needed (right-drag turns the camera).
+3. **Humanoid** / **Creature** design a new NPC with a 3D preview; **Clone** starts from
+   the selected NPC. Saving it starts placement: click where it should stand (Esc
+   cancels). **Place** (or double-clicking the preview) places it again.
+4. Click an NPC in the world to select it. Drag to move; while dragging, scroll to
+   rotate (Shift: larger steps, Ctrl: 45-degree steps). The card's placement buttons
+   duplicate (click where the copy goes), remove, or locate that placement.
+5. **Quests** opens the quest browser on the NPC's quests, **Chain** its quest chain
+   diagram. See [Quests](#quests).
+6. **Test in game → At this NPC** or **At a spot** (click anywhere in the world) saves,
+   restarts the local runtime and launches WoW there. **Test Local** in LOCAL SERVER
+   launches without moving your character.
 7. Select the WoW executable once. Its relative path is remembered. The launcher
    backs up `realmlist.wtf` once and points the client at the local realm.
 
@@ -30,8 +35,15 @@ own hash (`AccountService`, `AccountDialog.*`) and only exist in the local datab
 
 ## Implementation / files
 
-- `Services.hpp/.cpp`: CreatureService, SpawnService, EquipmentService, QuestService;
+- `Services.hpp/.cpp`: CreatureService, SpawnService, EquipmentService, AccountService;
   typed drafts, validation, local allocation, safe field copying, and persistence.
+- `ContentStore.hpp/.cpp`: the quest and item editors' reads and writes: runs the pure
+  plans below under Creator ownership, the recovery journal and Local Changes.
+- `../quest/`, `../item/`, `../content/SqlText.*`: pure SQL planning for quests (template,
+  givers/enders, drops, scripted events, chains, save plan) and items. Ported from the
+  ssh-tunnel branch; unit-tested in `../../../test/quest`.
+- `../ui/quest/`, `../ui/item/`, `../ui/content/`: quest browser, six-page quest editor,
+  chain diagram, item editor, shared pickers and style. `ContentSession` opens the lists.
 - `AppearanceService.cpp`: named factions and valid looks from loaded client DBCs.
 - `Database.hpp/.cpp`: dedicated loopback connection, advisory allocation lock,
   Creator ownership metadata, durable before-image recovery journal.
@@ -39,7 +51,7 @@ own hash (`AccountService`, `AccountDialog.*`) and only exist in the local datab
 - `ChangeExport.hpp/.cpp`: change package export (`manifest.json`, `changes.sql`).
 - `LocalChangesPanel.hpp/.cpp`: status-bar "Local changes" button and panel.
 - `AuthoringDialogs.hpp/.cpp`: named selectors, humanoid/creature/clone flows,
-  body preview, three weapon slots, outfits, combat settings, quest editor.
+  body preview, three weapon slots, outfits, combat settings.
 - `../MapView.h/.cpp`: click placement, world editing and save integration. Reuses
   existing NPC drag/rotate/rendering, coordinate conversion and selection systems.
 - `../runtime/LocalClientLauncher.hpp/.cpp`: client selection, realm setup, launch.
@@ -52,14 +64,22 @@ own hash (`AccountService`, `AccountDialog.*`) and only exist in the local datab
 
 ## Database and metadata
 
-Writes: `creature_template`, `creature`, `creature_equip_template`, `quest_template`,
-`creature_questrelation`, `creature_involvedrelation`, and `creator_content` (new).
-Optional clone copies also insert into `npc_vendor` and `npc_trainer`.
-Reads: those tables plus `item_template`. Loot/gossip definitions are referenced,
-not edited; script tables are untouched. Custom outfits live in `Workspace/creator-outfits.json`.
+NPC writes: `creature_template`, `creature`, `creature_equip_template`, and
+`creator_content` (new). Optional clone copies also insert into `npc_vendor` and `npc_trainer`.
+Quest and item writes: `quest_template`, `creature_/gameobject_questrelation` and
+`_involvedrelation`, `areatrigger_involvedrelation`, `quest_start_scripts` /
+`quest_end_scripts` with their lines in `broadcast_text` (IDs from 6,000,000, above the
+game's own), quest-only rows in `creature_/gameobject_loot_template` (a source without
+loot gets a loot table keyed by its entry), `item_template` (new items, `start_quest`),
+and the quest-giver bit of `creature_template.npc_flags`. Gossip and AI scripts are
+untouched. Custom outfits live in `Workspace/creator-outfits.json`.
+
+Ownership is the `creator_content` table (kinds `npc`, `spawn`, `quest`, `item`), not ID
+ranges: Turtle's own content already uses IDs above 1,000,000.
 
 Identifiers allocate above the existing maximum and at least 1,000,000, under a
-MariaDB advisory lock. NPC IDs stay within signed mediumint range for kill targets.
+MariaDB advisory lock. NPC IDs stay within signed mediumint range for kill targets;
+quest IDs within the signed quest-chain columns (8,388,607).
 All Creator writers use this lock; external SQL writers are outside this contract.
 The native world tables are MyISAM, so rollback uses persisted before-images,
 not misleading SQL transactions. `Workspace/creator-recovery.json` restores an
@@ -80,9 +100,10 @@ The status bar shows **Local changes: N**; click it to see what was changed loca
 ```
 
 Tracked: NPC create/update/delete, placement create/move/update/delete, quest
-create/update/delete, saved through Noggit's Creator services. NPCs and quests can be
-deleted from their editors (**Delete NPC…** removes all its placements; an NPC used by
-a Creator quest must be freed first). Original content is never deletable.
+create/update/delete (including chain links a save changes on other quests), and item
+create/update/delete, saved through Noggit. NPCs, quests and items can be deleted from
+their editors (**Delete NPC…** removes all its placements; an NPC used by a Creator quest,
+or an item a quest uses, must be freed first). Original content is never deletable.
 
 Each entry holds the entity type and ID, action (CREATE, UPDATE, DELETE, MOVE), the
 before-state (rows at the first tracked change) and after-state (rows now), and a UTC
@@ -93,7 +114,10 @@ that only changes position/orientation is a MOVE. Rows per entity:
 - NPC: `creature_template`, its `creature_equip_template`, `npc_vendor`, `npc_trainer`,
   and quest relations to original quests (relations to Creator quests belong to the quest).
 - Placement: `creature`.
-- Quest: `quest_template`, `creature_questrelation`, `creature_involvedrelation`.
+- Quest: `quest_template`, NPC/object givers and enders, the exploration area trigger,
+  accept/hand-in scripts with the editor's spoken lines, quest-only drops of the items it
+  collects (plus loot tables the editor gave their sources), and the item that starts it.
+- Item: `item_template`.
 
 The list lives in `Workspace/creator-changes.json`, never in the world database. It
 is written in two phases around the recovery journal (`creator-changes.pending.json`
@@ -111,11 +135,13 @@ list entries; the content stays in the local world.
 - `changes.sql`: only the exported changes, never a dump. Upserts use `REPLACE INTO`
   with full rows; deletions are guarded so they only remove rows that the target
   database also marks as Creator content. Statements are ordered by dependency and
-  replaying a package is idempotent. Creator NPCs that exported placements or quests
-  refer to (giver, ender, kill target, spawned NPC) are included automatically and
-  flagged `includedAsDependency`; original content is assumed present on the target.
+  replaying a package is idempotent. What an edit removed (spoken lines, drops, the
+  start item) is removed on import; drops another quest still collects are kept.
+  Creator NPCs, items and quests the changes refer to (givers, kill targets, summoned
+  creatures, collected/rewarded/starting items, chain neighbours) are included
+  automatically and flagged `includedAsDependency`; original content is assumed present.
 
-Export needs the local database running (to find those NPCs and the content version).
+Export needs the local database running (to find those dependencies and the content version).
 An existing package folder is never overwritten. After exporting, the exported entries
 can be cleared (with confirmation).
 
@@ -153,12 +179,45 @@ not transactional.
 
 ## Quests
 
-Create/edit Creator quests with title, required/quest level, giver/ender, description,
-completion text, XP and gold/silver/copper rewards. Up to four kill/collect objectives
-use searchable NPC/item selectors. Kill counts cap at 63 for Vanilla's six-bit
-progress counter. Talk quests are single-objective delivery/turn-in quests with
-no custom conversation script. Relations and giver flags are saved automatically.
-Collect objectives require already-obtainable items; this stage does not add drops.
+The quest editor and browser come from the ssh-tunnel branch, writing to the local
+database. In the creature editor's NPC card, **Quests** opens it for that NPC. The
+browser lists every quest (yours in **bold**), filtered to the NPC's quests when opened
+from one. **New**, **Copy**, **Edit**, **Delete** and **Test** do what they say;
+double-click edits your quests and copies game quests. **Your items...** manages items.
+
+The editor has a sidebar of pages; a red dot marks a page with something to fix, and
+the problem is shown at the bottom. Before anything is written, a confirmation lists
+every consequence (e.g. "Young Wolf drops Wolf Pelt (40 %) for players on the quest").
+
+1. **Story**: title, quest level and the level it becomes available at, zone, kind
+   (normal, elite/group with a suggested group size, dungeon, raid, PvP), time limit,
+   repeatable/shareable, and the texts (`$N` name, `$C` class, `$R` race, `$B` new line).
+2. **Who can take it**: Alliance / Horde / everyone, classes, a profession with a minimum
+   skill, a reputation range, earlier quests (all or any), and either/or partners.
+3. **Objectives**: kill creatures (optionally only when a spell is cast on them), use an
+   object (lever, altar), collect items and where they drop (a creature or a chest, with a
+   chance; **New item...** makes one), explore a place (pick one or **Nearest to my
+   cursor**; places used by another quest, teleports or inns are greyed out), or reach a
+   reputation. No objectives: players just talk to the ender.
+4. **Rewards**: experience (**Use typical** fills in what the game's quests of that level
+   give), money, items given, items to choose from, reputation with up to five factions,
+   a spell taught and a spell cast on the player.
+5. **Givers**: NPCs or objects (a wanted poster) that give and take the quest (NPCs become
+   quest givers), an item that starts it (your own items only), an item handed out when
+   accepting, and the quest offered right after this one.
+6. **Events**: a timeline for accepting and handing in: the NPC says/yells something,
+   emotes, casts a spell, gives an item, summons a creature (at your cursor, for a number
+   of seconds), attacks, or completes the quest ("listen to the story" quests).
+
+**Chain...** shows a quest chain as a diagram: drag from a quest's right-edge handle onto
+another quest to link them (all / any / instead when it already needs one), right-click
+for either/or groups, editing, or a follow-up quest. Changes are saved together.
+
+**Save and test** in the editor (or **Test** in the browser) saves, restarts the local
+server and launches WoW next to the quest's giver (see local testing). Kill counts cap at
+63 for Vanilla's six-bit progress counter. Escorts and other complex scripts are not
+supported; a quest whose stored script has steps the editor cannot show says so, and
+saving its events replaces them.
 
 ## Build and verification
 
@@ -189,8 +248,17 @@ cmake --build build-runtime-tests -j2
 ctest --test-dir build-runtime-tests --output-on-failure
 ```
 
+Quest and item planning unit tests (no database; the ssh-tunnel branch's suites):
+
+```bash
+cmake -S test/quest -B build-quest-tests
+cmake --build build-quest-tests -j2
+ctest --test-dir build-quest-tests --output-on-failure
+```
+
 Local change tracking unit test (no database; covers merging, restart persistence,
-crash recovery around the journal, clearing, and SQL escaping/order):
+crash recovery around the journal, clearing, and SQL escaping/order, quest events,
+drops and items):
 
 ```bash
 cmake -S test/creator -B build-creator-tests
@@ -201,22 +269,24 @@ cmake --build build-creator-tests --target change_tracker_tests
 Real database integration checks require a disposable, stopped copy of the bundle.
 The test leaves test content in that copy, starts all three services, checks ID
 uniqueness, source preservation, names, placement movement/deletion, respawn edits,
-kill/collect/talk quest round-trips, invalid inputs and MyISAM rollback, Local Changes
-entries, package export (and replaying its `changes.sql` on the live schema), and
-NPC/quest deletion, then stops.
+quests (events, a quest drop giving a creature its own loot table, a refused self-link,
+a follow-up chain), items (create, edit, delete protection), MyISAM rollback, Local
+Changes entries, package export (and replaying its `changes.sql` on the live schema),
+NPC/quest/item deletion and local accounts, then stops.
 Do not copy a running MariaDB data directory. Do not run beside another local server.
+The copy needs about 7 GB; `/tmp` is often too small, so pick a roomier parent folder.
 
 ```bash
 cmake -S test/creator -B build-creator-tests
 cmake --build build-creator-tests -j2
-creator_test_root="$(mktemp -d /tmp/noggit-creator-test.XXXXXX)"
-cp -a build/Creator/. "$creator_test_root/"
+creator_test_root="$(mktemp -d "${CREATOR_TEST_PARENT:-$HOME}/noggit-creator-test.XXXXXX")"
+cp -a build/Creator/Runtime build/Creator/Database build/Creator/Workspace "$creator_test_root/"
 touch "$creator_test_root/CREATOR_TEST_DISPOSABLE"
 ./build-creator-tests/creator_integration "$creator_test_root"
 ```
 
 Manual acceptance: create a humanoid and a creature, clone an original with the safe
 copy defaults and appearance-only, save/reapply an outfit, move/rotate/duplicate/delete,
-reopen properties, and save each quest type. Test locally, reconnect the client, and
+reopen properties, and make quests with each objective kind, events and a chain. Test locally, reconnect the client, and
 verify names/looks/placement, quest acceptance/progress/completion and rewards. Repeat
 Test Locally with the server stopped and ensure shutdown leaves no child services.

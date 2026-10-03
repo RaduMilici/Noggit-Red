@@ -132,7 +132,7 @@ namespace Noggit::Quest
 
   std::string buildQuestGiverFlagStatement(NpcFlagSchema const& npc_schema, std::vector<std::uint32_t> const& npcs)
   {
-    if (npcs.empty() || npc_schema.npc_flags_col.empty() || npc_schema.entry_col.empty())
+    if (npcs.empty() || !npc_schema.valid())
     {
       return {};
     }

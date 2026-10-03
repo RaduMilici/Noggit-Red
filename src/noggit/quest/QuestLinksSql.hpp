@@ -81,6 +81,8 @@ namespace Noggit::Quest
   struct NpcFlagSchema
   {
     std::string entry_col, npc_flags_col;
+
+    bool valid() const { return !entry_col.empty() && !npc_flags_col.empty(); }
   };
   NpcFlagSchema detectNpcFlagSchema(std::vector<std::string> const& creature_template_columns);
 

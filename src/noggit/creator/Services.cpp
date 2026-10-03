@@ -41,6 +41,11 @@ QVector<Choice> CreatureService::search(QString const& text, bool ownedOnly) {
   return choices(db.query("SELECT entry,name,CONCAT('Level ',level_min,'–',level_max,' · ',CASE type WHEN 1 THEN 'Beast' WHEN 2 THEN 'Dragonkin' WHEN 3 THEN 'Demon' WHEN 4 THEN 'Elemental' WHEN 6 THEN 'Undead' WHEN 7 THEN 'Humanoid' ELSE 'Creature' END) AS detail FROM creature_template WHERE name LIKE "+db.quote('%'+text+'%')+(ownedOnly?" AND entry IN (SELECT entry FROM creator_content WHERE kind='npc')":"")+" ORDER BY name LIMIT 250"));
 }
 bool CreatureService::owned(Id entry) { Database db; return db.owned("npc",entry); }
+QSet<Id> CreatureService::ownedEntries() {
+  Database db; QSet<Id> result;
+  for(auto const& row:db.query("SELECT entry FROM creator_content WHERE kind='npc'")) result.insert(row["entry"].toUInt());
+  return result;
+}
 Npc CreatureService::load(Id entry) {
   Database db; auto row=one(db,"creature_template",entry); Npc d;
   d.entry=entry; d.name=row["name"].toString(); d.display=row["display_id1"].toUInt(); d.faction=row["faction"].toUInt();
@@ -54,10 +59,10 @@ Npc CreatureService::load(Id entry) {
   if(!spawns.isEmpty()) d.respawn=spawns[0]["spawntimesecsmin"].toInt();
   return d;
 }
-Id CreatureService::save(Npc const& d, Position const& pos, Id* spawn) {
+Id CreatureService::save(Npc const& d, std::optional<Position> const& place, Id* spawn) {
   require(!d.name.trimmed().isEmpty() && d.name.size()<=100,"Enter an NPC name of up to 100 characters.");
   require(d.display && d.level>=1 && d.level<=63 && d.health>0 && d.damageMin>=0 && d.damageMax>=d.damageMin,"Choose an appearance and valid combat values.");
-  require(std::isfinite(pos.x)&&std::isfinite(pos.y)&&std::isfinite(pos.z)&&std::isfinite(pos.orientation),"Choose a valid location in the world.");
+  if(place) require(std::isfinite(place->x)&&std::isfinite(place->y)&&std::isfinite(place->z)&&std::isfinite(place->orientation),"Choose a valid location in the world.");
   Database db; if(d.entry) require(db.owned("npc",d.entry),"Original NPCs are read-only here. Clone this NPC to make changes.");
   equipmentValid(db,d.equipment);
   Id entry=d.entry?d.entry:db.allocate("creature_template","entry",0x7fffff); Fields values;
@@ -108,8 +113,8 @@ Id CreatureService::save(Npc const& d, Position const& pos, Id* spawn) {
     copyRows(d.quests,"creature_involvedrelation","id");
   }
   db.snapshot("creator_content","entry",entry); db.mark("npc",entry);
-  if(!d.entry) {
-    auto guid=db.allocate("creature","guid",0xfffffffe); db.track(EntityType::Spawn,guid); db.snapshot("creature","guid",guid);
+  if(!d.entry && place) {
+    auto const& pos=*place; auto guid=db.allocate("creature","guid",0xfffffffe); db.track(EntityType::Spawn,guid); db.snapshot("creature","guid",guid);
     db.insert("creature",{{"guid",guid},{"id",entry},{"map",pos.map},{"position_x",pos.x},{"position_y",pos.y},{"position_z",pos.z},{"orientation",pos.orientation},{"spawntimesecsmin",d.respawn},{"spawntimesecsmax",d.respawn},{"movement_type",d.movement},{"wander_distance",d.movement==1?5:0}});
     db.snapshot("creator_content","entry",guid); db.mark("spawn",guid); if(spawn) *spawn=guid;
   }
@@ -183,54 +188,6 @@ void EquipmentService::saveOutfit(Outfit const& outfit) {
   saved.push_back(outfit); QJsonArray array;
   for(auto const& o:saved) array.append(QJsonObject{{"name",o.name},{"display",int(o.display)},{"equipment",QJsonArray{int(o.equipment[0]),int(o.equipment[1]),int(o.equipment[2])}}});
   QSaveFile file(outfitFile()); auto bytes=QJsonDocument(array).toJson(); require(file.open(QIODevice::WriteOnly)&&file.write(bytes)==bytes.size()&&file.commit(),"Cannot save the outfit.");
-}
-QVector<Choice> QuestService::search(QString const& text) {
-  Database db; return choices(db.query("SELECT entry,Title AS name FROM quest_template WHERE entry IN (SELECT entry FROM creator_content WHERE kind='quest') AND Title LIKE "+db.quote('%'+text+'%')+" ORDER BY Title LIMIT 250"));
-}
-Quest QuestService::load(Id entry) {
-  Database db; require(db.owned("quest",entry),"Only Creator quests can be edited here."); auto r=one(db,"quest_template",entry); Quest q;
-  q.entry=entry; q.title=r["Title"].toString(); q.description=r["Details"].toString(); q.completion=r["OfferRewardText"].toString();
-  q.level=r["QuestLevel"].toInt(); q.requiredLevel=r["MinLevel"].toInt(); q.xp=r["RewXP"].toInt(); q.money=r["RewOrReqMoney"].toInt();
-  for(auto table:{"creature_questrelation","creature_involvedrelation"}) { auto rows=db.query("SELECT id FROM "+QString(table)+" WHERE quest="+n(entry)); if(!rows.isEmpty()) (QString(table)=="creature_questrelation"?q.giver:q.ender)=rows[0]["id"].toUInt(); }
-  for(int i=1;i<=4;++i) { auto k=QString::number(i); if(r["ReqItemId"+k].toUInt()) q.objectives.push_back({Objective::Collect,r["ReqItemId"+k].toUInt(),r["ReqItemCount"+k].toInt(),r["ObjectiveText"+k].toString()}); else if(r["ReqCreatureOrGOId"+k].toUInt()) q.objectives.push_back({Objective::Kill,r["ReqCreatureOrGOId"+k].toUInt(),r["ReqCreatureOrGOCount"+k].toInt(),r["ObjectiveText"+k].toString()}); }
-  if(q.objectives.isEmpty()) q.objectives.push_back({Objective::Talk,q.ender,1,"Speak to the quest ender"}); return q;
-}
-Id QuestService::save(Quest const& q) {
-  require(!q.title.trimmed().isEmpty()&&q.title.size()<=255,"Enter a quest title of up to 255 characters.");
-  require(q.giver&&q.ender&&q.requiredLevel>=1&&q.level>=1&&q.level<=63&&q.requiredLevel<=q.level,"Choose a giver, an ender, and valid quest levels.");
-  require(q.xp>=0&&q.money>=0,"Rewards cannot be negative.");
-  require(!q.objectives.isEmpty()&&q.objectives.size()<=4,"Choose one to four objectives.");
-  Database db; if(q.entry) require(db.owned("quest",q.entry),"Only Creator quests can be changed.");
-  one(db,"creature_template",q.giver); one(db,"creature_template",q.ender);
-  Fields values{{"Title",q.title},{"Details",q.description},{"OfferRewardText",q.completion},{"MinLevel",q.requiredLevel},{"QuestLevel",q.level},{"RewXP",q.xp},{"RewOrReqMoney",q.money},{"Method",2}};
-  QStringList objectives;
-  for(int i=1;i<=4;++i) { auto k=QString::number(i); for(auto base:{"ReqItemId","ReqItemCount","ReqCreatureOrGOId","ReqCreatureOrGOCount","ReqSpellCast"}) values[QString(base)+k]=0; values["ObjectiveText"+k]=""; }
-  for(int i=0;i<q.objectives.size();++i) {
-    auto const& o=q.objectives[i]; require(o.target&&o.count>0&&o.count<=65535,"Select an objective target and a positive count.");
-    require(o.type!=Objective::Kill||o.count<=63,"Vanilla supports at most 63 kills per objective.");
-    auto target=one(db,o.type==Objective::Collect?"item_template":"creature_template",o.target);
-    auto k=QString::number(i+1); QString label;
-    if(o.type==Objective::Talk) { require(q.objectives.size()==1&&o.target==q.ender,"A Talk quest must have one objective, targeting its quest ender."); label="Speak to "+target["name"].toString(); }
-    else { QString base=o.type==Objective::Collect?"ReqItem":"ReqCreatureOrGO"; values[base+"Id"+k]=o.target; values[base+"Count"+k]=o.count; label=(o.type==Objective::Collect?"Collect ":"Defeat ")+QString::number(o.count)+" × "+target["name"].toString(); }
-    values["ObjectiveText"+k]=label; objectives<<label;
-  }
-  values["Objectives"]=objectives.join('\n');
-  auto entry=q.entry?q.entry:db.allocate("quest_template","entry"); db.track(EntityType::Quest,entry); db.snapshot("quest_template","entry",entry);
-  if(q.entry) update(db,"quest_template","entry",entry,values); else { values["entry"]=entry; db.insert("quest_template",values); }
-  for(auto table:{"creature_questrelation","creature_involvedrelation"}) {
-    db.snapshot(table,"quest",entry); db.exec("DELETE FROM "+QString(table)+" WHERE quest="+n(entry));
-    db.insert(table,{{"id",QString(table)=="creature_questrelation"?q.giver:q.ender},{"quest",entry}});
-  }
-  for(auto npc:{q.giver,q.ender}) { db.snapshot("creature_template","entry",npc); db.exec("UPDATE creature_template SET npc_flags=npc_flags|2 WHERE entry="+n(npc)); }
-  db.snapshot("creator_content","entry",entry); db.mark("quest",entry); db.commit(); return entry;
-}
-void QuestService::remove(Id entry) {
-  Database db; require(db.owned("quest",entry),"Only Creator quests can be deleted."); one(db,"quest_template",entry);
-  db.track(EntityType::Quest,entry);
-  for(auto table:{"creature_questrelation","creature_involvedrelation"}) { db.snapshot(table,"quest",entry); db.exec("DELETE FROM "+QString(table)+" WHERE quest="+n(entry)); }
-  db.snapshot("quest_template","entry",entry); db.exec("DELETE FROM quest_template WHERE entry="+n(entry));
-  db.snapshot("creator_content","entry",entry); db.exec("DELETE FROM creator_content WHERE kind='quest' AND entry="+n(entry));
-  db.commit();
 }
 QStringList AccountService::list() {
   Database db; QStringList names;

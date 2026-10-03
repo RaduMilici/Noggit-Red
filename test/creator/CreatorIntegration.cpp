@@ -1,6 +1,7 @@
 #include <noggit/creator/Services.hpp>
 #include <noggit/creator/Database.hpp>
 #include <noggit/creator/ChangeExport.hpp>
+#include <noggit/creator/ContentStore.hpp>
 #include <noggit/runtime/RuntimeManager.hpp>
 #include <QCoreApplication>
 #include <QFileInfo>
@@ -12,6 +13,7 @@
 #include <QTimer>
 #include <stdexcept>
 using namespace Noggit::Creator;
+namespace Q = Noggit::Quest;
 namespace {
 void check(bool condition, char const* message) { if(!condition) throw std::runtime_error(message); }
 QVector<Fields> query(QString const& sql) { Database db; return db.query(sql); }
@@ -38,29 +40,66 @@ void runChecks() {
   check(query("SELECT spawntimesecsmin FROM creature WHERE guid="+QString::number(guid))[0]["spawntimesecsmin"].toInt()==321,"Respawn edit was lost");
   position.x+=2; SpawnService::save({{guid,entry,position,321,false,false}});
   check(query("SELECT position_x FROM creature WHERE guid="+QString::number(guid))[0]["position_x"].toFloat()==position.x,"Movement was lost");
-  Quest quest; quest.title="Creator integration quest"; quest.giver=entry;quest.ender=second;quest.xp=100;quest.money=42;
-  quest.objectives={{Objective::Kill,entry,2,{}}}; auto questId=QuestService::save(quest);
+  // Quests: the ssh-tunnel editor's pure plans, written through ContentStore.
+  Layouts layouts;
+  auto data=loadQuest(layouts,0,loadQuestList(layouts));
+  QuestSaveRequest request; request.entry=data.next_entry;
+  auto& fields=request.content.fields;
+  fields.title="Creator integration quest"; fields.level=5; fields.min_level=1; fields.xp=100; fields.money=42;
+  Q::Target kill; kill.id=entry; kill.count=2; fields.targets=std::vector<Q::Target>{kill};
+  request.content.links.starters={{Q::Giver::Kind::Npc,entry}}; request.content.links.enders={{Q::Giver::Kind::Npc,second}};
+  Q::ScriptAction say; say.kind=Q::ScriptAction::Kind::Say; say.text="Welcome, O'Brien"; request.content.on_accept={say};
+  saveQuest(layouts,data,loadQuestList(layouts),request); auto questId=request.entry;
+  check(questId>=1000000&&!query("SELECT entry FROM creator_content WHERE kind='quest' AND entry="+QString::number(questId)).isEmpty(),"Quest was not created as Creator content");
+  check(query("SELECT npc_flags FROM creature_template WHERE entry="+QString::number(entry))[0]["npc_flags"].toUInt()&2,"Giver did not become a quest giver");
+  auto spoken=query("SELECT t.entry,t.male_text FROM quest_start_scripts s JOIN broadcast_text t ON t.entry=s.dataint WHERE s.id="+QString::number(questId)+" AND s.command=0");
+  check(!spoken.isEmpty()&&spoken[0]["entry"].toUInt()>=Q::OWN_TEXT_START&&spoken[0]["male_text"].toString()=="Welcome, O'Brien","Accept event was not written");
+  auto loaded=loadQuest(layouts,questId,loadQuestList(layouts));
+  check(loaded.content.fields.targets->at(0).id==entry&&loaded.content.fields.targets->at(0).count==2&&loaded.content.on_accept.at(0).text=="Welcome, O'Brien","Quest did not round-trip");
+  auto items=EquipmentService::search("",-1);check(!items.isEmpty(),"Seed has no items");
+  // A collect objective whose item a Creator NPC without loot drops for the quest: it gets its own loot table.
+  QuestSaveRequest edit=request; edit.mode=Q::SaveMode::Edit; edit.content=loaded.content;
+  Q::ItemCount collect; collect.id=items[0].id; collect.count=3; edit.content.fields.collect=std::vector<Q::ItemCount>{collect};
+  Q::QuestDrop drop; drop.source_entry=entry; drop.item=items[0].id; drop.chance=40; edit.content.drops={drop};
+  saveQuest(layouts,loaded,loadQuestList(layouts),edit);
+  check(query("SELECT loot_id FROM creature_template WHERE entry="+QString::number(entry))[0]["loot_id"].toUInt()==entry,"Drop source got no loot table");
+  check(!query("SELECT item FROM creature_loot_template WHERE entry="+QString::number(entry)+" AND item="+QString::number(items[0].id)+" AND ChanceOrQuestChance<0").isEmpty(),"Quest drop was not written");
+  // A save the plan refuses changes nothing.
+  auto refused=edit; refused.content.links.area_trigger=0; refused.content.prerequisites={{questId},Q::Prerequisites::Mode::Any};
+  bool selfRejected=false;
+  try { saveQuest(layouts,loadQuest(layouts,questId,loadQuestList(layouts)),loadQuestList(layouts),refused); } catch(std::exception const&) { selfRejected=true; }
+  check(selfRejected&&loadQuestList(layouts).quests.size()>0,"A quest depending on itself was accepted");
+  // Items made in Noggit: created, changed, and protected while a quest uses them.
+  auto itemData=loadItem(layouts,0); Noggit::Item::ItemFields itemFields; itemFields.name="Creator test pelt"; itemFields.quality=1;
+  auto itemId=createItem(layouts,itemData,itemFields);
+  check(itemId>=1000000&&!query("SELECT entry FROM creator_content WHERE kind='item' AND entry="+QString::number(itemId)).isEmpty(),"Item was not created as Creator content");
+  itemFields.name="Creator test pelt (renamed)"; updateItem(layouts,loadItem(layouts,itemId),itemId,itemFields);
+  check(query("SELECT name FROM item_template WHERE entry="+QString::number(itemId))[0]["name"].toString()=="Creator test pelt (renamed)","Item edit was lost");
+  auto rewarded=loadQuest(layouts,questId,loadQuestList(layouts)); auto reward=edit; reward.content=rewarded.content;
+  reward.content.fields.rewards=std::vector<Q::ItemCount>{{itemId,1}}; saveQuest(layouts,rewarded,loadQuestList(layouts),reward);
+  bool itemProtected=false;
+  try { deleteItem(layouts,loadItem(layouts,itemId),itemId); } catch(std::exception const&) { itemProtected=true; }
+  check(itemProtected,"An item a quest rewards was deleted");
+  // A follow-up quest: chain links are written on both quests.
+  auto followData=loadQuest(layouts,0,loadQuestList(layouts)); QuestSaveRequest follow; follow.entry=followData.next_entry;
+  follow.content.fields.title="Creator integration follow-up"; follow.content.fields.level=6; follow.content.fields.min_level=1;
+  follow.content.links.starters={{Q::Giver::Kind::Npc,second}}; follow.content.links.enders={{Q::Giver::Kind::Npc,second}};
+  follow.content.prerequisites={{questId},Q::Prerequisites::Mode::Any};
+  saveQuest(layouts,followData,loadQuestList(layouts),follow);
+  check(query("SELECT PrevQuestId FROM quest_template WHERE entry="+QString::number(follow.entry))[0]["PrevQuestId"].toUInt()==questId
+        &&query("SELECT NextQuestInChain FROM quest_template WHERE entry="+QString::number(questId))[0]["NextQuestInChain"].toUInt()==follow.entry,"Follow-up chain was not linked");
   Npc questCopy=CreatureService::load(entry);questCopy.entry=0;questCopy.source=entry;questCopy.quests=true;questCopy.name="Opt-in quest copy";
   auto copyEntry=CreatureService::save(questCopy,position);
   check(query("SELECT quest FROM creature_questrelation WHERE id="+QString::number(copyEntry))[0]["quest"].toUInt()==questId,"Opt-in quest relation was not copied");
-  auto loaded=QuestService::load(questId);check(loaded.giver==entry&&loaded.ender==second&&loaded.objectives[0].count==2&&loaded.xp==100,"Kill quest did not round-trip");
-  auto tooManyKills=loaded;tooManyKills.objectives[0].count=64;bool unsafeRejected=false;
-  try {QuestService::save(tooManyKills);}catch(std::exception const&){unsafeRejected=true;}
-  check(unsafeRejected,"Unsafe Vanilla kill count was accepted");
-  loaded.objectives={{Objective::Talk,second,1,{}}}; QuestService::save(loaded);
-  check(QuestService::load(questId).objectives[0].type==Objective::Talk,"Talk quest retained kill requirements");
-  auto items=EquipmentService::search("",-1);check(!items.isEmpty(),"Seed has no items");
-  loaded.objectives={{Objective::Collect,items[0].id,3,{}}};QuestService::save(loaded);
-  check(QuestService::load(questId).objectives[0].type==Objective::Collect,"Collect quest did not round-trip");
-  bool rejected=false;loaded.objectives[0].count=0;
-  try { QuestService::save(loaded); } catch(std::exception const&) {rejected=true;}
-  check(rejected&&QuestService::load(questId).objectives[0].count==3,"Invalid quest damaged the saved quest");
-  // Exercise rollback on the native MyISAM world table, not a mock transaction.
+  // Exercise rollback on the native MyISAM world tables, not a mock transaction.
   {
     Database db;db.snapshot("creature_template","entry",entry);
+    db.snapshotWhere("broadcast_text","entry>="+QString::number(Q::OWN_TEXT_START));
     db.exec("UPDATE creature_template SET name='Interrupted save' WHERE entry="+QString::number(entry));
+    db.exec("DELETE FROM broadcast_text WHERE entry>="+QString::number(Q::OWN_TEXT_START));
   }
   check(CreatureService::load(entry).name==npc.name,"Recovery journal failed to restore an unfinished save");
+  check(!query("SELECT entry FROM broadcast_text WHERE entry>="+QString::number(Q::OWN_TEXT_START)).isEmpty(),"Recovery journal failed to restore deleted rows");
   SpawnService::save({{secondGuid,second,position,120,true,false}});
   check(query("SELECT guid FROM creature WHERE guid="+QString::number(secondGuid)).isEmpty(),"Placement deletion failed");
 
@@ -70,18 +109,21 @@ void runChecks() {
   check(tracked(EntityType::Spawn,guid)&&tracked(EntityType::Spawn,guid)->action==ChangeAction::Create,"Moved new placement is not a creation");
   check(!tracked(EntityType::Spawn,secondGuid),"Created-then-deleted placement still listed");
   check(tracked(EntityType::Quest,questId)&&tracked(EntityType::Quest,questId)->action==ChangeAction::Create,"Quest creation not tracked");
+  check(tracked(EntityType::Quest,questId)->after.contains("quest_start_scripts")&&tracked(EntityType::Quest,questId)->after.contains("creature_loot_template"),"Quest events or drops not tracked");
+  check(tracked(EntityType::Item,itemId)&&tracked(EntityType::Item,itemId)->action==ChangeAction::Create,"Item creation not tracked");
   clearTracked();
   position.x+=3; SpawnService::save({{guid,entry,position,321,false,false}});
   check(tracked(EntityType::Spawn,guid)&&tracked(EntityType::Spawn,guid)->action==ChangeAction::Move,"Placement movement is not a move");
   check(ChangeTracker::instance()->changes().size()==1,"Unrelated entries tracked");
-  loaded=QuestService::load(questId); loaded.title="Creator integration quest (edited)"; QuestService::save(loaded);
+  auto current=loadQuest(layouts,questId,loadQuestList(layouts)); auto retitle=edit; retitle.content=current.content;
+  retitle.content.fields.title="Creator integration quest (edited)"; saveQuest(layouts,current,loadQuestList(layouts),retitle);
   check(tracked(EntityType::Quest,questId)->action==ChangeAction::Update,"Quest edit is not an update");
 
   // Export: the spawn's and quest's Creator NPCs travel with the package.
   QTemporaryDir out; check(out.isValid(),"No export folder");
   auto beforeExport=query("SELECT * FROM creature_template WHERE entry="+QString::number(entry));
   auto result=ExportService::exportChanges("Haunted Mill","Integration",out.path(),ChangeTracker::instance()->changes());
-  check(result.folder==out.path()+"/Haunted-Mill"&&result.changes==2&&result.dependencies>=2,"Unexpected export result");
+  check(result.folder==out.path()+"/Haunted-Mill"&&result.changes==2&&result.dependencies>=3,"Unexpected export result (NPCs, the rewarded item, the follow-up quest)");
   QFile manifestFile(result.folder+"/manifest.json"),sqlFile(result.folder+"/changes.sql");
   check(manifestFile.open(QIODevice::ReadOnly)&&sqlFile.open(QIODevice::ReadOnly),"Package files missing");
   auto manifest=QJsonDocument::fromJson(manifestFile.readAll()).object();
@@ -97,14 +139,22 @@ void runChecks() {
     for (auto const& line : script.split('\n')) if (!line.isEmpty() && !line.startsWith("--")) db.exec(line);
   }
   check(query("SELECT * FROM creature_template WHERE entry="+QString::number(entry))==beforeExport,"Replaying the package changed the NPC");
-  check(query("SELECT Title FROM quest_template WHERE entry="+QString::number(questId))[0]["Title"].toString()==loaded.title,"Replaying the package lost the quest");
+  check(query("SELECT Title FROM quest_template WHERE entry="+QString::number(questId))[0]["Title"].toString()=="Creator integration quest (edited)","Replaying the package lost the quest");
+  check(query("SELECT COUNT(*) AS n FROM quest_start_scripts WHERE id="+QString::number(questId))[0]["n"].toInt()==1,"Replaying the package duplicated the quest's events");
 
   // Deletions.
   bool blocked=false;
   try { CreatureService::remove(entry); } catch(std::exception const&) { blocked=true; }
   check(blocked&&!query("SELECT entry FROM creature_template WHERE entry="+QString::number(entry)).isEmpty(),"NPC used by a quest was deleted");
-  QuestService::remove(questId);
-  check(query("SELECT entry FROM quest_template WHERE entry="+QString::number(questId)).isEmpty(),"Quest deletion failed");
+  for (auto quest : {follow.entry,questId}) {
+    auto stored=loadQuest(layouts,quest,loadQuestList(layouts));
+    deleteQuest(layouts,stored,loadQuestList(layouts),quest,{});
+  }
+  check(query("SELECT entry FROM quest_template WHERE entry="+QString::number(questId)).isEmpty()
+        &&query("SELECT id FROM quest_start_scripts WHERE id="+QString::number(questId)).isEmpty()
+        &&query("SELECT item FROM creature_loot_template WHERE entry="+QString::number(entry)+" AND ChanceOrQuestChance<0").isEmpty(),"Quest deletion left rows behind");
+  deleteItem(layouts,loadItem(layouts,itemId),itemId);
+  check(query("SELECT entry FROM item_template WHERE entry="+QString::number(itemId)).isEmpty(),"Item deletion failed");
   check(tracked(EntityType::Quest,questId)->action==ChangeAction::Delete,"Quest deletion not tracked");
   CreatureService::remove(entry);
   check(query("SELECT guid FROM creature WHERE id="+QString::number(entry)).isEmpty()&&query("SELECT entry FROM creature_template WHERE entry="+QString::number(entry)).isEmpty(),"NPC deletion failed");

@@ -49,7 +49,7 @@ void exportChanges(QWidget* parent) {
   folder->setReadOnly(true); auto browse = new QPushButton("Browse…"); auto folderRow = new QHBoxLayout; folderRow->addWidget(folder, 1); folderRow->addWidget(browse);
   form->addRow("Save in", folderRow);
   auto preview = new QLabel; preview->setWordWrap(true); preview->setTextFormat(Qt::PlainText); layout->addWidget(preview);
-  auto note = new QLabel(QString("Exports %1 %2. Creator NPCs that these changes rely on are included automatically.")
+  auto note = new QLabel(QString("Exports %1 %2. NPCs, items and quests made in Noggit that these changes rely on are included automatically.")
     .arg(changes.size()).arg(changes.size() == 1 ? "change" : "changes"));
   note->setWordWrap(true); layout->addWidget(note);
   auto buttons = new QDialogButtonBox(QDialogButtonBox::Cancel); auto save = buttons->addButton("Export", QDialogButtonBox::AcceptRole);
@@ -76,7 +76,7 @@ void exportChanges(QWidget* parent) {
   settings.setValue("export/folder", folder->text());
   QMessageBox done(QMessageBox::Information, "Export Changes",
     QString("Exported %1 %2 to\n%3").arg(result.changes).arg(result.changes == 1 ? "change" : "changes").arg(QDir::toNativeSeparators(result.folder))
-      + (result.dependencies ? QString("\n\n%1 Creator NPC %2 they rely on %3 included.").arg(result.dependencies).arg(result.dependencies == 1 ? "definition" : "definitions").arg(result.dependencies == 1 ? "was" : "were") : QString()),
+      + (result.dependencies ? QString("\n\n%1 NPC, item or quest %2 they rely on %3 included.").arg(result.dependencies).arg(result.dependencies == 1 ? "definition" : "definitions").arg(result.dependencies == 1 ? "was" : "were") : QString()),
     QMessageBox::Close, parent);
   auto open = done.addButton("Open Folder", QMessageBox::ActionRole);
   auto clear = done.addButton("Clear Exported Entries…", QMessageBox::ActionRole);

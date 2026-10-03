@@ -1,5 +1,9 @@
 #include <noggit/creator/TestSessionService.hpp>
 #include <noggit/creator/AuthoringDialogs.hpp>
+#include <noggit/ui/content/ContentSession.hpp>
+#include <noggit/ui/quest/QuestBrowserDialog.hpp>
+#include <noggit/ui/quest/QuestChainDialog.hpp>
+#include <noggit/creator/NpcStudio.hpp>
 #include <noggit/runtime/RuntimeManager.hpp>
 // This file is part of Noggit3, licensed under GNU General Public License (version 3).
 #include <noggit/rendering/vulkan/VkParticleFeed.hpp>
@@ -1285,6 +1289,12 @@ void MapView::set_editing_mode(editing_mode mode)
         break;
       case editing_mode::creature:
         _show_creature_browser.set(true);
+        if (qApp->property("creatorRuntimeManaged").toBool())
+        {
+          try { _creator_npcs = Noggit::Creator::CreatureService::ownedEntries(); }
+          catch (std::exception const&) { /* the local database is not running yet */ }
+          refreshStudio();
+        }
         if (!_world->hasCreatureSpawnsLoaded())
         {
           _world->reloadCreatureSpawns();
@@ -1307,6 +1317,10 @@ void MapView::set_editing_mode(editing_mode mode)
   MoveObj = false;
   _world->reset_selection();
   _rotation_editor_need_update = true;
+  if (_world_pick)
+  {
+    endWorldPick();
+  }
 
   if (!ui_hidden)
   {
@@ -2420,10 +2434,6 @@ void MapView::setupCreatureActionsUi()
 void MapView::setupCreatureModelPickerUi()
 {
   _creature_model_picker_dock = new QDockWidget("NPC Model Picker", _main_window);
-  // Creator authors through the named-look dialog; the legacy picker exposes raw identifiers.
-  connect(_creature_model_picker_dock, &QDockWidget::visibilityChanged, this, [this](bool visible) {
-    if (visible && qApp->property("creatorRuntimeManaged").toBool()) _creature_model_picker_dock->hide();
-  });
   _creature_model_picker_dock->setFeatures(QDockWidget::DockWidgetMovable
                                            | QDockWidget::DockWidgetFloatable
                                            | QDockWidget::DockWidgetClosable);
@@ -2462,6 +2472,11 @@ void MapView::setupCreatureModelPickerUi()
   filter_layout->addWidget(boss_only);
   filter_layout->addWidget(civilian_only);
   filter_layout->addWidget(trainer_only);
+  bool const creator = qApp->property("creatorRuntimeManaged").toBool();
+  auto mine_only = new QCheckBox("Only my NPCs", filter_panel);
+  mine_only->setToolTip("Show only NPCs made in Noggit (shown in bold).");
+  mine_only->setVisible(creator);
+  filter_layout->addWidget(mine_only);
   filter_layout->addStretch();
 
   auto splitter = new QSplitter(Qt::Horizontal, container);
@@ -2692,6 +2707,44 @@ void MapView::setupCreatureModelPickerUi()
   splitter->setSizes({380, 130, 520, 520, 240});
   root_layout->addWidget(splitter, 1);
 
+  // Creator: the NPC card replaces the raw GUID / entry / display form.
+  if (creator)
+  {
+    using Noggit::Creator::NpcKind;
+    Noggit::Creator::NpcStudio::Actions actions;
+    actions.newHumanoid = [this] { studioCreate(NpcKind::Humanoid); };
+    actions.newCreature = [this] { studioCreate(NpcKind::Creature); };
+    actions.clone = [this] { studioCreate(NpcKind::Clone); };
+    actions.edit = [this] { studioEdit(); };
+    actions.place = [this] { if (_studio_entry) studioPlace(*_studio_entry); };
+    actions.quests = [this] { if (_studio_entry && prepareCreatorChange()) { openQuests(*_studio_entry); reloadCreatorContent(_selected_creature_spawn_guid); refreshStudio(); } };
+    actions.chain = [this] { if (_studio_entry) openQuestChain(*_studio_entry); };
+    actions.testAtNpc = [this] { studioTestAtNpc(); };
+    actions.testAtSpot = [this]
+    {
+      beginWorldPick("Click where you want to start testing", [this](glm::vec3 const& position)
+      {
+        if (auto* tests = Noggit::Creator::TestSessionService::instance())
+        {
+          tests->testHere(this, serverPosition(position, _camera.yaw()._));
+        }
+      });
+    };
+    actions.duplicatePlacement = [this] { studioDuplicatePlacement(); };
+    actions.deletePlacement = [this] { studioRemovePlacement(); };
+    actions.locatePlacement = [this]
+    {
+      if (auto const* spawn = _selected_creature_spawn_guid ? _world->findCreatureSpawn(*_selected_creature_spawn_guid) : nullptr)
+      {
+        focus_camera_on_target(spawn->pos);
+      }
+    };
+    _npc_studio = new Noggit::Creator::NpcStudio(std::move(actions), splitter);
+    splitter->insertWidget(splitter->indexOf(spawn_box), _npc_studio);
+    spawn_box->hide();
+    refreshStudio();
+  }
+
   // Extended-field change handlers: edits write through to the SELECTED spawn (marking it dirty for
   // the SQL export); while authoring a New spawn the values are captured by Add Pending Spawn.
   auto on_ext_changed = [this]()
@@ -2806,7 +2859,7 @@ void MapView::setupCreatureModelPickerUi()
   // CreatureDisplayInfo.CreatureModelScale (D), the object-scale fallback used when
   // creature_template.scale is 0 (server ObjectMgr.cpp:1436). Final render = (template.scale or D) * M.
   // D is a fallback, NOT an extra multiplier -- do not fold it into model_scale.
-  auto resolve_display_model = [&](std::uint32_t display_id,
+  auto resolve_display_model = [normalize_picker_path](std::uint32_t display_id,
                                    std::uint32_t& model_id,
                                    std::string& model_path,
                                    float& model_scale,
@@ -2836,9 +2889,14 @@ void MapView::setupCreatureModelPickerUi()
 
   auto template_entries = std::make_shared<std::vector<TemplatePickerEntry>>();
 
+  auto template_error = std::make_shared<std::string>();
+  // Reloaded after Creator makes, edits or deletes an NPC, so the list always shows them.
+  auto load_templates = [=]()
+  {
+    template_entries->clear();
 #ifdef USE_MYSQL_UID_STORAGE
-  std::string template_error;
-  auto records = mysql::getCreatureTemplates(25000, &template_error);
+  template_error->clear();
+  auto records = mysql::getCreatureTemplates(200000, template_error.get());
   template_entries->reserve(records.size());
   for (auto const& record : records)
   {
@@ -2870,8 +2928,10 @@ void MapView::setupCreatureModelPickerUi()
     template_entries->push_back(std::move(entry));
   }
 #else
-  std::string template_error = "Build does not include MySQL support.";
+  *template_error = "Build does not include MySQL support.";
 #endif
+  };
+  load_templates();
 
   // Populate the type dropdown with every distinct creature type present in the loaded list.
   {
@@ -2962,6 +3022,10 @@ void MapView::setupCreatureModelPickerUi()
     {
       return false;
     }
+    if (mine_only->isChecked() && !_creator_npcs.contains(entry.entry))
+    {
+      return false;
+    }
     return true;
   };
 
@@ -2992,6 +3056,12 @@ void MapView::setupCreatureModelPickerUi()
       {
         row->setForeground(0, QColor(135, 135, 135));
       }
+      if (_creator_npcs.contains(entry.entry))
+      {
+        QFont font = row->font(0);
+        font.setBold(true);
+        row->setFont(0, font);
+      }
     }
 
     _creature_model_tree->sortItems(0, Qt::AscendingOrder);
@@ -3002,9 +3072,9 @@ void MapView::setupCreatureModelPickerUi()
                           .arg(visible_count)
                           .arg(visible_count == 1 ? "y" : "ies")
                           .arg(previewable_count);
-      if (!template_error.empty())
+      if (!template_error->empty())
       {
-        message = QString("Template load failed: %1").arg(QString::fromStdString(template_error));
+        message = QString("Template load failed: %1").arg(QString::fromStdString(*template_error));
       }
       _creature_model_picker_status->setText(message);
     }
@@ -3038,6 +3108,7 @@ void MapView::setupCreatureModelPickerUi()
     }
 
     *selected_template = *found;
+    showStudioNpc(found->entry, QString::fromStdString(found->name));
     guid_field->setText(QString::number(suggested_guid()));
     entry_field->setText(QString::number(found->entry));
     display_field->setText(QString::number(found->display_id));
@@ -3211,11 +3282,31 @@ void MapView::setupCreatureModelPickerUi()
   connect(boss_only, &QCheckBox::stateChanged, rebuild_template_tree);
   connect(civilian_only, &QCheckBox::stateChanged, rebuild_template_tree);
   connect(trainer_only, &QCheckBox::stateChanged, rebuild_template_tree);
+  connect(mine_only, &QCheckBox::stateChanged, rebuild_template_tree);
   connect(search_box, &QLineEdit::textChanged, rebuild_template_tree);
   connect(add_button, &QPushButton::clicked, add_pending_spawn);
-  preview->on_double_click = add_pending_spawn;
+  // Double-clicking the preview places the NPC (Creator: only NPCs made in Noggit can be placed).
+  preview->on_double_click = creator ? std::function<void()>([this] { if (_studio_entry && _creator_npcs.contains(*_studio_entry)) studioPlace(*_studio_entry); })
+                                     : std::function<void()>(add_pending_spawn);
 
   rebuild_template_tree();
+
+  _reload_creature_picker = [=](std::optional<std::uint32_t> select)
+  {
+    load_templates();
+    rebuild_template_tree();
+    if (!select)
+    {
+      return;
+    }
+    select_template_entry(*select);
+    auto const rows = _creature_model_tree->findItems(QString("%1 - ").arg(*select), Qt::MatchStartsWith);
+    if (!rows.isEmpty())
+    {
+      _creature_model_tree->setCurrentItem(rows.front());
+      _creature_model_tree->scrollToItem(rows.front());
+    }
+  };
 
   _creature_model_picker_dock->setWidget(container);
   _main_window->addDockWidget(Qt::BottomDockWidgetArea, _creature_model_picker_dock);
@@ -6067,6 +6158,15 @@ std::size_t MapView::selectedCreatureSpawnCount() const
 
 void MapView::setSelectedCreatureSpawn(std::optional<std::uint32_t> guid, bool update_browser)
 {
+  // The NPC card follows the world selection.
+  if (_npc_studio && guid)
+  {
+    if (auto const* spawn = _world->findCreatureSpawn(*guid))
+    {
+      _studio_entry = spawn->entry;
+      _studio_name = QString::fromStdString(spawn->name);
+    }
+  }
   _selected_creature_spawn_guid = guid;
 
   // Collect the spawns whose selected flag actually flips: their row text carries a "[selected]"
@@ -6116,6 +6216,7 @@ void MapView::setSelectedCreatureSpawn(std::optional<std::uint32_t> guid, bool u
   }
 
   refreshCreatureEditorKnobs();
+  refreshStudio();
 }
 
 void MapView::addCreatureSpawnToSelection(std::uint32_t guid, bool update_browser)
@@ -7053,40 +7154,6 @@ void MapView::showSelectedCreatureSpawnMenu(QPoint const& global_pos)
     return;
   }
 
-  if (qApp->property("creatorRuntimeManaged").toBool())
-  {
-    QMenu menu(this);
-    menu.addAction(QString::fromStdString(spawn->name))->setEnabled(false);
-    auto edit = menu.addAction("Edit NPC properties");
-    auto quest = menu.addAction("Create / Edit Quest");
-    auto testNpc = menu.addAction("Test NPC");
-    auto duplicate = menu.addAction("Duplicate placement");
-    auto remove = menu.addAction("Delete placement");
-    auto locate = menu.addAction("Locate NPC");
-    auto save = menu.addAction("Save NPC placements");
-    // Copy before any service operation refreshes the world's spawn vector.
-    auto guid=spawn->guid, entry=spawn->entry;
-    auto position=spawn->pos;
-    auto p=client_to_server_creature_position(position, _world->mapIndex.hasAGlobalWMO());
-    Noggit::Creator::Position server{static_cast<unsigned>(_world->getMapID()),p.x,p.y,p.z,client_to_server_creature_orientation(spawn->orientation)};
-    auto chosen=menu.exec(global_pos);
-    if(chosen==locate) focus_camera_on_target(position);
-    else if(chosen==testNpc) { if(auto session=Noggit::Creator::TestSessionService::instance()) session->testNpc(this,server); }
-    else if(chosen==save) saveDirtyCreatureSpawns();
-    else if(chosen==remove) { deleteSelectedCreatureSpawns(); }
-    else if(chosen==edit && prepareCreatorChange()) {
-      if(Noggit::Creator::editNpc(this,_world.get(),entry,server)) reloadCreatorContent(guid);
-    }
-    else if(chosen==quest && prepareCreatorChange()) {
-      if(Noggit::Creator::editQuest(this,entry)) reloadCreatorContent(guid);
-    }
-    else if(chosen==duplicate && prepareCreatorChange()) {
-      try { auto ids=Noggit::Creator::SpawnService::save({{0,entry,server,120,false,true}});reloadCreatorContent(ids[0]); }
-      catch(std::exception const& e) { QMessageBox::warning(this,"Duplicate NPC",e.what()); }
-    }
-    return;
-  }
-
   QMenu menu(this);
   menu.addAction(QString("NPC: %1").arg(QString::fromStdString(spawn->name.empty() ? std::string("<unnamed>") : spawn->name)))->setEnabled(false);
   menu.addAction(QString("Unique ID: %1").arg(spawn->guid))->setEnabled(false);
@@ -7635,6 +7702,299 @@ void MapView::reloadCreatorContent(std::optional<std::uint32_t> select)
     setSelectedCreatureSpawn(select);
   updateDatabaseStatus();
   _needs_redraw = true;
+}
+
+std::unique_ptr<Noggit::Ui::Content::ContentSession> MapView::openContentSession()
+{
+  auto session = Noggit::Ui::Content::ContentSession::open(this);
+  if (session)
+  {
+    // "Nearest to my cursor" and summon positions: the last world position under the cursor.
+    session->cursor_position = [this]() -> std::optional<Noggit::Ui::Content::WorldPosition>
+    {
+      auto const server = client_to_server_creature_position(_cursor_pos, _world->mapIndex.hasAGlobalWMO());
+      return Noggit::Ui::Content::WorldPosition{static_cast<std::uint32_t>(_world->getMapID()), server.x, server.y,
+                                                server.z, client_to_server_creature_orientation(_camera.yaw()._)};
+    };
+  }
+  return session;
+}
+
+void MapView::openQuestChain(std::uint32_t npc)
+{
+  auto session = openContentSession();
+  if (!session)
+  {
+    return;
+  }
+  // The chain the NPC's first quest is in (quests it gives first, then ones it takes).
+  std::uint32_t quest = 0;
+  for (bool starts : {true, false})
+  {
+    for (auto const& link : session->quests().links)
+    {
+      if (!quest && link.starts == starts && link.giver.kind == Noggit::Quest::Giver::Kind::Npc && link.giver.entry == npc)
+      {
+        quest = link.quest;
+      }
+    }
+  }
+  if (!quest)
+  {
+    QMessageBox::information(this, "Quest chain", QString("%1 has no quests yet. Use Quests to make one.").arg(_studio_name));
+    return;
+  }
+  Noggit::Ui::Quest::QuestChainDialog chain(*session, quest, this);
+  chain.exec();
+  refreshStudio();
+}
+
+Noggit::Creator::Position MapView::serverPosition(glm::vec3 const& position, float client_orientation) const
+{
+  auto const p = client_to_server_creature_position(position, _world->mapIndex.hasAGlobalWMO());
+  return {static_cast<unsigned>(_world->getMapID()), p.x, p.y, p.z, client_to_server_creature_orientation(client_orientation)};
+}
+
+void MapView::beginWorldPick(QString const& hint, std::function<void(glm::vec3 const&)> done)
+{
+  _world_pick = std::move(done);
+  if (!_world_pick_hint)
+  {
+    _world_pick_hint = new QLabel(this);
+    _world_pick_hint->setAttribute(Qt::WA_TransparentForMouseEvents);
+    _world_pick_hint->setStyleSheet("background: rgba(20, 24, 32, 215); color: white; border-radius: 8px;"
+                                    "padding: 8px 16px; font-size: 11pt; font-weight: bold;");
+  }
+  _world_pick_hint->setText(hint + "     Esc cancels");
+  _world_pick_hint->adjustSize();
+  _world_pick_hint->move((width() - _world_pick_hint->width()) / 2, 48);
+  _world_pick_hint->show();
+  _world_pick_hint->raise();
+  setCursor(Qt::CrossCursor);
+  setFocus();
+}
+
+void MapView::endWorldPick()
+{
+  _world_pick = nullptr;
+  if (_world_pick_hint)
+  {
+    _world_pick_hint->hide();
+  }
+  unsetCursor();
+}
+
+void MapView::showStudioNpc(std::uint32_t entry, QString const& name)
+{
+  _studio_entry = entry;
+  _studio_name = name;
+  refreshStudio();
+}
+
+void MapView::refreshStudio()
+{
+  if (!_npc_studio)
+  {
+    return;
+  }
+  if (!_studio_entry)
+  {
+    _npc_studio->setNpc(std::nullopt);
+  }
+  else
+  {
+    auto const& spawns = _world->creatureSpawns();
+    auto const placements = std::count_if(spawns.begin(), spawns.end(), [&](auto const& spawn) { return spawn.entry == *_studio_entry; });
+    // "Humanoid · Elite · Quest giver, Vendor · 2 placements here"
+    QStringList details;
+    if (auto const info = _creature_template_filter_info.find(*_studio_entry); info != _creature_template_filter_info.end())
+    {
+      auto const& npc = info->second;
+      if (npc.creature_type)
+      {
+        details << creature_type_label(npc.creature_type);
+      }
+      QStringList const ranks{"", "Elite", "Rare elite", "Boss", "Rare"};
+      if (npc.rank && npc.rank < static_cast<std::uint32_t>(ranks.size()))
+      {
+        details << ranks[npc.rank];
+      }
+      QStringList roles;
+      for (auto const& [flag, role] : std::initializer_list<std::pair<std::uint32_t, char const*>>{
+             {0x2u, "Quest giver"}, {0x4u, "Vendor"}, {0x10u, "Trainer"}, {0x1u, "Gossip"}})
+      {
+        if (npc.npc_flags & flag)
+        {
+          roles << role;
+        }
+      }
+      if (!roles.isEmpty())
+      {
+        details << roles.join(", ");
+      }
+    }
+    details << (placements ? QString("%1 placement%2 here").arg(placements).arg(placements == 1 ? "" : "s") : QString("Not placed here"));
+    details << QString("#%1").arg(*_studio_entry);
+    _npc_studio->setNpc(Noggit::Creator::NpcStudio::Npc{*_studio_entry, _studio_name, details.join("  ·  "),
+                                                        _creator_npcs.contains(*_studio_entry), placements > 0});
+  }
+  auto const* selected = _selected_creature_spawn_guid ? _world->findCreatureSpawn(*_selected_creature_spawn_guid) : nullptr;
+  _npc_studio->setPlacement(selected ? std::optional<std::uint32_t>(selected->guid) : std::nullopt);
+}
+
+void MapView::studioCreate(Noggit::Creator::NpcKind kind)
+{
+  if (!prepareCreatorChange())
+  {
+    return;
+  }
+  auto const source = kind == Noggit::Creator::NpcKind::Clone && _studio_entry ? *_studio_entry : 0u;
+  auto const entry = Noggit::Creator::createNpc(this, _world.get(), kind, source);
+  if (!entry)
+  {
+    return;
+  }
+  _creator_npcs.insert(*entry);
+  if (_reload_creature_picker)
+  {
+    _reload_creature_picker(*entry); // lists and selects it, filling the NPC card
+  }
+  studioPlace(*entry);
+}
+
+void MapView::studioEdit()
+{
+  if (!_studio_entry || !prepareCreatorChange())
+  {
+    return;
+  }
+  auto const entry = *_studio_entry;
+  if (!Noggit::Creator::editNpc(this, _world.get(), entry))
+  {
+    return;
+  }
+  bool const deleted = [&]
+  {
+    try { Noggit::Creator::CreatureService::load(entry); return false; }
+    catch (std::exception const&) { return true; }
+  }();
+  if (deleted)
+  {
+    _creator_npcs.remove(entry);
+    _studio_entry.reset();
+  }
+  reloadCreatorContent();
+  if (_reload_creature_picker)
+  {
+    _reload_creature_picker(deleted ? std::nullopt : std::optional<std::uint32_t>(entry));
+  }
+  refreshStudio();
+}
+
+void MapView::studioPlace(std::uint32_t entry)
+{
+  beginWorldPick(QString("Click where %1 should stand").arg(_studio_entry == entry ? _studio_name : QString("the NPC")),
+                 [this, entry](glm::vec3 const& position)
+  {
+    if (!prepareCreatorChange())
+    {
+      return;
+    }
+    try
+    {
+      auto const npc = Noggit::Creator::CreatureService::load(entry);
+      // Facing the camera, so the new NPC greets whoever placed it.
+      auto const ids = Noggit::Creator::SpawnService::save(
+        {{0, entry, serverPosition(position, _camera.yaw()._ + 180.0f), npc.respawn, false, true}});
+      reloadCreatorContent(ids.value(0));
+      refreshStudio();
+      _main_window->statusBar()->showMessage(QString("%1 placed. Use Test to see it in game.").arg(npc.name), 6000);
+    }
+    catch (std::exception const& e)
+    {
+      QMessageBox::warning(this, "Place NPC", e.what());
+    }
+  });
+}
+
+void MapView::studioTestAtNpc()
+{
+  auto* tests = Noggit::Creator::TestSessionService::instance();
+  if (!tests || !_studio_entry)
+  {
+    return;
+  }
+  // The selected placement of this NPC, else its first one in the loaded world.
+  World::CreatureSpawnOverlay const* spawn = _selected_creature_spawn_guid ? _world->findCreatureSpawn(*_selected_creature_spawn_guid) : nullptr;
+  if (!spawn || spawn->entry != *_studio_entry)
+  {
+    spawn = nullptr;
+    for (auto const& candidate : _world->creatureSpawns())
+    {
+      if (candidate.entry == *_studio_entry)
+      {
+        spawn = &candidate;
+        break;
+      }
+    }
+  }
+  if (spawn)
+  {
+    tests->testNpc(this, serverPosition(spawn->pos, spawn->orientation));
+  }
+}
+
+void MapView::studioDuplicatePlacement()
+{
+  auto const* spawn = _selected_creature_spawn_guid ? _world->findCreatureSpawn(*_selected_creature_spawn_guid) : nullptr;
+  if (!spawn)
+  {
+    return;
+  }
+  auto const entry = spawn->entry;
+  auto const respawn = static_cast<int>(spawn->ext.spawntimesecs_min);
+  auto const orientation = spawn->orientation;
+  beginWorldPick(QString("Click where the copy of %1 should stand").arg(QString::fromStdString(spawn->name)),
+                 [this, entry, respawn, orientation](glm::vec3 const& position)
+  {
+    if (!prepareCreatorChange())
+    {
+      return;
+    }
+    try
+    {
+      auto const ids = Noggit::Creator::SpawnService::save({{0, entry, serverPosition(position, orientation), respawn, false, true}});
+      reloadCreatorContent(ids.value(0));
+      refreshStudio();
+    }
+    catch (std::exception const& e)
+    {
+      QMessageBox::warning(this, "Duplicate placement", e.what());
+    }
+  });
+}
+
+void MapView::studioRemovePlacement()
+{
+  auto const* spawn = _selected_creature_spawn_guid ? _world->findCreatureSpawn(*_selected_creature_spawn_guid) : nullptr;
+  if (!spawn || QMessageBox::question(this, "Remove placement",
+        QString("Remove this placement of %1 from the world? The NPC itself is kept.").arg(QString::fromStdString(spawn->name)),
+        QMessageBox::Yes | QMessageBox::No, QMessageBox::No) != QMessageBox::Yes)
+  {
+    return;
+  }
+  deleteSelectedCreatureSpawns();
+  saveDirtyCreatureSpawns();
+  refreshStudio();
+}
+
+void MapView::openQuests(std::uint32_t focus_npc)
+{
+  if (auto session = openContentSession())
+  {
+    Noggit::Ui::Quest::QuestBrowserDialog browser(*session, focus_npc, this);
+    browser.exec();
+  }
 }
 
 void MapView::saveDirtyCreatureSpawns()
@@ -9857,7 +10217,9 @@ MapView::MapView( math::degrees camera_yaw0
       , [=] { _main_window->statusBar()->removeWidget(_status_database); }
   );
 
-  setContextMenuPolicy(Qt::CustomContextMenu);
+  // The context menu opens on right-button RELEASE without a drag (mouseReleaseEvent): Qt's default opens
+  // it on press on Linux, which swallowed every right-drag camera turn.
+  setContextMenuPolicy(Qt::PreventContextMenu);
 
   if (auto runtime = Noggit::Runtime::RuntimeManager::instance())
     connect(runtime, &Noggit::Runtime::RuntimeManager::beforeLocalTest, this, [this](bool* proceed)
@@ -9866,8 +10228,6 @@ MapView::MapView( math::degrees camera_yaw0
       if (_world->dirtyCreatureSpawnCount()) *proceed = false;
     }, Qt::DirectConnection);
 
-  connect(this, SIGNAL(customContextMenuRequested(const QPoint&)),
-      this, SLOT(ShowContextMenu(const QPoint&)));
 
   moving = strafing = updown = lookat = turn = 0.0f;
 
@@ -17884,6 +18244,12 @@ bool MapView::eventFilter(QObject* obj, QEvent* e)
 
 void MapView::keyPressEvent (QKeyEvent *event)
 {
+  if (_world_pick && event->key() == Qt::Key_Escape)
+  {
+    endWorldPick();
+    return;
+  }
+
   // Creature / GameObject tools: X raises, Z lowers the selected spawn(s). Handled before the hotkey
   // loop so X/Z don't trigger their menu shortcuts (e.g. texture browser) while editing spawns.
   // PLAIN key (or Shift for the coarse step) only -- Ctrl/Alt/Meta combos fall through so Ctrl+Z /
@@ -18271,6 +18637,10 @@ void MapView::mouseMoveEvent (QMouseEvent* event)
   makeCurrent();
   OpenGL::context::scoped_setter const _ (::gl, context());
   QLineF const relative_movement (_last_mouse_pos, event->pos());
+  if (rightMouse)
+  {
+    _right_drag_travel += static_cast<int>(std::abs(relative_movement.dx()) + std::abs(relative_movement.dy()));
+  }
 
   // [game mode] LMB orbit: rotate the VIEW around the character; facing untouched. Same drag feel
   // as the RMB look (matching signs of add_to_yaw/add_to_pitch, which subtract their argument).
@@ -18671,6 +19041,19 @@ void MapView::mousePressEvent(QMouseEvent* event)
     }
   }
 
+  // A pending "click in the world" (place an NPC, test at a spot) takes the next left click.
+  if (_world_pick && event->button() == Qt::LeftButton)
+  {
+    _last_mouse_pos = event->pos();
+    if (auto const hit = surface_pos_under_cursor())
+    {
+      auto const done = std::move(_world_pick);
+      endWorldPick();
+      done(*hit);
+    }
+    return;
+  }
+
   switch (event->button())
   {
   case Qt::LeftButton:
@@ -18746,6 +19129,7 @@ void MapView::mousePressEvent(QMouseEvent* event)
   if (rightMouse)
   {
     _right_click_pos = event->pos();
+    _right_drag_travel = 0;
     look = true;
   }
 }
@@ -19043,13 +19427,7 @@ void MapView::mouseReleaseEvent (QMouseEvent* event)
     if (_display_mode == display_mode::in_2D)
       updown = 0;
 
-    // // may need to be done in constructor of widget
-    // this->setContextMenuPolicy(Qt::CustomContextMenu); 
-    // connect(this, SIGNAL(customContextMenuRequested(const QPoint&)),
-    //     this, SLOT(ShowContextMenu(const QPoint&)));
-
-
-
+    ShowContextMenu(event->pos());
     break;
 
   case Qt::MiddleButton:
@@ -19282,81 +19660,20 @@ void MapView::onSettingsSave()
 void MapView::ShowContextMenu(QPoint pos) 
 {
     // QApplication::startDragDistance() is 10
-    auto mouse_moved = QApplication::startDragDistance() < (_right_click_pos - pos).manhattanLength();;
+    auto mouse_moved = QApplication::startDragDistance() < std::max(_right_drag_travel, (_right_click_pos - pos).manhattanLength());
 
     // don't show context menu if dragging mouse
     if (mouse_moved || ImGuizmo::IsUsing())
         return;
 
-    // Right-clicking a spawn in its editor opens that spawn's menu (edit, quest, test, duplicate...).
-    if (terrainMode == editing_mode::creature || terrainMode == editing_mode::gameobject)
-    {
-      std::optional<std::uint32_t> guid;
-      {
-        // The pick ray-casts animated models, which needs the GL context outside paintGL.
-        makeCurrent();
-        OpenGL::context::scoped_setter const _(::gl, context());
-        _last_mouse_pos = pos;
-        guid = terrainMode == editing_mode::creature ? findCreatureSpawnAtCursor() : findGameObjectSpawnAtCursor();
-      }
-      if (guid)
-      {
-        if (terrainMode == editing_mode::creature)
-        {
-          setSelectedCreatureSpawn(guid);
-          showSelectedCreatureSpawnMenu(mapToGlobal(pos));
-        }
-        else
-        {
-          setSelectedGameObjectSpawn(guid);
-          showSelectedGameObjectSpawnMenu(mapToGlobal(pos));
-        }
+    // Only object editing has a context menu; NPC and gameobject work happens in their panels.
+    if (terrainMode != editing_mode::object)
         return;
-      }
-    }
 
     // TODO : build the menu only once, store it and instead use setVisible ?
 
     QMenu* menu = new QMenu(this);
     menu->setAttribute(Qt::WA_DeleteOnClose);
-
-    if (Noggit::Project::CurrentProject::get()->projectVersion == Noggit::Project::ProjectVersion::CLASSIC)
-    {
-      // Picking animates M2s, which uploads bone matrices: this slot runs outside paintGL,
-      // so the GL context must be made current here or the pick throws.
-      std::optional<glm::vec3> hit;
-      {
-        makeCurrent();
-        OpenGL::context::scoped_setter const _(::gl, context());
-        hit = surface_pos_under_cursor();
-      }
-      auto testHere = menu->addAction("Test Here");
-      testHere->setEnabled(hit.has_value() && qApp->property("creatorRuntimeManaged").toBool());
-      connect(testHere,&QAction::triggered,this,[this,hit] {
-        if(!hit)return;
-        auto p=client_to_server_creature_position(*hit,_world->mapIndex.hasAGlobalWMO());
-        if(auto session=Noggit::Creator::TestSessionService::instance())
-          session->testHere(this,{static_cast<unsigned>(_world->getMapID()),p.x,p.y,p.z,client_to_server_creature_orientation(_camera.yaw()._)});
-      });
-      auto create = menu->addMenu("Create");
-      auto npc = create->addAction("NPC");
-      npc->setEnabled(hit.has_value());
-      connect(npc, &QAction::triggered, this, [this, hit]
-      {
-        if (!hit || !prepareCreatorChange()) return;
-        auto p = client_to_server_creature_position(*hit, _world->mapIndex.hasAGlobalWMO());
-        Noggit::Creator::Id guid = 0;
-        if (Noggit::Creator::createNpc(this, _world.get(),
-            {static_cast<unsigned>(_world->getMapID()), p.x, p.y, p.z, 0.f}, &guid))
-        {
-          set_editing_mode(editing_mode::creature);
-          reloadCreatorContent(guid);
-        }
-      });
-      connect(create->addAction("Quest"), &QAction::triggered, this, [this]
-      { if (prepareCreatorChange() && Noggit::Creator::editQuest(this)) reloadCreatorContent(); });
-      menu->addSeparator();
-    }
 
     // Undo
     QAction action_undo("Undo", this);
@@ -19771,10 +20088,5 @@ void MapView::ShowContextMenu(QPoint pos)
 
         menu->exec(mapToGlobal(pos)); // synch
         // menu->popup(mapToGlobal(pos)); // asynch, needs to be preloaded to work
-    }
-    else
-    {
-        // Other modes still offer the Creator actions and Undo/Redo built above.
-        menu->exec(mapToGlobal(pos));
     }
 }

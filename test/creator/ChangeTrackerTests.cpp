@@ -87,9 +87,46 @@ void sql() {
   check(!text.contains("creature_questrelation WHERE id=1000000;"), "NPC export touches Creator quest relations");
 }
 }
+// Quests carry their scripts, spoken lines, drops and start item; what an edit removes is removed on import.
+void questContentSql() {
+  auto row = [](std::initializer_list<std::pair<QString, QString>> fields) {
+    QJsonObject o; for (auto const& [k, v] : fields) o[k] = v; return o;
+  };
+  QJsonObject before{
+    {"quest_template", QJsonArray{row({{"entry", "1000001"}, {"Title", "Beneath the Mill"}, {"StartScript", "1000001"}, {"ReqItemId1", "1000005"}})}},
+    {"quest_start_scripts", QJsonArray{row({{"id", "1000001"}, {"command", "0"}, {"dataint", "6000000"}})}},
+    {"broadcast_text", QJsonArray{row({{"entry", "6000000"}, {"male_text", "Old line"}})}},
+    {"creature_loot_template", QJsonArray{row({{"entry", "300"}, {"item", "1000005"}, {"ChanceOrQuestChance", "-50"}})}},
+    {"item_start_link", QJsonArray{row({{"entry", "1000006"}})}}};
+  QJsonObject after{
+    {"quest_template", QJsonArray{row({{"entry", "1000001"}, {"Title", "Beneath the Mill"}, {"StartScript", "1000001"}, {"ReqItemId1", "1000005"}})}},
+    {"quest_start_scripts", QJsonArray{row({{"id", "1000001"}, {"command", "0"}, {"dataint", "6000001"}})}},
+    {"broadcast_text", QJsonArray{row({{"entry", "6000001"}, {"male_text", "New line"}})}},
+    {"gameobject_loot_template", QJsonArray{row({{"entry", "400"}, {"item", "1000005"}, {"ChanceOrQuestChance", "-25"}})}},
+    {"gameobject_loot_link", QJsonArray{row({{"entry", "400"}})}},
+    {"gameobject_questrelation", QJsonArray{row({{"id", "500"}, {"quest", "1000001"}})}}};
+  auto edited = change(EntityType::Quest, 1000001, before, after, "Beneath the Mill"); edited.action = ChangeAction::Update;
+  auto text = ChangeTracker::sql({edited});
+  check(text.contains("DELETE FROM quest_start_scripts WHERE id=1000001;") && text.contains("'New line'"), "Scripts are not replaced");
+  check(text.contains("DELETE FROM broadcast_text WHERE entry IN (6000000);"), "Removed spoken line is kept");
+  check(text.contains("DELETE FROM creature_loot_template WHERE entry=300 AND item=1000005 AND ChanceOrQuestChance<0 AND NOT EXISTS"), "Removed drop is kept");
+  check(text.contains("UPDATE gameobject_template SET data1=400 WHERE entry=400 AND type=3 AND data1=0;"), "Chest loot table is not given");
+  check(text.contains("UPDATE item_template SET start_quest=0 WHERE entry=1000006 AND start_quest=1000001;"), "Old start item still starts the quest");
+  check(text.contains("REPLACE INTO `gameobject_questrelation`") && !text.contains("WHERE entry IN (500)"), "Object giver missing or flagged as an NPC");
+
+  auto removed = change(EntityType::Quest, 1000001, after, {}); removed.action = ChangeAction::Delete;
+  text = ChangeTracker::sql({removed});
+  check(text.contains("DELETE FROM quest_start_scripts WHERE id=1000001 AND @owned>0;") && text.contains("DELETE FROM broadcast_text WHERE entry IN (6000001) AND @owned>0;"), "Deleted quest leaves its scripts");
+  check(text.contains("DELETE FROM gameobject_loot_template WHERE entry=400 AND item=1000005 AND ChanceOrQuestChance<0 AND @owned>0 AND NOT EXISTS"), "Deleted quest leaves its drops");
+
+  auto item = change(EntityType::Item, 1000005, {}, rows("item_template", {{"entry", "1000005"}, {"name", "Wolf Pelt"}}), "Wolf Pelt");
+  item.action = ChangeAction::Create;
+  text = ChangeTracker::sql({edited, item});
+  check(item.summary() == "+ Item: Wolf Pelt" && text.indexOf("-- Item:") < text.indexOf("-- Quest:") && text.contains("VALUES('item',1000005)"), "Item is not exported before its quest");
+}
 int main(int argc, char** argv) {
   QCoreApplication app(argc, argv);
-  try { merging(); persistence(); sql(); }
+  try { merging(); persistence(); sql(); questContentSql(); }
   catch (std::exception const& e) { QTextStream(stderr) << e.what() << Qt::endl; return 1; }
   QTextStream(stdout) << "Change tracker checks passed\n";
   return 0;

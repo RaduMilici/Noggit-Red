@@ -5,6 +5,8 @@
 #include <QVariant>
 #include <QStringList>
 #include <array>
+#include <optional>
+#include <QSet>
 #include <cstdint>
 
 namespace Noggit::Creator {
@@ -24,19 +26,14 @@ struct Npc {
   bool loot = false, vendor = false, trainer = false, gossip = false, quests = false;
 };
 struct SpawnEdit { Id guid = 0, entry = 0; Position position; int respawn = 120; bool remove = false, create = false; };
-struct Objective { enum Type { Kill, Collect, Talk }; Type type = Kill; Id target = 0; int count = 1; QString label; };
-struct Quest {
-  Id entry = 0, giver = 0, ender = 0;
-  QString title, description, completion;
-  int requiredLevel = 1, level = 1, xp = 0, money = 0;
-  QVector<Objective> objectives;
-};
 struct Outfit { QString name; Id display = 0; std::array<Id, 3> equipment{}; };
 class CreatureService {
 public:
   static QVector<Choice> search(QString const& text, bool ownedOnly = false);
   static Npc load(Id entry);
-  static Id save(Npc const&, Position const&, Id* spawn = nullptr);
+  // A new NPC is also placed at `place` when given (its first spawn's guid in *spawn).
+  static Id save(Npc const&, std::optional<Position> const& place = std::nullopt, Id* spawn = nullptr);
+  static QSet<Id> ownedEntries(); // NPCs made in Noggit
   static void remove(Id entry); // Creator NPCs only, with all their placements
   static bool owned(Id entry);
 };
@@ -50,13 +47,6 @@ public:
   static QString name(Id item);
   static QVector<Outfit> outfits();
   static void saveOutfit(Outfit const& outfit);
-};
-class QuestService {
-public:
-  static QVector<Choice> search(QString const& text);
-  static Quest load(Id entry);
-  static Id save(Quest const&);
-  static void remove(Id entry); // Creator quests only
 };
 // Local login accounts in the bundled realmd database. Never used for remote servers.
 class AccountService {

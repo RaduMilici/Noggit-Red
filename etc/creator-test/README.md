@@ -11,12 +11,15 @@ hash is stored, in the local `realmd.account` table. Client paths
 are relative to the Creator installation; keeping the client inside that folder
 makes the installation portable.
 
-- Right-click terrain → **Test Here**: save pending NPC changes and test that point,
-  using the current camera heading.
-- Select/right-click an NPC → **Test NPC**: save and test about two meters in front
-  of it, facing the NPC. This also works after a pending move or rotation.
-- Quest Editor → **Test Quest**: save the quest and test beside its giver. If there
-  are multiple placements, choose by NPC/map name and placement number.
+- Creature editor NPC card → **Test in game → At a spot**: click anywhere in the world
+  (Esc cancels); pending NPC changes are saved and you test at that point, facing the
+  way the camera looks.
+- NPC card → **Test in game → At this NPC**: save and test about two meters in front of
+  the selected placement (or the NPC's first one), facing the NPC. This also works after
+  a pending move or rotation.
+- Quest editor → **Save and test**, or **Test** in the quest browser: save the quest
+  and test beside its giver. If there are multiple placements, choose by NPC/map name
+  and placement number.
 - **Test Local**: start/restart the local runtime and launch the local client without
   a teleport request. Use this to create a local character the first time.
 - **Play Production**: switch the same client to the configured Lightsail endpoint
@@ -44,8 +47,8 @@ Production uses the configured hostname/IP and optional port (otherwise WoW's de
   readiness/launch/login-result state machine. No process logic in button handlers.
 - `RuntimeManager.*`: synchronous save hook, shutdown notification, generated local
   module configuration. The existing ordered runtime restart is reused.
-- `MapView.cpp`, `AuthoringDialogs.cpp`, `LocalServerPanel.cpp`: context actions,
-  Test Quest and profile/status/cancellation controls.
+- `MapView.cpp`, `ui/quest/`, `LocalServerPanel.cpp`: context actions, Save and test /
+  Test in the quest editor and browser, profile/status/cancellation controls.
 - `mod-creator-test`: small static Tortoise module using PlayerScript::OnLogin and
   Player::TeleportTo. No direct edits to character position columns.
 - `CreatorTestProtocol.hpp`: shared versioned request serialization/validation.
