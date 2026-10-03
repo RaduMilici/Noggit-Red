@@ -14,6 +14,7 @@
 #include <QFileInfo>
 #include <QUuid>
 #include <QDateTime>
+#include <algorithm>
 #include <cmath>
 #include <sstream>
 #include <stdexcept>
@@ -40,13 +41,18 @@ void TestSessionService::testGameObject(QWidget* parent,Position const& p){begin
 void TestSessionService::testNpc(QWidget* parent,Position const& p){begin(parent,NpcTarget,0,p);}
 void TestSessionService::testQuest(QWidget* parent,Id quest){begin(parent,QuestTarget,quest);}
 void TestSessionService::testLocal(QWidget* parent){begin(parent,None,0);}
+void TestSessionService::testEntity(QWidget* parent,bool object,Id entry,TestOptions const& options) {
+  if(busy()){QMessageBox::information(parent,"Local test","A local test is already in progress. Finish or cancel it first.");return;}
+  _object=object;_options=options;begin(parent,EntityTarget,entry);
+}
 void TestSessionService::begin(QWidget* parent,Target target,Id id,Position position) {
   if(busy()){QMessageBox::information(parent,"Local test","A local test is already in progress. Finish or cancel it first.");return;}
   _parent=parent;
   try {
     require(!_runtime->stopping(),"Wait for the local runtime to finish stopping, then try again.");
     if(!Runtime::ClientManager::prepare(parent,Runtime::ClientManager::Profile::TestLocal))return;
-    _target=target;_id=id;_position=position;_token.clear();_loginHint.clear();
+    if(target!=EntityTarget)_options={};
+    _target=target;_id=id;_position=position;_token.clear();_loginHint.clear();_character=_account=0;
     _phase=WaitDatabase;_status="Starting local database…";_deadline.start();_moduleDeadline.invalidate();emit changed();
     _runtime->start();_timer.start();
   }catch(std::exception const& e){finish(QString::fromUtf8(e.what()),true);}
@@ -78,7 +84,22 @@ void TestSessionService::prepareRequest() {
     }
     _position=positionOf(rows[choice]);
   }
-  if(_target==NpcTarget||_target==QuestTarget) {
+  if(_target==EntityTarget) {
+    QVector<Fields> rows;
+    { Database db;
+      rows=_object?db.query("SELECT g.*,m.map_name,t.name AS npc_name FROM gameobject g JOIN gameobject_template t ON t.entry=g.id LEFT JOIN map_template m ON m.entry=g.map WHERE g.id="+QString::number(_id)+" ORDER BY g.map,g.guid LIMIT 100")
+                  :db.query("SELECT c.*,m.map_name,t.name AS npc_name FROM creature c JOIN creature_template t ON t.entry=c.id LEFT JOIN map_template m ON m.entry=c.map WHERE c.id="+QString::number(_id)+" ORDER BY c.map,c.guid LIMIT 100");
+    }
+    require(!rows.isEmpty(),_object?"This object has no saved placement. Place it in the world first.":"This NPC has no saved placement. Place it in the world first.");
+    int choice=0;
+    if(rows.size()>1) {
+      QStringList names;for(int i=0;i<rows.size();++i)names<<QString("%1 — %2 — placement %3").arg(rows[i]["npc_name"].toString(),rows[i]["map_name"].toString()).arg(i+1);
+      bool ok=false;auto selected=QInputDialog::getItem(_parent,"Test","Choose the placement to test beside",names,0,false,&ok);
+      if(!ok)throw std::runtime_error("Local test cancelled.");choice=names.indexOf(selected);
+    }
+    _position=positionOf(rows[choice]);
+  }
+  if(_target==NpcTarget||_target==QuestTarget||_target==EntityTarget) {
     _position.x+=2.f*std::cos(_position.orientation);_position.y+=2.f*std::sin(_position.orientation);
     _position.orientation=std::fmod(_position.orientation+3.14159265f,6.2831853f);
   }
@@ -97,6 +118,7 @@ void TestSessionService::prepareRequest() {
     if(!ok)throw std::runtime_error("Local test cancelled.");selected=names.indexOf(chosen);
   }
   auto character=characters[selected];settings.setValue("testCharacterName",character["name"].toString());
+  _character=character["guid"].toUInt();_account=character["account"].toUInt();
   _loginHint="Log in as "+character["name"].toString()+" (local account "+character["username"].toString()+"). The test expires in 15 minutes.";
   _token=QUuid::createUuid().toString(QUuid::Id128);
   _expires=QDateTime::currentSecsSinceEpoch()+900;
@@ -122,6 +144,8 @@ void TestSessionService::tick() {
         bool armed=ready.open(QIODevice::ReadOnly)&&QString::fromUtf8(ready.readAll()).trimmed()==_token;
         if(!armed){if(!_moduleDeadline.isValid())_moduleDeadline.start();require(_moduleDeadline.elapsed()<5000,"The local worldserver does not acknowledge creator-test. Build and package the supplied module, then retry.");return;}
       }
+      // The world server is back and nobody has logged in yet: the character's saved state is ours to change.
+      applyOptions();
       Runtime::ClientManager::launch(Runtime::ClientManager::Profile::TestLocal);
       if(_token.isEmpty()){finish("Local client launched. Log in with your local account.");return;}
       _phase=WaitLogin;_deadline.restart();_status=_loginHint;emit changed();return;
@@ -136,6 +160,17 @@ void TestSessionService::tick() {
       }
     }
   }catch(std::exception const& e){finish(QString::fromUtf8(e.what()),true);}
+}
+void TestSessionService::applyOptions() {
+  if(!_character||(!_options.money&&!_options.level&&!_options.developer))return;
+  Database db;
+  auto guid=QString::number(_character);
+  // Only the bundled local databases: Database always connects to the local runtime.
+  require(db.query("SELECT online FROM characters.characters WHERE guid="+guid+" AND online=0").size()==1,"The test character is still online; log out and try again.");
+  if(_options.money>0) db.exec("UPDATE characters.characters SET money=LEAST(money+"+QString::number(_options.money)+",2147483647) WHERE guid="+guid);
+  if(_options.level>0) db.exec("UPDATE characters.characters SET level="+QString::number(std::clamp(_options.level,1,60))+",xp=0 WHERE guid="+guid);
+  if(_options.developer&&_account) db.exec("UPDATE realmd.account SET `rank`=GREATEST(`rank`,3) WHERE id="+QString::number(_account));
+  db.commit();
 }
 void TestSessionService::removeRequest() {
   if(_token.isEmpty())return;QString path=_runtime->root()+"/Workspace/creator-test.request";QFile file(path);

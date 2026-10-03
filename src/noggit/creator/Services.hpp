@@ -13,6 +13,8 @@ namespace Noggit::Creator {
 using Id = std::uint32_t;
 using Fields = QMap<QString, QVariant>;
 struct Choice { Id id = 0; QString name, detail; };
+// A problem shown beside its row in a list editor (row -1: the whole list). Errors block saving; warnings do not.
+struct RowProblem { int row = -1; QString text; bool error = true; };
 struct Position { unsigned map = 0; float x = 0, y = 0, z = 0, orientation = 0; bool operator==(Position const&) const = default; };
 struct Npc {
   Id entry = 0, source = 0, display = 0, faction = 35;

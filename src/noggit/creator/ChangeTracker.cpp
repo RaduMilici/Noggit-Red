@@ -14,7 +14,7 @@ namespace Noggit::Creator {
 namespace {
 void require(bool b, QString const& message) { if (!b) throw std::runtime_error(message.toStdString()); }
 QString n(Id id) { return QString::number(id); }
-QStringList const typeNames{"npc", "spawn", "quest", "item", "gameobject", "object_spawn"};
+QStringList const typeNames{"npc", "spawn", "quest", "item", "gameobject", "object_spawn", "loot", "object_loot", "vendor", "trainer"};
 QStringList const actionNames{"CREATE", "UPDATE", "DELETE", "MOVE"};
 QStringList const relations{"creature_questrelation", "creature_involvedrelation"};
 // Everything that links a quest to its givers, enders and exploration spot, keyed by quest.
@@ -59,6 +59,30 @@ QString replaceRows(QString const& table, QJsonArray const& rows) {
   }
   return out;
 }
+// Rows written only when @owned is set: services of an NPC or object another database does not
+// know as Creator content are left alone.
+QString replaceRowsIfOwned(QString const& table, QJsonArray const& rows) {
+  QString out;
+  for (auto const& value : rows) {
+    auto row = value.toObject(); QStringList keys, values;
+    for (auto it = row.begin(); it != row.end(); ++it) { keys << identifier(it.key()); values << literal(it.value()); }
+    out += "REPLACE INTO " + identifier(table) + " (" + keys.join(',') + ") SELECT " + values.join(',') + " FROM DUAL WHERE @owned>0;\n";
+  }
+  return out;
+}
+bool isService(EntityType type) {
+  return type == EntityType::Loot || type == EntityType::ObjectLoot || type == EntityType::Vendor || type == EntityType::Trainer;
+}
+// A service's owner row (synthetic: the owner's columns the service sets) and its own rows.
+QString headTable(EntityType type) {
+  return type == EntityType::Loot ? "creature_loot" : type == EntityType::ObjectLoot ? "gameobject_loot"
+       : type == EntityType::Vendor ? "creature_vendor" : "creature_trainer";
+}
+QString rowTable(EntityType type) {
+  return type == EntityType::Loot ? "creature_loot_template" : type == EntityType::ObjectLoot ? "gameobject_loot_template"
+       : type == EntityType::Vendor ? "npc_vendor" : "npc_trainer";
+}
+bool chestType(Id type) { return type == 3 || type == 25; } // chest, fishing hole: data1 is the loot table
 // Guards deletions so another database's original content with the same ID is never removed.
 QString ownedGuard(QString const& kind, Id id) {
   return "SET @owned := (SELECT COUNT(*) FROM creator_content WHERE kind='" + kind + "' AND entry=" + n(id) + ");\n";
@@ -114,6 +138,26 @@ QString TrackedChange::summary() const {
     QString what = action == ChangeAction::Create ? "placed" : action == ChangeAction::Move ? "moved"
                  : action == ChangeAction::Delete ? "placement removed" : "placement edited";
     return sign + " Spawn: " + name + " " + what;
+  }
+  if (isService(type)) {
+    auto rows = [&](QJsonObject const& state) { QMap<QString, QJsonObject> map; for (auto const& r : state[rowTable(type)].toArray())
+      map[r.toObject()[type == EntityType::Trainer ? "spell" : "item"].toString() + "/" + r.toObject()["groupid"].toString()] = r.toObject(); return map; };
+    auto had = rows(before), has = rows(after);
+    if (type == EntityType::Trainer && before[headTable(type)] == after[headTable(type)]) {
+      QStringList added, removed; bool changed = false;
+      for (auto it = has.begin(); it != has.end(); ++it) if (!had.contains(it.key())) added << it.key(); else if (had[it.key()] != *it) changed = true;
+      for (auto it = had.begin(); it != had.end(); ++it) if (!has.contains(it.key())) removed << it.key();
+      auto spellName = [&](QString const& key) {
+        for (auto const* state : {&after, &before}) for (auto const& r : (*state)["spell_names"].toArray())
+          if (r.toObject()["spell"].toString() + "/" == key)
+            return r.toObject()["name"].toString() + (r.toObject()["rank"].toString().isEmpty() ? QString() : " " + r.toObject()["rank"].toString());
+        return "spell " + key.section('/', 0, 0);
+      };
+      if (!changed && added.size() + removed.size() == 1)
+        return (added.isEmpty() ? "- Trainer spell: " + spellName(removed[0]) : "+ Trainer spell: " + spellName(added[0])) + " (" + name + ")";
+    }
+    QString mark = had.isEmpty() && !has.isEmpty() ? "+" : has.isEmpty() && !had.isEmpty() ? "-" : "~";
+    return mark + (type == EntityType::Vendor ? " Vendor: " : type == EntityType::Trainer ? " Trainer: " : " Loot: ") + name;
   }
   return sign + (type == EntityType::Npc ? " NPC: " : type == EntityType::Item ? " Item: " : type == EntityType::GameObject ? " GameObject: " : " Quest: ") + name;
 }
@@ -221,8 +265,7 @@ QJsonObject ChangeTracker::capture(QueryFunction const& query, EntityType type, 
     if (rows.isEmpty()) return rows;
     auto main = firstRow(rows, "creature_template");
     if (auto equipment = field(main, "equipment_id")) add("creature_equip_template", "entry=" + n(equipment));
-    add("npc_vendor", "entry=" + n(id));
-    add("npc_trainer", "entry=" + n(id));
+    // Vendor and trainer rows are Vendor and Trainer changes.
     // Relations to Creator quests belong to those quests' own changes.
     for (auto const& table : relations) add(table, "id=" + n(id) + creatorOnlyQuests());
     if (label) *label = main["name"].toString();
@@ -233,6 +276,34 @@ QJsonObject ChangeTracker::capture(QueryFunction const& query, EntityType type, 
       auto main = firstRow(rows, table);
       if (type == EntityType::GameObject) *label = main["name"].toString();
       else { auto names=query("SELECT name FROM gameobject_template WHERE entry="+n(field(main,"id"))); if(!names.isEmpty()) *label=names[0]["name"].toString(); }
+    }
+  } else if (isService(type)) {
+    bool object = type == EntityType::ObjectLoot;
+    QString columns = type == EntityType::Loot ? "loot_id,gold_min,gold_max" : object ? "type,data1,mingold,maxgold"
+                    : type == EntityType::Vendor ? "vendor_id,npc_flags" : "trainer_id,trainer_type,trainer_class,npc_flags";
+    auto heads = query("SELECT entry,name," + columns + " FROM " + (object ? "gameobject_template" : "creature_template") + " WHERE entry=" + n(id));
+    if (heads.isEmpty()) return rows;
+    auto head = heads[0];
+    if (label) *label = head["name"].toString();
+    head.remove("name");
+    // Only the role's own flag: the NPC's other roles belong to its NPC change.
+    if (head.contains("npc_flags")) {
+      auto flag = type == EntityType::Vendor ? 4u : 16u;
+      head[type == EntityType::Vendor ? "vendor" : "trainer"] = QString::number((head["npc_flags"].toUInt() & flag) ? 1 : 0);
+      head.remove("npc_flags");
+    }
+    rows[headTable(type)] = QJsonArray{QJsonObject::fromVariantMap(head)};
+    if (type == EntityType::Loot) { if (auto loot = head["loot_id"].toUInt()) add(rowTable(type), "entry=" + n(loot)); }
+    else if (object) { if (auto loot = head["data1"].toUInt(); loot && chestType(head["type"].toUInt())) add(rowTable(type), "entry=" + n(loot)); }
+    else add(rowTable(type), "entry=" + n(id));
+    if (type == EntityType::Trainer) {
+      auto spells = ids(rows["npc_trainer"].toArray(), "spell");
+      if (!spells.isEmpty()) {
+        QJsonArray names;
+        for (auto const& row : query("SELECT t.entry AS spell,s.name,s.nameSubtext AS `rank` FROM spell_template t JOIN spell_template s ON s.entry=t.effectTriggerSpell1 WHERE t.entry IN (" + spells.join(',') + ")"))
+          names.append(QJsonObject::fromVariantMap(row));
+        if (!names.isEmpty()) rows["spell_names"] = names;
+      }
     }
   } else if (type == EntityType::Spawn) {
     add("creature", "guid=" + n(id));
@@ -291,6 +362,20 @@ QString ChangeTracker::sql(QVector<TrackedChange> const& changes) {
     for (auto const& c : changes) if (c.type == type && (c.action == ChangeAction::Delete) == deleted) result.push_back(c);
     return result;
   };
+  auto ownerGuard = [](TrackedChange const& c) { return ownedGuard(c.type == EntityType::ObjectLoot ? "gameobject" : "npc", c.entity); };
+  // A loot table is only written when it is the owner's own (the loot editor gives it one).
+  auto ownTable = [](TrackedChange const& c, QJsonObject const& state) {
+    auto head = firstRow(state, headTable(c.type));
+    if (c.type == EntityType::Loot) return field(head, "loot_id") == c.entity;
+    if (c.type == EntityType::ObjectLoot) return field(head, "data1") == c.entity && chestType(field(head, "type"));
+    return true;
+  };
+  // Services go before their owners, while the owner's Creator mark still guards them.
+  for (auto type : {EntityType::Loot, EntityType::ObjectLoot, EntityType::Vendor, EntityType::Trainer})
+    for (auto const& c : ordered(type, true)) {
+      out += "\n-- Remove " + QString(type == EntityType::Vendor ? "vendor" : type == EntityType::Trainer ? "trainer" : "loot") + ": " + oneLine(c.label) + " (#" + n(c.entity) + ")\n" + ownerGuard(c);
+      if (ownTable(c, c.before)) out += "DELETE FROM " + rowTable(type) + " WHERE entry=" + n(c.entity) + " AND @owned>0;\n";
+    }
   // Remove dependents before their NPCs, then recreate NPCs before what refers to them.
   for (auto const& c : ordered(EntityType::Quest, true)) {
     auto id = n(c.entity);
@@ -357,10 +442,13 @@ QString ChangeTracker::sql(QVector<TrackedChange> const& changes) {
   for (auto const& c : ordered(EntityType::Npc, false)) {
     auto id = n(c.entity);
     out += "\n-- NPC: " + oneLine(c.label) + " (#" + id + ")\n";
-    out += "DELETE FROM npc_vendor WHERE entry=" + id + ";\nDELETE FROM npc_trainer WHERE entry=" + id + ";\n";
+    // Vendor and trainer rows are Vendor/Trainer changes now; entries recorded before that still carry them.
+    bool legacy = false;
+    for (auto table : {"npc_vendor", "npc_trainer"}) legacy = legacy || c.before.contains(table) || c.after.contains(table);
+    if (legacy) out += "DELETE FROM npc_vendor WHERE entry=" + id + ";\nDELETE FROM npc_trainer WHERE entry=" + id + ";\n";
     for (auto const& table : relations) out += "DELETE FROM " + table + " WHERE id=" + id + creatorOnlyQuests() + ";\n";
     for (auto const& table : {"creature_equip_template", "creature_template", "npc_vendor", "npc_trainer", "creature_questrelation", "creature_involvedrelation"})
-      out += replaceRows(table, c.after[table].toArray());
+      if (legacy || (QString(table) != "npc_vendor" && QString(table) != "npc_trainer")) out += replaceRows(table, c.after[table].toArray());
     out += "INSERT IGNORE INTO creator_content(kind,entry) VALUES('npc'," + id + ");\n";
   }
   for (auto const& c : ordered(EntityType::Item, false)) {
@@ -376,6 +464,23 @@ QString ChangeTracker::sql(QVector<TrackedChange> const& changes) {
     out += "\n-- Placement: " + oneLine(c.label) + " (#" + n(c.entity) + ")\n" + replaceRows("creature", c.after["creature"].toArray());
     out += "INSERT IGNORE INTO creator_content(kind,entry) VALUES('spawn'," + n(c.entity) + ");\n";
   }
+  for (auto type : {EntityType::Loot, EntityType::ObjectLoot, EntityType::Vendor, EntityType::Trainer})
+    for (auto const& c : ordered(type, false)) {
+      auto id = n(c.entity);
+      auto head = firstRow(c.after, headTable(type));
+      out += "\n-- " + QString(type == EntityType::Vendor ? "Vendor" : type == EntityType::Trainer ? "Trainer" : "Loot") + ": " + oneLine(c.label) + " (#" + id + ")\n" + ownerGuard(c);
+      QStringList sets;
+      auto set = [&](QString const& column) { sets << identifier(column) + "=" + literal(head[column]); };
+      if (type == EntityType::Loot) for (auto column : {"loot_id", "gold_min", "gold_max"}) set(column);
+      else if (type == EntityType::ObjectLoot) for (auto column : {"mingold", "maxgold"}) set(column);
+      else if (type == EntityType::Vendor) { set("vendor_id"); sets << QString("`npc_flags`=(`npc_flags`&~4)|%1").arg(field(head, "vendor") ? 4 : 0); }
+      else { for (auto column : {"trainer_id", "trainer_type", "trainer_class"}) set(column); sets << QString("`npc_flags`=(`npc_flags`&~16)|%1").arg(field(head, "trainer") ? 16 : 0); }
+      if (type == EntityType::ObjectLoot && chestType(field(head, "type"))) set("data1");
+      out += "UPDATE " + QString(type == EntityType::ObjectLoot ? "gameobject_template" : "creature_template") + " SET " + sets.join(',') + " WHERE entry=" + id + " AND @owned>0;\n";
+      if (!ownTable(c, c.after)) continue;
+      out += "DELETE FROM " + rowTable(type) + " WHERE entry=" + id + " AND @owned>0;\n";
+      out += replaceRowsIfOwned(rowTable(type), c.after[rowTable(type)].toArray());
+    }
   for (auto const& c : ordered(EntityType::Quest, false)) {
     auto id = n(c.entity);
     out += "\n-- Quest: " + oneLine(c.label) + " (#" + id + ")\n";
@@ -449,6 +554,11 @@ QVector<QPair<QString, QString>> ChangeTracker::footprint(QVector<TrackedChange>
         add("creature_movement", "id", guids);
         owned("spawn", guids);
       }
+    } else if (isService(c.type)) {
+      add(c.type == EntityType::ObjectLoot ? "gameobject_template" : "creature_template", "entry", {id});
+      if (c.type == EntityType::Loot) add(rowTable(c.type), "entry", values(headTable(c.type), "loot_id"));
+      else if (c.type == EntityType::ObjectLoot) add(rowTable(c.type), "entry", values(headTable(c.type), "data1"));
+      else add(rowTable(c.type), "entry", {id});
     } else if (c.type == EntityType::GameObject || c.type == EntityType::GameObjectSpawn) {
       add(c.type==EntityType::GameObject?"gameobject_template":"gameobject",c.type==EntityType::GameObject?"entry":"guid",{id});
     } else if (c.type == EntityType::Spawn) {

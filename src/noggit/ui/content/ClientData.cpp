@@ -139,6 +139,31 @@ namespace Noggit::Ui::Content::ClientData
     return {};
   }
 
+  QIcon spellIcon(std::uint32_t icon)
+  {
+    static std::map<std::uint32_t, QIcon> cache;
+    if (auto it = cache.find(icon); it != cache.end())
+    {
+      return it->second;
+    }
+    QIcon result;
+    try
+    {
+      std::string path = gSpellIconDB.getByID(icon).getString(SpellIconDB::TextureFilename);
+      if (!path.empty())
+      {
+        if (QPixmap* pixmap = BLPRenderer::getInstance().render_blp_to_pixmap(path + ".blp", 64, 64))
+        {
+          result = QIcon(*pixmap);
+        }
+      }
+    }
+    catch (...)
+    {
+    }
+    return cache[icon] = result;
+  }
+
   QString creatureModelName(std::uint32_t display)
   {
     try

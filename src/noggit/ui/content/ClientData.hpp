@@ -29,6 +29,8 @@ namespace Noggit::Ui::Content::ClientData
 
   // The inventory icon of an item display ID (empty icon when unknown).
   QIcon itemIcon(std::uint32_t display);
+  // A spell's icon (SpellIcon.dbc ID; empty icon when unknown).
+  QIcon spellIcon(std::uint32_t icon);
   // The model file name of a creature display ID ("" when the client has no such display).
   QString creatureModelName(std::uint32_t display);
 }

@@ -26,6 +26,13 @@ Id number(QJsonObject const& row, QString const& column) { return Id(std::abs(ro
 QVector<QPair<EntityType, Id>> references(TrackedChange const& c) {
   QVector<QPair<EntityType, Id>> out;
   auto rows = [&](QString const& table) { return c.after[table].toArray(); };
+  // Loot, vendor and trainer travel with their owner and the Creator items they hand out.
+  if (c.type == EntityType::Loot || c.type == EntityType::ObjectLoot || c.type == EntityType::Vendor || c.type == EntityType::Trainer) {
+    out.push_back({c.type == EntityType::ObjectLoot ? EntityType::GameObject : EntityType::Npc, c.entity});
+    auto table = c.type == EntityType::Loot ? "creature_loot_template" : c.type == EntityType::ObjectLoot ? "gameobject_loot_template" : "npc_vendor";
+    if (c.type != EntityType::Trainer) for (auto const& row : rows(table)) out.push_back({EntityType::Item, number(row.toObject(), "item")});
+    return out;
+  }
   auto first = rows(c.type == EntityType::GameObject ? "gameobject_template" : c.type == EntityType::GameObjectSpawn ? "gameobject" : c.type == EntityType::Quest ? "quest_template" : c.type == EntityType::Npc ? "creature_template" : "creature").at(0).toObject();
   if (c.type == EntityType::GameObjectSpawn) out.push_back({EntityType::GameObject, number(first, "id")});
   if (c.type == EntityType::GameObject && (number(first,"type")==10 || number(first,"type")==3)) out.push_back({EntityType::Quest,number(first,number(first,"type")==10?"data1":"data8")});

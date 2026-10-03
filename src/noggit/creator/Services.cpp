@@ -107,6 +107,9 @@ Id CreatureService::save(Npc const& d, std::optional<Position> const& place, Id*
         row[key]=entry; db.insert(table,row);
       }
     };
+    // Copied goods and spells are the new NPC's own Vendor and Trainer changes.
+    if(d.vendor) db.track(EntityType::Vendor,entry);
+    if(d.trainer) db.track(EntityType::Trainer,entry);
     copyRows(d.vendor,"npc_vendor","entry");
     copyRows(d.trainer,"npc_trainer","entry");
     copyRows(d.quests,"creature_questrelation","id");
@@ -133,6 +136,9 @@ void CreatureService::remove(Id entry) {
   auto quests=db.query("SELECT Title FROM quest_template WHERE entry IN (SELECT entry FROM creator_content WHERE kind='quest') AND (entry IN (SELECT quest FROM creature_questrelation WHERE id="+id+") OR entry IN (SELECT quest FROM creature_involvedrelation WHERE id="+id+") OR "+id+" IN (ReqCreatureOrGOId1,ReqCreatureOrGOId2,ReqCreatureOrGOId3,ReqCreatureOrGOId4)) LIMIT 1");
   require(quests.isEmpty(),"This NPC is used by the quest \""+(quests.isEmpty()?QString():quests[0]["Title"].toString())+"\". Edit or delete that quest first.");
   db.track(EntityType::Npc,entry);
+  for(auto type:{EntityType::Loot,EntityType::Vendor,EntityType::Trainer}) db.track(type,entry);
+  // Its own loot table goes with it (a table it still shares with the NPC it was copied from stays).
+  if(row["loot_id"].toUInt()==entry) { db.snapshotWhere("creature_loot_template","entry="+id); db.exec("DELETE FROM creature_loot_template WHERE entry="+id); }
   for(auto const& spawn:db.query("SELECT guid FROM creature WHERE id="+id)) {
     auto guid=spawn["guid"].toUInt(); db.track(EntityType::Spawn,guid);
     db.snapshot("creature","guid",guid); db.snapshot("creature_movement","id",guid); db.exec("DELETE FROM creature_movement WHERE id="+n(guid)); db.snapshot("creator_content","entry",guid);

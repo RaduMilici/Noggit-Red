@@ -9,7 +9,8 @@
 #include <functional>
 #include <optional>
 namespace Noggit::Creator {
-enum class EntityType { Npc, Spawn, Quest, Item, GameObject, GameObjectSpawn };
+// Loot, ObjectLoot, Vendor and Trainer are keyed by the NPC or GameObject entry that owns them.
+enum class EntityType { Npc, Spawn, Quest, Item, GameObject, GameObjectSpawn, Loot, ObjectLoot, Vendor, Trainer };
 enum class ChangeAction { Create, Update, Delete, Move };
 QString toString(EntityType);
 QString toString(ChangeAction);

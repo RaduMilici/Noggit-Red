@@ -11,9 +11,10 @@ using Icon = Ui::FontAwesome::Icons;
 QToolButton* tile(QString const& text, Icon icon, QString const& tooltip, std::function<void()> const& action, QWidget* parent) {
   auto button = new QToolButton(parent);
   button->setText(text); button->setToolTip(tooltip);
-  button->setIcon(Ui::FontAwesomeIcon(icon)); button->setIconSize(QSize(24, 24));
-  button->setToolButtonStyle(Qt::ToolButtonTextUnderIcon);
-  button->setMinimumSize(92, 64); button->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+  button->setIcon(Ui::FontAwesomeIcon(icon)); button->setIconSize(QSize(14, 14));
+  // Text beside a small icon: the bottom panel is short, and taller tiles clipped their labels.
+  button->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+  button->setMinimumSize(0, 28); button->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
   QObject::connect(button, &QToolButton::clicked, parent, [action] { if (action) action(); });
   return button;
 }
@@ -33,7 +34,7 @@ NpcStudio::NpcStudio(Actions actions, QWidget* parent) : QWidget(parent), _actio
     "#StudioHeading { font-size: 9pt; font-weight: bold; letter-spacing: 1px; color: palette(mid); margin-top: 6px; }"
     "#StudioName { font-size: 15pt; font-weight: bold; }"
     "#StudioBadge { border-radius: 8px; padding: 2px 8px; font-size: 8pt; font-weight: bold; color: white; }"
-    "QToolButton { border: 1px solid palette(mid); border-radius: 6px; padding: 4px; }"
+    "QToolButton { border: 1px solid palette(mid); border-radius: 5px; padding: 3px 6px; }"
     "QToolButton:hover:enabled { background: palette(highlight); color: palette(highlighted-text); }");
   auto layout = new QVBoxLayout(this);
   layout->setContentsMargins(8, 6, 8, 6); layout->setSpacing(4);
