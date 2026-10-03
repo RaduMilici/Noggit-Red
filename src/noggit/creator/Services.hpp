@@ -3,6 +3,7 @@
 #include <QVector>
 #include <QMap>
 #include <QVariant>
+#include <QStringList>
 #include <array>
 #include <cstdint>
 
@@ -56,6 +57,12 @@ public:
   static Quest load(Id entry);
   static Id save(Quest const&);
   static void remove(Id entry); // Creator quests only
+};
+// Local login accounts in the bundled realmd database. Never used for remote servers.
+class AccountService {
+public:
+  static QStringList list();
+  static void create(QString const& username, QString const& password);
 };
 struct Appearance {
   Id display = 0; QString name, model; int race = 0, sex = 0;

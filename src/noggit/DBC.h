@@ -510,6 +510,7 @@ public:
     static const size_t ModelName2 = 2;
     static const size_t ModelTexture1 = 3;
     static const size_t ModelTexture2 = 4;
+    static const size_t InventoryIcon = 5; // icon file name under Interface\Icons (1.12 and 3.3.5a)
     // WotLK ItemDisplayInfo.dbc has 25 fields vs Vanilla/Classic's 23: it inserts a 2nd inventory-icon
     // column at index 6, shifting EVERY column from the geoset groups onward by +1 (empirically verified
     // -- item 15676 HelmetGeosetVis 248,306 sits at 12,13 in Turtle vs 13,14 in WotLK). Reading the fixed
@@ -883,6 +884,7 @@ public:
   { }
 
   static const size_t ID = 0;
+  static const size_t ReputationIndex = 1; // -1: not a faction players gain reputation with
   static const size_t Team = 18;
   static const size_t Name = 19; // localized
 };

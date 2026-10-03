@@ -18,6 +18,8 @@
 #include <QCheckBox>
 #include <QSettings>
 #include <array>
+#include <functional>
+#include <QTimer>
 namespace Noggit::Runtime {
 void addLocalServerPanel(QMainWindow* window)
 {
@@ -64,14 +66,18 @@ void addLocalServerPanel(QMainWindow* window)
   auto testStatus = new QLabel(panel);testStatus->setWordWrap(true);testStatus->setTextFormat(Qt::PlainText);
   for(auto button:{test,production,settings,cancel})layout->addWidget(button);
   layout->addWidget(testStatus);
-  QObject::connect(test,&QPushButton::clicked,panel,[panel,session]{session->testLocal(panel);});
+  // Dialogs must not be opened from inside the popup: it keeps its input grab, and on Wayland
+  // a native file chooser opened from there never receives input, blocking the editor. Close the
+  // popup first and parent dialogs to the window.
+  auto fromWindow=[menu,window](std::function<void()> action){menu->hide();QTimer::singleShot(0,window,std::move(action));};
+  QObject::connect(test,&QPushButton::clicked,panel,[=]{fromWindow([window,session]{session->testLocal(window);});});
   QObject::connect(cancel,&QPushButton::clicked,session,&Creator::TestSessionService::cancel);
-  QObject::connect(settings,&QPushButton::clicked,panel,[panel]{try{ClientManager::configure(panel);}catch(std::exception const& e){QMessageBox::warning(panel,"Client profiles",e.what());}});
-  QObject::connect(production,&QPushButton::clicked,panel,[panel,session]{
-    if(session->busy()){QMessageBox::information(panel,"Play Production","Cancel the pending local test before switching profiles.");return;}
-    try {if(ClientManager::prepare(panel,ClientManager::Profile::PlayProduction))ClientManager::launch(ClientManager::Profile::PlayProduction);}
-    catch(std::exception const& e){QMessageBox::warning(panel,"Play Production",e.what());}
-  });
+  QObject::connect(settings,&QPushButton::clicked,panel,[=]{fromWindow([window]{try{ClientManager::configure(window);}catch(std::exception const& e){QMessageBox::warning(window,"Client profiles",e.what());}});});
+  QObject::connect(production,&QPushButton::clicked,panel,[=]{fromWindow([window,session]{
+    if(session->busy()){QMessageBox::information(window,"Play Production","Cancel the pending local test before switching profiles.");return;}
+    try {if(ClientManager::prepare(window,ClientManager::Profile::PlayProduction))ClientManager::launch(ClientManager::Profile::PlayProduction);}
+    catch(std::exception const& e){QMessageBox::warning(window,"Play Production",e.what());}
+  });});
   auto refreshTest=[session,testStatus,cancel,test,production,settings]{testStatus->setText(session->status());cancel->setEnabled(session->busy());test->setEnabled(!session->busy());production->setEnabled(!session->busy());settings->setEnabled(!session->busy());};
   QObject::connect(session,&Creator::TestSessionService::changed,panel,refreshTest);refreshTest();
   auto autostart = new QCheckBox(QObject::tr("Start with Noggit"), panel);

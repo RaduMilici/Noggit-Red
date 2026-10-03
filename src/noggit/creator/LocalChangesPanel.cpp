@@ -61,7 +61,7 @@ void exportChanges(QWidget* parent) {
   };
   QObject::connect(name, &QLineEdit::textChanged, &dialog, update);
   QObject::connect(browse, &QPushButton::clicked, &dialog, [&] {
-    auto chosen = QFileDialog::getExistingDirectory(&dialog, "Save package in", folder->text());
+    auto chosen = QFileDialog::getExistingDirectory(&dialog, "Save package in", folder->text(), QFileDialog::ShowDirsOnly | QFileDialog::DontUseNativeDialog);
     if (!chosen.isEmpty()) { folder->setText(chosen); update(); }
   });
   QObject::connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);

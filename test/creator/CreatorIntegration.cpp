@@ -4,6 +4,7 @@
 #include <noggit/runtime/RuntimeManager.hpp>
 #include <QCoreApplication>
 #include <QFileInfo>
+#include <QDateTime>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QTemporaryDir>
@@ -109,6 +110,18 @@ void runChecks() {
   check(query("SELECT guid FROM creature WHERE id="+QString::number(entry)).isEmpty()&&query("SELECT entry FROM creature_template WHERE entry="+QString::number(entry)).isEmpty(),"NPC deletion failed");
   check(tracked(EntityType::Npc,entry)->action==ChangeAction::Delete&&tracked(EntityType::Spawn,guid)->action==ChangeAction::Delete,"NPC deletion not tracked");
   check(!ChangeTracker::sql(ChangeTracker::instance()->changes()).isEmpty(),"Deletion export failed");
+
+  // Local login accounts use the server's own hash and get a realm character slot.
+  auto account=QString("ct%1").arg(QDateTime::currentSecsSinceEpoch()%100000000);
+  AccountService::create(account,"Secret1");
+  auto stored=query("SELECT id,sha_pass_hash FROM realmd.account WHERE username='"+account.toUpper()+"'");
+  check(!stored.isEmpty()&&stored[0]["sha_pass_hash"].toString()==query("SELECT UPPER(SHA1('"+account.toUpper()+":SECRET1')) AS h")[0]["h"].toString(),"Account hash does not match the server's");
+  check(!query("SELECT acctid FROM realmd.realmcharacters WHERE acctid="+stored[0]["id"].toString()).isEmpty(),"Account has no realm character slot");
+  check(AccountService::list().contains(account.toUpper()),"New account is not listed");
+  bool duplicate=false,invalid=false;
+  try { AccountService::create(account.toLower(),"Other1"); } catch(std::exception const&) { duplicate=true; }
+  try { AccountService::create("a b","Secret1"); } catch(std::exception const&) { invalid=true; }
+  check(duplicate&&invalid,"Duplicate or invalid account was accepted");
 }
 }
 int main(int argc,char** argv) {

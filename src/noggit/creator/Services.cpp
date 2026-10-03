@@ -6,6 +6,8 @@
 #include <QJsonObject>
 #include <QFile>
 #include <QSaveFile>
+#include <QCryptographicHash>
+#include <QRegularExpression>
 #include <cmath>
 #include <initializer_list>
 #include <utility>
@@ -228,6 +230,24 @@ void QuestService::remove(Id entry) {
   for(auto table:{"creature_questrelation","creature_involvedrelation"}) { db.snapshot(table,"quest",entry); db.exec("DELETE FROM "+QString(table)+" WHERE quest="+n(entry)); }
   db.snapshot("quest_template","entry",entry); db.exec("DELETE FROM quest_template WHERE entry="+n(entry));
   db.snapshot("creator_content","entry",entry); db.exec("DELETE FROM creator_content WHERE kind='quest' AND entry="+n(entry));
+  db.commit();
+}
+QStringList AccountService::list() {
+  Database db; QStringList names;
+  for(auto const& row:db.query("SELECT username FROM realmd.account ORDER BY username")) names<<row["username"].toString();
+  return names;
+}
+void AccountService::create(QString const& username,QString const& password) {
+  // Vanilla clients send names and passwords upper-cased, limited to 16 characters.
+  require(QRegularExpression("^[A-Za-z0-9]{3,16}$").match(username).hasMatch(),"Use 3 to 16 letters or digits for the account name.");
+  require(QRegularExpression("^[\\x21-\\x7E]{4,16}$").match(password).hasMatch(),"Use 4 to 16 characters for the password, without spaces or accents.");
+  auto name=username.toUpper();
+  // Same hash as Tortoise's AccountMgr::CreateAccount: SHA1("NAME:PASSWORD"), upper-case hex.
+  auto hash=QString(QCryptographicHash::hash((name+':'+password.toUpper()).toUtf8(),QCryptographicHash::Sha1).toHex()).toUpper();
+  Database db;
+  require(db.query("SELECT id FROM realmd.account WHERE username="+db.quote(name)).isEmpty(),"That account name is already taken.");
+  db.exec("INSERT INTO realmd.account(username,sha_pass_hash,joindate) VALUES("+db.quote(name)+","+db.quote(hash)+",NOW())");
+  db.exec("REPLACE INTO realmd.realmcharacters(realmid,acctid,numchars) SELECT realmlist.id,account.id,0 FROM realmd.realmlist,realmd.account LEFT JOIN realmd.realmcharacters ON acctid=account.id WHERE acctid IS NULL");
   db.commit();
 }
 }

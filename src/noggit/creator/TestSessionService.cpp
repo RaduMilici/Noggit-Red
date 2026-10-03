@@ -1,5 +1,6 @@
 #include "TestSessionService.hpp"
 #include "Database.hpp"
+#include "AccountDialog.hpp"
 #include <noggit/runtime/RuntimeManager.hpp>
 #include <noggit/runtime/ClientManager.hpp>
 #include "../../../etc/creator-test/mod-creator-test/src/CreatorTestProtocol.hpp"
@@ -56,6 +57,9 @@ void TestSessionService::prepareRequest() {
     // A plain local launch must not replay a request left by an interrupted session.
     auto path=_runtime->root()+"/Workspace/creator-test.request";
     require(!QFileInfo::exists(path)||QFile::remove(path),"Cannot clear the previous local test request.");
+    // A fresh installation has no login; offer one before launching WoW.
+    if(AccountService::list().isEmpty())
+      require(!createLocalAccount(_parent).isEmpty(),"Local test cancelled. Create a local account to log in to WoW.");
     return;
   }
   if(_target==QuestTarget) {

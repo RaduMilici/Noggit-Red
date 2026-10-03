@@ -7,7 +7,7 @@
 #include <functional>
 #include <optional>
 namespace Noggit::Creator {
-enum class EntityType { Npc, Spawn, Quest };
+enum class EntityType { Npc, Spawn, Quest, Item };
 enum class ChangeAction { Create, Update, Delete, Move };
 QString toString(EntityType);
 QString toString(ChangeAction);

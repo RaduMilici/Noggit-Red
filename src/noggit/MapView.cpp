@@ -19288,9 +19288,37 @@ void MapView::ShowContextMenu(QPoint pos)
     if (mouse_moved || ImGuizmo::IsUsing())
         return;
 
+    // Right-clicking a spawn in its editor opens that spawn's menu (edit, quest, test, duplicate...).
+    if (terrainMode == editing_mode::creature || terrainMode == editing_mode::gameobject)
+    {
+      std::optional<std::uint32_t> guid;
+      {
+        // The pick ray-casts animated models, which needs the GL context outside paintGL.
+        makeCurrent();
+        OpenGL::context::scoped_setter const _(::gl, context());
+        _last_mouse_pos = pos;
+        guid = terrainMode == editing_mode::creature ? findCreatureSpawnAtCursor() : findGameObjectSpawnAtCursor();
+      }
+      if (guid)
+      {
+        if (terrainMode == editing_mode::creature)
+        {
+          setSelectedCreatureSpawn(guid);
+          showSelectedCreatureSpawnMenu(mapToGlobal(pos));
+        }
+        else
+        {
+          setSelectedGameObjectSpawn(guid);
+          showSelectedGameObjectSpawnMenu(mapToGlobal(pos));
+        }
+        return;
+      }
+    }
+
     // TODO : build the menu only once, store it and instead use setVisible ?
 
     QMenu* menu = new QMenu(this);
+    menu->setAttribute(Qt::WA_DeleteOnClose);
 
     if (Noggit::Project::CurrentProject::get()->projectVersion == Noggit::Project::ProjectVersion::CLASSIC)
     {
@@ -19743,6 +19771,10 @@ void MapView::ShowContextMenu(QPoint pos)
 
         menu->exec(mapToGlobal(pos)); // synch
         // menu->popup(mapToGlobal(pos)); // asynch, needs to be preloaded to work
-    };
-
+    }
+    else
+    {
+        // Other modes still offer the Creator actions and Undo/Redo built above.
+        menu->exec(mapToGlobal(pos));
+    }
 }

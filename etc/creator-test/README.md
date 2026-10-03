@@ -4,7 +4,10 @@
 
 Open **LOCAL SERVER → Client Profiles…** once. Choose the existing WoW executable,
 enter the Lightsail hostname/IP for **Play Production**, and optionally enter the
-name of an existing local test character. No passwords are stored. Client paths
+name of an existing local test character. **Create Local Account…** in the same dialog
+makes the login for the local server (3–16 letters/digits, 4–16 character password);
+Test Local offers it automatically when no account exists yet. Only the server's login
+hash is stored, in the local `realmd.account` table. Client paths
 are relative to the Creator installation; keeping the client inside that folder
 makes the installation portable.
 
@@ -127,9 +130,11 @@ The agent did not perform these live acceptance checks. Existing limitations:
 
 - A matching WoW client and local account/character must already exist. No automatic
   authentication or character creation is added. First-run selection is expected.
-- Linux Windows-client launching requires a working portable Wine launcher at
-  `Runtime/Wine/bin/wine`. This repository does not supply Wine or client assets;
-  the current development bundle lacks Wine. Windows launches the client directly.
+- On Linux, Client Profiles → **Run with** picks how the Windows client starts: bundled
+  Wine (`Runtime/Wine/bin/wine`), a Bottles bottle (Flatpak `com.usebottles.bottles`
+  or native `bottles-cli`, launched with `run -b <bottle> -e <client>`), or `wine`
+  from PATH. A Flatpak Bottles needs filesystem access to the client folder. This
+  repository does not supply Wine or client assets. Windows launches the client directly.
 - Client process tracking covers Creator launches; Wine launchers that fork away
   and externally launched clients may require the designer to close WoW manually.
 - NPC offsets use the saved position plus a small offset; near walls, ledges, or

@@ -86,6 +86,33 @@ QVector<Fields> Database::query(QString const& sql) {
   return rows;
 }
 void Database::exec(QString const& sql) { query(sql); }
+std::vector<std::vector<std::optional<std::string>>> Database::rows(std::string const& sql) {
+  std::vector<std::vector<std::optional<std::string>>> rows;
+#ifdef USE_MYSQL_UID_STORAGE
+  if (mysql_real_query(_impl->connection, sql.data(), sql.size()))
+    fail("Reading local content failed: " + QString::fromUtf8(mysql_error(_impl->connection)));
+  MYSQL_RES* result = mysql_store_result(_impl->connection);
+  if (!result) { if (mysql_field_count(_impl->connection)) fail("Cannot read local content."); return rows; }
+  unsigned count = mysql_num_fields(result);
+  while (auto row = mysql_fetch_row(result)) {
+    auto lengths = mysql_fetch_lengths(result); std::vector<std::optional<std::string>> values;
+    for (unsigned i=0;i<count;++i) values.push_back(row[i] ? std::optional<std::string>(std::string(row[i], lengths[i])) : std::nullopt);
+    rows.push_back(std::move(values));
+  }
+  mysql_free_result(result);
+#endif
+  return rows;
+}
+std::uint64_t Database::execute(std::string const& sql) {
+#ifdef USE_MYSQL_UID_STORAGE
+  if (mysql_real_query(_impl->connection, sql.data(), sql.size()))
+    fail("Local content save failed: " + QString::fromUtf8(mysql_error(_impl->connection)));
+  if (auto result = mysql_store_result(_impl->connection)) mysql_free_result(result);
+  return mysql_affected_rows(_impl->connection);
+#else
+  return 0;
+#endif
+}
 void Database::insert(QString const& table, Fields const& fields) {
   QStringList keys, values;
   for (auto it=fields.begin();it!=fields.end();++it) { keys << identifier(it.key()); values << quote(it.value()); }
@@ -109,10 +136,18 @@ void Database::snapshot(QString const& table, QString const& key, Id id) {
   for (auto const& row : query("SELECT * FROM "+identifier(table)+" WHERE "+identifier(key)+"="+QString::number(id))) rows.append(QJsonObject::fromVariantMap(row));
   _undo.append(QJsonObject{{"table",table},{"key",key},{"id",double(id)},{"rows",rows}}); persist();
 }
+void Database::snapshotWhere(QString const& table, QString const& where) {
+  for (auto const& v : _undo) { auto obj=v.toObject(); if (obj["table"]==table && obj["where"]==where) return; }
+  QJsonArray rows;
+  for (auto const& row : query("SELECT * FROM "+identifier(table)+" WHERE "+where)) rows.append(QJsonObject::fromVariantMap(row));
+  _undo.append(QJsonObject{{"table",table},{"where",where},{"rows",rows}}); persist();
+}
+// Newest first, so where before-images overlap the oldest one is what remains.
 void Database::restore(QJsonArray const& undo) {
   for (int i=undo.size()-1;i>=0;--i) {
     auto object=undo[i].toObject(); QString table=object["table"].toString(), key=object["key"].toString();
-    exec("DELETE FROM "+identifier(table)+" WHERE "+identifier(key)+"="+QString::number(qulonglong(object["id"].toDouble())));
+    if (object.contains("where")) exec("DELETE FROM "+identifier(table)+" WHERE "+object["where"].toString());
+    else exec("DELETE FROM "+identifier(table)+" WHERE "+identifier(key)+"="+QString::number(qulonglong(object["id"].toDouble())));
     for (auto const& row : object["rows"].toArray()) insert(table, row.toObject().toVariantMap());
   }
 }

@@ -24,8 +24,9 @@ flags and relations to an original NPC.
 7. Select the WoW executable once. Its relative path is remembered. The launcher
    backs up `realmlist.wtf` once and points the client at the local realm.
 
-No teleport, account creation, client distribution, or automatic login is added.
-Use the local account provided by the prepared runtime and travel to the NPC.
+Log in with a local account: **Client Profiles… → Create Local Account…**, or accept the
+prompt Test Local shows when no account exists. Accounts are created with the server's
+own hash (`AccountService`, `AccountDialog.*`) and only exist in the local database.
 
 ## Implementation / files
 

@@ -13,9 +13,20 @@ namespace Noggit::Creator {
 namespace {
 void require(bool b, QString const& message) { if (!b) throw std::runtime_error(message.toStdString()); }
 QString n(Id id) { return QString::number(id); }
-QStringList const typeNames{"npc", "spawn", "quest"};
+QStringList const typeNames{"npc", "spawn", "quest", "item"};
 QStringList const actionNames{"CREATE", "UPDATE", "DELETE", "MOVE"};
 QStringList const relations{"creature_questrelation", "creature_involvedrelation"};
+// Everything that links a quest to its givers, enders and exploration spot, keyed by quest.
+QStringList const questLinks{"creature_questrelation", "creature_involvedrelation", "gameobject_questrelation",
+                             "gameobject_involvedrelation", "areatrigger_involvedrelation"};
+QStringList const scriptTables{"quest_start_scripts", "quest_end_scripts"};
+QStringList const scriptColumns{"StartScript", "CompleteScript"};
+QStringList const lootTables{"creature_loot_template", "gameobject_loot_template"};
+// The editor's spoken lines (see Noggit::Quest::OWN_TEXT_START).
+constexpr Id ownTextStart = 6000000;
+QString collectedBy(QString const& item) {
+  return item + " IN (ReqItemId1,ReqItemId2,ReqItemId3,ReqItemId4)";
+}
 QJsonObject firstRow(QJsonObject const& rows, QString const& table) { return rows[table].toArray().at(0).toObject(); }
 Id field(QJsonObject const& row, QString const& key) { return row[key].toString().toUInt(); }
 QString literal(QJsonValue const& value) {
@@ -71,6 +82,23 @@ TrackedChange fromJson(QJsonObject const& o) {
   c.timestamp = QDateTime::fromString(o["timestamp"].toString(), Qt::ISODateWithMs);
   c.before = o["before"].toObject(); c.after = o["after"].toObject(); return c;
 }
+QStringList ids(QJsonArray const& rows, QString const& key) {
+  QStringList result; for (auto const& row : rows) result << n(field(row.toObject(), key));
+  result.removeDuplicates(); return result;
+}
+// Rows of `before` whose key is no longer in `after` (e.g. a drop or spoken line the edit removed).
+QJsonArray removedRows(QJsonObject const& before, QJsonObject const& after, QString const& table, QStringList const& key) {
+  auto keyOf = [&](QJsonObject const& row) { QStringList parts; for (auto const& k : key) parts << row[k].toString(); return parts.join('/'); };
+  QStringList kept; for (auto const& row : after[table].toArray()) kept << keyOf(row.toObject());
+  QJsonArray removed; for (auto const& row : before[table].toArray()) if (!kept.contains(keyOf(row.toObject()))) removed.append(row);
+  return removed;
+}
+// Quest-only drop rows are removed unless another quest still collects the item, as the editor does.
+QString dropRemoval(QString const& table, QJsonObject const& row, Id quest, QString const& guard) {
+  auto item = n(field(row, "item"));
+  return "DELETE FROM " + table + " WHERE entry=" + n(field(row, "entry")) + " AND item=" + item + " AND ChanceOrQuestChance<0" + guard
+       + " AND NOT EXISTS (SELECT 1 FROM quest_template WHERE entry<>" + n(quest) + " AND " + collectedBy(item) + ");\n";
+}
 }
 QString toString(EntityType type) { return typeNames[int(type)]; }
 QString toString(ChangeAction action) { return actionNames[int(action)]; }
@@ -82,7 +110,7 @@ QString TrackedChange::summary() const {
                  : action == ChangeAction::Delete ? "placement removed" : "placement edited";
     return sign + " Spawn: " + name + " " + what;
   }
-  return sign + (type == EntityType::Npc ? " NPC: " : " Quest: ") + name;
+  return sign + (type == EntityType::Npc ? " NPC: " : type == EntityType::Item ? " Item: " : " Quest: ") + name;
 }
 ChangeTracker* ChangeTracker::instance() {
   auto runtime = Runtime::RuntimeManager::instance();
@@ -191,11 +219,40 @@ QJsonObject ChangeTracker::capture(QueryFunction const& query, EntityType type, 
     if (rows.isEmpty() || !label) return rows;
     auto names = query("SELECT name FROM creature_template WHERE entry=" + n(field(firstRow(rows, "creature"), "id")));
     if (!names.isEmpty()) *label = names[0]["name"].toString();
+  } else if (type == EntityType::Item) {
+    add("item_template", "entry=" + n(id));
+    if (!rows.isEmpty() && label) *label = firstRow(rows, "item_template")["name"].toString();
   } else {
     add("quest_template", "entry=" + n(id));
     if (rows.isEmpty()) return rows;
-    for (auto const& table : relations) add(table, "quest=" + n(id));
-    if (label) *label = firstRow(rows, "quest_template")["Title"].toString();
+    auto quest = firstRow(rows, "quest_template");
+    for (auto const& table : questLinks) add(table, "quest=" + n(id));
+    QStringList texts;
+    for (int i = 0; i < 2; ++i) {
+      auto script = field(quest, scriptColumns[i]);
+      if (!script) continue;
+      add(scriptTables[i], "id=" + n(script));
+      for (auto const& row : rows[scriptTables[i]].toArray())
+        if (field(row.toObject(), "command") == 0 && field(row.toObject(), "dataint") >= ownTextStart) texts << n(field(row.toObject(), "dataint"));
+    }
+    if (!texts.isEmpty()) add("broadcast_text", "entry IN (" + texts.join(',') + ")");
+    // Quest-only drops of the items it collects, and the loot tables the editor gave their sources.
+    QStringList items;
+    for (int i = 1; i <= 4; ++i) if (auto item = field(quest, "ReqItemId" + n(i))) items << n(item);
+    if (!items.isEmpty()) {
+      for (auto const& table : lootTables) add(table, "item IN (" + items.join(',') + ") AND ChanceOrQuestChance<0");
+      auto link = [&](QString const& name, QString const& sql) {
+        QJsonArray array; for (auto const& row : query(sql)) array.append(QJsonObject::fromVariantMap(row));
+        if (!array.isEmpty()) rows[name] = array;
+      };
+      if (auto loot = ids(rows["creature_loot_template"].toArray(), "entry"); !loot.isEmpty())
+        link("creature_loot_link", "SELECT entry FROM creature_template WHERE entry=loot_id AND loot_id IN (" + loot.join(',') + ")");
+      if (auto loot = ids(rows["gameobject_loot_template"].toArray(), "entry"); !loot.isEmpty())
+        link("gameobject_loot_link", "SELECT entry FROM gameobject_template WHERE type=3 AND entry=data1 AND data1 IN (" + loot.join(',') + ")");
+    }
+    QJsonArray starts; for (auto const& row : query("SELECT entry FROM item_template WHERE start_quest=" + n(id))) starts.append(QJsonObject::fromVariantMap(row));
+    if (!starts.isEmpty()) rows["item_start_link"] = starts;
+    if (label) *label = quest["Title"].toString();
   }
   return rows;
 }
@@ -212,10 +269,27 @@ QString ChangeTracker::sql(QVector<TrackedChange> const& changes) {
   };
   // Remove dependents before their NPCs, then recreate NPCs before what refers to them.
   for (auto const& c : ordered(EntityType::Quest, true)) {
-    out += "\n-- Delete quest: " + c.label + " (#" + n(c.entity) + ")\n" + ownedGuard("quest", c.entity);
-    for (auto const& table : relations) out += "DELETE FROM " + table + " WHERE quest=" + n(c.entity) + " AND @owned>0;\n";
-    out += "DELETE FROM quest_template WHERE entry=" + n(c.entity) + " AND @owned>0;\n";
-    out += "DELETE FROM creator_content WHERE kind='quest' AND entry=" + n(c.entity) + ";\n";
+    auto id = n(c.entity);
+    out += "\n-- Delete quest: " + c.label + " (#" + id + ")\n" + ownedGuard("quest", c.entity);
+    for (auto const& table : questLinks) out += "DELETE FROM " + table + " WHERE quest=" + id + " AND @owned>0;\n";
+    auto quest = firstRow(c.before, "quest_template");
+    for (int i = 0; i < 2; ++i)
+      if (auto script = field(quest, scriptColumns[i])) out += "DELETE FROM " + scriptTables[i] + " WHERE id=" + n(script) + " AND @owned>0;\n";
+    if (auto texts = ids(c.before["broadcast_text"].toArray(), "entry"); !texts.isEmpty())
+      out += "DELETE FROM broadcast_text WHERE entry IN (" + texts.join(',') + ") AND @owned>0;\n";
+    for (auto const& table : lootTables)
+      for (auto const& row : c.before[table].toArray()) out += dropRemoval(table, row.toObject(), c.entity, " AND @owned>0");
+    out += "UPDATE item_template SET start_quest=0 WHERE start_quest=" + id + " AND @owned>0;\n";
+    out += "DELETE FROM quest_template WHERE entry=" + id + " AND @owned>0;\n";
+    out += "DELETE FROM creator_content WHERE kind='quest' AND entry=" + id + ";\n";
+  }
+  for (auto const& c : ordered(EntityType::Item, true)) {
+    auto id = n(c.entity);
+    out += "\n-- Delete item: " + c.label + " (#" + id + ")\n" + ownedGuard("item", c.entity);
+    for (auto const& table : QStringList{"creature_loot_template", "gameobject_loot_template", "npc_vendor"})
+      out += "DELETE FROM " + table + " WHERE item=" + id + " AND @owned>0;\n";
+    out += "DELETE FROM item_template WHERE entry=" + id + " AND @owned>0;\n";
+    out += "DELETE FROM creator_content WHERE kind='item' AND entry=" + id + ";\n";
   }
   for (auto const& c : ordered(EntityType::Spawn, true)) {
     out += "\n-- Remove placement: " + c.label + " (#" + n(c.entity) + ")\n" + ownedGuard("spawn", c.entity);
@@ -244,6 +318,10 @@ QString ChangeTracker::sql(QVector<TrackedChange> const& changes) {
       out += replaceRows(table, c.after[table].toArray());
     out += "INSERT IGNORE INTO creator_content(kind,entry) VALUES('npc'," + id + ");\n";
   }
+  for (auto const& c : ordered(EntityType::Item, false)) {
+    out += "\n-- Item: " + c.label + " (#" + n(c.entity) + ")\n" + replaceRows("item_template", c.after["item_template"].toArray());
+    out += "INSERT IGNORE INTO creator_content(kind,entry) VALUES('item'," + n(c.entity) + ");\n";
+  }
   for (auto const& c : ordered(EntityType::Spawn, false)) {
     out += "\n-- Placement: " + c.label + " (#" + n(c.entity) + ")\n" + replaceRows("creature", c.after["creature"].toArray());
     out += "INSERT IGNORE INTO creator_content(kind,entry) VALUES('spawn'," + n(c.entity) + ");\n";
@@ -251,13 +329,38 @@ QString ChangeTracker::sql(QVector<TrackedChange> const& changes) {
   for (auto const& c : ordered(EntityType::Quest, false)) {
     auto id = n(c.entity);
     out += "\n-- Quest: " + c.label + " (#" + id + ")\n";
-    for (auto const& table : relations) out += "DELETE FROM " + table + " WHERE quest=" + id + ";\n";
-    out += replaceRows("quest_template", c.after["quest_template"].toArray());
-    QStringList npcs;
-    for (auto const& table : relations) {
-      out += replaceRows(table, c.after[table].toArray());
-      for (auto const& row : c.after[table].toArray()) npcs << n(field(row.toObject(), "id"));
+    for (auto const& table : questLinks) out += "DELETE FROM " + table + " WHERE quest=" + id + ";\n";
+    // Scripts are replaced whole; spoken lines, drops and the start item the edit dropped are removed.
+    QStringList scripts[2];
+    for (auto const* rows : {&c.before, &c.after})
+      for (int i = 0; i < 2; ++i) if (auto script = field(firstRow(*rows, "quest_template"), scriptColumns[i])) scripts[i] << n(script);
+    for (int i = 0; i < 2; ++i) {
+      scripts[i].removeDuplicates();
+      for (auto const& script : scripts[i]) out += "DELETE FROM " + scriptTables[i] + " WHERE id=" + script + ";\n";
     }
+    if (auto texts = ids(removedRows(c.before, c.after, "broadcast_text", {"entry"}), "entry"); !texts.isEmpty())
+      out += "DELETE FROM broadcast_text WHERE entry IN (" + texts.join(',') + ");\n";
+    for (auto const& table : lootTables)
+      for (auto const& row : removedRows(c.before, c.after, table, {"entry", "item"})) out += dropRemoval(table, row.toObject(), c.entity, "");
+    for (auto const& row : removedRows(c.before, c.after, "item_start_link", {"entry"}))
+      out += "UPDATE item_template SET start_quest=0 WHERE entry=" + n(field(row.toObject(), "entry")) + " AND start_quest=" + id + ";\n";
+    out += replaceRows("quest_template", c.after["quest_template"].toArray());
+    for (auto const& table : questLinks) out += replaceRows(table, c.after[table].toArray());
+    for (auto const& table : scriptTables) out += replaceRows(table, c.after[table].toArray());
+    out += replaceRows("broadcast_text", c.after["broadcast_text"].toArray());
+    for (auto const& table : lootTables) out += replaceRows(table, c.after[table].toArray());
+    for (auto const& row : c.after["creature_loot_link"].toArray()) {
+      auto entry = n(field(row.toObject(), "entry"));
+      out += "UPDATE creature_template SET loot_id=" + entry + " WHERE entry=" + entry + " AND loot_id=0;\n";
+    }
+    for (auto const& row : c.after["gameobject_loot_link"].toArray()) {
+      auto entry = n(field(row.toObject(), "entry"));
+      out += "UPDATE gameobject_template SET data1=" + entry + " WHERE entry=" + entry + " AND type=3 AND data1=0;\n";
+    }
+    for (auto const& row : c.after["item_start_link"].toArray())
+      out += "UPDATE item_template SET start_quest=" + id + " WHERE entry=" + n(field(row.toObject(), "entry")) + ";\n";
+    QStringList npcs;
+    for (auto const& table : relations) npcs << ids(c.after[table].toArray(), "id");
     npcs.removeDuplicates();
     if (!npcs.isEmpty()) out += "UPDATE creature_template SET npc_flags=npc_flags|2 WHERE entry IN (" + npcs.join(',') + ");\n";
     out += "INSERT IGNORE INTO creator_content(kind,entry) VALUES('quest'," + id + ");\n";
