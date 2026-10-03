@@ -29,8 +29,12 @@ void result(std::string const& token, char const* message) {
 class CreatorWorld final : public WorldScript {
 public:
     CreatorWorld():WorldScript("creator_test_world",{WORLDHOOK_ON_AFTER_CONFIG_LOAD,WORLDHOOK_ON_STARTUP}){}
+    // Only reached on ".reload config": Tortoise registers module scripts after the first config load.
     void OnAfterConfigLoad(bool) override { enabled=localOnly(); }
     void OnStartup() override {
+        enabled=localOnly();
+        sLog.outString(enabled ? "[creator-test] Enabled for the local Creator runtime."
+                               : "[creator-test] Disabled (needs CreatorTest.Enable = 1 and loopback-only addresses).");
         if(!enabled) return;
         std::ifstream in(requestPath);CreatorTest::Request request;
         if(!CreatorTest::read(in,request,std::time(nullptr))) return;
