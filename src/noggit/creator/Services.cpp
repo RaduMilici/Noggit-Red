@@ -121,7 +121,7 @@ Id CreatureService::save(Npc const& d, std::optional<Position> const& place, Id*
   if(d.entry) {
     for(auto const& row:db.query("SELECT guid FROM creature WHERE id="+n(entry))) {
       auto guid=row["guid"].toUInt(); db.track(EntityType::Spawn,guid); db.snapshot("creature","guid",guid);
-      update(db,"creature","guid",guid,{{"spawntimesecsmin",d.respawn},{"spawntimesecsmax",d.respawn},{"movement_type",d.movement},{"wander_distance",d.movement==1?5:0}});
+      update(db,"creature","guid",guid,{{"spawntimesecsmin",d.respawn},{"spawntimesecsmax",d.respawn},{"movement_type",db.query("SELECT point FROM creature_movement WHERE id="+n(guid)+" LIMIT 1").isEmpty()?d.movement:2},{"wander_distance",d.movement==1?5:0}});
     }
   }
   db.commit(); return entry;
@@ -135,7 +135,7 @@ void CreatureService::remove(Id entry) {
   db.track(EntityType::Npc,entry);
   for(auto const& spawn:db.query("SELECT guid FROM creature WHERE id="+id)) {
     auto guid=spawn["guid"].toUInt(); db.track(EntityType::Spawn,guid);
-    db.snapshot("creature","guid",guid); db.snapshot("creator_content","entry",guid);
+    db.snapshot("creature","guid",guid); db.snapshot("creature_movement","id",guid); db.exec("DELETE FROM creature_movement WHERE id="+n(guid)); db.snapshot("creator_content","entry",guid);
     db.exec("DELETE FROM creature WHERE guid="+n(guid)); db.exec("DELETE FROM creator_content WHERE kind='spawn' AND entry="+n(guid));
   }
   for(auto [table,key]:std::initializer_list<std::pair<char const*,char const*>>{{"npc_vendor","entry"},{"npc_trainer","entry"},{"creature_questrelation","id"},{"creature_involvedrelation","id"}}) {
@@ -161,7 +161,7 @@ QVector<Id> SpawnService::save(QVector<SpawnEdit> const& edits) {
     Id guid=d.create?db.allocate("creature","guid",0xfffffffe):d.guid;
     if(!d.create) { auto old=one(db,"creature",guid,"guid"); require(old["id"].toUInt()==d.entry,"The NPC placement changed. Refresh before saving."); }
     db.track(EntityType::Spawn,guid); db.snapshot("creature","guid",guid);
-    if(d.remove) db.exec("DELETE FROM creature WHERE guid="+n(guid));
+    if(d.remove) { db.snapshot("creature_movement","id",guid); db.exec("DELETE FROM creature_movement WHERE id="+n(guid)); db.exec("DELETE FROM creature WHERE guid="+n(guid)); }
     else {
       Fields values{{"id",d.entry},{"map",d.position.map},{"position_x",d.position.x},{"position_y",d.position.y},{"position_z",d.position.z},{"orientation",d.position.orientation},{"spawntimesecsmin",d.respawn},{"spawntimesecsmax",d.respawn}};
       if(d.create) { values["guid"]=guid; db.insert("creature",values); } else update(db,"creature","guid",guid,values);
@@ -206,5 +206,109 @@ void AccountService::create(QString const& username,QString const& password) {
   db.exec("INSERT INTO realmd.account(username,sha_pass_hash,joindate) VALUES("+db.quote(name)+","+db.quote(hash)+",NOW())");
   db.exec("REPLACE INTO realmd.realmcharacters(realmid,acctid,numchars) SELECT realmlist.id,account.id,0 FROM realmd.realmlist,realmd.account LEFT JOIN realmd.realmcharacters ON acctid=account.id WHERE acctid IS NULL");
   db.commit();
+}
+}
+
+namespace Noggit::Creator {
+QVector<Choice> GameObjectService::search(QString const& text) {
+  Database db;
+  return choices(db.query("SELECT entry,name,CONCAT(CASE type WHEN 0 THEN 'Door' WHEN 3 THEN 'Chest / resource' WHEN 5 THEN 'Decoration' WHEN 6 THEN 'Trap' WHEN 10 THEN 'Interactive quest object' ELSE 'Custom object' END,' · Display ',displayId) AS detail FROM gameobject_template WHERE displayId>0 AND name LIKE "+db.quote('%'+text+'%')+" ORDER BY name LIMIT 250"));
+}
+GameObject GameObjectService::load(Id entry, Id guid) {
+  Database db; auto r=one(db,"gameobject_template",entry); GameObject d;
+  d.entry=entry; d.display=r["displayId"].toUInt(); d.name=r["name"].toString(); d.type=r["type"].toInt();
+  d.size=r["size"].toDouble(); d.faction=r["faction"].toUInt();
+  d.quest=(d.type==10||d.type==3)?r[d.type==10?"data1":"data8"].toUInt():0;
+  if(guid) { auto p=one(db,"gameobject",guid,"guid"); d.state=p["state"].toInt(); d.respawn=p["spawntimesecsmin"].toInt(); }
+  return d;
+}
+Id GameObjectService::save(GameObject const& d, std::optional<Position> place) {
+  require(!d.name.trimmed().isEmpty() && d.name.size()<=100 && d.display && std::isfinite(d.size) && d.size>0 && d.size<=100,"Choose a model, name and valid size.");
+  require(d.state>=0 && d.state<=2 && d.respawn>=0,"Invalid state or respawn time.");
+  Database db;
+  if(d.entry) require(db.owned("gameobject",d.entry),"Original objects are read-only. Create a new object from its model.");
+  if(d.quest) { one(db,"quest_template",d.quest); require(d.type==3||d.type==10,"Quest relations require a chest or quest object."); }
+  Id entry=d.entry?d.entry:db.allocate("gameobject_template","entry",0x7fffff);
+  db.track(EntityType::GameObject,entry); db.snapshot("gameobject_template","entry",entry);
+  Fields f;
+  // Custom objects explicitly inherit their existing behavior; standard types start clean.
+  if(d.source) { f=one(db,"gameobject_template",d.source); f.remove("entry"); }
+  else if(!d.entry || one(db,"gameobject_template",d.entry)["type"].toInt()!=d.type)
+    for(int i=0;i<24;++i) f["data"+QString::number(i)]=0;
+  f["name"]=d.name.trimmed(); f["displayId"]=d.display; f["type"]=d.type; f["size"]=d.size; f["faction"]=d.faction;
+  if(d.type==10) { f["data1"]=d.quest; f["data3"]=3000; }
+  if(d.type==3) f["data8"]=d.quest;
+  if(d.entry) update(db,"gameobject_template","entry",entry,f); else { f["entry"]=entry; db.insert("gameobject_template",f); }
+  db.snapshot("creator_content","entry",entry); db.mark("gameobject",entry);
+  if(place) {
+    auto p=*place; require(std::isfinite(p.x)&&std::isfinite(p.y)&&std::isfinite(p.z)&&std::isfinite(p.orientation),"Invalid placement.");
+    auto guid=db.allocate("gameobject","guid",0xfffffffe); db.track(EntityType::GameObjectSpawn,guid); db.snapshot("gameobject","guid",guid);
+    db.insert("gameobject",{{"guid",guid},{"id",entry},{"map",p.map},{"position_x",p.x},{"position_y",p.y},{"position_z",p.z},{"orientation",p.orientation},{"rotation2",std::sin(p.orientation/2)},{"rotation3",std::cos(p.orientation/2)},{"state",d.state},{"spawntimesecsmin",d.respawn},{"spawntimesecsmax",d.respawn}});
+    db.snapshot("creator_content","entry",guid); db.mark("object_spawn",guid);
+  }
+  if(d.entry) for(auto const& r:db.query("SELECT guid FROM gameobject WHERE id="+n(entry))) {
+    auto guid=r["guid"].toUInt(); db.track(EntityType::GameObjectSpawn,guid); db.snapshot("gameobject","guid",guid);
+    update(db,"gameobject","guid",guid,{{"state",d.state},{"spawntimesecsmin",d.respawn},{"spawntimesecsmax",d.respawn}});
+  }
+  db.commit(); return entry;
+}
+void GameObjectService::placements(QVector<SpawnEdit> const& edits) {
+  Database db;
+  for(auto const& d:edits) {
+    require(db.owned("gameobject",d.entry),"Create a Creator object before editing its placements.");
+    auto p=d.position; require(std::isfinite(p.x)&&std::isfinite(p.y)&&std::isfinite(p.z)&&std::isfinite(p.orientation),"Invalid object position.");
+    if(d.create&&d.remove) continue;
+    auto guid=d.create?db.allocate("gameobject","guid",0xfffffffe):d.guid;
+    if(!d.create) require(one(db,"gameobject",guid,"guid")["id"].toUInt()==d.entry,"Object placement changed. Refresh first.");
+    db.track(EntityType::GameObjectSpawn,guid); db.snapshot("gameobject","guid",guid);
+    if(d.remove) db.exec("DELETE FROM gameobject WHERE guid="+n(guid));
+    else {
+      Fields f{{"id",d.entry},{"map",p.map},{"position_x",p.x},{"position_y",p.y},{"position_z",p.z},{"orientation",p.orientation},{"rotation0",0},{"rotation1",0},{"rotation2",std::sin(p.orientation/2)},{"rotation3",std::cos(p.orientation/2)}};
+      if(d.create) { f["guid"]=guid; f["state"]=1; f["spawntimesecsmin"]=d.respawn; f["spawntimesecsmax"]=d.respawn; db.insert("gameobject",f); }
+      else update(db,"gameobject","guid",guid,f);
+    }
+    db.snapshot("creator_content","entry",guid);
+    if(d.remove) db.exec("DELETE FROM creator_content WHERE kind='object_spawn' AND entry="+n(guid)); else db.mark("object_spawn",guid);
+  }
+  db.commit();
+}
+Patrol PatrolService::load(Id guid) {
+  Database db; auto spawn=one(db,"creature",guid,"guid"); Patrol result;
+  auto nodes=db.query("SELECT * FROM creature_movement WHERE id="+n(guid)+" ORDER BY point");
+  if(nodes.isEmpty() && spawn["movement_type"].toInt()==2)
+    nodes=db.query("SELECT * FROM creature_movement_template WHERE entry="+spawn["id"].toString()+" ORDER BY point");
+  for(auto const& r:nodes) {
+    Waypoint w; w.position={spawn["map"].toUInt(),r["position_x"].toFloat(),r["position_y"].toFloat(),r["position_z"].toFloat(),r["orientation"].toFloat()}; w.waitMs=r["waittime"].toInt();
+    for(auto const& script:db.query("SELECT * FROM creature_movement_scripts WHERE id="+r["script_id"].toString())) {
+      if(script["command"].toInt()!=25 && script["comments"].toString()!="Creator patrol stop") { auto preserved=script; preserved.remove("id"); w.scripts.push_back(preserved); }
+      if(script["command"].toInt()==25) {
+        w.run=script["datalong"].toBool();
+        if(script["comments"].toString()=="Creator patrol movement" && w.waitMs==1) w.waitMs=0;
+      }
+      if(script["command"].toInt()==20 && script["datalong"].toInt()==0) result.loop=false;
+    }
+    result.points.push_back(w);
+  }
+  return result;
+}
+void PatrolService::save(Id guid, Patrol const& patrol) {
+  if(load(guid)==patrol) return;
+  Database db; auto spawn=one(db,"creature",guid,"guid");
+
+  db.track(EntityType::Spawn,guid); db.snapshot("creature","guid",guid); db.snapshot("creature_movement","id",guid);
+  db.exec("DELETE FROM creature_movement WHERE id="+n(guid));
+  for(int i=0;i<patrol.points.size();++i) {
+    auto const& w=patrol.points[i]; auto p=w.position;
+    require(p.map==spawn["map"].toUInt() && std::isfinite(p.x)&&std::isfinite(p.y)&&std::isfinite(p.z)&&std::isfinite(p.orientation)&&w.waitMs>=0,"Invalid waypoint.");
+    auto script=db.allocate("creature_movement_scripts","id"); db.snapshot("creature_movement_scripts","id",script);
+    for(auto row:w.scripts) { row["id"]=script; db.insert("creature_movement_scripts",row); }
+    db.insert("creature_movement_scripts",{{"id",script},{"command",25},{"datalong",w.run?1:0},{"comments","Creator patrol movement"}});
+    if(!patrol.loop && i==patrol.points.size()-1) db.insert("creature_movement_scripts",{{"id",script},{"delay",0},{"command",20},{"datalong",0},{"comments","Creator patrol stop"}});
+    db.snapshot("creator_content","entry",script); db.mark("patrol_script",script);
+    // Scripts execute at the end of the map tick. Yield before launching the next spline.
+    db.insert("creature_movement",{{"id",guid},{"point",i+1},{"position_x",p.x},{"position_y",p.y},{"position_z",p.z},{"orientation",p.orientation},{"waittime",w.waitMs==0?1:w.waitMs},{"script_id",script}});
+  }
+  update(db,"creature","guid",guid,{{"movement_type",patrol.points.isEmpty()?0:2},{"wander_distance",0}});
+  db.snapshot("creator_content","entry",guid); db.mark("spawn",guid); db.commit();
 }
 }

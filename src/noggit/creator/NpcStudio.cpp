@@ -69,6 +69,7 @@ NpcStudio::NpcStudio(Actions actions, QWidget* parent) : QWidget(parent), _actio
                             tile("Locate", Icon::crosshairs, "Move the camera to this placement.", _actions.locatePlacement, _placementRow)}, _placementRow));
   layout->addWidget(_placementRow);
 
+  layout->addWidget(tile("Edit Patrol", Icon::edit, "Click terrain to draw a walk or run path.", _actions.patrol, this));
   layout->addWidget(heading("Test in game", this));
   _testNpc = tile("At this NPC", Icon::play, "Saves, restarts the local server and launches WoW standing in front of this NPC.", _actions.testAtNpc, this);
   layout->addWidget(row({_testNpc, tile("At a spot", Icon::locationarrow, "Click anywhere in the world to start testing there. Esc cancels.", _actions.testAtSpot, this)}, this));

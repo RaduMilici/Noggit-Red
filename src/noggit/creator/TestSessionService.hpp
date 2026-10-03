@@ -13,6 +13,7 @@ public:
   static TestSessionService* instance();
   explicit TestSessionService(Runtime::RuntimeManager* runtime);
   void testHere(QWidget* parent,Position const& position);
+  void testGameObject(QWidget* parent,Position const& position);
   void testNpc(QWidget* parent,Position const& position);
   void testQuest(QWidget* parent,Id quest);
   void testLocal(QWidget* parent);

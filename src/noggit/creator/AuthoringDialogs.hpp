@@ -4,6 +4,7 @@
 class QWidget;
 class World;
 namespace Noggit::Creator {
+std::optional<GameObject> designGameObject(QWidget* parent, Id entry = 0, Id guid = 0);
 // All persistence belongs to the services.
 enum class NpcKind { Clone, Humanoid, Creature };
 // Designs a new NPC (not yet placed in the world) and returns its entry; nothing when cancelled.

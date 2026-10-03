@@ -383,3 +383,60 @@ copy defaults and appearance-only, save/reapply an outfit, move/rotate/duplicate
 reopen properties, and make quests with each objective kind, events and a chain. Test locally, reconnect the client, and
 verify names/looks/placement, quest acceptance/progress/completion and rewards. Repeat
 Test Locally with the server stopped and ensure shutdown leaves no child services.
+
+
+## GameObjects and Patrol Studio
+
+Right-click the world → **Create → GameObject**. Browse existing appearances with a
+3D preview, then set the name, type, size, state, respawn, faction and optional quest
+relation. Click the world to place it. IDs, GUIDs and server coordinates are allocated
+by the local service. The GameObject browser retains its visual move/rotate controls;
+the context menu adds edit, duplicate, delete placement, locate, save and **Test
+GameObject**. Definition edits affect all placements of that definition. Save pending
+placements before editing definitions. Loot editing and custom models are not included.
+Trap/resource presets inherit the existing behavior of a matching selected template;
+Custom uses the selected template's existing behavior.
+
+For **Interact with Ancient Chest**, create a **Quest Object** using a chest appearance.
+In Quests → Objectives → **Interact with a GameObject**, search for its name. Tortoise
+uses the interactive (goober) type for interaction credit; ordinary loot chests remain
+available as chest objects. No numeric objective IDs are needed.
+
+Select any saved NPC placement → **Edit Patrol** (NPC Studio or world context menu).
+The panel starts new paths at the NPC's spawn position. Choose **Walk** or **Run** for
+the entire path, then click terrain to add nodes. Drag the numbered nodes to reposition
+them. Select a node to insert after it, delete it, move it earlier/later, set its departure
+speed, wait or facing. **Loop path** closes the route; disabling it stops at the last
+node. Closing with unsaved edits offers Save / Discard / Cancel.
+
+**Save patrol locally** journals the placement, waypoint rows and private movement
+scripts together. This also works on original NPCs without cloning their template;
+only that placement gets the new path. Existing template paths are read as a starting
+point; unrelated script actions are copied rather than changing shared scripts. A
+zero-duration wait uses a one-tick handoff internally so Tortoise applies the speed
+script before starting the next segment. **Save & Test NPC** starts local testing.
+Existing scripted AI may independently take control of an NPC's movement in game.
+
+GameObjects, their placements, and patrols appear in **Local Changes** and use the
+existing database-only SSH sync and rollback. A first sync of an original NPC's patrol
+requires the production placement/path to match the captured local baseline. Script-ID
+collisions are reported before applying changes. Client and world files are not sent.
+
+Targeted checks (no server):
+
+```bash
+cmake -S test/creator -B build-creator-tests
+cmake --build build-creator-tests --target change_tracker_tests -j2
+ctest --test-dir build-creator-tests -R '^change_tracker$' --output-on-failure
+```
+
+The disposable-runtime `creator_integration` checks also cover GameObject placement and
+movement, a named interaction objective, walk/run/wait/loop persistence, repeated saves,
+and authoring an original NPC's patrol. Use the disposable-copy instructions above;
+that suite is deliberately not run against the designer's workspace.
+
+After building, manually verify: chest preview and placement; move/rotate/duplicate/delete;
+interaction credit in the local client; walking and running on a multi-node patrol;
+insertion, dragging and reordering; stopping versus looping; and reload persistence.
+Full application build, visual rendering, client behavior and SSH execution were left
+for the developer to run.

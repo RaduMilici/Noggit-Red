@@ -14,7 +14,7 @@ class NpcStudio final : public QWidget {
 public:
   struct Actions {
     std::function<void()> newHumanoid, newCreature, clone, edit, place, quests, chain, testAtNpc, testAtSpot;
-    std::function<void()> duplicatePlacement, deletePlacement, locatePlacement;
+    std::function<void()> duplicatePlacement, deletePlacement, locatePlacement, patrol;
   };
   struct Npc {
     Id entry = 0;

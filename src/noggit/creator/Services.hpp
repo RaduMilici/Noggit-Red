@@ -13,7 +13,7 @@ namespace Noggit::Creator {
 using Id = std::uint32_t;
 using Fields = QMap<QString, QVariant>;
 struct Choice { Id id = 0; QString name, detail; };
-struct Position { unsigned map = 0; float x = 0, y = 0, z = 0, orientation = 0; };
+struct Position { unsigned map = 0; float x = 0, y = 0, z = 0, orientation = 0; bool operator==(Position const&) const = default; };
 struct Npc {
   Id entry = 0, source = 0, display = 0, faction = 35;
   QString name;
@@ -26,6 +26,26 @@ struct Npc {
   bool loot = false, vendor = false, trainer = false, gossip = false, quests = false;
 };
 struct SpawnEdit { Id guid = 0, entry = 0; Position position; int respawn = 120; bool remove = false, create = false; };
+struct GameObject {
+  Id entry = 0, source = 0, display = 0, faction = 0, quest = 0;
+  QString name;
+  int type = 3, state = 1, respawn = 120;
+  double size = 1;
+};
+class GameObjectService {
+public:
+  static QVector<Choice> search(QString const& text);
+  static GameObject load(Id entry, Id guid = 0);
+  static Id save(GameObject const&, std::optional<Position> place = std::nullopt);
+  static void placements(QVector<SpawnEdit> const&);
+};
+struct Waypoint { Position position; int waitMs = 0; bool run = false; QVector<Fields> scripts; bool operator==(Waypoint const&) const = default; };
+struct Patrol { QVector<Waypoint> points; bool loop = true; bool operator==(Patrol const&) const = default; };
+class PatrolService {
+public:
+  static Patrol load(Id guid);
+  static void save(Id guid, Patrol const&);
+};
 struct Outfit { QString name; Id display = 0; std::array<Id, 3> equipment{}; };
 class CreatureService {
 public:

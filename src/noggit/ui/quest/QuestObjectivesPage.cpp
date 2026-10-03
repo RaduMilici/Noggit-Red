@@ -76,7 +76,7 @@ namespace Noggit::Ui::Quest
         picker->setEntry(target.id);
         count = countBox(this, static_cast<int>(target.count));
         text = new QLineEdit(QString::fromStdString(target.text), this);
-        text->setPlaceholderText(object ? "Quest log text (optional), e.g. \"Brazier lit\""
+        text->setPlaceholderText(object ? "Quest log text (optional), e.g. \"Interact with Ancient Chest\""
                                         : "Quest log text (optional) -- default: \"<name> slain\"");
         fields->addWidget(picker, 0, 0);
         fields->addWidget(count, 0, 1);
@@ -105,7 +105,7 @@ namespace Noggit::Ui::Quest
         }
         else
         {
-          picker->setToolTip("Objects players click (levers, altars, braziers, ...). Using one counts once per object.");
+          picker->setToolTip("Quest Objects players click, including chest appearances. Create one with Create → GameObject → Quest Object.");
         }
         fields->setColumnStretch(0, 1);
       }
@@ -396,7 +396,7 @@ namespace Noggit::Ui::Quest
       return action;
     };
     add("Kill creatures", "e.g. \"Kill 10 Young Wolves\"", [this] { return new TargetRow({}, lookups(), _objectives); });
-    add("Use an object", "e.g. \"Light the brazier\", \"Search the altar\"", [this]
+    add("Interact with a GameObject", "e.g. \"Light the brazier\", \"Search the altar\"", [this]
     {
       Q::Target target;
       target.kind = Q::Target::Kind::Object;

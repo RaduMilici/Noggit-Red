@@ -14,7 +14,7 @@ namespace Noggit::Creator {
 namespace {
 void require(bool b, QString const& message) { if (!b) throw std::runtime_error(message.toStdString()); }
 QString n(Id id) { return QString::number(id); }
-QStringList const typeNames{"npc", "spawn", "quest", "item"};
+QStringList const typeNames{"npc", "spawn", "quest", "item", "gameobject", "object_spawn"};
 QStringList const actionNames{"CREATE", "UPDATE", "DELETE", "MOVE"};
 QStringList const relations{"creature_questrelation", "creature_involvedrelation"};
 // Everything that links a quest to its givers, enders and exploration spot, keyed by quest.
@@ -108,12 +108,14 @@ QString toString(ChangeAction action) { return actionNames[int(action)]; }
 QString TrackedChange::summary() const {
   QString name = label.isEmpty() ? "#" + n(entity) : label;
   QString sign = action == ChangeAction::Create ? "+" : action == ChangeAction::Delete ? "-" : "~";
-  if (type == EntityType::Spawn) {
+  if(type==EntityType::Spawn && action==ChangeAction::Update && before["creature_movement"]!=after["creature_movement"])
+    return sign+" Patrol: "+name+QString(" · %1 waypoints").arg(after["creature_movement"].toArray().size());
+  if (type == EntityType::Spawn || type == EntityType::GameObjectSpawn) {
     QString what = action == ChangeAction::Create ? "placed" : action == ChangeAction::Move ? "moved"
                  : action == ChangeAction::Delete ? "placement removed" : "placement edited";
     return sign + " Spawn: " + name + " " + what;
   }
-  return sign + (type == EntityType::Npc ? " NPC: " : type == EntityType::Item ? " Item: " : " Quest: ") + name;
+  return sign + (type == EntityType::Npc ? " NPC: " : type == EntityType::Item ? " Item: " : type == EntityType::GameObject ? " GameObject: " : " Quest: ") + name;
 }
 ChangeTracker* ChangeTracker::instance() {
   auto runtime = Runtime::RuntimeManager::instance();
@@ -224,8 +226,20 @@ QJsonObject ChangeTracker::capture(QueryFunction const& query, EntityType type, 
     // Relations to Creator quests belong to those quests' own changes.
     for (auto const& table : relations) add(table, "id=" + n(id) + creatorOnlyQuests());
     if (label) *label = main["name"].toString();
+  } else if (type == EntityType::GameObject || type == EntityType::GameObjectSpawn) {
+    QString table = type == EntityType::GameObject ? "gameobject_template" : "gameobject";
+    add(table, (type == EntityType::GameObject ? "entry=" : "guid=") + n(id));
+    if (!rows.isEmpty() && label) {
+      auto main = firstRow(rows, table);
+      if (type == EntityType::GameObject) *label = main["name"].toString();
+      else { auto names=query("SELECT name FROM gameobject_template WHERE entry="+n(field(main,"id"))); if(!names.isEmpty()) *label=names[0]["name"].toString(); }
+    }
   } else if (type == EntityType::Spawn) {
     add("creature", "guid=" + n(id));
+    if (rows.isEmpty()) return rows;
+    add("creature_movement", "id=" + n(id));
+    auto scripts=ids(rows["creature_movement"].toArray(),"script_id"); scripts.removeAll("0");
+    if(!scripts.isEmpty()) add("creature_movement_scripts","id IN ("+scripts.join(',')+")");
     if (rows.isEmpty() || !label) return rows;
     auto names = query("SELECT name FROM creature_template WHERE entry=" + n(field(firstRow(rows, "creature"), "id")));
     if (!names.isEmpty()) *label = names[0]["name"].toString();
@@ -301,8 +315,28 @@ QString ChangeTracker::sql(QVector<TrackedChange> const& changes) {
     out += "DELETE FROM item_template WHERE entry=" + id + " AND @owned>0;\n";
     out += "DELETE FROM creator_content WHERE kind='item' AND entry=" + id + ";\n";
   }
+  for (auto type : {EntityType::GameObject, EntityType::GameObjectSpawn}) {
+    QString table=type==EntityType::GameObject?"gameobject_template":"gameobject";
+    QString key=type==EntityType::GameObject?"entry":"guid";
+    for(auto const& c:ordered(type,false)) {
+      out+=replaceRows(table,c.after[table].toArray());
+      out+="INSERT IGNORE INTO creator_content(kind,entry) VALUES('"+toString(type)+"',"+n(c.entity)+");\n";
+    }
+    for(auto const& c:ordered(type,true)) {
+      out+=ownedGuard(toString(type),c.entity);
+      out+="DELETE FROM "+table+" WHERE "+key+"="+n(c.entity)+" AND @owned>0;\n";
+      out+="DELETE FROM creator_content WHERE kind='"+toString(type)+"' AND entry="+n(c.entity)+";\n";
+    }
+  }
+  auto removePath=[&](TrackedChange const& c) {
+    QString sql;
+
+    sql+="DELETE FROM creature_movement WHERE id="+n(c.entity)+";\n";
+    return sql;
+  };
   for (auto const& c : ordered(EntityType::Spawn, true)) {
     out += "\n-- Remove placement: " + oneLine(c.label) + " (#" + n(c.entity) + ")\n" + ownedGuard("spawn", c.entity);
+    out += "DELETE FROM creature_movement WHERE id="+n(c.entity)+" AND @owned>0;\n";
     out += "DELETE FROM creature WHERE guid=" + n(c.entity) + " AND @owned>0;\n";
     out += "DELETE FROM creator_content WHERE kind='spawn' AND entry=" + n(c.entity) + ";\n";
   }
@@ -310,6 +344,7 @@ QString ChangeTracker::sql(QVector<TrackedChange> const& changes) {
     auto id = n(c.entity);
     out += "\n-- Delete NPC: " + oneLine(c.label) + " (#" + id + ")\n" + ownedGuard("npc", c.entity);
     out += "DELETE FROM creator_content WHERE kind='spawn' AND @owned>0 AND entry IN (SELECT guid FROM creature WHERE id=" + id + ");\n";
+    out += "DELETE FROM creature_movement WHERE id IN (SELECT guid FROM creature WHERE id="+id+") AND @owned>0;\n";
     out += "DELETE FROM creature WHERE id=" + id + " AND @owned>0;\n";
     out += "DELETE FROM npc_vendor WHERE entry=" + id + " AND @owned>0;\n";
     out += "DELETE FROM npc_trainer WHERE entry=" + id + " AND @owned>0;\n";
@@ -333,6 +368,11 @@ QString ChangeTracker::sql(QVector<TrackedChange> const& changes) {
     out += "INSERT IGNORE INTO creator_content(kind,entry) VALUES('item'," + n(c.entity) + ");\n";
   }
   for (auto const& c : ordered(EntityType::Spawn, false)) {
+    out += removePath(c);
+    for(auto const& script:ids(c.after["creature_movement_scripts"].toArray(),"id"))
+      out += "DELETE FROM creature_movement_scripts WHERE id="+script+";\n";
+    out += replaceRows("creature_movement_scripts", c.after["creature_movement_scripts"].toArray());
+    out += replaceRows("creature_movement", c.after["creature_movement"].toArray());
     out += "\n-- Placement: " + oneLine(c.label) + " (#" + n(c.entity) + ")\n" + replaceRows("creature", c.after["creature"].toArray());
     out += "INSERT IGNORE INTO creator_content(kind,entry) VALUES('spawn'," + n(c.entity) + ");\n";
   }
@@ -406,10 +446,15 @@ QVector<QPair<QString, QString>> ChangeTracker::footprint(QVector<TrackedChange>
         QStringList guids;
         for (auto const& row : target("SELECT guid FROM creature WHERE id=" + id)) guids << row["guid"].toString();
         add("creature", "guid", guids);
+        add("creature_movement", "id", guids);
         owned("spawn", guids);
       }
+    } else if (c.type == EntityType::GameObject || c.type == EntityType::GameObjectSpawn) {
+      add(c.type==EntityType::GameObject?"gameobject_template":"gameobject",c.type==EntityType::GameObject?"entry":"guid",{id});
     } else if (c.type == EntityType::Spawn) {
       add("creature", "guid", {id});
+      add("creature_movement", "id", {id});
+      add("creature_movement_scripts", "id", values("creature_movement_scripts", "id"));
     } else if (c.type == EntityType::Item) {
       add("item_template", "entry", {id});
       if (c.action == ChangeAction::Delete)

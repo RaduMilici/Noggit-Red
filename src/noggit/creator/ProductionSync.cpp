@@ -10,14 +10,14 @@ namespace {
 using Rollback = ProductionSync::Outcome::Rollback;
 QString const createOwnership =
   "CREATE TABLE IF NOT EXISTS creator_content (kind VARCHAR(20) NOT NULL, entry INT UNSIGNED NOT NULL, PRIMARY KEY(kind,entry)) ENGINE=InnoDB";
-QStringList const worldTables{"creature_template", "creature", "quest_template", "item_template"};
+QStringList const worldTables{"creature_template", "creature", "quest_template", "item_template", "gameobject_template", "gameobject", "creature_movement", "creature_movement_scripts"};
 void writeFile(QString const& path, QByteArray const& bytes) {
   QSaveFile file(path);
   if (!file.open(QIODevice::WriteOnly) || file.write(bytes) != bytes.size() || !file.commit())
     throw std::runtime_error(("Cannot write " + path).toStdString());
 }
 QString title(EntityType type) {
-  return type == EntityType::Npc ? "NPC" : type == EntityType::Spawn ? "Placement" : type == EntityType::Item ? "Item" : "Quest";
+  return type == EntityType::GameObject ? "GameObject" : type == EntityType::GameObjectSpawn ? "Object placement" : type == EntityType::Npc ? "NPC" : type == EntityType::Spawn ? "Placement" : type == EntityType::Item ? "Item" : "Quest";
 }
 // The server's message, in terms of the profile.
 QString databaseProblem(QString const& message, ProductionProfile const& profile) {
@@ -81,9 +81,23 @@ QStringList ProductionSync::conflicts(ChangePackage const& package, QueryFunctio
   QStringList clashes;
   for (int i = 0; i < package.changes.size(); ++i) {
     auto const& c = package.changes[i];
+    if(c.type==EntityType::Spawn && c.action!=ChangeAction::Delete) {
+      QSet<QString> checked;
+      for(auto const& value:c.after["creature_movement_scripts"].toArray()) {
+        auto id=value.toObject()["id"].toString(); if(checked.contains(id)) continue; checked.insert(id);
+        QJsonArray remote,expected,baseline;
+        for(auto const& row:production("SELECT * FROM creature_movement_scripts WHERE id="+id)) remote.append(QJsonObject::fromVariantMap(row));
+        for(auto const& row:c.after["creature_movement_scripts"].toArray()) if(row.toObject()["id"].toString()==id) expected.append(row);
+        for(auto const& row:c.before["creature_movement_scripts"].toArray()) if(row.toObject()["id"].toString()==id) baseline.append(row);
+        if(!remote.isEmpty() && remote!=expected && remote!=baseline) clashes << "Patrol script #"+id+" already exists on production with different behavior.";
+      }
+    }
     if (!package.owned.value(i) || c.action == ChangeAction::Delete) continue;
     QString existing;
-    if (ChangeTracker::capture(production, c.type, c.entity, &existing).isEmpty()) continue;
+    auto current=ChangeTracker::capture(production, c.type, c.entity, &existing);
+    if (current.isEmpty()) continue;
+    // Explicitly authored patrols may belong to original NPCs. Only replace an unchanged baseline.
+    if(c.type==EntityType::Spawn && !c.before.isEmpty() && c.before==current) continue;
     if (!production("SELECT entry FROM creator_content WHERE kind='" + toString(c.type) + "' AND entry=" + QString::number(c.entity)).isEmpty()) continue;
     clashes << QString("%1 #%2 \"%3\": production already has \"%4\"").arg(title(c.type)).arg(c.entity).arg(c.label, existing);
   }

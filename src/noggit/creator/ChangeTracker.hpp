@@ -9,7 +9,7 @@
 #include <functional>
 #include <optional>
 namespace Noggit::Creator {
-enum class EntityType { Npc, Spawn, Quest, Item };
+enum class EntityType { Npc, Spawn, Quest, Item, GameObject, GameObjectSpawn };
 enum class ChangeAction { Create, Update, Delete, Move };
 QString toString(EntityType);
 QString toString(ChangeAction);

@@ -1,4 +1,6 @@
 #include "AuthoringDialogs.hpp"
+#include "Database.hpp"
+#include <noggit/DBC.h>
 #include <noggit/World.h>
 #include <noggit/ui/tools/AssetBrowser/ModelView.hpp>
 #include <QDialog>
@@ -29,19 +31,34 @@ namespace {
 void error(QWidget* parent, std::exception const& e) { QMessageBox::warning(parent,"Creator",QString::fromUtf8(e.what())); }
 QLabel* note(QString text,QWidget* parent) { auto l=new QLabel(text,parent); l->setWordWrap(true); l->setTextFormat(Qt::PlainText); return l; }
 QSpinBox* spin(QFormLayout* form,QString name,int value,int minimum,int maximum) { auto s=new QSpinBox; s->setRange(minimum,maximum); s->setValue(value); form->addRow(name,s); return s; }
-std::optional<Choice> choose(QWidget* parent,QString title,std::function<QVector<Choice>(QString)> search) {
+std::optional<Choice> choose(QWidget* parent,QString title,std::function<QVector<Choice>(QString)> search, QWidget* preview = nullptr, std::function<void(Id)> selected = {}) {
   QDialog dialog(parent); dialog.setWindowTitle(title); dialog.resize(560,500); auto layout=new QVBoxLayout(&dialog);
   auto input=new QLineEdit; input->setPlaceholderText("Search by name…"); layout->addWidget(input);
-  auto list=new QListWidget; layout->addWidget(list); auto status=note("",&dialog); layout->addWidget(status);
+  auto list=new QListWidget; auto resultsRow=new QHBoxLayout; resultsRow->addWidget(list,1); if(preview) { resultsRow->addWidget(preview,1); dialog.resize(900,540); } layout->addLayout(resultsRow,1); auto status=note("",&dialog); layout->addWidget(status);
   auto buttons=new QDialogButtonBox(QDialogButtonBox::Ok|QDialogButtonBox::Cancel); layout->addWidget(buttons);
   QVector<Choice> results; QTimer timer; timer.setSingleShot(true); timer.setInterval(250);
   auto refresh=[&] { try { results=search(input->text()); list->clear(); for(auto const& r:results) list->addItem(r.name+(r.detail.isEmpty()?"":"\n"+r.detail)); status->setText(results.size()==250?"Showing the first 250 matches. Refine your search.":QString()); } catch(std::exception const& e) { results.clear(); list->clear(); status->setText(e.what()); } };
+  QObject::connect(list,&QListWidget::currentRowChanged,&dialog,[&](int i) { if(selected&&i>=0&&i<results.size()) selected(results[i].id); });
   QObject::connect(input,&QLineEdit::textChanged,&timer,[&]{timer.start();}); QObject::connect(&timer,&QTimer::timeout,&dialog,refresh);
   QObject::connect(buttons,&QDialogButtonBox::accepted,&dialog,[&]{if(list->currentRow()>=0)dialog.accept();});
   QObject::connect(list,&QListWidget::itemDoubleClicked,&dialog,[&]{dialog.accept();});
   QObject::connect(buttons,&QDialogButtonBox::rejected,&dialog,&QDialog::reject); refresh();
   if(dialog.exec()!=QDialog::Accepted||list->currentRow()<0) return {}; return results[list->currentRow()];
 }
+class ObjectPreview final : public Ui::Tools::AssetBrowser::ModelViewer {
+  QString _path;
+public:
+  explicit ObjectPreview(QWidget* parent):ModelViewer(parent,Noggit::ASSET_BROWSER_PREVIEW) { setMinimumSize(220,200); }
+  void display(Id id) {
+    try {
+      _path=QString::fromStdString(gGameObjectDisplayInfoDB.getByID(id).getString(GameObjectDisplayInfoDB::ModelName)).toLower();
+      _path.replace('\\','/');
+      if(_path.endsWith(".mdx")||_path.endsWith(".mdl")) _path=_path.left(_path.size()-4)+".m2";
+    } catch(DBCFile::NotFound const&) { _path.clear(); }
+  }
+protected:
+  void draw() override { if(!_path.isEmpty()) { auto path=_path; _path.clear(); setModel(path.toStdString()); } PreviewRenderer::draw(); }
+};
 class AppearancePreview : public Ui::Tools::AssetBrowser::ModelViewer {
   World* _world; World::CreatureSpawnOverlay _spawn; bool _pending=false; QString _requested;
 public:
@@ -222,5 +239,58 @@ std::optional<Id> createNpc(QWidget* parent,World* world,NpcKind kind,Id source)
 bool editNpc(QWidget* parent,World* world,Id entry) {
   try { if(!CreatureService::owned(entry)){QMessageBox::information(parent,"NPC properties","This is an original NPC. Clone it to make your own version.");return false;}auto npc=CreatureService::load(entry);return npcDialog(parent,world,npc,npc.type==7?1:2,nullptr); }
   catch(std::exception const& e){error(parent,e);return false;}
+}
+}
+
+namespace Noggit::Creator {
+std::optional<GameObject> designGameObject(QWidget* parent, Id entry, Id guid) {
+  GameObject d;
+  try { if(entry) d=GameObjectService::load(entry,guid); } catch(std::exception const& e) { error(parent,e); return {}; }
+  QDialog dialog(parent); dialog.setWindowTitle(entry?"GameObject · Edit":"GameObject · Create"); dialog.resize(540,580);
+  dialog.setStyleSheet("QGroupBox {font-weight:600; margin-top:16px; padding:16px;} QPushButton {padding:9px;} QLineEdit,QComboBox,QSpinBox,QDoubleSpinBox {padding:6px;}");
+  auto layout=new QVBoxLayout(&dialog);
+  auto title=new QLabel("<h2>Bring the world to life</h2><p>Choose an existing appearance, then place it in the world.</p>"); layout->addWidget(title);
+  auto form=new QFormLayout; layout->addLayout(form);
+  auto name=new QLineEdit(d.name); form->addRow("Name",name);
+  auto model=new QPushButton(d.display?QString("Display %1 · Change appearance").arg(d.display):"Browse appearances…"); form->addRow("Appearance",model);
+  Id source=0;
+  auto preview=new ObjectPreview(&dialog); layout->addWidget(preview); if(d.display) preview->display(d.display);
+  QObject::connect(model,&QPushButton::clicked,&dialog,[&] {
+    auto browserPreview=new ObjectPreview(&dialog);
+    if(auto choice=choose(&dialog,"Existing GameObject appearances",GameObjectService::search,browserPreview,[browserPreview](Id id) {
+      try { browserPreview->display(GameObjectService::load(id).display); } catch(std::exception const&) {}
+    })) {
+      try { auto selected=GameObjectService::load(choice->id); d.display=selected.display; preview->display(d.display); source=choice->id; model->setText(choice->name+QString(" · Display %1").arg(d.display)); if(name->text().isEmpty()) name->setText(choice->name); }
+      catch(std::exception const& e) { error(&dialog,e); }
+    }
+  });
+  auto type=new QComboBox;
+  for(auto const& item:QVector<QPair<QString,int>>{{"Chest",3},{"Door",0},{"Quest Object",10},{"Lever / Interactive Object",10},{"Decoration",5},{"Trap",6},{"Resource Node",3},{"Custom · inherit selected object behavior",-1}}) type->addItem(item.first,item.second);
+  type->setCurrentIndex(std::max(0,type->findData(d.type))); form->addRow("Type",type);
+  auto size=new QDoubleSpinBox; size->setRange(.01,100); size->setValue(d.size); size->setSuffix(" ×"); form->addRow("Size",size);
+  auto state=new QComboBox; state->addItems({"Active / open","Ready / closed","Alternative state"}); state->setCurrentIndex(d.state); form->addRow("State",state);
+  auto respawn=spin(form,"Respawn (seconds)",d.respawn,0,604800);
+  auto faction=new QComboBox; faction->addItem("Neutral / none",0u);
+  try { for(auto const& f:AppearanceService::factions()) faction->addItem(f.name,f.id); } catch(std::exception const& e) { error(&dialog,e); }
+  faction->setCurrentIndex(std::max(0,faction->findData(d.faction))); form->addRow("Faction",faction);
+  auto quest=new QPushButton("Choose quest…"); form->addRow("Quest relation",quest);
+  if(d.quest) try { Database db; auto names=db.query("SELECT Title FROM quest_template WHERE entry="+QString::number(d.quest)); if(!names.isEmpty()) quest->setText(names[0]["Title"].toString()); } catch(std::exception const& e) { error(&dialog,e); }
+  QObject::connect(quest,&QPushButton::clicked,&dialog,[&] {
+    auto q=choose(&dialog,"Quest relation",[](QString const& text) { Database db; QVector<Choice> out{{0,"None",{}}}; for(auto const& r:db.query("SELECT entry,Title FROM quest_template WHERE Title LIKE "+db.quote('%'+text+'%')+" ORDER BY Title LIMIT 249")) out.push_back({r["entry"].toUInt(),r["Title"].toString(),{}}); return out; });
+    if(q) { d.quest=q->id; quest->setText(q->name); }
+  });
+  layout->addWidget(note("Loot relation · coming later. For an ‘Interact with’ objective, choose Quest Object; it can use a chest appearance.",&dialog));
+  auto buttons=new QDialogButtonBox(QDialogButtonBox::Save|QDialogButtonBox::Cancel); layout->addWidget(buttons);
+  QObject::connect(buttons,&QDialogButtonBox::rejected,&dialog,&QDialog::reject);
+  QObject::connect(buttons,&QDialogButtonBox::accepted,&dialog,[&] {
+    if(!d.display||name->text().trimmed().isEmpty()) { QMessageBox::information(&dialog,"GameObject","Choose an appearance and a name."); return; }
+    d.name=name->text(); d.type=type->currentData().toInt(); d.size=size->value(); d.state=state->currentIndex(); d.respawn=respawn->value(); d.faction=faction->currentData().toUInt();
+    if(d.type==-1) { if(!source) { QMessageBox::information(&dialog,"Custom object","Browse and select the object whose behavior you want to use."); return; } try { d.type=GameObjectService::load(source).type; d.source=source; } catch(std::exception const& e) { error(&dialog,e); return; } }
+    if(source && (d.type==6 || type->currentText()=="Resource Node")) {
+      try { auto existing=GameObjectService::load(source); if(existing.type!=d.type) { QMessageBox::information(&dialog,"Choose matching behavior","For a trap or resource node, select an existing model of that type so its interaction works in game."); return; } d.source=source; } catch(std::exception const& e) { error(&dialog,e); return; }
+    }
+    dialog.accept();
+  });
+  if(dialog.exec()!=QDialog::Accepted) return {}; return d;
 }
 }

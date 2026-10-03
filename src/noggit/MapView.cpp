@@ -385,6 +385,7 @@ namespace
 #include <QProgressDialog>
 #include <QProcess>
 #include <QDialogButtonBox>
+#include <QSignalBlocker>
 #include <QCoreApplication>
 #include <QOpenGLExtraFunctions> // [VULKAN phase A] glFenceSync/glClientWaitSync for the GL->VK hard sync
 #include <noggit/MapHeaders.h>    // [VULKAN phase B] MCLYFlags for the textured-terrain feed
@@ -2719,6 +2720,7 @@ void MapView::setupCreatureModelPickerUi()
     actions.place = [this] { if (_studio_entry) studioPlace(*_studio_entry); };
     actions.quests = [this] { if (_studio_entry && prepareCreatorChange()) { openQuests(*_studio_entry); reloadCreatorContent(_selected_creature_spawn_guid); refreshStudio(); } };
     actions.chain = [this] { if (_studio_entry) openQuestChain(*_studio_entry); };
+    actions.patrol = [this] { editCreatorPatrol(); };
     actions.testAtNpc = [this] { studioTestAtNpc(); };
     actions.testAtSpot = [this]
     {
@@ -3623,6 +3625,13 @@ void MapView::setupGameObjectModelPickerUi()
   spawn_layout->addRow("Entry:", entry_field);
   spawn_layout->addRow("Display:", display_field);
   spawn_layout->addRow(add_button);
+  if(qApp->property("creatorRuntimeManaged").toBool()) {
+    guid_field->hide(); entry_field->hide(); display_field->hide(); add_button->hide();
+    for(auto label:{spawn_layout->labelForField(guid_field),spawn_layout->labelForField(entry_field),spawn_layout->labelForField(display_field)}) if(label) label->hide();
+    spawn_box->setTitle("GameObject Studio");
+    auto intro=new QLabel("Choose an appearance, design your object, then click in the world to place it."); intro->setWordWrap(true); spawn_layout->addRow(intro);
+    auto create=new QPushButton("Create GameObject…"); spawn_layout->addRow(create); connect(create,&QPushButton::clicked,this,[this] { creatorGameObject(); });
+  }
 
   splitter->addWidget(list_column);
   splitter->addWidget(filter_panel);
@@ -4018,7 +4027,8 @@ void MapView::setupGameObjectModelPickerUi()
   connect(type_filter, qOverload<int>(&QComboBox::currentIndexChanged), rebuild_template_tree);
   connect(search_box, &QLineEdit::textChanged, rebuild_template_tree);
   connect(add_button, &QPushButton::clicked, add_pending_spawn);
-  preview->on_double_click = add_pending_spawn;
+  preview->on_double_click = qApp->property("creatorRuntimeManaged").toBool()
+    ? std::function<void()>([this] { creatorGameObject(); }) : std::function<void()>(add_pending_spawn);
 
   rebuild_template_tree();
 
@@ -9100,6 +9110,17 @@ QString MapView::buildDirtyGameObjectSpawnSql(bool rebase_state)
 
 void MapView::saveDirtyGameObjectSpawns()
 {
+  if(qApp->property("creatorRuntimeManaged").toBool()) {
+    try {
+      if(_world->dirtyCreatureSpawnCount()) throw std::runtime_error("Save or discard pending NPC placements first.");
+      QVector<Noggit::Creator::SpawnEdit> edits;
+      for(auto const& s:_world->gameObjectSpawns()) if(s.dirty)
+        edits.push_back({s.guid,s.entry,serverPosition(s.pos,s.orientation),120,s.pending_delete,s.pending_create});
+      if(edits.isEmpty()) return;
+      Noggit::Creator::GameObjectService::placements(edits); reloadCreatorObjects();
+    } catch(std::exception const& e) { QMessageBox::warning(this,"Save GameObjects",e.what()); }
+    return;
+  }
   auto dirty_count = _world->dirtyGameObjectSpawnCount();
   if (dirty_count == 0)
   {
@@ -9196,6 +9217,7 @@ namespace
 
 void MapView::applyDirtyCreatureSpawnsToDb()
 {
+  if(qApp->property("creatorRuntimeManaged").toBool()) { saveDirtyCreatureSpawns(); return; }
   auto dirty_count = _world->dirtyCreatureSpawnCount();
   if (dirty_count == 0)
   {
@@ -9245,6 +9267,7 @@ void MapView::applyDirtyCreatureSpawnsToDb()
 
 void MapView::applyDirtyGameObjectSpawnsToDb()
 {
+  if(qApp->property("creatorRuntimeManaged").toBool()) { saveDirtyGameObjectSpawns(); return; }
   auto dirty_count = _world->dirtyGameObjectSpawnCount();
   if (dirty_count == 0)
   {
@@ -18244,6 +18267,9 @@ bool MapView::eventFilter(QObject* obj, QEvent* e)
 
 void MapView::keyPressEvent (QKeyEvent *event)
 {
+  if(_patrol_guid && (event->key()==Qt::Key_Delete || event->key()==Qt::Key_Backspace)) {
+    auto i=_patrol_list->currentRow(); if(i>=0) { _creator_patrol.points.removeAt(i); refreshCreatorPatrol(); } return;
+  }
   if (_world_pick && event->key() == Qt::Key_Escape)
   {
     endWorldPick();
@@ -18633,6 +18659,12 @@ void MapView::focusOutEvent (QFocusEvent*)
 
 void MapView::mouseMoveEvent (QMouseEvent* event)
 {
+  if(_patrol_drag>=0) {
+    makeCurrent(); OpenGL::context::scoped_setter const guard(::gl,context());
+    _last_mouse_pos=event->pos();
+    if(auto hit=surface_pos_under_cursor()) { auto& p=_creator_patrol.points[_patrol_drag].position; auto orientation=p.orientation; p=serverPosition(*hit,0); p.orientation=orientation; _patrol_overlay->update(); }
+    return;
+  }
   //! \todo:  move the function call requiring a context in tick ?
   makeCurrent();
   OpenGL::context::scoped_setter const _ (::gl, context());
@@ -19041,6 +19073,19 @@ void MapView::mousePressEvent(QMouseEvent* event)
     }
   }
 
+  if(_patrol_guid && event->button()==Qt::LeftButton) {
+    _last_mouse_pos=event->pos();
+    for(int i=0;i<_creator_patrol.points.size();++i) if((patrolScreen(i)-event->pos()).manhattanLength()<24) {
+      _patrol_drag=i; _patrol_list->setCurrentRow(i); return;
+    }
+    if(_patrol_add) if(auto hit=surface_pos_under_cursor()) {
+      Noggit::Creator::Waypoint w; w.position=serverPosition(*hit,0); w.position.orientation=100;
+      w.run=_patrol_default_run;
+      int index=_patrol_insert<0?_creator_patrol.points.size():std::min(_patrol_insert,_creator_patrol.points.size());
+      _creator_patrol.points.insert(index,w); _patrol_insert=-1; refreshCreatorPatrol(); _patrol_list->setCurrentRow(index);
+    }
+    return;
+  }
   // A pending "click in the world" (place an NPC, test at a spot) takes the next left click.
   if (_world_pick && event->button() == Qt::LeftButton)
   {
@@ -19236,6 +19281,7 @@ void MapView::wheelEvent (QWheelEvent* event)
 
 void MapView::mouseReleaseEvent (QMouseEvent* event)
 {
+  if(_patrol_guid && event->button()==Qt::LeftButton) { _patrol_drag=-1; return; }
   makeCurrent();
   OpenGL::context::scoped_setter const _(::gl, context());
 
@@ -19666,6 +19712,35 @@ void MapView::ShowContextMenu(QPoint pos)
     if (mouse_moved || ImGuizmo::IsUsing())
         return;
 
+    if(qApp->property("creatorRuntimeManaged").toBool()) {
+      QMenu menu(this); auto create=menu.addMenu("Create");
+      create->addAction("GameObject",this,[this] { creatorGameObject(); });
+      if(_selected_creature_spawn_guid) menu.addAction("Edit Patrol",this,[this] { editCreatorPatrol(); });
+      if(_selected_gameobject_spawn_guid) {
+        auto guid=*_selected_gameobject_spawn_guid;
+        auto spawn=_world->findGameObjectSpawn(guid);
+        if(spawn) {
+          auto entry=spawn->entry; auto position=spawn->pos; auto orientation=spawn->orientation;
+          menu.addAction("Edit GameObject",this,[this,entry,guid] {
+            if(!prepareCreatorChange()) return;
+            if(auto d=Noggit::Creator::designGameObject(this,entry,guid)) try { Noggit::Creator::GameObjectService::save(*d); reloadCreatorObjects(); } catch(std::exception const& e) { QMessageBox::warning(this,"GameObject",e.what()); }
+          });
+          menu.addAction("Locate in world",this,[this,position] { focus_camera_on_target(position); });
+          menu.addAction("Duplicate GameObject",this,[this,entry,guid] {
+            if(!prepareCreatorChange()) return;
+            try { auto d=Noggit::Creator::GameObjectService::load(entry,guid); beginWorldPick("Click to place the duplicate",[this,d](glm::vec3 const& p) { try { Noggit::Creator::GameObjectService::save(d,serverPosition(p,0)); reloadCreatorObjects(); } catch(std::exception const& e) { QMessageBox::warning(this,"Duplicate",e.what()); } }); } catch(std::exception const& e) { QMessageBox::warning(this,"Duplicate",e.what()); }
+          });
+          menu.addAction("Delete GameObject",this,[this,guid,entry,position,orientation] { if(!prepareCreatorChange()) return; try { Noggit::Creator::GameObjectService::placements({{guid,entry,serverPosition(position,orientation),120,true,false}}); reloadCreatorObjects(); } catch(std::exception const& e) { QMessageBox::warning(this,"Delete",e.what()); } });
+          menu.addAction("Save object placements",this,[this] { saveDirtyGameObjectSpawns(); });
+          menu.addAction("Test GameObject",this,[this,guid] {
+            saveDirtyGameObjectSpawns();
+            if(_world->dirtyGameObjectSpawnCount()) return;
+            if(auto s=_world->findGameObjectSpawn(guid)) if(auto tests=Noggit::Creator::TestSessionService::instance()) tests->testGameObject(this,serverPosition(s->pos,s->orientation));
+          });
+        }
+      }
+      menu.exec(mapToGlobal(pos)); return;
+    }
     // Only object editing has a context menu; NPC and gameobject work happens in their panels.
     if (terrainMode != editing_mode::object)
         return;
@@ -20089,4 +20164,110 @@ void MapView::ShowContextMenu(QPoint pos)
         menu->exec(mapToGlobal(pos)); // synch
         // menu->popup(mapToGlobal(pos)); // asynch, needs to be preloaded to work
     }
+}
+
+namespace {
+class PatrolDialog final : public QDialog {
+public:
+  using QDialog::QDialog;
+  std::function<bool()> canClose;
+  void reject() override { if(!canClose || canClose()) QDialog::reject(); }
+};
+class PatrolCanvas final : public QWidget {
+public:
+  std::function<void(QPainter&)> draw;
+  explicit PatrolCanvas(QWidget* parent):QWidget(parent) { setAttribute(Qt::WA_TransparentForMouseEvents); setAttribute(Qt::WA_NoSystemBackground); }
+  void paintEvent(QPaintEvent*) override { QPainter p(this); p.setRenderHint(QPainter::Antialiasing); if(draw) draw(p); }
+};
+}
+void MapView::reloadCreatorObjects() {
+  makeCurrent(); OpenGL::context::scoped_setter const guard(::gl,context());
+  _selected_gameobject_spawn_guid.reset(); _gameobject_undo_ops.clear();
+  auto npc=_selected_creature_spawn_guid;
+  _world->reloadCreatureSpawns(); _world->setDrawGameObjectSpawns(true);
+  rebuildCreatureBrowserList(false); setSelectedCreatureSpawn(npc);
+  rebuildGameObjectBrowserList(false); refreshGameObjectEditorKnobs(); _needs_redraw=true;
+}
+void MapView::creatorGameObject() {
+  if(!prepareCreatorChange()) return;
+  if(auto d=Noggit::Creator::designGameObject(this)) {
+    set_editing_mode(editing_mode::gameobject);
+    beginWorldPick("Click to place "+d->name,[this,d](glm::vec3 const& p) {
+      try { Noggit::Creator::GameObjectService::save(*d,serverPosition(p,0)); reloadCreatorObjects(); }
+      catch(std::exception const& e) { QMessageBox::warning(this,"Create GameObject",e.what()); }
+    });
+  }
+}
+QPoint MapView::patrolScreen(int index) const {
+  auto p=_creator_patrol.points[index].position;
+  auto v=server_to_client_creature_position(p.x,p.y,p.z,_world->mapIndex.hasAGlobalWMO()); v.y+=0.3f;
+  auto screen=glm::project(v,model_view(),projection(),glm::vec4(0,0,width(),height()));
+  if(screen.z<0||screen.z>1) return {-10000,-10000};
+  return {int(screen.x),height()-int(screen.y)};
+}
+void MapView::refreshCreatorPatrol() {
+  auto selected=_patrol_list->currentRow(); _patrol_list->clear();
+  for(int i=0;i<_creator_patrol.points.size();++i) { auto const& w=_creator_patrol.points[i]; _patrol_list->addItem(QString("%1    %2     ·     %3 s pause").arg(i+1,2,10,QChar('0')).arg(w.run?"Run":"Walk").arg(w.waitMs/1000.0)); }
+  if(selected>=0) _patrol_list->setCurrentRow(std::min(selected,_patrol_list->count()-1));
+  _patrol_overlay->update();
+}
+void MapView::editCreatorPatrol() {
+  if(_patrol_guid) return;
+  if(_world->dirtyCreatureSpawnCount() || _world->dirtyGameObjectSpawnCount()) {
+    QMessageBox::information(this,"Edit Patrol","Save or discard pending placements before editing a patrol."); return;
+  }
+  if(!_selected_creature_spawn_guid) { QMessageBox::information(this,"Edit Patrol","Select an NPC placement in the world first."); return; }
+  auto guid=*_selected_creature_spawn_guid;
+  try { _creator_patrol=Noggit::Creator::PatrolService::load(guid); }
+  catch(std::exception const& e) { QMessageBox::warning(this,"Patrol",e.what()); return; }
+  if(_creator_patrol.points.isEmpty()) if(auto spawn=_world->findCreatureSpawn(guid)) {
+    Noggit::Creator::Waypoint first; first.position=serverPosition(spawn->pos,spawn->orientation); first.position.orientation=100; _creator_patrol.points.push_back(first);
+  }
+  _patrol_default_run=!_creator_patrol.points.isEmpty()&&_creator_patrol.points.front().run;
+  _saved_creator_patrol=_creator_patrol;
+  _patrol_guid=guid; _patrol_add=true;
+  auto panel=new PatrolDialog(this,Qt::Tool); panel->setAttribute(Qt::WA_DeleteOnClose); panel->setWindowTitle("Patrol Studio"); panel->resize(350,620);
+  panel->setStyleSheet("QDialog {background:#202936;color:#eef4ff;} QLabel {color:#eef4ff;} QPushButton {padding:9px;border-radius:6px;background:#34455d;color:white;} QPushButton:checked {background:#187e9c;} QListWidget {background:#16202d;color:#eef4ff;border:0;border-radius:8px;padding:8px;} QListWidget::item {padding:9px;} QListWidget::item:selected {background:#187e9c;}");
+  panel->canClose=[this,panel] {
+    if(_creator_patrol==_saved_creator_patrol) return true;
+    auto answer=QMessageBox::question(panel,"Unsaved patrol","Save this patrol before closing?",QMessageBox::Save|QMessageBox::Discard|QMessageBox::Cancel,QMessageBox::Save);
+    if(answer==QMessageBox::Cancel) return false;
+    if(answer==QMessageBox::Save) try { Noggit::Creator::PatrolService::save(_patrol_guid,_creator_patrol); } catch(std::exception const& e) { QMessageBox::warning(panel,"Save patrol",e.what()); return false; }
+    return true;
+  };
+  auto layout=new QVBoxLayout(panel); layout->setSpacing(10);
+  auto title=new QLabel("<h2>Draw a patrol</h2>Click terrain to add. Drag numbered nodes to move."); title->setWordWrap(true); layout->addWidget(title);
+  auto speed=new QComboBox; speed->addItems({"Walk · entire path","Run · entire path"}); speed->setCurrentIndex(_patrol_default_run); layout->addWidget(speed);
+  auto canvas=new PatrolCanvas(this); _patrol_overlay=canvas; canvas->setGeometry(rect()); canvas->show(); canvas->raise();
+  canvas->draw=[this](QPainter& p) {
+    if(!_patrol_guid || !_patrol_list) return;
+    p.setPen(QPen(QColor("#42cbe5"),3));
+    for(int i=1;i<_creator_patrol.points.size();++i) { auto a=patrolScreen(i-1),b=patrolScreen(i); if(a.x()>-9999&&b.x()>-9999) p.drawLine(a,b); }
+    if(_creator_patrol.loop&&_creator_patrol.points.size()>1) { auto a=patrolScreen(0),b=patrolScreen(_creator_patrol.points.size()-1); if(a.x()>-9999&&b.x()>-9999) { p.setPen(QPen(QColor("#42cbe5"),2,Qt::DashLine)); p.drawLine(a,b); } }
+    for(int i=0;i<_creator_patrol.points.size();++i) { auto at=patrolScreen(i); p.setPen(QPen(Qt::white,2)); p.setBrush(i==_patrol_list->currentRow()?QColor("#efac49"):QColor("#187e9c")); p.drawEllipse(at,14,14); p.drawText(QRect(at-QPoint(14,14),QSize(28,28)),Qt::AlignCenter,QString::number(i+1)); }
+  };
+  auto timer=new QTimer(panel); timer->setInterval(33); connect(timer,&QTimer::timeout,canvas,[this,canvas] { canvas->setGeometry(rect()); canvas->update(); }); timer->start();
+  _patrol_list=new QListWidget; layout->addWidget(_patrol_list,1);
+  auto button=[&](QString text,auto fn) { auto b=new QPushButton(text); layout->addWidget(b); connect(b,&QPushButton::clicked,panel,fn); return b; };
+  auto add=button("Add waypoints · click terrain",[this] { _patrol_add=!_patrol_add; }); add->setCheckable(true); add->setChecked(true);
+  button("Insert after selected",[this,add] { if(_patrol_list->currentRow()>=0) { _patrol_insert=_patrol_list->currentRow()+1; _patrol_add=true; add->setChecked(true); } });
+  button("Delete selected node",[this] { int i=_patrol_list->currentRow(); if(i>=0) { _creator_patrol.points.removeAt(i); refreshCreatorPatrol(); } });
+  auto row=new QHBoxLayout; layout->addLayout(row);
+  for(int delta:{-1,1}) { auto b=new QPushButton(delta<0?"Move earlier":"Move later"); row->addWidget(b); connect(b,&QPushButton::clicked,panel,[this,delta] { int i=_patrol_list->currentRow(),j=i+delta; if(i>=0&&j>=0&&j<_creator_patrol.points.size()) { _creator_patrol.points.swapItemsAt(i,j); refreshCreatorPatrol(); _patrol_list->setCurrentRow(j); } }); }
+  auto form=new QFormLayout; layout->addLayout(form);
+  auto nodeSpeed=new QComboBox; nodeSpeed->addItems({"Walk","Run"}); form->addRow("From selected node",nodeSpeed);
+  auto wait=new QDoubleSpinBox; wait->setRange(0,3600); wait->setSuffix(" s"); form->addRow("Wait at node",wait);
+  auto angle=new QDoubleSpinBox; angle->setRange(-1,360); angle->setSpecialValueText("Face travel direction"); angle->setValue(-1); angle->setSuffix("°"); form->addRow("Facing",angle);
+  auto loop=new QCheckBox("Loop path"); loop->setChecked(_creator_patrol.loop); layout->addWidget(loop);
+  connect(loop,&QCheckBox::toggled,panel,[this](bool v) { _creator_patrol.loop=v; });
+  connect(speed,qOverload<int>(&QComboBox::activated),panel,[this](int v) { _patrol_default_run=v; for(auto& w:_creator_patrol.points) w.run=v; refreshCreatorPatrol(); });
+  connect(_patrol_list,&QListWidget::currentRowChanged,panel,[this,nodeSpeed,wait,angle](int i) { if(i<0)return; QSignalBlocker a(nodeSpeed),b(wait),c(angle); auto w=_creator_patrol.points[i]; nodeSpeed->setCurrentIndex(w.run); wait->setValue(w.waitMs/1000.0); angle->setValue(w.position.orientation==100?-1:w.position.orientation*180/3.14159265); });
+  connect(nodeSpeed,qOverload<int>(&QComboBox::activated),panel,[this](int v) { int i=_patrol_list->currentRow(); if(i>=0) { _creator_patrol.points[i].run=v; refreshCreatorPatrol(); } });
+  connect(wait,qOverload<double>(&QDoubleSpinBox::valueChanged),panel,[this](double v) { int i=_patrol_list->currentRow(); if(i>=0) _creator_patrol.points[i].waitMs=int(v*1000); });
+  connect(angle,qOverload<double>(&QDoubleSpinBox::valueChanged),panel,[this](double v) { int i=_patrol_list->currentRow(); if(i>=0) _creator_patrol.points[i].position.orientation=v<0?100:v*3.14159265/180; });
+  button("Save patrol locally",[this] { try { Noggit::Creator::PatrolService::save(_patrol_guid,_creator_patrol); _saved_creator_patrol=_creator_patrol; _main_window->statusBar()->showMessage("Patrol saved · ready to test and sync",5000); } catch(std::exception const& e) { QMessageBox::warning(this,"Save patrol",e.what()); } });
+  button("Save & Test NPC",[this] { try { Noggit::Creator::PatrolService::save(_patrol_guid,_creator_patrol); _saved_creator_patrol=_creator_patrol; if(auto s=_world->findCreatureSpawn(_patrol_guid)) if(auto tests=Noggit::Creator::TestSessionService::instance()) tests->testNpc(this,serverPosition(s->pos,s->orientation)); } catch(std::exception const& e) { QMessageBox::warning(this,"Test patrol",e.what()); } });
+  button("Close",[panel] { panel->close(); });
+  connect(panel,&QDialog::finished,this,[this,canvas,timer] { timer->stop(); canvas->hide(); _patrol_guid=0; _patrol_drag=-1; _patrol_add=false; _patrol_insert=-1; _patrol_list=nullptr; _patrol_overlay=nullptr; canvas->deleteLater(); });
+  refreshCreatorPatrol(); panel->show();
 }

@@ -952,6 +952,19 @@ private:
   // NPC Studio (creature mode, Creator runtime): the NPC card in the bottom panel and its actions.
   void showStudioNpc(std::uint32_t entry, QString const& name);
   void refreshStudio();
+  void creatorGameObject();
+  void reloadCreatorObjects();
+  void editCreatorPatrol();
+  void refreshCreatorPatrol();
+  QPoint patrolScreen(int index) const;
+  Noggit::Creator::Patrol _creator_patrol, _saved_creator_patrol;
+  std::uint32_t _patrol_guid = 0;
+  QWidget* _patrol_overlay = nullptr;
+  QListWidget* _patrol_list = nullptr;
+  int _patrol_drag = -1;
+  bool _patrol_add = false;
+  bool _patrol_default_run = false;
+  int _patrol_insert = -1;
   void studioCreate(Noggit::Creator::NpcKind kind);
   void studioEdit();
   void studioPlace(std::uint32_t entry);

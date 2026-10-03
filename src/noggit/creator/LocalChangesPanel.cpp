@@ -30,7 +30,7 @@ QString settingsPath() { return Runtime::RuntimeManager::instance()->root() + "/
 QStringList ids(QVector<TrackedChange> const& changes) { QStringList result; for (auto const& c : changes) result << c.id; return result; }
 bool confirmClear(QWidget* parent, int count) {
   return QMessageBox::question(parent, "Clear Local Changes",
-    QString("Remove %1 %2 from Local Changes?\n\nThis only clears the list. The NPCs, placements and quests stay in your local world exactly as they are.")
+    QString("Remove %1 %2 from Local Changes?\n\nThis only clears the list. The NPCs, GameObjects, patrols and quests stay in your local world exactly as they are.")
       .arg(count).arg(count == 1 ? "entry" : "entries"),
     QMessageBox::Yes | QMessageBox::No, QMessageBox::No) == QMessageBox::Yes;
 }
@@ -52,7 +52,7 @@ void exportChanges(QWidget* parent) {
   folder->setReadOnly(true); auto browse = new QPushButton("Browse…"); auto folderRow = new QHBoxLayout; folderRow->addWidget(folder, 1); folderRow->addWidget(browse);
   form->addRow("Save in", folderRow);
   auto preview = new QLabel; preview->setWordWrap(true); preview->setTextFormat(Qt::PlainText); layout->addWidget(preview);
-  auto note = new QLabel(QString("Exports %1 %2. NPCs, items and quests made in Noggit that these changes rely on are included automatically.")
+  auto note = new QLabel(QString("Exports %1 %2. NPCs, GameObjects, items and quests made in Noggit that these changes rely on are included automatically.")
     .arg(changes.size()).arg(changes.size() == 1 ? "change" : "changes"));
   note->setWordWrap(true); layout->addWidget(note);
   auto buttons = new QDialogButtonBox(QDialogButtonBox::Cancel); auto save = buttons->addButton("Export", QDialogButtonBox::AcceptRole);
@@ -98,7 +98,7 @@ void addLocalChangesPanel(QMainWindow* window) {
   layout->addWidget(new QLabel("LOCAL CHANGES", panel));
   auto warning = new QLabel(panel); warning->setWordWrap(true); warning->setTextFormat(Qt::PlainText); layout->addWidget(warning);
   auto list = new QListWidget(panel); list->setSelectionMode(QAbstractItemView::ExtendedSelection); layout->addWidget(list, 1);
-  auto empty = new QLabel("No local changes yet. NPCs, placements and quests you save appear here.", panel);
+  auto empty = new QLabel("No local changes yet. NPCs, GameObjects, patrols and quests you save appear here.", panel);
   empty->setWordWrap(true); layout->addWidget(empty);
   auto testLocal = new QPushButton("Test Locally", panel);
   testLocal->setToolTip("Restart the local server with these changes and play them in WoW");

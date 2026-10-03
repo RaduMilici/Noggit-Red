@@ -41,13 +41,39 @@ void runChecks() {
   check(query("SELECT spawntimesecsmin FROM creature WHERE guid="+QString::number(guid))[0]["spawntimesecsmin"].toInt()==321,"Respawn edit was lost");
   position.x+=2; SpawnService::save({{guid,entry,position,321,false,false}});
   check(query("SELECT position_x FROM creature WHERE guid="+QString::number(guid))[0]["position_x"].toFloat()==position.x,"Movement was lost");
+  // GameObjects and patrols use the same journal, tracker and export service.
+  auto models=GameObjectService::search(""); check(!models.isEmpty(),"Seed has no GameObject models");
+  GameObject object; object.name="Ancient Chest"; object.type=10; object.display=GameObjectService::load(models[0].id).display;
+  auto objectEntry=GameObjectService::save(object,position);
+  auto objectRows=query("SELECT * FROM gameobject WHERE id="+QString::number(objectEntry));
+  check(objectRows.size()==1,"Object was not placed"); auto objectGuid=objectRows[0]["guid"].toUInt();
+  check(tracked(EntityType::GameObject,objectEntry)&&tracked(EntityType::GameObjectSpawn,objectGuid),"Object changes missing");
+  auto moved=position; moved.x+=4; moved.orientation=1.5f;
+  GameObjectService::placements({{objectGuid,objectEntry,moved,120,false,false}});
+  check(query("SELECT position_x FROM gameobject WHERE guid="+QString::number(objectGuid))[0]["position_x"].toFloat()==moved.x,"Object move was lost");
+  Patrol patrol; patrol.loop=false;
+  Waypoint first; first.position=position; first.position.orientation=100; first.run=true; first.waitMs=2000;
+  Waypoint last=first; last.position.x+=5; last.run=false;
+  patrol.points={first,last}; PatrolService::save(guid,patrol);
+  check(PatrolService::load(guid)==patrol,"Patrol walk/run/wait/loop did not round-trip");
+  auto patrolBefore=tracked(EntityType::Spawn,guid)->after;
+  PatrolService::save(guid,patrol);
+  check(tracked(EntityType::Spawn,guid)->after==patrolBefore,"Unchanged patrol save allocated new scripts");
+  CreatureService::save(saved);
+  check(query("SELECT movement_type FROM creature WHERE guid="+QString::number(guid))[0]["movement_type"].toInt()==2,"NPC template edit disabled its patrol");
+  auto originals=query("SELECT guid,map,position_x,position_y,position_z FROM creature WHERE id="+original["entry"].toString()+" LIMIT 1");
+  if(!originals.isEmpty()) {
+    auto r=originals[0]; auto originalGuid=r["guid"].toUInt(); Patrol path;
+    Waypoint node; node.position={r["map"].toUInt(),r["position_x"].toFloat(),r["position_y"].toFloat(),r["position_z"].toFloat(),100}; node.run=true; path.points={node};
+    PatrolService::save(originalGuid,path); check(PatrolService::load(originalGuid)==path,"Original NPC patrol could not be authored");
+  }
   // Quests: the ssh-tunnel editor's pure plans, written through ContentStore.
   Layouts layouts;
   auto data=loadQuest(layouts,0,loadQuestList(layouts));
   QuestSaveRequest request; request.entry=data.next_entry;
   auto& fields=request.content.fields;
   fields.title="Creator integration quest"; fields.level=5; fields.min_level=1; fields.xp=100; fields.money=42;
-  Q::Target kill; kill.id=entry; kill.count=2; fields.targets=std::vector<Q::Target>{kill};
+  Q::Target kill; kill.id=entry; kill.count=2; Q::Target use; use.kind=Q::Target::Kind::Object; use.id=objectEntry; use.count=1; use.text="Interact with Ancient Chest"; fields.targets=std::vector<Q::Target>{kill,use};
   request.content.links.starters={{Q::Giver::Kind::Npc,entry}}; request.content.links.enders={{Q::Giver::Kind::Npc,second}};
   Q::ScriptAction say; say.kind=Q::ScriptAction::Kind::Say; say.text="Welcome, O'Brien"; request.content.on_accept={say};
   saveQuest(layouts,data,loadQuestList(layouts),request); auto questId=request.entry;
@@ -57,6 +83,7 @@ void runChecks() {
   check(!spoken.isEmpty()&&spoken[0]["entry"].toUInt()>=Q::OWN_TEXT_START&&spoken[0]["male_text"].toString()=="Welcome, O'Brien","Accept event was not written");
   auto loaded=loadQuest(layouts,questId,loadQuestList(layouts));
   check(loaded.content.fields.targets->at(0).id==entry&&loaded.content.fields.targets->at(0).count==2&&loaded.content.on_accept.at(0).text=="Welcome, O'Brien","Quest did not round-trip");
+  check(loaded.content.fields.targets->at(1).kind==Q::Target::Kind::Object && loaded.content.fields.targets->at(1).id==objectEntry,"GameObject objective did not round-trip");
   auto items=EquipmentService::search("",-1);check(!items.isEmpty(),"Seed has no items");
   // A collect objective whose item a Creator NPC without loot drops for the quest: it gets its own loot table.
   QuestSaveRequest edit=request; edit.mode=Q::SaveMode::Edit; edit.content=loaded.content;

@@ -124,9 +124,37 @@ void questContentSql() {
   text = ChangeTracker::sql({edited, item});
   check(item.summary() == "+ Item: Wolf Pelt" && text.indexOf("-- Item:") < text.indexOf("-- Quest:") && text.contains("VALUES('item',1000005)"), "Item is not exported before its quest");
 }
+void objectAndPatrolSql() {
+  auto object=change(EntityType::GameObject,1000100,{},rows("gameobject_template",{{"entry","1000100"},{"name","Ancient Chest"},{"type","10"}}),"Ancient Chest");
+  auto placement=change(EntityType::GameObjectSpawn,2000100,{},rows("gameobject",{{"guid","2000100"},{"id","1000100"}}));
+  auto text=ChangeTracker::sql({placement,object});
+  check(text.indexOf("REPLACE INTO `gameobject_template`")<text.indexOf("REPLACE INTO `gameobject`"),"Object placements precede their template");
+  check(text.contains("VALUES('gameobject',1000100)")&&text.contains("VALUES('object_spawn',2000100)"),"Object ownership missing");
+  auto deleted=change(EntityType::GameObjectSpawn,2000100,placement.after,{}); deleted.action=ChangeAction::Delete;
+  check(ChangeTracker::sql({deleted}).contains("DELETE FROM gameobject WHERE guid=2000100 AND @owned>0"),"Object deletion is unguarded");
+  QJsonObject before=spawn("5"),after=before;
+  before["creature_movement"]=QJsonArray{QJsonObject{{"id","2000000"},{"point","1"},{"script_id","81"}}};
+  before["creature_movement_scripts"]=QJsonArray{QJsonObject{{"id","81"},{"command","0"}}};
+  after["creature_movement"]=QJsonArray{QJsonObject{{"id","2000000"},{"point","1"},{"script_id","1000101"}}};
+  after["creature_movement_scripts"]=QJsonArray{QJsonObject{{"id","1000101"},{"command","25"},{"datalong","1"}}};
+  auto patrol=change(EntityType::Spawn,2000000,before,after); patrol.action=ChangeAction::Update;
+  check(ChangeTracker::derive(EntityType::Spawn,before,after)==ChangeAction::Update,"Patrol edit classified as a move");
+  text=ChangeTracker::sql({patrol});
+  check(text.contains("DELETE FROM creature_movement WHERE id=2000000;"),"Removed nodes survive patrol replacement");
+  check(text.contains("DELETE FROM creature_movement_scripts WHERE id=1000101;"),"Non-keyed scripts duplicate on repeated sync");
+  check(!text.contains("DELETE FROM creature_movement_scripts WHERE id=81;"),"Shared original script was deleted");
+  check(text.indexOf("REPLACE INTO `creature_movement_scripts`")<text.indexOf("REPLACE INTO `creature_movement`"),"Path precedes its script");
+  auto footprint=ChangeTracker::footprint({patrol,object,placement},[](QString const&) { return QVector<Fields>{}; });
+  bool path=false,script=false,go=false;
+  for(auto const& pair:footprint) { path|=pair.first=="creature_movement"; script|=pair.first=="creature_movement_scripts"&&pair.second.contains("1000101"); go|=pair.first=="gameobject"; }
+  check(path&&script&&go,"Backup footprint omits path, script or object rows");
+  QTemporaryDir dir;
+  { ChangeTracker tracker(dir.path()); tracker.stage({object,placement,patrol}); tracker.promote(); }
+  { ChangeTracker tracker(dir.path()); check(tracker.changes().size()==3,"Object and patrol changes did not persist"); }
+}
 int main(int argc, char** argv) {
   QCoreApplication app(argc, argv);
-  try { merging(); persistence(); sql(); questContentSql(); }
+  try { merging(); persistence(); sql(); questContentSql(); objectAndPatrolSql(); }
   catch (std::exception const& e) { QTextStream(stderr) << e.what() << Qt::endl; return 1; }
   QTextStream(stdout) << "Change tracker checks passed\n";
   return 0;

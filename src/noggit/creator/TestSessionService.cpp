@@ -36,6 +36,7 @@ TestSessionService::TestSessionService(Runtime::RuntimeManager* runtime):QObject
   connect(runtime,&Runtime::RuntimeManager::aboutToShutdown,this,&TestSessionService::cancel);
 }
 void TestSessionService::testHere(QWidget* parent,Position const& p){begin(parent,Here,0,p);}
+void TestSessionService::testGameObject(QWidget* parent,Position const& p){begin(parent,NpcTarget,0,p);}
 void TestSessionService::testNpc(QWidget* parent,Position const& p){begin(parent,NpcTarget,0,p);}
 void TestSessionService::testQuest(QWidget* parent,Id quest){begin(parent,QuestTarget,quest);}
 void TestSessionService::testLocal(QWidget* parent){begin(parent,None,0);}

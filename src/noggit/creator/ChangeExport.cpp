@@ -26,7 +26,9 @@ Id number(QJsonObject const& row, QString const& column) { return Id(std::abs(ro
 QVector<QPair<EntityType, Id>> references(TrackedChange const& c) {
   QVector<QPair<EntityType, Id>> out;
   auto rows = [&](QString const& table) { return c.after[table].toArray(); };
-  auto first = rows(c.type == EntityType::Quest ? "quest_template" : c.type == EntityType::Npc ? "creature_template" : "creature").at(0).toObject();
+  auto first = rows(c.type == EntityType::GameObject ? "gameobject_template" : c.type == EntityType::GameObjectSpawn ? "gameobject" : c.type == EntityType::Quest ? "quest_template" : c.type == EntityType::Npc ? "creature_template" : "creature").at(0).toObject();
+  if (c.type == EntityType::GameObjectSpawn) out.push_back({EntityType::GameObject, number(first, "id")});
+  if (c.type == EntityType::GameObject && (number(first,"type")==10 || number(first,"type")==3)) out.push_back({EntityType::Quest,number(first,number(first,"type")==10?"data1":"data8")});
   if (c.type == EntityType::Spawn) out.push_back({EntityType::Npc, number(first, "id")});
   if (c.type == EntityType::Npc)
     for (auto const& row : rows("creature_equip_template"))
@@ -34,6 +36,10 @@ QVector<QPair<EntityType, Id>> references(TrackedChange const& c) {
   if (c.type == EntityType::Quest) {
     for (auto table : {"creature_questrelation", "creature_involvedrelation"})
       for (auto const& row : rows(table)) out.push_back({EntityType::Npc, number(row.toObject(), "id")});
+    for (auto table : {"gameobject_questrelation", "gameobject_involvedrelation"})
+      for (auto const& row : rows(table)) out.push_back({EntityType::GameObject, number(row.toObject(), "id")});
+    for (int i = 1; i <= 4; ++i)
+      if (first["ReqCreatureOrGOId" + QString::number(i)].toString().toInt() < 0) out.push_back({EntityType::GameObject, number(first, "ReqCreatureOrGOId" + QString::number(i))});
     for (int i = 1; i <= 4; ++i)
       if (first["ReqCreatureOrGOId" + QString::number(i)].toString().toInt() > 0) out.push_back({EntityType::Npc, number(first, "ReqCreatureOrGOId" + QString::number(i))});
     for (auto table : {"quest_start_scripts", "quest_end_scripts"})
