@@ -189,7 +189,7 @@ private:
     auto cell = new QTableWidgetItem;
     if (r.reference) {
       cell->setText(QString("Shared loot table #%1 (%2 items)").arg(r.reference).arg(_references.value(r.reference).size()));
-      cell->setIcon(Ui::FontAwesomeIcon(Icon::book)); cell->setToolTip("A loot table several original creatures share, rolled as a whole.");
+      cell->setIcon(Ui::FontAwesomeIcon(Icon::book)); cell->setToolTip("A loot table several original creatures share. Group 0 rolls the whole table; another group selects only that group in the shared table.");
     } else if (_items.contains(r.item)) {
       auto const& info = _items[r.item];
       cell->setText(info.name + (r.quest() ? "  (quest drop)" : QString())); cell->setIcon(itemIcon(info)); cell->setToolTip(itemTooltip(info));
@@ -204,7 +204,7 @@ private:
     connect(chance, qOverload<double>(&QDoubleSpinBox::valueChanged), this, [this, i](double v) { if (!_building) { _loot.rows[i].chance = v; changed(); } });
     _table->setCellWidget(i, ChanceColumn, chance);
 
-    auto always = new QCheckBox; always->setChecked(r.chance >= 100); always->setEnabled(!locked && r.group == 0);
+    auto always = new QCheckBox; always->setChecked(r.chance >= 100); always->setEnabled(!locked && (r.reference || r.group == 0));
     always->setToolTip("Guaranteed: drops every time.");
     connect(always, &QCheckBox::toggled, this, [this, i, chance](bool on) {
       if (_building) return;
@@ -222,11 +222,11 @@ private:
     connect(max, qOverload<int>(&QSpinBox::valueChanged), this, [this, i](int v) { if (!_building) { _loot.rows[i].maxCount = v; changed(); } });
     _table->setCellWidget(i, MinColumn, min); _table->setCellWidget(i, MaxColumn, max);
 
-    auto group = new QSpinBox; group->setRange(0, 255); group->setSpecialValueText("—"); group->setValue(r.group); group->setEnabled(!locked);
+    auto group = new QSpinBox; group->setRange(0, 127); group->setSpecialValueText("—"); group->setValue(r.group); group->setEnabled(!locked);
     group->setToolTip("0 / —: rolled on its own. 1 or more: exactly one item of the group drops.");
     connect(group, qOverload<int>(&QSpinBox::valueChanged), this, [this, i, always](int v) {
       if (_building) return;
-      _loot.rows[i].group = v; always->setEnabled(v == 0 && editable()); changed();
+      _loot.rows[i].group = v; always->setEnabled((v == 0 || _loot.rows[i].reference) && editable()); changed();
     });
     _table->setCellWidget(i, GroupColumn, group);
 

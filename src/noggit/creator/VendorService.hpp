@@ -7,6 +7,7 @@ struct VendorItem {
   int stock = 0;          // 0: unlimited
   int restockSeconds = 0; // how long until a sold-out limited item is back
   Id condition = 0;
+  quint32 flags = 0;      // Preserve server restock behavior when copying/editing goods.
   bool operator==(VendorItem const&) const = default;
 };
 struct Vendor {

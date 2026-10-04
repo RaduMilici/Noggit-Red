@@ -23,7 +23,7 @@ LootRow fromFields(Fields const& f) {
 }
 QVector<LootRow> rowsOf(QVector<Fields> const& fields) { QVector<LootRow> rows; for (auto const& f : fields) rows.push_back(fromFields(f)); return rows; }
 Fields toFields(LootRow const& r, Id entry) {
-  return {{"entry", entry}, {"item", r.reference ? r.reference : r.item}, {"ChanceOrQuestChance", r.chance}, {"groupid", r.group},
+  return {{"entry", entry}, {"item", r.item}, {"ChanceOrQuestChance", r.chance}, {"groupid", r.group},
           {"mincountOrRef", r.reference ? -qint64(r.reference) : qint64(r.minCount)}, {"maxcount", r.maxCount}, {"condition_id", r.condition}};
 }
 }
@@ -89,20 +89,21 @@ QVector<RowProblem> LootService::check(LootTable const& t, QSet<Id> const& exist
     if (r.reference && !existingReferences.contains(r.reference)) add(i, QString("Shared loot table %1 does not exist.").arg(r.reference));
     if (!r.quest() && (r.chance > 100 || !std::isfinite(r.chance))) add(i, "The chance must be between 0% and 100%.");
     if (r.quest() && r.chance < -100) add(i, "A quest drop's chance must be at most 100%.");
+    if (r.reference && r.chance == 0) add(i, "A shared-table reference needs a nonzero chance, even when it selects a group.");
     if (r.chance == 0 && r.group == 0) add(i, "A 0% item outside a group never drops. Give it a chance, or put it in a group.");
-    if (r.group < 0 || r.group > 255) add(i, "Groups are numbered 1 to 255.");
+    if (r.group < 0 || r.group > 127) add(i, "Groups are numbered 1 to 127.");
     if (!r.reference && r.minCount < 1) add(i, "The quantity must be at least 1.");
     if (r.maxCount < 1 || r.maxCount > 255) add(i, r.reference ? "A shared table is rolled 1 to 255 times." : "At most 255 can drop at once.");
     if (!r.reference && r.minCount > r.maxCount) add(i, "The minimum quantity is greater than the maximum.");
     // The database keeps one row per item (per group for NPCs).
-    auto key = n(r.reference ? r.reference : r.item) + (t.owner.kind == LootOwner::Kind::Npc ? "/" + n(r.group) : QString());
+    auto key = n(r.item) + (t.owner.kind == LootOwner::Kind::Npc ? "/" + n(r.group) : QString());
     if (seen.contains(key)) add(i, "This item is already in the loot" + QString(t.owner.kind == LootOwner::Kind::Npc && r.group ? " in this group." : "."));
     else seen[key] = i;
-    if (r.group > 0 && !r.quest()) { if (r.chance > 0) explicitSum[r.group] += r.chance; else if (r.chance == 0) ++equalCount[r.group]; }
+    if (!r.reference && r.group > 0 && !r.quest()) { if (r.chance > 0) explicitSum[r.group] += r.chance; else if (r.chance == 0) ++equalCount[r.group]; }
   }
   for (int i = 0; i < t.rows.size(); ++i) {
     auto const& r = t.rows[i];
-    if (r.group <= 0 || r.quest()) continue;
+    if (r.reference || r.group <= 0 || r.quest()) continue;
     auto sum = explicitSum.value(r.group);
     if (sum > 100.0001) add(i, QString("Group %1's chances add up to %2%; at most 100% can drop.").arg(r.group).arg(sum, 0, 'g', 4));
     else if (r.chance == 0 && sum >= 99.9999) add(i, QString("Group %1's other items already use 100%, so this one never drops.").arg(r.group));
@@ -111,15 +112,15 @@ QVector<RowProblem> LootService::check(LootTable const& t, QSet<Id> const& exist
 }
 double LootService::expectedChance(QVector<LootRow> const& rows, int index) {
   auto const& r = rows.value(index);
-  if (r.quest()) return std::min(-r.chance, 100.0) / 100;
-  if (r.group <= 0) return std::clamp(r.chance, 0.0, 100.0) / 100;
+  if (r.reference || r.group <= 0) return std::clamp(std::abs(r.chance), 0.0, 100.0) / 100;
   // Explicit chances are taken in order and cut off at 100%; equal-chance items share what is left.
   double before = 0, sum = 0; int equal = 0;
   for (int i = 0; i < rows.size(); ++i) {
-    if (rows[i].group != r.group || rows[i].quest()) continue;
-    if (rows[i].chance > 0) { if (i < index) before += rows[i].chance; sum += rows[i].chance; } else ++equal;
+    if (rows[i].reference || rows[i].group != r.group) continue;
+    double chance = std::abs(rows[i].chance);
+    if (chance > 0) { if (i < index) before += chance; sum += chance; } else ++equal;
   }
-  if (r.chance > 0) return std::max(0.0, std::min(before + r.chance, 100.0) - std::min(before, 100.0)) / 100;
+  if (r.chance != 0) return std::max(0.0, std::min(before + std::abs(r.chance), 100.0) - std::min(before, 100.0)) / 100;
   return equal ? std::max(0.0, 100 - sum) / 100 / equal : 0;
 }
 LootSimulation LootService::simulate(LootTable const& t, QHash<Id, QVector<LootRow>> const& references, int kills, quint32 seed) {
@@ -134,17 +135,20 @@ LootSimulation LootService::simulate(LootTable const& t, QHash<Id, QVector<LootR
   };
   for (int i = 0; i < t.rows.size(); ++i) if (!t.rows[i].reference && t.rows[i].item) slot(t.rows[i].item).expected = expectedChance(t.rows, i);
   QHash<Id, qint64> dropped;
-  std::function<void(QVector<LootRow> const&, int)> roll = [&](QVector<LootRow> const& rows, int depth) {
+  std::function<void(QVector<LootRow> const&, int, int)> roll = [&](QVector<LootRow> const& rows, int depth, int selectedGroup) {
     auto give = [&](LootRow const& r) {
       if (r.reference) {
-        if (depth < 8 && references.contains(r.reference)) for (int k = 0; k < std::max(1, r.maxCount); ++k) roll(references[r.reference], depth + 1);
+        if (depth < 8 && references.contains(r.reference)) for (int k = 0; k < std::max(1, r.maxCount); ++k) roll(references[r.reference], depth + 1, r.group);
         return;
       }
       if (r.item) dropped[r.item] += between(std::max(1, r.minCount), std::max(1, r.maxCount));
     };
     QMap<int, QVector<LootRow const*>> groups;
     for (auto const& r : rows) {
-      if (r.group > 0 && !r.quest()) { groups[r.group].push_back(&r); continue; }
+      // A reference's group selects a group in the referenced table; it is not
+      // a member of the parent's group. A group-only roll skips plain rows and references.
+      if (selectedGroup && (r.reference || r.group != selectedGroup)) continue;
+      if (!r.reference && r.group > 0) { groups[r.group].push_back(&r); continue; }
       auto chance = r.quest() ? -r.chance : r.chance; // quest drops: as if the quest were active
       if (chance >= 100 || percent(random) < chance) give(r);
     }
@@ -152,8 +156,9 @@ LootSimulation LootService::simulate(LootTable const& t, QHash<Id, QVector<LootR
       QVector<LootRow const*> equal; LootRow const* picked = nullptr;
       double left = percent(random);
       for (auto const* r : group) {
-        if (r->chance <= 0) { equal.push_back(r); continue; }
-        if (!picked && (r->chance >= 100 || (left -= r->chance) < 0)) picked = r;
+        double chance = std::abs(r->chance);
+        if (chance == 0) { equal.push_back(r); continue; }
+        if (!picked && (chance >= 100 || (left -= chance) < 0)) picked = r;
       }
       if (!picked && !equal.isEmpty()) picked = equal[between(0, equal.size() - 1)];
       if (picked) give(*picked);
@@ -162,7 +167,7 @@ LootSimulation LootService::simulate(LootTable const& t, QHash<Id, QVector<LootR
   double money = 0;
   for (int k = 0; k < s.kills; ++k) {
     dropped.clear();
-    roll(t.rows, 0);
+    roll(t.rows, 0, 0);
     qint64 coins = t.moneyMax > 0 ? std::uniform_int_distribution<qint64>(std::min(t.moneyMin, t.moneyMax), t.moneyMax)(random) : 0;
     money += coins;
     if (dropped.isEmpty() && !coins) ++s.empty;

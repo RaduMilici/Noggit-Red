@@ -74,6 +74,29 @@ void lootSimulation() {
   auto repeat = LootService::simulate(t, refs, 1000, 42);
   check(again.items.size() == repeat.items.size() && again.items[0].kills == repeat.items[0].kills, "Same seed, different result");
 }
+void lootServerCompatibility() {
+  LootTable t; t.rows = {row(1, 100, 128)};
+  check(has(LootService::check(t, {1}, {}), 0, "127"), "Server rejects loot group 128, but editor accepts it");
+  t.rows[0].group = 127;
+  check(LootService::check(t, {1}, {}).isEmpty(), "Largest server-supported loot group rejected");
+  LootRow ref; ref.item = 900; ref.reference = 900; ref.group = 2; ref.chance = 100;
+  t.rows = {ref, row(1, 100, 2)};
+  check(LootService::check(t, {1}, {900}).isEmpty(), "Reference group wrongly contributes to the parent group's chance");
+  QHash<Id, QVector<LootRow>> refs{{900, {row(10, 100), row(11, 100, 1), row(12, 100, 2)}}};
+  auto result = LootService::simulate(t, refs, 10, 42);
+  auto drops = [&](Id id) { for (auto const& item : result.items) if (item.item == id) return item.count; return qint64(0); };
+  check(drops(1) == 10 && drops(12) == 10 && drops(10) == 0 && drops(11) == 0,
+        "Reference must roll only its selected group, independently of the parent's group");
+  auto otherRef = ref; otherRef.item = 901;
+  t.rows = {ref, otherRef};
+  check(LootService::check(t, {}, {900}).isEmpty(), "Distinct reference rows incorrectly treated as duplicate items");
+  ref.chance = 0; t.rows = {ref};
+  check(has(LootService::check(t, {}, {900}), 0, "reference"), "Server rejects zero-chance references even with a group");
+  t.rows = {row(1, -100, 1), row(2, 0, 1)};
+  result = LootService::simulate(t, {}, 10, 42);
+  check(drops(1) == 10 && drops(2) == 0, "Quest drops must compete in their loot group");
+  check(LootService::expectedChance(t.rows, 1) == 0, "Quest drop omitted from expected group chance");
+}
 void vendorChecks() {
   Vendor v; v.sells = true;
   v.items = {{1}, {2, 3, 0}, {1}, {3, 0, 600}, {4}, {5, 300}};
@@ -437,7 +460,7 @@ void spellChanges() {
 int main(int argc, char** argv) {
   QCoreApplication app(argc, argv);
   try {
-    lootValidation(); lootChances(); lootSimulation(); vendorChecks(); trainerChecks(); serviceChanges();
+    lootValidation(); lootChances(); lootSimulation(); lootServerCompatibility(); vendorChecks(); trainerChecks(); serviceChanges();
     dialogueRoundTrip(); dialogueChecks(); dialogueChanges();
     clientTables(); spellRules(); itemRules(); spellChanges();
     QTextStream(stdout) << "Loot, vendor, trainer, dialogue, client data, spell and item tests passed\n";

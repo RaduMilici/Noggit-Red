@@ -186,12 +186,27 @@ void runChecks() {
     bool found=false; for(auto const& r:saved.rows) found=found||(r.item==items[0].id&&r.chance==25&&r.maxCount==2);
     check(found&&saved.moneyMax==50&&query("SELECT loot_id FROM creature_template WHERE entry="+QString::number(entry))[0]["loot_id"].toUInt()==entry,"Loot did not round-trip");
     check(tracked(EntityType::Loot,entry)&&tracked(EntityType::Loot,entry)->summary().contains("Loot:"),"Loot change not tracked");
+    auto referenceRows=query("SELECT DISTINCT entry FROM reference_loot_template LIMIT 1");
+    check(!referenceRows.isEmpty(), "Seed has no reference loot table");
+    LootRow reference; reference.item=15000000; reference.reference=referenceRows[0]["entry"].toUInt();
+    saved.rows.push_back(reference);
+    auto secondReference=reference; secondReference.item=15000001; saved.rows.push_back(secondReference);
+    LootService::save(saved);
+    auto storedReferences=query("SELECT item,mincountOrRef FROM creature_loot_template WHERE entry="+QString::number(entry)+" AND item IN (15000000,15000001) AND mincountOrRef<0 ORDER BY item");
+    check(storedReferences.size()==2&&storedReferences[0]["item"].toUInt()==15000000&&storedReferences[1]["item"].toUInt()==15000001,
+          "Saving shared loot references changed their row keys");
     auto original=LootService::load({LootOwner::Kind::Npc,sources[0]["entry"].toUInt()});
     bool refused=false; try { LootService::save(original); } catch(std::exception const&) { refused=true; }
     check(refused&&!original.editable,"An original NPC's loot was editable");
-    Vendor vendor=VendorService::load(entry); vendor.sells=true; vendor.items={{items[0].id,3,900}};
+    Vendor vendor=VendorService::load(entry); vendor.sells=true; vendor.items={{items[0].id,3,900,0,3}};
     VendorService::save(vendor);
     check(VendorService::load(entry).items.value(0).stock==3&&(query("SELECT npc_flags FROM creature_template WHERE entry="+QString::number(entry))[0]["npc_flags"].toUInt()&4),"Vendor did not round-trip");
+    auto reopenedVendor = VendorService::load(entry);
+    check(reopenedVendor.items.value(0).flags == 3, "Vendor restock flags lost on load/save");
+    reopenedVendor.items[0].stock = 4;
+    VendorService::save(reopenedVendor);
+    check(query("SELECT itemflags FROM npc_vendor WHERE entry="+QString::number(entry))[0]["itemflags"].toUInt()==3,
+          "Editing vendor stock erased restock flags");
     check(tracked(EntityType::Vendor,entry),"Vendor change not tracked");
     auto spells=TrainerService::search("Fireball");
     check(!spells.isEmpty(),"No learnable spell found");

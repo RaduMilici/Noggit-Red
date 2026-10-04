@@ -8,7 +8,7 @@ QString n(qint64 value) { return QString::number(value); }
 void require(bool condition, QString const& message) { if (!condition) throw std::runtime_error(message.toStdString()); }
 QVector<VendorItem> itemsOf(QVector<Fields> const& rows) {
   QVector<VendorItem> items;
-  for (auto const& r : rows) items.push_back({r["item"].toUInt(), r["maxcount"].toInt(), r["incrtime"].toInt(), r["condition_id"].toUInt()});
+  for (auto const& r : rows) items.push_back({r["item"].toUInt(), r["maxcount"].toInt(), r["incrtime"].toInt(), r["condition_id"].toUInt(), r["itemflags"].toUInt()});
   return items;
 }
 }
@@ -73,7 +73,7 @@ void VendorService::save(Vendor const& v) {
   for (int slot = 0; slot < v.items.size(); ++slot) {
     auto const& i = v.items[slot];
     db.insert("npc_vendor", {{"entry", v.entry}, {"slot", slot}, {"item", i.item}, {"maxcount", i.stock}, {"incrtime", i.restockSeconds},
-                             {"itemflags", 0}, {"condition_id", i.condition}});
+                             {"itemflags", i.flags}, {"condition_id", i.condition}});
   }
   db.snapshot("creature_template", "entry", v.entry);
   db.exec("UPDATE creature_template SET vendor_id=" + n(v.sharedList) + ",npc_flags=(npc_flags&~4)|" + n(v.sells ? 4 : 0) + " WHERE entry=" + id);

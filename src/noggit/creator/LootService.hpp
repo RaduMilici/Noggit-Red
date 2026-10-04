@@ -11,7 +11,7 @@ struct LootOwner {
 struct LootRow {
   Id item = 0;
   double chance = 100; // percent. 0 inside a group shares what the group's other items leave; negative: quest drop
-  int group = 0;       // 0: rolled on its own; 1+: exactly one item of the group drops per kill
+  int group = 0;       // 0: independent; 1..127: at most one item; references select this group in their table
   int minCount = 1, maxCount = 1;
   Id reference = 0;    // a shared loot table, rolled maxCount times, instead of an item
   Id condition = 0;
