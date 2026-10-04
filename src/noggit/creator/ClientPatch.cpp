@@ -110,12 +110,41 @@ struct State {
   QString installed() const { return json["installed"].toString(); }
   QString backup() const { return json["backup"].toObject()["file"].toString(); }
 };
-State loadState(QString const& path) {
+State readState(QString const& path) {
   QFile file(path); State s;
   if (file.open(QIODevice::ReadOnly)) s.json = QJsonDocument::fromJson(file.readAll()).object();
   return s;
 }
-void saveState(QString const& path, State const& s) {
+QString clientPath(QString const& data) {
+  auto canonical = QFileInfo(data).canonicalFilePath();
+  return canonical.isEmpty() ? QDir(data).absolutePath() : canonical;
+}
+QString statePath(QString const& path, QString const& data) {
+  auto key = QCryptographicHash::hash(clientPath(data).toUtf8(), QCryptographicHash::Sha256).toHex();
+  return QFileInfo(path).absolutePath() + "/clients/" + key + ".json";
+}
+State loadState(QString const& path, QString const& data) {
+  auto scoped = statePath(path, data);
+  if (QFileInfo::exists(scoped)) return readState(scoped);
+  // Read old single-client state only for the client it actually describes.
+  auto legacy = readState(path);
+  auto owner = legacy.json["data"].toString();
+  if (owner.isEmpty()) {
+    auto original = legacy.json["backup"].toObject()["from"].toString();
+    if (!original.isEmpty()) owner = QFileInfo(original).absolutePath();
+  }
+  return !owner.isEmpty() && clientPath(owner) == clientPath(data) ? legacy : State{};
+}
+QString verifiedBackup(State const& state) {
+  auto backup = state.backup();
+  if (backup.isEmpty()) return {};
+  auto expected = state.json["backup"].toObject()["sha256"].toString();
+  require(QFileInfo::exists(backup) && !expected.isEmpty() && sha(backup) == expected,
+          "The original client patch backup is missing or damaged. Restore the backup before changing the test patch: " + backup);
+  return backup;
+}
+void saveState(QString const& legacyPath, QString const& data, State const& s) {
+  auto path = statePath(legacyPath, data);
   QDir().mkpath(QFileInfo(path).absolutePath());
   QSaveFile file(path); auto bytes = QJsonDocument(s.json).toJson();
   require(file.open(QIODevice::WriteOnly) && file.write(bytes) == bytes.size() && file.commit(), "Cannot record the test client's state.");
@@ -125,7 +154,7 @@ QString originalPatch(QString const& data, State const& state) {
   auto patch = findFile(data, patchName);
   if (patch.isEmpty()) return {};
   if (state.installed().isEmpty() || sha(patch) != state.installed()) return patch;
-  return QFileInfo::exists(state.backup()) ? state.backup() : QString();
+  return verifiedBackup(state);
 }
 // The client's archives as they are without Creator's patch.
 QStringList originalArchives(QString const& data, State const& state) {
@@ -145,9 +174,11 @@ std::optional<QByteArray> effective(QStringList const& archives, QString const& 
 std::optional<Wdbc> ClientPatchService::table(QString const& data, QString const& file) const {
   auto key = data + "|" + file;
   if (auto it = _tables.find(key); it != _tables.end()) return *it;
-  auto bytes = effective(originalArchives(data, loadState(_state)), "DBFilesClient\\" + file);
-  if (!bytes) return {};
-  try { auto table = Wdbc::parse(*bytes); _tables.insert(key, table); return table; } catch (std::exception const&) { return {}; }
+  try {
+    auto bytes = effective(originalArchives(data, loadState(_state, data)), "DBFilesClient\\" + file);
+    if (!bytes) return {};
+    auto table = Wdbc::parse(*bytes); _tables.insert(key, table); return table;
+  } catch (std::exception const&) { return {}; }
 }
 std::optional<Wdbc> ClientPatchService::table(QString const& file) const {
   auto data = dataFolder();
@@ -156,11 +187,15 @@ std::optional<Wdbc> ClientPatchService::table(QString const& file) const {
 ClientDataStatus ClientPatchService::status(QString const& data, QVector<Fields> const& spells) const {
   ClientDataStatus s; s.data = data;
   if (data.isEmpty() || !QFileInfo(data).isDir()) { s.problem = "Choose the WoW client in Client Profiles to test spells locally."; return s; }
-  auto state = loadState(_state);
+  auto state = loadState(_state, data);
   auto patch = findFile(data, patchName);
   s.patch = patch.isEmpty() ? data + "/" + patchName : patch;
   s.installed = !patch.isEmpty() && !state.installed().isEmpty() && sha(patch) == state.installed();
   s.backup = QFileInfo::exists(state.backup()) ? state.backup() : QString();
+  if (s.installed) {
+    try { verifiedBackup(state); }
+    catch (std::exception const& e) { s.problem = QString::fromUtf8(e.what()); }
+  }
   auto installed = s.installed ? state.json["spells"].toObject() : QJsonObject();
   for (auto it = installed.begin(); it != installed.end(); ++it) s.installedSpells << it.value().toObject()["label"].toString();
   QSet<QString> current;
@@ -179,7 +214,7 @@ ClientDataStatus ClientPatchService::status() const {
   return status(dataFolder(), spells);
 }
 QByteArray ClientPatchService::build(QString const& data, QVector<Fields> const& spells, QString const& output) const {
-  auto state = loadState(_state);
+  auto state = loadState(_state, data);
   auto sources = originalArchives(data, state);
   auto base = effective(sources, spellFile);
   require(base.has_value(), "The client has no Spell.dbc.");
@@ -219,32 +254,37 @@ QByteArray ClientPatchService::build(QString const& data, QVector<Fields> const&
 }
 void ClientPatchService::install(QString const& data, QVector<Fields> const& spells) {
   require(!data.isEmpty() && QFileInfo(data).isDir(), "Choose the WoW client in Client Profiles first.");
-  auto state = loadState(_state);
+  if (spells.isEmpty()) { restoreOriginal(data); return; }
+  auto state = loadState(_state, data);
   auto patch = findFile(data, patchName);
   bool ours = !patch.isEmpty() && !state.installed().isEmpty() && sha(patch) == state.installed();
   if (!patch.isEmpty() && !ours) {
     // The client's own patch: back it up before Creator replaces it. An older, different backup is kept too.
     QDir().mkpath(_backups);
-    auto backup = _backups + "/" + QFileInfo(patch).fileName();
     auto current = sha(patch);
-    if (QFileInfo::exists(backup) && sha(backup) != current)
-      QFile::rename(backup, backup + "." + QDateTime::currentDateTimeUtc().toString("yyyyMMdd-HHmmss"));
-    if (!QFileInfo::exists(backup)) require(QFile::copy(patch, backup) && sha(backup) == current, "Cannot back up the client's " + QFileInfo(patch).fileName() + ".");
+    require(!current.isEmpty(), "Cannot read the client's original patch.");
+    auto backup = _backups + "/" + current + ".mpq";
+    if (!QFileInfo::exists(backup)) require(QFile::copy(patch, backup), "Cannot back up the client's " + QFileInfo(patch).fileName() + ".");
+    require(sha(backup) == current, "The original client patch backup is damaged: " + backup);
     state.json["backup"] = QJsonObject{{"file", backup}, {"sha256", current}, {"from", patch}, {"saved", QDateTime::currentDateTimeUtc().toString(Qt::ISODate)}};
     state.json["installed"] = QString();
-    saveState(_state, state);
+    saveState(_state, data, state);
   }
-  if (spells.isEmpty()) { restoreOriginal(data); return; }
-  if (patch.isEmpty()) patch = data + "/" + patchName;
+  if (patch.isEmpty()) {
+    // A previously restored original may have been removed by the user since the last test.
+    state.json.remove("backup"); state.json["installed"] = QString(); state.json["data"] = data;
+    saveState(_state, data, state);
+    patch = data + "/" + patchName;
+  }
   auto fresh = patch + ".creator-new";
   build(data, spells, fresh);
   replace(fresh, patch);
   QJsonObject installed;
   for (auto const& spell : spells) installed[spell.value("entry").toString()] = QJsonObject{{"hash", recordHash(spell)}, {"label", spellLabel(spell)}};
-  state = loadState(_state);
+  state = loadState(_state, data);
   state.json["installed"] = sha(patch); state.json["spells"] = installed; state.json["data"] = data;
   state.json["updated"] = QDateTime::currentDateTimeUtc().toString(Qt::ISODate);
-  saveState(_state, state);
+  saveState(_state, data, state);
   emit changed();
 }
 void ClientPatchService::install() {
@@ -253,20 +293,21 @@ void ClientPatchService::install() {
 }
 void ClientPatchService::restoreOriginal(QString const& data) {
   if (data.isEmpty()) return;
-  auto state = loadState(_state);
+  auto state = loadState(_state, data);
   auto patch = findFile(data, patchName);
   bool ours = !patch.isEmpty() && !state.installed().isEmpty() && sha(patch) == state.installed();
   if (ours) {
-    if (!state.backup().isEmpty() && QFileInfo::exists(state.backup())) {
+    auto backup = verifiedBackup(state);
+    if (!backup.isEmpty()) {
       auto fresh = patch + ".creator-new";
       QFile::remove(fresh);
-      require(QFile::copy(state.backup(), fresh), "Cannot restore the client's own " + QFileInfo(patch).fileName() + ".");
+      require(QFile::copy(backup, fresh), "Cannot restore the client's own " + QFileInfo(patch).fileName() + ".");
       replace(fresh, patch);
     } else require(QFile::remove(patch), "Cannot remove Creator's test patch from the client.");
   }
   if (!state.installed().isEmpty() || state.json.contains("spells")) {
     state.json["installed"] = QString(); state.json.remove("spells");
-    saveState(_state, state);
+    saveState(_state, data, state);
     emit changed();
   }
 }

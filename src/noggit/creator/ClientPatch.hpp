@@ -25,7 +25,7 @@ struct ClientDataStatus {
 // in the client's Spell.dbc. Creator generates those rows from spell_template and puts them in the
 // highest patch the client loads (patch-Z): the client's own patch-Z, if any, is backed up first and its
 // files are kept inside Creator's version. Playing on production puts the original back. Tracked apart from
-// Local Changes in Workspace/client-data/state.json; never sent to production by Sync.
+// Local Changes in per-client files under Workspace/client-data/clients/; never sent to production by Sync.
 class ClientPatchService final : public QObject {
   Q_OBJECT
 public:

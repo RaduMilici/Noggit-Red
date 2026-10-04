@@ -53,6 +53,7 @@ struct SpellFacts {
 class SpellService {
 public:
   static constexpr Id idLimit = 65535; // The 1.12 spellbook protocol transmits spell IDs as uint16
+  static Id nextFreeId(QSet<Id> const& occupied); // throws only when every supported ID is in use
   static QVector<Choice> search(QString const& text, bool own = false, int limit = 400); // detail: rank and school
   static QVector<SpellListEntry> browse(QString const& text, bool own = false, int limit = 400);
   static QVector<Choice> quests(QString const& text); // for "complete a quest" effects

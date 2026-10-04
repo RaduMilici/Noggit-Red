@@ -13,10 +13,10 @@ constexpr Id teachTemplate = 483; // Fireball (Rank 2)'s teaching spell: how tra
 // Spell IDs have a tighter limit than other Creator content. Ignore old, incompatible
 // IDs above the wire limit when finding the next ID; never overwrite an existing spell.
 Id allocateSpell(Database& db) {
-  auto rows = db.query("SELECT COALESCE(MAX(entry),0) AS maximum FROM spell_template WHERE entry<=" + n(SpellService::idLimit));
-  auto next = rows[0]["maximum"].toUInt() + 1;
-  require(next <= SpellService::idLimit, "No spell IDs remain in the 1.12 client's supported range (1–65535).");
-  return next;
+  QSet<Id> occupied;
+  for (auto const& row : db.query("SELECT entry FROM spell_template WHERE entry BETWEEN 1 AND " + n(SpellService::idLimit)))
+    occupied.insert(row["entry"].toUInt());
+  return SpellService::nextFreeId(occupied);
 }
 QString owned(QString const& column) { return column + " IN (SELECT entry FROM creator_content WHERE kind='spell')"; }
 Fields row(Database& db, Id entry) {
@@ -73,6 +73,14 @@ void relink(Database& db, Id spell, Id previous, int depth = 0) {
     if (r["spell_id"].toUInt() != spell && db.owned("spell", r["spell_id"].toUInt())) relink(db, r["spell_id"].toUInt(), spell, depth + 1);
 }
 QSet<int> ids(std::optional<Wdbc> const& table) { QSet<int> out; if (table) for (int r = 0; r < table->rows(); ++r) out.insert(int(table->cell(r, 0))); return out; }
+}
+Id SpellService::nextFreeId(QSet<Id> const& occupied) {
+  Id highest = 0;
+  for (auto id : occupied) if (id <= idLimit) highest = std::max(highest, id);
+  if (highest < idLimit) return highest + 1;
+  // Reaching the wire limit does not mean lower, unused IDs are exhausted.
+  for (Id id = idLimit; id > 0; --id) if (!occupied.contains(id)) return id;
+  throw std::runtime_error("No spell IDs remain in the 1.12 client's supported range (1–65535).");
 }
 QVector<Choice> SpellService::search(QString const& text, bool own, int limit) {
   Database db; QVector<Choice> out;

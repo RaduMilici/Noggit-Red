@@ -7,6 +7,10 @@
 #include <noggit/creator/SpellService.hpp>
 #include <noggit/creator/ItemDesignService.hpp>
 #include <QtEndian>
+#include <StormLib.h>
+#include <QTemporaryDir>
+#include <QDir>
+#include <QFile>
 #include <cstring>
 #include <noggit/creator/ChangeTracker.hpp>
 #include <QCoreApplication>
@@ -356,6 +360,12 @@ void clientTables() {
   check(again.cell(again.find(1), 1) == 11 && again.text(again.find(1), 2) == "Changed" && again.cell(again.find(2), 1) == 20, "WDBC replace");
   bool rejected = false; try { Wdbc::parse("WDBC\1\0\0\0"); } catch (std::exception const&) { rejected = true; }
   check(rejected, "Damaged WDBC accepted");
+  // Four-byte column multiplication must not wrap to a zero-byte record.
+  QByteArray overflow("WDBC"); char header[4];
+  for (quint32 value : {1u, 0x40000000u, 0u, 0u}) { qToLittleEndian(value, header); overflow.append(header, 4); }
+  rejected = false;
+  try { Wdbc::parse(overflow); } catch (std::runtime_error const&) { rejected = true; }
+  check(rejected, "Overflowing WDBC layout accepted");
   // Spell.dbc columns of the 1.12 client, as verified against the bundled spell_template.
   Fields spell{{"entry", "1000001"}, {"castingTimeIndex", "14"}, {"effect1", "2"}, {"effectBasePoints1", "49"}, {"effectImplicitTargetA1", "6"},
                {"spellIconId", "185"}, {"name", "Holy Smite"}, {"nameSubtext", "Rank 2"}, {"description", "Deals $s1 damage."}, {"auraDescription", ""},
@@ -374,12 +384,75 @@ void clientTables() {
   auto casts = ClientLists::castTimes(Wdbc::parse(wdbc(4, {{1, 0, 0, 0}, {16, 1500, 0, 1500}})));
   check(casts.size() == 2 && casts[0].label == "Instant" && casts[1].label == "1.5 sec cast", "Cast time list");
 }
+// Real tiny MPQs in temporary directories; no client, database or server is needed.
+void clientPatchRecovery() {
+  auto read = [](QString const& path) { QFile file(path); check(file.open(QIODevice::ReadOnly), "Cannot read test file"); return file.readAll(); };
+  auto archive = [](QString const& path, QByteArray const& table, QByteArray const& marker) {
+    HANDLE mpq = nullptr;
+    check(SFileCreateArchive(QFile::encodeName(path).constData(), MPQ_CREATE_LISTFILE, 16, &mpq), "Cannot create test MPQ");
+    for (auto const& entry : QVector<QPair<QByteArray, QByteArray>>{{"DBFilesClient\\Spell.dbc", table}, {"marker.txt", marker}}) {
+      HANDLE file = nullptr;
+      check(SFileCreateFile(mpq, entry.first.constData(), 0, entry.second.size(), 0, MPQ_FILE_COMPRESS, &file), "Cannot create MPQ member");
+      check(SFileWriteFile(file, entry.second.constData(), entry.second.size(), MPQ_COMPRESSION_ZLIB) && SFileFinishFile(file), "Cannot write MPQ member");
+    }
+    check(SFileCloseArchive(mpq), "Cannot close test MPQ");
+  };
+  QVector<quint32> baseRow(173, 0); baseRow[0] = 133;
+  auto base = wdbc(173, {baseRow});
+  QVector<Fields> spells{{{"entry", "60000"}, {"name", "Test spell"}}};
+  QTemporaryDir temp; check(temp.isValid(), "Cannot create patch test directory");
+  auto a = temp.path()+"/a", b = temp.path()+"/b", workspace = temp.path()+"/workspace";
+  QDir().mkpath(a); QDir().mkpath(b);
+  archive(a+"/patch-Z.mpq", base, "Original A");
+  archive(b+"/patch-Z.mpq", base, "Original B");
+  auto originalA = read(a+"/patch-Z.mpq"), originalB = read(b+"/patch-Z.mpq");
+  ClientPatchService service(workspace);
+  service.install(a, spells);
+  // Exercise upgrading from the old single-client state file as well as fresh per-client state.
+  QDir clients(workspace+"/client-data/clients");
+  auto states = clients.entryList({"*.json"}, QDir::Files);
+  if (!states.isEmpty()) check(QFile::rename(clients.filePath(states[0]), workspace+"/client-data/state.json"), "Cannot stage legacy client state");
+  service.install(b, spells);
+  check(service.status(a, spells).installed, "Switching clients lost the first client's patch state");
+  service.restoreOriginal(a); service.restoreOriginal(b);
+  check(read(a+"/patch-Z.mpq")==originalA && read(b+"/patch-Z.mpq")==originalB, "Wrong original patch restored after switching clients");
+
+  service.install(a, spells);
+  auto installed = read(a+"/patch-Z.mpq");
+  auto backup = service.status(a, spells).backup;
+  { QFile damaged(backup); check(damaged.open(QIODevice::WriteOnly|QIODevice::Truncate), "Cannot corrupt test backup"); damaged.write("damaged"); }
+  check(!service.status(a, spells).problem.isEmpty(), "Damaged backup not reported in client data status");
+  bool blocked = false;
+  try { service.restoreOriginal(a); } catch (std::exception const&) { blocked = true; }
+  check(blocked && read(a+"/patch-Z.mpq")==installed, "Damaged backup replaced the active patch");
+  blocked = false;
+  try { service.install(a, spells); } catch (std::exception const&) { blocked = true; }
+  check(blocked && read(a+"/patch-Z.mpq")==installed, "Reinstall ignored a damaged backup");
+  check(QFile::remove(backup), "Cannot remove test backup");
+  blocked = false;
+  try { service.restoreOriginal(a); } catch (std::exception const&) { blocked = true; }
+  check(blocked && read(a+"/patch-Z.mpq")==installed, "Missing original backup caused the active patch to be deleted");
+
+  // The user removes their original patch between test sessions. It must stay absent on restore.
+  service.install(b, spells); service.restoreOriginal(b);
+  check(QFile::remove(b+"/patch-Z.mpq"), "Cannot remove original B");
+  archive(b+"/dbc.MPQ", base, "Base B");
+  service.install(b, spells); service.restoreOriginal(b);
+  check(!QFileInfo::exists(b+"/patch-Z.mpq"), "An old backup resurrected a patch the user removed");
+}
 SpellDesign spellOf(SpellCatalog::Template t) {
   SpellDesign d; d.name = "Test"; d.editable = true; d.castTime = 1; d.range = 1;
   for (auto column : {"entry", "effect1", "effect2", "effect3"}) d.row[column] = "0";
   SpellCatalog::apply(t, d, 0); return d;
 }
 void spellRules() {
+  check(SpellService::nextFreeId({133, 1000000}) == 134, "Legacy incompatible IDs affected spell allocation");
+  check(SpellService::nextFreeId({65535, 65534, 1000000}) == 65533, "Spell allocation ignored free IDs below the limit");
+  QSet<Id> occupied; for (Id id = 1; id <= 65535; ++id) occupied.insert(id);
+  bool full = false; try { SpellService::nextFreeId(occupied); } catch (std::runtime_error const&) { full = true; }
+  check(full, "Full spell ID range did not fail");
+  occupied.remove(1);
+  check(SpellService::nextFreeId(occupied) == 1, "Last free spell ID was not allocated");
   // The server's roll: base + baseDice .. base + dieSides; 0 or 1 sides is exactly base + baseDice.
   Fields row{{"effect1", "2"}, {"effectBasePoints1", "49"}, {"effectBaseDice1", "1"}, {"effectDieSides1", "11"},
              {"effect2", "6"}, {"effectApplyAuraName2", "22"}, {"effectBasePoints2", "-201"}, {"effectBaseDice2", "1"}, {"effectDieSides2", "1"}};
@@ -462,7 +535,7 @@ int main(int argc, char** argv) {
   try {
     lootValidation(); lootChances(); lootSimulation(); lootServerCompatibility(); vendorChecks(); trainerChecks(); serviceChanges();
     dialogueRoundTrip(); dialogueChecks(); dialogueChanges();
-    clientTables(); spellRules(); itemRules(); spellChanges();
+    clientTables(); clientPatchRecovery(); spellRules(); itemRules(); spellChanges();
     QTextStream(stdout) << "Loot, vendor, trainer, dialogue, client data, spell and item tests passed\n";
     return 0;
   } catch (std::exception const& e) { QTextStream(stderr) << e.what() << Qt::endl; return 1; }

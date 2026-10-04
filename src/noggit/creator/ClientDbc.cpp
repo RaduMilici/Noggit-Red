@@ -14,7 +14,7 @@ Wdbc Wdbc::parse(QByteArray const& bytes) {
   require(bytes.size() >= 20 && bytes.startsWith("WDBC"), "This is not a client table (WDBC) file.");
   auto u32 = [&](int at) { return qFromLittleEndian<quint32>(bytes.constData() + at); };
   quint32 rows = u32(4), columns = u32(8), rowSize = u32(12), stringSize = u32(16);
-  require(columns && rowSize == columns * 4 && 20 + qint64(rows) * rowSize + stringSize == bytes.size(), "The client table is damaged or has an unexpected layout.");
+  require(columns && quint64(rowSize) == quint64(columns) * 4 && 20 + quint64(rows) * rowSize + stringSize == quint64(bytes.size()), "The client table is damaged or has an unexpected layout.");
   Wdbc table; table._columns = columns;
   table._records.resize(std::size_t(rows) * columns);
   for (std::size_t i = 0; i < table._records.size(); ++i) table._records[i] = u32(20 + int(i) * 4);

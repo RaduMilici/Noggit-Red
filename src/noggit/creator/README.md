@@ -456,7 +456,8 @@ local client's `Data` folder: `patch-Z.mpq`, the last patch the 1.12 client load
   Production** puts the client's own `patch-Z.mpq` back first (or removes Creator's).
 - **Local changes → Client data** lists what the test client does not have yet (`+ Spell.dbc:
   Holy Smite (Rank 2)`), with **Update Test Client**, **Restore Original** and **Export Client
-  Patch…** (the patch to hand to players). The state is `Workspace/client-data/state.json`,
+  Patch…** (the patch to hand to players). State is kept separately for each client in `Workspace/client-data/clients/` (existing
+  `state.json` files are read for migration),
   apart from Local Changes.
 - **Sync to Production does not send client data**; its confirmation warns when synced spells need
   the patch. On Windows, replacing `patch-Z.mpq` needs the client closed (and fails while another

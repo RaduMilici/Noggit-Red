@@ -161,6 +161,7 @@ void TestSessionService::grantTo(Id character,TestOptions const& _options) {
   QSet<int> taken;
   for(auto const& r:db.query("SELECT slot FROM characters.character_inventory WHERE guid="+guid+" AND bag=0"))taken.insert(r["slot"].toInt());
   auto next=db.query("SELECT COALESCE(MAX(guid),0)+100 AS g FROM characters.item_instance")[0]["g"].toUInt();
+  QStringList statements; // Validate every item and reserve all slots before writing any rows.
   int slot=23; // the backpack's 16 slots are 23..38
   for(auto const& wanted:_options.items) {
     auto item=wanted.first;auto count=wanted.second;
@@ -173,15 +174,16 @@ void TestSessionService::grantTo(Id character,TestOptions const& _options) {
       while(slot<=38&&taken.contains(slot))++slot;
       require(slot<=38,"The test character's backpack is full. Make room in it (or test with another character) and try again.");
       int amount=std::min(left,stack);left-=amount;
-      db.exec(QString("INSERT INTO characters.item_instance (guid,itemEntry,owner_guid,creatorGuid,giftCreatorGuid,count,duration,charges,flags,enchantments,randomPropertyId,transmogrifyId,durability,text,generated_loot) "
+      statements.push_back(QString("INSERT INTO characters.item_instance (guid,itemEntry,owner_guid,creatorGuid,giftCreatorGuid,count,duration,charges,flags,enchantments,randomPropertyId,transmogrifyId,durability,text,generated_loot) "
                       "VALUES (%1,%2,%3,0,0,%4,%5,%6,0,%7,0,0,%8,0,0)").arg(next).arg(item).arg(guid).arg(amount).arg(proto[0]["duration"].toInt())
                       .arg(db.quote(charges),db.quote(enchantments)).arg(proto[0]["max_durability"].toInt()));
-      db.exec(QString("INSERT INTO characters.character_inventory (guid,bag,slot,item,item_template) VALUES (%1,0,%2,%3,%4)").arg(guid).arg(slot).arg(next).arg(item));
+      statements.push_back(QString("INSERT INTO characters.character_inventory (guid,bag,slot,item,item_template) VALUES (%1,0,%2,%3,%4)").arg(guid).arg(slot).arg(next).arg(item));
       taken.insert(slot);++next;
     }
   }
   for(auto spell:_options.spells)
-    db.exec("INSERT INTO characters.character_spell (guid,spell,active,disabled) VALUES ("+guid+","+QString::number(spell)+",1,0) ON DUPLICATE KEY UPDATE active=1,disabled=0");
+    statements.push_back("INSERT INTO characters.character_spell (guid,spell,active,disabled) VALUES ("+guid+","+QString::number(spell)+",1,0) ON DUPLICATE KEY UPDATE active=1,disabled=0");
+  for(auto const& statement:statements) db.exec(statement);
   db.commit();
 }
 void TestSessionService::tick() {
