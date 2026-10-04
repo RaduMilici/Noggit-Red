@@ -101,9 +101,9 @@ ItemDetails::ItemDetails(QWidget* parent, bool model) : QWidget(parent) {
   _modelNote = new QLabel(this); _modelNote->setWordWrap(true); _modelNote->setStyleSheet("color: gray; font-style: italic;");
   layout->addWidget(_modelNote);
   layout->addStretch();
-  show(std::nullopt);
+  setItem(std::nullopt);
 }
-void ItemDetails::show(std::optional<ItemInfo> const& item) {
+void ItemDetails::setItem(std::optional<ItemInfo> const& item) {
   if (!item) {
     _icon->clear(); _name->setText("<i>No item selected</i>"); _text->hide(); _modelNote->hide();
     if (_model) _model->hide();
@@ -114,7 +114,7 @@ void ItemDetails::show(std::optional<ItemInfo> const& item) {
   _name->setText(QString("<span style='font-size:12pt;font-weight:bold;%1'>%2</span><br><span style='color:gray'>%3 · %4</span>")
                    .arg(color.isValid() ? "color:" + color.name() + ";" : QString(), item->name.toHtmlEscaped(),
                         ItemService::qualityName(item->quality), typeLine(*item).toHtmlEscaped()));
-  _text->setText(itemTooltip(*item)); _text->QWidget::show();
+  _text->setText(itemTooltip(*item)); _text->show();
   if (_model) {
     _model->showItem(item->display, item->inventoryType);
     _model->setVisible(_model->hasModel());
@@ -183,7 +183,7 @@ ItemBrowser::ItemBrowser(ItemFilter const& preset, bool compact, QWidget* parent
   for (auto spin : {_minLevel, _maxLevel}) connect(spin, qOverload<int>(&QSpinBox::valueChanged), this, later);
   connect(_view->selectionModel(), &QItemSelectionModel::currentChanged, this, [this] {
     auto item = current();
-    if (_details) _details->show(item);
+    if (_details) _details->setItem(item);
     if (onCurrent) onCurrent(item);
   });
   connect(_view, &QListView::activated, this, [this](QModelIndex const& index) { if (onActivated) onActivated(index.data(EntryRole).toUInt()); });

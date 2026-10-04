@@ -955,6 +955,7 @@ private:
   void creatorGameObject();
   void reloadCreatorObjects();
   void editCreatorPatrol();
+  bool editCreatorDialogue(std::uint32_t entry);
   void refreshCreatorPatrol();
   QPoint patrolScreen(int index) const;
   Noggit::Creator::Patrol _creator_patrol, _saved_creator_patrol;

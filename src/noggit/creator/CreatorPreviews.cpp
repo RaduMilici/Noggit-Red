@@ -13,30 +13,28 @@ std::string modelPath(std::string path) {
 NpcPreview::NpcPreview(World* world, QWidget* parent) : CreaturePreviewModelViewer(parent), _world(world) { setMinimumSize(240, 260); }
 void NpcPreview::showNpc(Id entry) {
   _pending.reset();
-  if (!_world) return;
-  try {
-    auto look = CreatureService::look(entry);
-    auto display = gCreatureDisplayInfoDB.getByID(look.display);
-    auto model = gCreatureModelDataDB.getByID(display.getUInt(CreatureDisplayInfoDB::ModelID));
-    World::CreatureSpawnOverlay spawn;
-    spawn.entry = entry; spawn.display_id = look.display; spawn.name = look.name.toStdString();
-    spawn.model_path = modelPath(model.getString(CreatureModelDataDB::ModelName));
-    // Same scale rule as the world: the template's scale, else the display's; times the model's own.
-    float const displayScale = display.getFloat(CreatureDisplayInfoDB::CreatureModelScale);
-    spawn.template_scale = look.scale > 0 ? float(look.scale) : (displayScale > 0 ? displayScale : 1.0f);
-    float const modelScale = model.getFloat(CreatureModelDataDB::ModelScale);
-    spawn.model_scale = modelScale > 0 ? modelScale : 1.0f;
-    spawn.is_character_model = spawn.model_path.rfind("character/", 0) == 0;
-    spawn.mainhand_display_id = look.mainhand; spawn.offhand_display_id = look.offhand; spawn.ranged_display_id = look.ranged;
-    spawn.offhand_inventory_type = std::uint32_t(look.offhandType);
-    if (!spawn.model_path.empty()) _pending = spawn;
-  } catch (...) { /* unknown look: the preview stays empty */ }
+  try { _pending = std::make_pair(entry, CreatureService::look(entry)); } catch (...) { /* unknown NPC: the preview stays empty */ }
   update();
 }
 void NpcPreview::draw() {
-  if (_pending) {
-    auto spawn = *_pending; _pending.reset();
-    try { setCreatureSpawnPreview(*_world, spawn); } catch (...) {}
+  if (_pending && _world) {
+    auto [entry, look] = *_pending; _pending.reset();
+    try {
+      auto display = gCreatureDisplayInfoDB.getByID(look.display);
+      auto model = gCreatureModelDataDB.getByID(display.getUInt(CreatureDisplayInfoDB::ModelID));
+      World::CreatureSpawnOverlay spawn;
+      spawn.entry = entry; spawn.display_id = look.display; spawn.name = look.name.toStdString();
+      spawn.model_path = modelPath(model.getString(CreatureModelDataDB::ModelName));
+      // Same scale rule as the world: the template's scale, else the display's; times the model's own.
+      float const displayScale = display.getFloat(CreatureDisplayInfoDB::CreatureModelScale);
+      spawn.template_scale = look.scale > 0 ? float(look.scale) : (displayScale > 0 ? displayScale : 1.0f);
+      float const modelScale = model.getFloat(CreatureModelDataDB::ModelScale);
+      spawn.model_scale = modelScale > 0 ? modelScale : 1.0f;
+      spawn.is_character_model = spawn.model_path.rfind("character/", 0) == 0;
+      spawn.mainhand_display_id = look.mainhand; spawn.offhand_display_id = look.offhand; spawn.ranged_display_id = look.ranged;
+      spawn.offhand_inventory_type = std::uint32_t(look.offhandType);
+      if (!spawn.model_path.empty()) setCreatureSpawnPreview(*_world, spawn);
+    } catch (...) { /* unknown look: the preview stays empty */ }
   }
   CreaturePreviewModelViewer::draw();
 }

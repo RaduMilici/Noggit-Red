@@ -90,7 +90,7 @@ namespace Noggit::Ui::Quest
     _start_item->setEnabled(!links.item_start_quest_col.empty());
     _start_item->setToolTip("Looting this item offers the quest (\"This Item Begins a Quest\"). Only your own items "
                             "can be used, so game items keep working as before.");
-    start_row->addWidget(_start_item, 1);
+    start_row->addWidget(browsable(_start_item), 1);
     if (_setup.create_item)
     {
       auto* create = new QPushButton("New item...", items);
@@ -113,7 +113,7 @@ namespace Noggit::Ui::Quest
     _source_count->setRange(1, 255);
     _source_count->setPrefix("x ");
     _source_count->setEnabled(!s.source_item_count_col.empty());
-    source_row->addWidget(_source_item, 1);
+    source_row->addWidget(browsable(_source_item), 1);
     source_row->addWidget(_source_count);
     form->addRow("Given on accepting", source_row);
     cards()->addWidget(items);

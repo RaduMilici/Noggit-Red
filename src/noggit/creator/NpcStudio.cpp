@@ -58,9 +58,22 @@ NpcStudio::NpcStudio(Actions actions, QWidget* parent) : QWidget(parent), _actio
   layout->addWidget(heading("This NPC", this));
   _place = tile("Place", Icon::mapmarkeralt, "Click in the world to place this NPC there. Esc cancels.", _actions.place, this);
   _edit = tile("Edit", Icon::edit, "Change looks, combat and role, or delete it.", _actions.edit, this);
+  layout->addWidget(row({_place, _edit}, this));
+
+  layout->addWidget(heading("Dialogue", this));
+  _dialogue = tile("Edit Dialogue", Icon::comments, "What this NPC says and how players can answer: a conversation tree, with a live preview and testing in game.", _actions.dialogue, this);
+  layout->addWidget(row({_dialogue}, this));
+
+  layout->addWidget(heading("Quests", this));
   _quests = tile("Quests", Icon::exclamation, "The quests this NPC gives or takes: make, change or copy them.", _actions.quests, this);
   _chain = tile("Chain", Icon::sitemap, "This NPC's quest chain as a diagram: link quests by drawing arrows.", _actions.chain, this);
-  layout->addWidget(row({_place, _edit, _quests, _chain}, this));
+  layout->addWidget(row({_quests, _chain}, this));
+
+  layout->addWidget(heading("Gives players", this));
+  _loot = tile("Loot", Icon::coins, "What it drops: items, chances, quantities and money, with a drop simulator.", _actions.loot, this);
+  _vendor = tile("Vendor", Icon::store, "What it sells, in a preview of the game's shop window.", _actions.vendor, this);
+  _trainer = tile("Trainer", Icon::graduationcap, "What it teaches, in a preview of the game's trainer window.", _actions.trainer, this);
+  layout->addWidget(row({_loot, _vendor, _trainer}, this));
 
   _placementRow = new QWidget(this);
   auto placement = new QVBoxLayout(_placementRow); placement->setContentsMargins(0, 0, 0, 0); placement->setSpacing(4);
@@ -95,6 +108,8 @@ void NpcStudio::refresh() {
   _clone->setEnabled(chosen);
   _place->setEnabled(own); _edit->setEnabled(own);
   _quests->setEnabled(chosen); _chain->setEnabled(chosen);
+  // Original NPCs open read-only, with a way to copy what they give to your own.
+  for (auto* service : {_loot, _vendor, _trainer, _dialogue}) service->setEnabled(chosen);
   _testNpc->setEnabled(chosen && _npc->placed);
   _testNpc->setToolTip(chosen && !_npc->placed ? "Place this NPC first, or select one of its placements."
                        : "Saves, restarts the local server and launches WoW standing in front of this NPC.");

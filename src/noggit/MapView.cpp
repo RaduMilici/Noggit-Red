@@ -4,6 +4,7 @@
 #include <noggit/ui/quest/QuestBrowserDialog.hpp>
 #include <noggit/ui/quest/QuestChainDialog.hpp>
 #include <noggit/creator/NpcStudio.hpp>
+#include <noggit/creator/ServiceEditors.hpp>
 #include <noggit/runtime/RuntimeManager.hpp>
 // This file is part of Noggit3, licensed under GNU General Public License (version 3).
 #include <noggit/rendering/vulkan/VkParticleFeed.hpp>
@@ -2292,6 +2293,24 @@ void MapView::setupCreatureModelPickerUi()
     actions.quests = [this] { if (_studio_entry && prepareCreatorChange()) { openQuests(*_studio_entry); reloadCreatorContent(_selected_creature_spawn_guid); refreshStudio(); } };
     actions.chain = [this] { if (_studio_entry) openQuestChain(*_studio_entry); };
     actions.patrol = [this] { editCreatorPatrol(); };
+    auto service = [this](auto edit)
+    {
+      return [this, edit]
+      {
+        if (!_studio_entry || !prepareCreatorChange())
+        {
+          return;
+        }
+        if (edit(*_studio_entry))
+        {
+          refreshStudio();
+        }
+      };
+    };
+    actions.loot = service([this](std::uint32_t entry) { return Noggit::Creator::editLoot(this, _world.get(), {Noggit::Creator::LootOwner::Kind::Npc, entry}); });
+    actions.vendor = service([this](std::uint32_t entry) { return Noggit::Creator::editVendor(this, _world.get(), entry); });
+    actions.trainer = service([this](std::uint32_t entry) { return Noggit::Creator::editTrainer(this, _world.get(), entry); });
+    actions.dialogue = service([this](std::uint32_t entry) { return editCreatorDialogue(entry); });
     actions.testAtNpc = [this] { studioTestAtNpc(); };
     actions.testAtSpot = [this]
     {
@@ -19287,6 +19306,10 @@ void MapView::ShowContextMenu(QPoint pos)
       QMenu menu(this); auto create=menu.addMenu("Create");
       create->addAction("GameObject",this,[this] { creatorGameObject(); });
       if(_selected_creature_spawn_guid) menu.addAction("Edit Patrol",this,[this] { editCreatorPatrol(); });
+      if(auto const* spawn=_selected_creature_spawn_guid?_world->findCreatureSpawn(*_selected_creature_spawn_guid):nullptr) {
+        auto entry=spawn->entry;
+        menu.addAction("Edit Dialogue…",this,[this,entry] { if(prepareCreatorChange() && editCreatorDialogue(entry)) refreshStudio(); });
+      }
       if(_selected_gameobject_spawn_guid) {
         auto guid=*_selected_gameobject_spawn_guid;
         auto spawn=_world->findGameObjectSpawn(guid);
@@ -19295,6 +19318,10 @@ void MapView::ShowContextMenu(QPoint pos)
           menu.addAction("Edit GameObject",this,[this,entry,guid] {
             if(!prepareCreatorChange()) return;
             if(auto d=Noggit::Creator::designGameObject(this,entry,guid)) try { Noggit::Creator::GameObjectService::save(*d); reloadCreatorObjects(); } catch(std::exception const& e) { QMessageBox::warning(this,"GameObject",e.what()); }
+          });
+          menu.addAction("Edit Loot…",this,[this,entry] {
+            if(!prepareCreatorChange()) return;
+            Noggit::Creator::editLoot(this,_world.get(),{Noggit::Creator::LootOwner::Kind::Object,entry});
           });
           menu.addAction("Locate in world",this,[this,position] { focus_camera_on_target(position); });
           menu.addAction("Duplicate GameObject",this,[this,entry,guid] {
@@ -19781,6 +19808,10 @@ void MapView::refreshCreatorPatrol() {
   for(int i=0;i<_creator_patrol.points.size();++i) { auto const& w=_creator_patrol.points[i]; _patrol_list->addItem(QString("%1    %2     ·     %3 s pause").arg(i+1,2,10,QChar('0')).arg(w.run?"Run":"Walk").arg(w.waitMs/1000.0)); }
   if(selected>=0) _patrol_list->setCurrentRow(std::min(selected,_patrol_list->count()-1));
   _patrol_overlay->update();
+}
+bool MapView::editCreatorDialogue(std::uint32_t entry) {
+  auto session=openContentSession();
+  return session && Noggit::Creator::editDialogue(this,_world.get(),entry,*session);
 }
 void MapView::editCreatorPatrol() {
   if(_patrol_guid) return;

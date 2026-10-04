@@ -72,6 +72,7 @@ namespace Noggit::Quest
     std::map<std::uint32_t, std::uint32_t> npc_flags;       // of the NPCs the quest links (missing = unknown)
     std::map<std::uint32_t, std::uint32_t> trigger_quests;  // area trigger -> the quest it completes now
     std::uint32_t next_text_id = OWN_TEXT_START;
+    bool completed_by_dialogue = false; // an NPC dialogue response completes it (keeps the "event" flag)
     NameLookup names;
   };
 

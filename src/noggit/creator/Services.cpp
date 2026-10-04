@@ -1,5 +1,6 @@
 #include "Services.hpp"
 #include "Database.hpp"
+#include "GossipService.hpp"
 #include <noggit/runtime/RuntimeManager.hpp>
 #include <QJsonDocument>
 #include <QJsonArray>
@@ -77,6 +78,13 @@ Id CreatureService::save(Npc const& d, std::optional<Position> const& place, Id*
   equipmentValid(db,d.equipment);
   Id entry=d.entry?d.entry:db.allocate("creature_template","entry",0x7fffff); Fields values;
   db.track(EntityType::Npc,entry);
+  // A dialogue made in Noggit is copied, never shared: editing one NPC's must not change another's.
+  bool ownDialogue=false;
+  if(d.source && !d.entry && d.gossip) {
+    auto root=one(db,"creature_template",d.source)["gossip_menu_id"].toUInt();
+    ownDialogue=root && db.owned("gossip_menu",root);
+    if(ownDialogue) db.track(EntityType::Gossip,entry);
+  }
   if(d.source && !d.entry) {
     auto source=one(db,"creature_template",d.source);
     auto copy=[&](bool enabled, QStringList const& keys){ if(enabled) for(auto const& key:keys) if(source.contains(key)) values[key]=source[key]; };
@@ -88,6 +96,7 @@ Id CreatureService::save(Npc const& d, std::optional<Position> const& place, Id*
     copy(d.vendor,{"vendor_id"});
     copy(d.trainer,{"trainer_id","trainer_type","trainer_spell","trainer_class","trainer_race"});
     copy(d.gossip,{"gossip_menu_id"});
+    if(ownDialogue) values["gossip_menu_id"]=0;
   }
   // Source templates are never updated; optional associations retain their existing definitions.
   values["name"]=d.name.trimmed(); values["display_id1"]=d.display;
@@ -124,6 +133,7 @@ Id CreatureService::save(Npc const& d, std::optional<Position> const& place, Id*
     copyRows(d.trainer,"npc_trainer","entry");
     copyRows(d.quests,"creature_questrelation","id");
     copyRows(d.quests,"creature_involvedrelation","id");
+    if(ownDialogue) GossipService::copyWith(db,d.source,entry);
   }
   db.snapshot("creator_content","entry",entry); db.mark("npc",entry);
   if(!d.entry && place) {
@@ -147,6 +157,7 @@ void CreatureService::remove(Id entry) {
   require(quests.isEmpty(),"This NPC is used by the quest \""+(quests.isEmpty()?QString():quests[0]["Title"].toString())+"\". Edit or delete that quest first.");
   db.track(EntityType::Npc,entry);
   for(auto type:{EntityType::Loot,EntityType::Vendor,EntityType::Trainer}) db.track(type,entry);
+  GossipService::removeWith(db,entry);
   // Its own loot table goes with it (a table it still shares with the NPC it was copied from stays).
   if(row["loot_id"].toUInt()==entry) { db.snapshotWhere("creature_loot_template","entry="+id); db.exec("DELETE FROM creature_loot_template WHERE entry="+id); }
   for(auto const& spawn:db.query("SELECT guid FROM creature WHERE id="+id)) {

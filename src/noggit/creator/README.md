@@ -29,7 +29,10 @@ gives that NPC the quest-giver role.
 7. Select the WoW executable once. Its relative path is remembered. The launcher
    backs up `realmlist.wtf` once and points the client at the local realm.
 
-8. When it works in game: **Local changes** (status bar) → **Sync to Production**. See
+8. **Gives players → Loot / Vendor / Trainer** on the NPC card (and **Edit Loot…** on a
+   chest's menu) edit what it drops, sells and teaches. See
+   [Loot, vendors and trainers](#loot-vendors-and-trainers).
+9. When it works in game: **Local changes** (status bar) → **Sync to Production**. See
    [Sync to Production](#sync-to-production).
 
 Log in with a local account: **Client Profiles… → Create Local Account…**, or accept the
@@ -53,6 +56,14 @@ own hash (`AccountService`, `AccountDialog.*`) and only exist in the local datab
 - `ChangeTracker.hpp/.cpp`: Local Changes list, persistence, net-change merging, SQL generation.
 - `ChangeExport.hpp/.cpp`: change package export (`manifest.json`, `changes.sql`).
 - `LocalChangesPanel.hpp/.cpp`: status-bar "Local changes" button and panel.
+- `ItemService`, `LootService`, `VendorService`, `TrainerService` (`.hpp/.cpp`): items as the
+  editors show them, and the loot, shop and trainer data of NPCs and objects (load, validate,
+  save, drop simulation). No widgets; their checks are unit-tested in `test/creator/ServiceTests.cpp`.
+- `ItemBrowser.hpp/.cpp`: the reusable Item Browser, item tooltip and details card.
+- `LootEditor.cpp`, `VendorEditor.cpp`, `TrainerEditor.cpp` (`ServiceEditors.hpp`), `EditorWidgets.*`:
+  the visual editors and their shared pieces (money editor, drop target table, row problems).
+- `CreatorPreviews.hpp/.cpp`: NPC, object and item 3D previews, on the creature picker's orbit
+  viewer (`ui/tools/PreviewRenderer/CreaturePreviewViewer.hpp`, moved out of MapView).
 - `SqlConnection.hpp/.cpp`: the MySQL client connection shared by the local database and the sync.
 - `Ssh.hpp/.cpp`: system OpenSSH client: hardened arguments, tunnel, remote command, host keys.
 - `ProductionProfile.hpp/.cpp`: production server settings and the database password store.
@@ -79,10 +90,12 @@ Quest and item writes: `quest_template`, `creature_/gameobject_questrelation` an
 `quest_end_scripts` with their lines in `broadcast_text` (IDs from 6,000,000, above the
 game's own), quest-only rows in `creature_/gameobject_loot_template` (a source without
 loot gets a loot table keyed by its entry), `item_template` (new items, `start_quest`),
-and the quest-giver bit of `creature_template.npc_flags`. Gossip and AI scripts are
-untouched. Custom outfits live in `Workspace/creator-outfits.json`.
+and the quest-giver bit of `creature_template.npc_flags`. Dialogue writes are listed under
+[Dialogue](#dialogue-gossip). AI scripts are untouched. Custom outfits live in
+`Workspace/creator-outfits.json`.
 
-Ownership is the `creator_content` table (kinds `npc`, `spawn`, `quest`, `item`), not ID
+Ownership is the `creator_content` table (kinds `npc`, `spawn`, `quest`, `item`, and for
+dialogues `gossip_menu`, `npc_text`, `gossip_text`, `gossip_script`, `condition`), not ID
 ranges: Turtle's own content already uses IDs above 1,000,000.
 
 Identifiers allocate above the existing maximum and at least 1,000,000, under a
@@ -126,6 +139,8 @@ that only changes position/orientation is a MOVE. Rows per entity:
   accept/hand-in scripts with the editor's spoken lines, quest-only drops of the items it
   collects (plus loot tables the editor gave their sources), and the item that starts it.
 - Item: `item_template`.
+- Dialogue (per NPC): its greeting and gossip flag, and the menus, options, texts, scripts and
+  conditions made in Noggit that the greeting leads to.
 
 The list lives in `Workspace/creator-changes.json`, never in the world database. It
 is written in two phases around the recovery journal (`creator-changes.pending.json`
@@ -242,6 +257,138 @@ staging servers, terrain/client files and DBC deployment. tortoise-deploy re-cre
 world database when an upstream migration is edited, which drops synced content. Keep
 the `Workspace/sync` folders: their `changes.sql` files can be applied again, oldest first.
 
+## Loot, vendors and trainers
+
+Open them from the NPC card's **Gives players** row (Loot, Vendor, Trainer) or a chest's
+**Edit Loot…** menu entry. Original NPCs and objects open read-only, with **Copy to My NPC…**
+to give one of yours the same setup. Nothing needs table names or IDs: items are picked in the
+Item Browser or dragged from it, spells by name. Problems show in the row's Notes column (✗
+errors block Save, ⚠ warnings do not); problems of the whole list show under it.
+
+**Loot** (NPCs; chests and fishing holes): the NPC or object in 3D, a table of items with
+chance, **Always** (guaranteed), quantity range, group and the resulting chance per kill, and
+the money it drops. Groups follow the server: exactly one item of a group drops, explicit
+chances are taken in order up to 100%, and 0% items share what is left. Quest drops are shown
+read-only (the quest editor manages them); shared reference tables are kept and shown as one
+row. **Copy Loot…** takes another NPC's or chest's loot (replace or add), **Use on Another…**
+gives one of your own the same loot, **Clear** and **Reset** discard. An NPC still using the
+loot of what it was cloned from gets its own table on save; the original is never changed.
+**Simulate Drops** rolls 10,000 kills (adjustable) with the server's group and reference rules
+and lists expected against observed chances, average quantity, average money and empty kills.
+Checked: missing items, chances outside 0–100%, 0% outside a group, min above max, duplicates,
+groups over 100% or starving their 0% items, money min above max.
+
+**Vendor**: a preview of the game's shop window (two columns of five per page, icons with
+stack size and stock, names in quality colours, prices in coins) next to the editable list:
+stock (or Unlimited), restock time, price (from the item), order (arrows or **Sort by** name,
+price, type, level, quality). **Sells items** gives the NPC the vendor role. A shared original
+vendor list is shown and can be made editable (copied into the NPC's own list). **Copy
+Inventory…** / **Use on Another…** as for loot. Checked: missing items, duplicates (also against
+the shared list), limited stock without restock, more than 128 goods, free items, no vendor role.
+
+**Trainer**: a preview of the trainer window, as one of your local characters or any
+character of a level, with the game's **Available / Too High Level / Already Known** filters
+and the selected spell's icon, rank, required level, cost, prerequisite and description. The
+editable list sets required level and cost (original trainers' values are suggested); **Add
+Spell** searches learnable spells by name, **Sort by Level**, **Copy Trainer Setup…**, **Use on
+Another…**. **Who can train**: everyone, or one class. Trainers list the spell that teaches a
+spell; the editor shows and stores that for you. Checked: spells trainers cannot teach,
+duplicates, levels outside 0–60, required level below the spell's own, a previous rank not
+taught here, a class trainer without a class, no trainer role.
+
+**Item Browser** (also used for NPC weapons and, through the "…" buttons, quest items):
+search by name, icon grid or list, quality, class, type, slot and required-level filters, and
+**All / My items / Recent** (recent picks are kept in `runtime.ini`). The selected item shows its
+icon, name, quality, the game's tooltip (damage, speed, stats, requirements, item level, sell
+price) and its own 3D model when it has one (weapons, shields, held items, helms, shoulders).
+
+**Testing**: **Test Loot / Test Chest / Test Vendor / Test Trainer** place your local test
+character beside the NPC's or object's saved placement (choosing one when there are several)
+after restarting the local server, which also resets it. Options, applied to the local
+character and account databases only, after the restart and before you log in: let the local
+account use `.respawn` to reset the NPC without restarting (loot), add test money (vendor,
+trainer), set the character's level (trainer).
+
+**Local Changes and sync**: each save is one entry per NPC or object — `+ Loot: Restless
+Miller`, `~ Vendor: Brother Alric`, `+ Trainer spell: Frostbolt Rank 2 (Brother Alric)` — that
+carries the owner's columns the editor sets (loot table and money, vendor and trainer
+settings, only the vendor or trainer role flag) and its rows. Their SQL only runs where the
+owner is Creator content (`@owned`), only writes a loot table the owner owns, and removing an
+NPC removes its loot, shop and trainer rows first. Older Local Changes entries that still carry
+vendor and trainer rows inside the NPC entry keep working.
+
+## Dialogue (gossip)
+
+NPC card → **Dialogue → Edit Dialogue**, or right-click a selected NPC in the world → **Edit
+Dialogue…**. A conversation is a tree: a node is what the NPC says, its children are the
+player's responses, and a node appears under the first response that leads to it (others say
+"back to Node 2"). Select a node or response to edit it on the right; no tables or IDs appear.
+
+```
+Greeting · "Something has disturbed the dead."
+├─ "What happened?"  →  Node 2
+│    └─ Node 2 · "The graves were opened from below."
+│         ├─ "I found the bones."  →  End conversation · complete The Missing Graves · if 2 conditions
+│         └─ "Something else..."  →  back to Greeting
+├─ "Show me your goods."  →  Open vendor
+└─ Lists quests: The Missing Graves
+```
+
+The left side shows the NPC in 3D and the game's gossip window: click responses to play the
+conversation (with Back / Start over); conditional responses say who sees them, effects say what
+happens. ✗ problems block Save, ⚠ warnings do not.
+
+What a response can do, all stored the way the Tortoise/VMaNGOS world database already does:
+
+| In the editor | Stored as |
+| --- | --- |
+| Continue the conversation / End the conversation | `gossip_menu_option` type 1, `action_menu_id` = next menu / -1 |
+| Open the shop / Open training | option type 3 / 5 (shown only when the NPC has the vendor / trainer role) |
+| List this NPC's quests (greeting) | the quest-giver marker option; the game lists available quests by title |
+| Cast a spell on the player | `gossip_scripts` command 15 (the NPC casts it) |
+| Teleport the player (map, position, "Use my cursor position") | `gossip_scripts` command 6, targets swapped so the player moves |
+| Complete a quest (talk/event quests) | `gossip_scripts` command 7; your own quests get the event flag on save |
+| Only shown when… (up to 4, all must hold) | `conditions` rows, combined with AND |
+
+Conditions: player is / is not on a quest, finished its objectives, has / has not completed it,
+carries / does not carry an item (count), level at least / at most. Text supports `$N`, `$C`,
+`$R` and `$B`. Effects only run on responses that continue or end the conversation (the game
+opens shop and trainer windows directly). Quests can only be listed in the greeting: offering a
+quest from a later node, escorts/following, custom logic and cinematics are shown greyed out as
+**needs scripting support**. Not supported: greetings that change with conditions, random
+greetings, confirmation pop-ups and payments, map markers, other services (flight master,
+innkeeper, banker…), unlearning talents.
+
+**Copy from NPC…** copies any NPC's dialogue into the editor; **Copy to My NPC…** (on game NPCs,
+which open read-only) gives one of yours a copy. Parts the editor cannot show are listed and left
+out of copies. A Creator NPC cloned with "dialogue" gets its own copy; game NPCs' dialogues are
+shared until edited, and saving then gives the NPC its own copy. Deleting an NPC deletes its
+dialogue.
+
+Checked: empty texts, responses without a target, nodes nothing leads to, more than 64 nodes or
+15 responses, missing quests/items/spells, a teleport without a destination, completing a game
+quest that is not an event quest, impossible level ranges; warned: shop/training responses on an
+NPC without that role, a vendor or trainer whose dialogue gives no way to shop or train, quests
+the greeting does not list, quest credit without an "is on quest" condition.
+
+**Test Dialogue…** saves, restarts the local server and puts your test character beside the NPC
+(asking which placement when there are several). It lists which responses only some players see
+and can set your character's level for level conditions.
+
+**Storage, Local Changes and sync**: each node is a `gossip_menu` with an `npc_text` and its line in
+`broadcast_text`; responses are `gossip_menu_option` rows, effects `gossip_scripts`. Saving
+replaces the NPC's previous version, reusing its IDs (a menu ID must fit the signed
+`action_menu_id`). Conditions are unique by value in the world database, so an existing identical
+condition is reused and new ones are only added, never deleted. One Local Changes entry per NPC —
+`+ Dialogue: Brother Malric · 3 nodes` — carries the greeting, the gossip flag and the rows
+marked as made in Noggit. Its SQL runs only where the NPC is Creator content, only removes rows
+the target also marks as made in Noggit (a game NPC's dialogue is never removed), and adds
+conditions with `INSERT IGNORE`. Before a sync, an ID production already uses for other content,
+or a condition production stores under another ID, stops the sync with nothing changed. The
+backup covers every dialogue row and mark the sync can change. A Creator quest the dialogue
+completes is listed and synced with its event flag; the quest editor keeps that flag while a
+dialogue completes the quest.
+
 ## Supported appearance and combat
 
 - Search existing NPCs by name, inspect levels/type/faction/look/role/equipment.
@@ -351,11 +498,13 @@ drops and items):
 
 ```bash
 cmake -S test/creator -B build-creator-tests
-cmake --build build-creator-tests --target change_tracker_tests ssh_tests
+cmake --build build-creator-tests --target change_tracker_tests ssh_tests service_tests
 ctest --test-dir build-creator-tests --output-on-failure
 ```
 
-`ssh_tests` covers SSH target validation, argument hardening, error classification,
+`service_tests` covers loot validation, group chances, the drop simulator, vendor and trainer
+checks, dialogues (rows written and read back, validation, conditions, effects), and their Local
+Changes summaries, sync SQL and backup footprint. `ssh_tests` covers SSH target validation, argument hardening, error classification,
 host-key fingerprints and forgetting, and that names cannot break the generated SQL.
 
 Real database integration checks require a disposable, stopped copy of the bundle.
@@ -364,7 +513,8 @@ uniqueness, source preservation, names, placement movement/deletion, respawn edi
 quests (events, a quest drop giving a creature its own loot table, a refused self-link,
 a follow-up chain), items (create, edit, delete protection), MyISAM rollback, Local
 Changes entries, package export (and replaying its `changes.sql` on the live schema),
-the sync backup restoring every row a package changed (table checksums) and ID conflicts,
+loot, vendor and trainer round-trips, the sync backup restoring every row a package changed
+(table checksums) and ID conflicts,
 NPC/quest/item deletion and local accounts, then stops.
 Do not copy a running MariaDB data directory. Do not run beside another local server.
 The copy needs about 7 GB; `/tmp` is often too small, so pick a roomier parent folder.
@@ -432,7 +582,10 @@ ctest --test-dir build-creator-tests -R '^change_tracker$' --output-on-failure
 
 The disposable-runtime `creator_integration` checks also cover GameObject placement and
 movement, a named interaction objective, walk/run/wait/loop persistence, repeated saves,
-and authoring an original NPC's patrol. Use the disposable-copy instructions above;
+and authoring an original NPC's patrol, and dialogues: a round trip with a condition, shop,
+training and a spell, unchanged saves keeping their rows, read-only game NPCs, a clone getting
+its own copy, deletion with the NPC, and the sync backup restoring every dialogue row. Use the
+disposable-copy instructions above;
 that suite is deliberately not run against the designer's workspace.
 
 After building, manually verify: chest preview and placement; move/rotate/duplicate/delete;

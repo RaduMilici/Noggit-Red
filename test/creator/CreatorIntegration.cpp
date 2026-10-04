@@ -3,6 +3,10 @@
 #include <noggit/creator/ChangeExport.hpp>
 #include <noggit/creator/ContentStore.hpp>
 #include <noggit/creator/ProductionSync.hpp>
+#include <noggit/creator/LootService.hpp>
+#include <noggit/creator/VendorService.hpp>
+#include <noggit/creator/TrainerService.hpp>
+#include <noggit/creator/GossipService.hpp>
 #include <noggit/runtime/RuntimeManager.hpp>
 #include <QCoreApplication>
 #include <QFileInfo>
@@ -170,6 +174,61 @@ void runChecks() {
   check(query("SELECT Title FROM quest_template WHERE entry="+QString::number(questId))[0]["Title"].toString()=="Creator integration quest (edited)","Replaying the package lost the quest");
   check(query("SELECT COUNT(*) AS n FROM quest_start_scripts WHERE id="+QString::number(questId))[0]["n"].toInt()==1,"Replaying the package duplicated the quest's events");
 
+  // Loot, vendor and trainer: saved through their services, listed in Local Changes, original NPCs untouched.
+  {
+    auto loot=LootService::load({LootOwner::Kind::Npc,entry});
+    check(loot.editable,"A Creator NPC's loot is read-only");
+    LootRow bone; bone.item=items[0].id; bone.chance=25; bone.minCount=1; bone.maxCount=2; loot.rows.push_back(bone); loot.moneyMin=10; loot.moneyMax=50;
+    LootService::save(loot);
+    auto saved=LootService::load({LootOwner::Kind::Npc,entry});
+    bool found=false; for(auto const& r:saved.rows) found=found||(r.item==items[0].id&&r.chance==25&&r.maxCount==2);
+    check(found&&saved.moneyMax==50&&query("SELECT loot_id FROM creature_template WHERE entry="+QString::number(entry))[0]["loot_id"].toUInt()==entry,"Loot did not round-trip");
+    check(tracked(EntityType::Loot,entry)&&tracked(EntityType::Loot,entry)->summary().contains("Loot:"),"Loot change not tracked");
+    auto original=LootService::load({LootOwner::Kind::Npc,sources[0]["entry"].toUInt()});
+    bool refused=false; try { LootService::save(original); } catch(std::exception const&) { refused=true; }
+    check(refused&&!original.editable,"An original NPC's loot was editable");
+    Vendor vendor=VendorService::load(entry); vendor.sells=true; vendor.items={{items[0].id,3,900}};
+    VendorService::save(vendor);
+    check(VendorService::load(entry).items.value(0).stock==3&&(query("SELECT npc_flags FROM creature_template WHERE entry="+QString::number(entry))[0]["npc_flags"].toUInt()&4),"Vendor did not round-trip");
+    check(tracked(EntityType::Vendor,entry),"Vendor change not tracked");
+    auto spells=TrainerService::search("Fireball");
+    check(!spells.isEmpty(),"No learnable spell found");
+    Trainer trainer=TrainerService::load(entry); trainer.teaches=true; trainer.spells={{spells[0].teach,100,spells[0].suggestedLevel}};
+    TrainerService::save(trainer);
+    check(TrainerService::load(entry).spells.value(0).spell==spells[0].teach,"Trainer did not round-trip");
+    check(tracked(EntityType::Trainer,entry)&&tracked(EntityType::Trainer,entry)->summary().contains("Trainer"),"Trainer change not tracked");
+
+    // Dialogue: a greeting that continues (for level 5+), opens the shop and training, then ends with a spell.
+    using Action=DialogueResponse::Action;
+    Dialogue talk=GossipService::load(entry);
+    DialogueNode greeting; greeting.text="Creator test: well met, $N. It's \"quiet\" here.";
+    DialogueResponse more; more.text="Tell me more."; more.action=Action::Continue; more.target=1; more.conditions={{DialogueCondition::Kind::MinLevel,5}};
+    DialogueResponse shop; shop.text="Show me your goods."; shop.action=Action::Vendor;
+    DialogueResponse train; train.text="Teach me."; train.action=Action::Trainer;
+    DialogueNode story; story.text="There is little more to say.";
+    DialogueResponse bye; bye.text="Farewell."; bye.action=Action::Close;
+    DialogueEffect cast; cast.kind=DialogueEffect::Kind::CastSpell; cast.id=spells[0].teach; bye.effects={cast};
+    greeting.responses={more,shop,train}; story.responses={bye}; talk.nodes={greeting,story};
+    GossipService::save(talk);
+    auto strip=[](QVector<DialogueNode> nodes){ for(auto& n:nodes) n.menu=0; return nodes; };
+    auto heard=GossipService::load(entry);
+    check(strip(heard.nodes)==talk.nodes&&heard.dropped.isEmpty()&&!heard.shared,"Dialogue did not round-trip");
+    check(query("SELECT npc_flags FROM creature_template WHERE entry="+QString::number(entry))[0]["npc_flags"].toUInt()&1,"Dialogue did not set the gossip flag");
+    GossipService::save(heard);
+    check(GossipService::load(entry).nodes.value(1).menu==heard.nodes[1].menu,"An unchanged dialogue save moved its rows");
+    check(tracked(EntityType::Gossip,entry)&&tracked(EntityType::Gossip,entry)->summary().startsWith("+ Dialogue"),"Dialogue change not tracked");
+    bool readOnly=false; try { GossipService::save(GossipService::load(sources[0]["entry"].toUInt())); } catch(std::exception const&) { readOnly=true; }
+    check(readOnly,"An original NPC's dialogue was editable");
+    // A clone gets its own copy; deleting it removes only that copy.
+    Npc twin=CreatureService::load(entry); twin.entry=0; twin.source=entry; twin.gossip=true; twin.name="Creator test: twin";
+    auto twinEntry=CreatureService::save(twin);
+    auto copied=GossipService::load(twinEntry);
+    check(!copied.shared&&copied.nodes.value(0).menu!=heard.nodes[0].menu&&strip(copied.nodes)==talk.nodes,"A cloned NPC shares or lost its dialogue");
+    CreatureService::remove(twinEntry);
+    check(query("SELECT entry FROM gossip_menu WHERE entry="+QString::number(copied.nodes[0].menu)).isEmpty()&&strip(GossipService::load(entry).nodes)==talk.nodes,
+          "Deleting a clone left its dialogue or changed the original's");
+  }
+
   // Sync to Production's rollback: back up the footprint, apply a package that deletes, moves and creates
   // across every kind, then restore. The checksums cover every table the generated SQL can write, so a
   // row changed outside the footprint shows up too.
@@ -188,10 +247,12 @@ void runChecks() {
     add(EntityType::Item,itemId,state(EntityType::Item,itemId),{});
     add(EntityType::Spawn,guid,state(EntityType::Spawn,guid),edited(state(EntityType::Spawn,guid),"creature","position_x","1234"));
     add(EntityType::Npc,copyEntry,state(EntityType::Npc,copyEntry),{});
+    add(EntityType::Gossip,entry,state(EntityType::Gossip,entry),{});
     add(EntityType::Npc,1999999,{},edited(state(EntityType::Npc,entry),"creature_template","entry","1999999"));
     QString const tables="creature_template,creature_equip_template,npc_vendor,npc_trainer,creature_questrelation,creature_involvedrelation,"
       "gameobject_questrelation,gameobject_involvedrelation,areatrigger_involvedrelation,creature,item_template,quest_template,"
-      "quest_start_scripts,quest_end_scripts,broadcast_text,creature_loot_template,gameobject_loot_template,gameobject_template,creator_content";
+      "quest_start_scripts,quest_end_scripts,broadcast_text,creature_loot_template,gameobject_loot_template,gameobject_template,creator_content,"
+      "gossip_menu,gossip_menu_option,npc_text,gossip_scripts,conditions";
     auto checksum=[&]{ return query("CHECKSUM TABLE "+tables); };
     auto pristine=checksum();
     auto backup=ProductionBackup::take(ChangeTracker::footprint(scenario,q),q);
@@ -222,7 +283,9 @@ void runChecks() {
   deleteItem(layouts,loadItem(layouts,itemId),itemId);
   check(query("SELECT entry FROM item_template WHERE entry="+QString::number(itemId)).isEmpty(),"Item deletion failed");
   check(tracked(EntityType::Quest,questId)->action==ChangeAction::Delete,"Quest deletion not tracked");
+  auto greetingMenu=GossipService::load(entry).nodes.value(0).menu;
   CreatureService::remove(entry);
+  check(greetingMenu&&query("SELECT entry FROM gossip_menu WHERE entry="+QString::number(greetingMenu)).isEmpty()&&tracked(EntityType::Gossip,entry),"NPC deletion left its dialogue");
   check(query("SELECT guid FROM creature WHERE id="+QString::number(entry)).isEmpty()&&query("SELECT entry FROM creature_template WHERE entry="+QString::number(entry)).isEmpty(),"NPC deletion failed");
   check(tracked(EntityType::Npc,entry)->action==ChangeAction::Delete&&tracked(EntityType::Spawn,guid)->action==ChangeAction::Delete,"NPC deletion not tracked");
   check(!ChangeTracker::sql(ChangeTracker::instance()->changes()).isEmpty(),"Deletion export failed");

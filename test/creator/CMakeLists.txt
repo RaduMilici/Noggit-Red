@@ -17,6 +17,11 @@ add_executable(creator_integration CreatorIntegration.cpp ${CONTENT_SOURCES}
   ../../src/noggit/creator/ChangeTracker.cpp
   ../../src/noggit/creator/ChangeExport.cpp
   ../../src/noggit/creator/ContentStore.cpp
+  ../../src/noggit/creator/ItemService.cpp
+  ../../src/noggit/creator/LootService.cpp
+  ../../src/noggit/creator/VendorService.cpp
+  ../../src/noggit/creator/TrainerService.cpp
+  ../../src/noggit/creator/GossipService.cpp
   ../../src/noggit/runtime/RuntimeManager.cpp)
 target_include_directories(creator_integration PRIVATE ../../src ${MYSQL_INCLUDE_DIR})
 target_compile_definitions(creator_integration PRIVATE USE_MYSQL_UID_STORAGE)
@@ -39,3 +44,20 @@ add_executable(ssh_tests SshTests.cpp
 target_include_directories(ssh_tests PRIVATE ../../src)
 target_link_libraries(ssh_tests PRIVATE Qt5::Core Qt5::Network)
 add_test(NAME ssh COMMAND ssh_tests)
+
+# Loot, vendor, trainer and dialogue rules without a database: validation, group chances, the drop
+# simulator, dialogue rows and parsing, Local Changes summaries and their Sync SQL.
+add_executable(service_tests ServiceTests.cpp
+  ../../src/noggit/creator/LootService.cpp
+  ../../src/noggit/creator/VendorService.cpp
+  ../../src/noggit/creator/TrainerService.cpp
+  ../../src/noggit/creator/GossipService.cpp
+  ../../src/noggit/creator/ItemService.cpp
+  ../../src/noggit/creator/Database.cpp
+  ../../src/noggit/creator/SqlConnection.cpp
+  ../../src/noggit/creator/ChangeTracker.cpp
+  ../../src/noggit/runtime/RuntimeManager.cpp)
+target_include_directories(service_tests PRIVATE ../../src ${MYSQL_INCLUDE_DIR})
+target_compile_definitions(service_tests PRIVATE USE_MYSQL_UID_STORAGE)
+target_link_libraries(service_tests PRIVATE Qt5::Core Qt5::Network ${MYSQL_LIBRARY})
+add_test(NAME services COMMAND service_tests)

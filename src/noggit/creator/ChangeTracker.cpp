@@ -14,7 +14,7 @@ namespace Noggit::Creator {
 namespace {
 void require(bool b, QString const& message) { if (!b) throw std::runtime_error(message.toStdString()); }
 QString n(Id id) { return QString::number(id); }
-QStringList const typeNames{"npc", "spawn", "quest", "item", "gameobject", "object_spawn", "loot", "object_loot", "vendor", "trainer"};
+QStringList const typeNames{"npc", "spawn", "quest", "item", "gameobject", "object_spawn", "loot", "object_loot", "vendor", "trainer", "gossip"};
 QStringList const actionNames{"CREATE", "UPDATE", "DELETE", "MOVE"};
 QStringList const relations{"creature_questrelation", "creature_involvedrelation"};
 // Everything that links a quest to its givers, enders and exploration spot, keyed by quest.
@@ -70,6 +70,22 @@ QString replaceRowsIfOwned(QString const& table, QJsonArray const& rows) {
   }
   return out;
 }
+// Rows written only when @owned is set and no row with the same unique values exists (shared conditions).
+QString insertIgnoreIfOwned(QString const& table, QJsonArray const& rows) {
+  QString out;
+  for (auto const& value : rows) {
+    auto row = value.toObject(); QStringList keys, values;
+    for (auto it = row.begin(); it != row.end(); ++it) { keys << identifier(it.key()); values << literal(it.value()); }
+    out += "INSERT IGNORE INTO " + identifier(table) + " (" + keys.join(',') + ") SELECT " + values.join(',') + " FROM DUAL WHERE @owned>0;\n";
+  }
+  return out;
+}
+// A dialogue's tables, their keys and the creator_content kind marking the rows made in Noggit
+// (conditions are shared by value and never removed).
+struct GossipTable { char const *table, *key, *kind; };
+GossipTable const gossipTables[] = {{"gossip_menu", "entry", "gossip_menu"}, {"npc_text", "ID", "npc_text"},
+                                    {"broadcast_text", "entry", "gossip_text"}, {"gossip_scripts", "id", "gossip_script"}};
+QStringList const gossipWritten{"gossip_menu", "gossip_menu_option", "npc_text", "broadcast_text", "gossip_scripts"};
 bool isService(EntityType type) {
   return type == EntityType::Loot || type == EntityType::ObjectLoot || type == EntityType::Vendor || type == EntityType::Trainer;
 }
@@ -113,6 +129,30 @@ QStringList ids(QJsonArray const& rows, QString const& key) {
   QStringList result; for (auto const& row : rows) result << n(field(row.toObject(), key));
   result.removeDuplicates(); return result;
 }
+// Removes a dialogue's rows of both versions, but only those the target database also marks as made in
+// Noggit (a game NPC's dialogue is never removed), then the marks the new version no longer has.
+QString gossipRemoval(QJsonObject const& before, QJsonObject const& after) {
+  QString out;
+  auto guard = [](QString const& kind, QString const& column) {
+    return " AND " + column + " IN (SELECT entry FROM creator_content WHERE kind='" + kind + "') AND @owned>0;\n";
+  };
+  auto both = [&](QString const& table, QString const& key) {
+    auto list = ids(before[table].toArray(), key) + ids(after[table].toArray(), key); list.removeDuplicates(); list.removeAll("0"); return list;
+  };
+  if (auto menus = both("gossip_menu", "entry"); !menus.isEmpty())
+    out += "DELETE FROM gossip_menu_option WHERE menu_id IN (" + menus.join(',') + ")" + guard("gossip_menu", "menu_id");
+  for (auto const& t : gossipTables)
+    if (auto list = both(t.table, t.key); !list.isEmpty())
+      out += "DELETE FROM " + QString(t.table) + " WHERE " + t.key + " IN (" + list.join(',') + ")" + guard(t.kind, t.key);
+  QSet<QString> kept;
+  for (auto const& m : after["creator_marks"].toArray()) kept.insert(m.toObject()["kind"].toString() + "/" + m.toObject()["entry"].toString());
+  for (auto const& value : before["creator_marks"].toArray()) {
+    auto m = value.toObject();
+    if (kept.contains(m["kind"].toString() + "/" + m["entry"].toString())) continue;
+    out += "DELETE FROM creator_content WHERE kind=" + literal(m["kind"]) + " AND entry=" + n(field(m, "entry")) + " AND @owned>0;\n";
+  }
+  return out;
+}
 // Rows of `before` whose key is no longer in `after` (e.g. a drop or spoken line the edit removed).
 QJsonArray removedRows(QJsonObject const& before, QJsonObject const& after, QString const& table, QStringList const& key) {
   auto keyOf = [&](QJsonObject const& row) { QStringList parts; for (auto const& k : key) parts << row[k].toString(); return parts.join('/'); };
@@ -138,6 +178,11 @@ QString TrackedChange::summary() const {
     QString what = action == ChangeAction::Create ? "placed" : action == ChangeAction::Move ? "moved"
                  : action == ChangeAction::Delete ? "placement removed" : "placement edited";
     return sign + " Spawn: " + name + " " + what;
+  }
+  if (type == EntityType::Gossip) {
+    auto had = before["gossip_menu"].toArray().size(), has = after["gossip_menu"].toArray().size();
+    QString mark = action == ChangeAction::Delete || (had && !has) ? "-" : !had && has ? "+" : "~";
+    return mark + " Dialogue: " + name + (has ? QString(" · %1 %2").arg(has).arg(has == 1 ? "node" : "nodes") : QString());
   }
   if (isService(type)) {
     auto rows = [&](QJsonObject const& state) { QMap<QString, QJsonObject> map; for (auto const& r : state[rowTable(type)].toArray())
@@ -305,6 +350,60 @@ QJsonObject ChangeTracker::capture(QueryFunction const& query, EntityType type, 
         if (!names.isEmpty()) rows["spell_names"] = names;
       }
     }
+  } else if (type == EntityType::Gossip) {
+    auto heads = query("SELECT entry,name,gossip_menu_id,npc_flags FROM creature_template WHERE entry=" + n(id));
+    if (heads.isEmpty()) return rows;
+    auto head = heads[0];
+    if (label) *label = head["name"].toString();
+    head.remove("name");
+    // Only the gossip flag: the NPC's other roles belong to its NPC change.
+    head["gossip"] = QString::number((head["npc_flags"].toUInt() & 1) ? 1 : 0);
+    head.remove("npc_flags");
+    rows["creature_gossip"] = QJsonArray{QJsonObject::fromVariantMap(head)};
+    // Only rows made in Noggit: a game NPC's dialogue it still uses stays original content.
+    QJsonArray marks;
+    auto owned = [&](QString const& kind, QStringList list) {
+      list.removeDuplicates(); list.removeAll("0"); QStringList result;
+      if (list.isEmpty()) return result;
+      for (auto const& row : query("SELECT entry FROM creator_content WHERE kind='" + kind + "' AND entry IN (" + list.join(',') + ") ORDER BY entry")) {
+        result << row["entry"].toString(); marks.append(QJsonObject{{"kind", kind}, {"entry", row["entry"].toString()}});
+      }
+      return result;
+    };
+    QStringList menus, frontier = owned("gossip_menu", {head["gossip_menu_id"].toString()});
+    while (!frontier.isEmpty() && menus.size() < 256) {
+      menus << frontier;
+      QStringList next;
+      for (auto const& row : query("SELECT action_menu_id FROM gossip_menu_option WHERE option_id=1 AND action_menu_id>0 AND menu_id IN (" + frontier.join(',') + ") ORDER BY menu_id,id"))
+        if (auto target = row["action_menu_id"].toString(); !menus.contains(target) && !next.contains(target)) next << target;
+      frontier = owned("gossip_menu", next);
+    }
+    if (!menus.isEmpty()) {
+      add("gossip_menu", "entry IN (" + menus.join(',') + ") ORDER BY entry,text_id");
+      add("gossip_menu_option", "menu_id IN (" + menus.join(',') + ") ORDER BY menu_id,id");
+      if (auto texts = owned("npc_text", ids(rows["gossip_menu"].toArray(), "text_id")); !texts.isEmpty()) add("npc_text", "ID IN (" + texts.join(',') + ") ORDER BY ID");
+      QStringList lines;
+      for (auto const& row : rows["npc_text"].toArray()) for (int i = 0; i < 8; ++i) lines << n(field(row.toObject(), "BroadcastTextID" + n(i)));
+      if (lines = owned("gossip_text", lines); !lines.isEmpty()) add("broadcast_text", "entry IN (" + lines.join(',') + ") ORDER BY entry");
+      auto scripts = owned("gossip_script", ids(rows["gossip_menu_option"].toArray(), "action_script_id") + ids(rows["gossip_menu"].toArray(), "script_id"));
+      if (!scripts.isEmpty()) add("gossip_scripts", "id IN (" + scripts.join(',') + ") ORDER BY id,delay,priority");
+      // Conditions made in Noggit, and those a combined one names. Ones the game already had are assumed present.
+      QStringList conditions = ids(rows["gossip_menu_option"].toArray(), "condition_id") + ids(rows["gossip_menu"].toArray(), "condition_id"), seen;
+      QVector<QJsonObject> found;
+      while (true) {
+        QStringList fresh; for (auto const& c : conditions) if (!seen.contains(c)) fresh << c;
+        if ((fresh = owned("condition", fresh)).isEmpty()) break;
+        seen << fresh; conditions.clear();
+        for (auto const& row : query("SELECT * FROM conditions WHERE condition_entry IN (" + fresh.join(',') + ")")) {
+          found.push_back(QJsonObject::fromVariantMap(row));
+          if (row["type"].toInt() < 0) for (int i = 1; i <= 4; ++i) conditions << row["value" + n(i)].toString();
+        }
+      }
+      std::sort(found.begin(), found.end(), [](QJsonObject const& a, QJsonObject const& b) { return field(a, "condition_entry") < field(b, "condition_entry"); });
+      QJsonArray array; for (auto const& c : found) array.append(c);
+      if (!array.isEmpty()) rows["conditions"] = array;
+    }
+    if (!marks.isEmpty()) rows["creator_marks"] = marks;
   } else if (type == EntityType::Spawn) {
     add("creature", "guid=" + n(id));
     if (rows.isEmpty()) return rows;
@@ -376,6 +475,8 @@ QString ChangeTracker::sql(QVector<TrackedChange> const& changes) {
       out += "\n-- Remove " + QString(type == EntityType::Vendor ? "vendor" : type == EntityType::Trainer ? "trainer" : "loot") + ": " + oneLine(c.label) + " (#" + n(c.entity) + ")\n" + ownerGuard(c);
       if (ownTable(c, c.before)) out += "DELETE FROM " + rowTable(type) + " WHERE entry=" + n(c.entity) + " AND @owned>0;\n";
     }
+  for (auto const& c : ordered(EntityType::Gossip, true))
+    out += "\n-- Remove dialogue: " + oneLine(c.label) + " (#" + n(c.entity) + ")\n" + ownedGuard("npc", c.entity) + gossipRemoval(c.before, {});
   // Remove dependents before their NPCs, then recreate NPCs before what refers to them.
   for (auto const& c : ordered(EntityType::Quest, true)) {
     auto id = n(c.entity);
@@ -481,6 +582,19 @@ QString ChangeTracker::sql(QVector<TrackedChange> const& changes) {
       out += "DELETE FROM " + rowTable(type) + " WHERE entry=" + id + " AND @owned>0;\n";
       out += replaceRowsIfOwned(rowTable(type), c.after[rowTable(type)].toArray());
     }
+  // Dialogues replace their previous version whole; conditions are shared by value, so only missing ones are added.
+  for (auto const& c : ordered(EntityType::Gossip, false)) {
+    auto head = firstRow(c.after, "creature_gossip");
+    out += "\n-- Dialogue: " + oneLine(c.label) + " (#" + n(c.entity) + ")\n" + ownedGuard("npc", c.entity) + gossipRemoval(c.before, c.after);
+    out += insertIgnoreIfOwned("conditions", c.after["conditions"].toArray());
+    for (auto const& table : gossipWritten) out += replaceRowsIfOwned(table, c.after[table].toArray());
+    for (auto const& value : c.after["creator_marks"].toArray()) {
+      auto m = value.toObject();
+      out += "INSERT IGNORE INTO creator_content(kind,entry) SELECT " + literal(m["kind"]) + "," + n(field(m, "entry")) + " FROM DUAL WHERE @owned>0;\n";
+    }
+    out += "UPDATE creature_template SET `gossip_menu_id`=" + n(field(head, "gossip_menu_id")) + QString(",`npc_flags`=(`npc_flags`&~1)|%1").arg(field(head, "gossip") ? 1 : 0)
+         + " WHERE entry=" + n(c.entity) + " AND @owned>0;\n";
+  }
   for (auto const& c : ordered(EntityType::Quest, false)) {
     auto id = n(c.entity);
     out += "\n-- Quest: " + oneLine(c.label) + " (#" + id + ")\n";
@@ -559,6 +673,16 @@ QVector<QPair<QString, QString>> ChangeTracker::footprint(QVector<TrackedChange>
       if (c.type == EntityType::Loot) add(rowTable(c.type), "entry", values(headTable(c.type), "loot_id"));
       else if (c.type == EntityType::ObjectLoot) add(rowTable(c.type), "entry", values(headTable(c.type), "data1"));
       else add(rowTable(c.type), "entry", {id});
+    } else if (c.type == EntityType::Gossip) {
+      add("creature_template", "entry", {id});
+      auto menus = values("gossip_menu", "entry");
+      add("gossip_menu_option", "menu_id", menus);
+      for (auto const& t : gossipTables) add(t.table, t.key, values(t.table, t.key));
+      add("conditions", "condition_entry", values("conditions", "condition_entry"));
+      QMap<QString, QStringList> marks;
+      for (auto const& state : states)
+        for (auto const& m : state["creator_marks"].toArray()) marks[m.toObject()["kind"].toString()] << m.toObject()["entry"].toString();
+      for (auto it = marks.begin(); it != marks.end(); ++it) owned(it.key(), it.value());
     } else if (c.type == EntityType::GameObject || c.type == EntityType::GameObjectSpawn) {
       add(c.type==EntityType::GameObject?"gameobject_template":"gameobject",c.type==EntityType::GameObject?"entry":"guid",{id});
     } else if (c.type == EntityType::Spawn) {

@@ -27,7 +27,7 @@ QString itemTooltip(ItemInfo const&);
 class ItemDetails final : public QWidget {
 public:
   explicit ItemDetails(QWidget* parent = nullptr, bool model = true);
-  void show(std::optional<ItemInfo> const& item);
+  void setItem(std::optional<ItemInfo> const& item);
 private:
   QLabel *_icon, *_name, *_text, *_modelNote;
   ItemPreview* _model = nullptr;

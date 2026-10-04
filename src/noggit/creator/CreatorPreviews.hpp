@@ -16,7 +16,7 @@ protected:
   void draw() override;
 private:
   World* _world;
-  std::optional<World::CreatureSpawnOverlay> _pending;
+  std::optional<std::pair<Id, NpcLook>> _pending;
 };
 // A GameObject display.
 class ObjectPreview final : public Ui::Tools::CreaturePreviewModelViewer {

@@ -418,6 +418,12 @@ namespace Noggit::Creator
       content = request.content;
       inputs = saveInputs(reader, data, list, content);
       inputs.names = request.names;
+      // A dialogue response (gossip_scripts "quest explored") completing the quest needs its event flag too.
+      if (data.db.scripts.valid() && request.mode == Q::SaveMode::Edit)
+      {
+        inputs.completed_by_dialogue = reader.number("SELECT COUNT(*) FROM `gossip_scripts` WHERE `command` = 7 AND `datalong` = "
+                                                     + literal(request.entry)) > 0;
+      }
       return Q::planQuestSave(data.db, request.mode, request.entry, request.mode == Q::SaveMode::Copy ? request.source : 0,
                               content, data.content, data.stored, inputs);
     }

@@ -1,6 +1,7 @@
 // This file is part of Noggit3, licensed under GNU General Public License (version 3).
 
 #include <noggit/ui/content/ContentSession.hpp>
+#include <noggit/creator/ItemBrowser.hpp>
 
 #include <noggit/ui/content/ClientData.hpp>
 
@@ -70,6 +71,7 @@ namespace Noggit::Ui::Content
                                         trigger.radius, trigger.quest, trigger.other_use});
       }
       session->_lookups = buildLookups(source);
+      session->_lookups->items->browse = [](QWidget* parent, std::uint32_t current) { return Creator::pickItem(parent, "Choose item", {}, current); };
     }
     catch (std::exception const& e)
     {

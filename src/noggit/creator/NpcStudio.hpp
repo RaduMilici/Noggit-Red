@@ -8,13 +8,14 @@ class QToolButton;
 class QWidget;
 namespace Noggit::Creator {
 // The creature editor's NPC card (bottom panel): the NPC chosen in the list or in the world, and every
-// Creator action as a large button -- design or clone an NPC, place it with a click, its quests and
-// quest chain, and testing in game. Shows state only; MapView performs the actions.
+// Creator action as a button -- design or clone an NPC, place it with a click, its dialogue, quests and
+// quest chain, its loot, shop and training, and testing in game. Shows state only; MapView performs the actions.
 class NpcStudio final : public QWidget {
 public:
   struct Actions {
     std::function<void()> newHumanoid, newCreature, clone, edit, place, quests, chain, testAtNpc, testAtSpot;
     std::function<void()> duplicatePlacement, deletePlacement, locatePlacement, patrol;
+    std::function<void()> loot, vendor, trainer, dialogue;
   };
   struct Npc {
     Id entry = 0;
@@ -32,6 +33,7 @@ private:
   std::optional<Id> _placement;
   QLabel *_name = nullptr, *_details = nullptr, *_badge = nullptr, *_hint = nullptr;
   QToolButton *_clone = nullptr, *_edit = nullptr, *_place = nullptr, *_quests = nullptr, *_chain = nullptr, *_testNpc = nullptr;
+  QToolButton *_loot = nullptr, *_vendor = nullptr, *_trainer = nullptr, *_dialogue = nullptr;
   QWidget* _placementRow = nullptr;
 };
 }

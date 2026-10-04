@@ -3,6 +3,9 @@
 #include <QFile>
 #include <QJsonDocument>
 #include <QSaveFile>
+#include <array>
+#include <initializer_list>
+#include <QSet>
 #include <memory>
 #include <stdexcept>
 namespace Noggit::Creator {
@@ -17,7 +20,7 @@ void writeFile(QString const& path, QByteArray const& bytes) {
     throw std::runtime_error(("Cannot write " + path).toStdString());
 }
 QString title(EntityType type) {
-  return type == EntityType::GameObject ? "GameObject" : type == EntityType::GameObjectSpawn ? "Object placement" : type == EntityType::Npc ? "NPC" : type == EntityType::Spawn ? "Placement" : type == EntityType::Item ? "Item" : "Quest";
+  return type == EntityType::Gossip ? "Dialogue" : type == EntityType::GameObject ? "GameObject" : type == EntityType::GameObjectSpawn ? "Object placement" : type == EntityType::Npc ? "NPC" : type == EntityType::Spawn ? "Placement" : type == EntityType::Item ? "Item" : "Quest";
 }
 // The server's message, in terms of the profile.
 QString databaseProblem(QString const& message, ProductionProfile const& profile) {
@@ -90,6 +93,32 @@ QStringList ProductionSync::conflicts(ChangePackage const& package, QueryFunctio
         for(auto const& row:c.after["creature_movement_scripts"].toArray()) if(row.toObject()["id"].toString()==id) expected.append(row);
         for(auto const& row:c.before["creature_movement_scripts"].toArray()) if(row.toObject()["id"].toString()==id) baseline.append(row);
         if(!remote.isEmpty() && remote!=expected && remote!=baseline) clashes << "Patrol script #"+id+" already exists on production with different behavior.";
+      }
+    }
+    // Dialogue rows get IDs of their own: each must be free on production, or already synced from Noggit.
+    if (c.type == EntityType::Gossip && c.action != ChangeAction::Delete) {
+      QSet<QString> seen;
+      auto clash = [&](QString const& what) { clashes << "Dialogue of \"" + c.label + "\": " + what; };
+      for (auto [table, key, kind] : std::initializer_list<std::array<char const*, 3>>{
+             {"gossip_menu", "entry", "gossip_menu"}, {"npc_text", "ID", "npc_text"}, {"broadcast_text", "entry", "gossip_text"}, {"gossip_scripts", "id", "gossip_script"}})
+        for (auto const& value : c.after[table].toArray()) {
+          auto id = QString::number(value.toObject()[key].toString().toUInt());
+          if (seen.contains(QString(table) + id)) continue;
+          seen.insert(QString(table) + id);
+          if (production("SELECT 1 FROM " + QString(table) + " WHERE " + key + "=" + id + " LIMIT 1").isEmpty()) continue;
+          if (production("SELECT entry FROM creator_content WHERE kind='" + QString(kind) + "' AND entry=" + id).isEmpty())
+            clash(QString("%1 #%2 is already used on production by content that was not synced from Noggit.").arg(table, id));
+        }
+      // Conditions are unique by value: a different row under our ID, or ours under another ID, would be skipped.
+      for (auto const& value : c.after["conditions"].toArray()) {
+        auto row = value.toObject(); auto id = QString::number(row["condition_entry"].toString().toUInt());
+        QStringList same;
+        for (auto column : {"type", "value1", "value2", "value3", "value4", "flags"}) same << QString(column) + "=" + QString::number(row[column].toString().toLongLong());
+        auto existing = production("SELECT condition_entry FROM conditions WHERE " + same.join(" AND ") + " LIMIT 1");
+        if (!existing.isEmpty() && existing[0]["condition_entry"].toString() != id)
+          clash("its condition #" + id + " already exists on production as #" + existing[0]["condition_entry"].toString() + ".");
+        else if (existing.isEmpty() && !production("SELECT 1 FROM conditions WHERE condition_entry=" + id).isEmpty())
+          clash("condition #" + id + " is already used on production for something else.");
       }
     }
     if (!package.owned.value(i) || c.action == ChangeAction::Delete) continue;

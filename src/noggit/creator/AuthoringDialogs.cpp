@@ -1,6 +1,8 @@
 #include "AuthoringDialogs.hpp"
 #include "CreatorPreviews.hpp"
+#include "ItemBrowser.hpp"
 #include "Database.hpp"
+#include <QToolButton>
 #include <noggit/DBC.h>
 #include <noggit/World.h>
 #include <noggit/ui/tools/AssetBrowser/ModelView.hpp>
@@ -89,11 +91,14 @@ bool npcDialog(QWidget* parent,World* world,Npc draft,int mode,Id* saved) {
   std::array<QPushButton*,3> weapons; QStringList slotNames{"Main Hand","Off Hand","Ranged"};
   auto refreshWeapons=[&]{for(int i=0;i<3;++i) weapons[i]->setText(EquipmentService::name(draft.equipment[i]));};
   for(int i=0;i<3;++i) {
-    weapons[i]=new QPushButton; equipmentForm->addRow(slotNames[i],weapons[i]);
+    weapons[i]=new QPushButton; auto clear=new QToolButton; clear->setText("✕"); clear->setToolTip("No visible item");
+    auto slotRow=new QHBoxLayout; slotRow->addWidget(weapons[i],1); slotRow->addWidget(clear); equipmentForm->addRow(slotNames[i],slotRow);
     QObject::connect(weapons[i],&QPushButton::clicked,&dialog,[&,i]{try {
-      auto item=choose(&dialog,"Choose "+slotNames[i],[i](QString text){auto choices=EquipmentService::search(text,i); choices.prepend({0,"None","Remove this visible item"}); return choices;});
-      if(item) {draft.equipment[i]=item->id;refreshWeapons();}
+      // The Item Browser, starting on weapons for the weapon hands; what fits the slot is checked on save.
+      ItemFilter preset; if(i!=1) preset.itemClass=2;
+      if(auto item=pickItem(&dialog,"Choose "+slotNames[i],preset,draft.equipment[i])) {draft.equipment[i]=*item;refreshWeapons();}
     }catch(std::exception const& e){error(&dialog,e);}});
+    QObject::connect(clear,&QToolButton::clicked,&dialog,[&,i]{draft.equipment[i]=0;refreshWeapons();});
   }
   refreshWeapons();
   auto outfitButtons=new QHBoxLayout; auto applyOutfit=new QPushButton("Apply Outfit / Existing NPC Look"); auto saveOutfit=new QPushButton("Save Current Outfit As…");

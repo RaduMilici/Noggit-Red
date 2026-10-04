@@ -201,7 +201,7 @@ namespace Noggit::Quest
     std::vector<ScriptAction> const& on_complete = write_scripts ? content.on_complete : before.on_complete;
     if (!db.quest.special_flags_col.empty())
     {
-      bool const event = content.links.area_trigger || completesQuest(on_accept) || completesQuest(on_complete);
+      bool const event = content.links.area_trigger || completesQuest(on_accept) || completesQuest(on_complete) || inputs.completed_by_dialogue;
       std::uint32_t const flags = content.fields.special_flags.value_or(before.fields.special_flags.value_or(0));
       fields.special_flags = (flags & ~SPECIAL_EXPLORATION_OR_EVENT) | (event ? SPECIAL_EXPLORATION_OR_EVENT : 0u);
     }

@@ -1,6 +1,8 @@
 // This file is part of Noggit3, licensed under GNU General Public License (version 3).
 
 #include <noggit/ui/content/ContentLookups.hpp>
+#include <QtWidgets/QToolButton>
+#include <QtWidgets/QHBoxLayout>
 
 #include <QtCore/QRegularExpression>
 #include <QtWidgets/QCompleter>
@@ -111,6 +113,32 @@ namespace Noggit::Ui::Content
       row = _model->rowOf(entry);
     }
     setCurrentIndex(row);
+  }
+
+  QWidget* browsable(EntryPicker* picker)
+  {
+    if (!picker->lookup()->browse)
+    {
+      return picker;
+    }
+    auto* row = new QWidget(picker->parentWidget());
+    auto* layout = new QHBoxLayout(row);
+    layout->setContentsMargins(0, 0, 0, 0);
+    layout->setSpacing(2);
+    layout->addWidget(picker, 1);
+    auto* browse = new QToolButton(row);
+    browse->setText("…");
+    browse->setToolTip("Browse items with icons, filters and previews");
+    browse->setEnabled(picker->isEnabled());
+    layout->addWidget(browse);
+    QObject::connect(browse, &QToolButton::clicked, picker, [picker]
+    {
+      if (auto const chosen = picker->lookup()->browse(picker, picker->entry()))
+      {
+        picker->setEntry(*chosen);
+      }
+    });
+    return row;
   }
 
   std::uint32_t EntryPicker::entry() const

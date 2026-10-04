@@ -33,6 +33,18 @@ QVector<QPair<EntityType, Id>> references(TrackedChange const& c) {
     if (c.type != EntityType::Trainer) for (auto const& row : rows(table)) out.push_back({EntityType::Item, number(row.toObject(), "item")});
     return out;
   }
+  // A dialogue travels with its NPC and the Creator quests and items its conditions and effects name.
+  if (c.type == EntityType::Gossip) {
+    out.push_back({EntityType::Npc, c.entity});
+    for (auto const& row : rows("conditions")) {
+      auto type = row.toObject()["type"].toString().toInt();
+      if (type == 8 || type == 9) out.push_back({EntityType::Quest, number(row.toObject(), "value1")});
+      if (type == 2) out.push_back({EntityType::Item, number(row.toObject(), "value1")});
+    }
+    for (auto const& row : rows("gossip_scripts"))
+      if (number(row.toObject(), "command") == 7) out.push_back({EntityType::Quest, number(row.toObject(), "datalong")});
+    return out;
+  }
   auto first = rows(c.type == EntityType::GameObject ? "gameobject_template" : c.type == EntityType::GameObjectSpawn ? "gameobject" : c.type == EntityType::Quest ? "quest_template" : c.type == EntityType::Npc ? "creature_template" : "creature").at(0).toObject();
   if (c.type == EntityType::GameObjectSpawn) out.push_back({EntityType::GameObject, number(first, "id")});
   if (c.type == EntityType::GameObject && (number(first,"type")==10 || number(first,"type")==3)) out.push_back({EntityType::Quest,number(first,number(first,"type")==10?"data1":"data8")});

@@ -15,6 +15,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -38,6 +39,8 @@ namespace Noggit::Ui::Content
     std::uint32_t kindOf(std::uint32_t entry) const;
 
     std::function<QIcon(std::uint32_t display)> icon_for;
+    // A visual picker for this list (the Item Browser for items); empty when there is none.
+    std::function<std::optional<std::uint32_t>(QWidget* parent, std::uint32_t current)> browse;
 
     QVariant data(QModelIndex const& index, int role) const override;
 
@@ -58,6 +61,9 @@ namespace Noggit::Ui::Content
   private:
     LookupModel* _model;
   };
+
+  // The picker plus a browse button when its list has a visual picker (otherwise the picker itself).
+  QWidget* browsable(EntryPicker* picker);
 
   struct NamedEntry
   {

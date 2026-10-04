@@ -140,7 +140,7 @@ namespace Noggit::Ui::Quest
         picker = new EntryPicker(lookups.items.get(), this);
         picker->setEntry(item.id);
         count = countBox(this, static_cast<int>(item.count));
-        fields->addWidget(picker, 0, 0);
+        fields->addWidget(browsable(picker), 0, 0);
         fields->addWidget(count, 0, 1);
         if (setup.create_item)
         {

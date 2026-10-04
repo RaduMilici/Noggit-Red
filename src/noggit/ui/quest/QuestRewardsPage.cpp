@@ -34,7 +34,7 @@ namespace Noggit::Ui::Quest
         amount->setRange(1, 255);
         amount->setPrefix("x ");
         amount->setValue(std::max<int>(count, 1));
-        layout->addWidget(picker, 1);
+        layout->addWidget(browsable(picker), 1);
         layout->addWidget(amount);
       }
       EntryPicker* picker = nullptr;
