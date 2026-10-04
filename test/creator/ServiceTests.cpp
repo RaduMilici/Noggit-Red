@@ -375,8 +375,17 @@ void spellRules() {
     check(!SpellService::describe(s, 0, [](QString const&, Id) { return QString("X"); }).isEmpty(), "Template without a readable description");
   }
   auto summon = spellOf(SpellCatalog::Template::Summon);
-  check(std::any_of(SpellService::check(summon, facts).begin(), SpellService::check(summon, facts).end(), [](SpellProblem const& p) { return p.text.contains("creature"); }), "Summon without a creature accepted");
+  auto summonProblems = SpellService::check(summon, facts);
+  check(std::any_of(summonProblems.begin(), summonProblems.end(), [](SpellProblem const& p) { return p.text.contains("creature"); }), "Summon without a creature accepted");
   auto has = [](QVector<SpellProblem> const& list, QString const& text) { return std::any_of(list.begin(), list.end(), [&](SpellProblem const& p) { return p.error && p.text.contains(text); }); };
+  auto incompatible = spellOf(SpellCatalog::Template::Heal);
+  incompatible.entry = 65536;
+  check(has(SpellService::check(incompatible, facts), "Clone the spell"), "Out-of-range spell ID accepted");
+  incompatible.entry = 65535;
+  check(!has(SpellService::check(incompatible, facts), "Clone the spell"), "Largest compatible spell ID rejected");
+  incompatible.entry = 0; incompatible.previous = 1000000;
+  facts.spells.insert(incompatible.previous);
+  check(has(SpellService::check(incompatible, facts), "Clone that rank"), "Incompatible previous rank accepted");
   auto dot = spellOf(SpellCatalog::Template::DoT); dot.duration = 0; dot.effects[0].period = 0;
   check(has(SpellService::check(dot, facts), "how long") && has(SpellService::check(dot, facts), "how often"), "Aura without duration / period accepted");
   auto area = spellOf(SpellCatalog::Template::DirectDamage); area.effects[0].targetA = 22; area.effects[0].targetB = 15;

@@ -14,6 +14,7 @@
 #include <QFileDialog>
 #include <QFileInfo>
 #include <algorithm>
+#include <stdexcept>
 #include <QFormLayout>
 #include <QHBoxLayout>
 #include <QLabel>
