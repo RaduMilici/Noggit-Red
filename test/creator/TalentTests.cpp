@@ -5,6 +5,7 @@
 #include <QTemporaryDir>
 #include <QTextStream>
 #include <QtEndian>
+#include <algorithm>
 #include <stdexcept>
 using namespace Noggit::Creator;
 namespace {
@@ -72,7 +73,7 @@ void arrows() {
   // That row blocked: down the prerequisite's column, then across.
   tree.talents << talent(3, 0, 2, {3});
   l = TalentLogic::link(tree, *tree.find(2));
-  check(l && l->blocked.isEmpty() && l->path[1] == QPoint(0, 2) && l->arrow == TalentLink::Arrow::Left, "The game's second diagonal route is wrong");
+  check(l && l->blocked.isEmpty() && l->path[1] == QPoint(0, 2) && l->arrow == TalentLink::Arrow::Right, "The game's second diagonal route is wrong");
   tree.talents << talent(4, 2, 1, {4});
   check(!TalentLogic::link(tree, *tree.find(2))->blocked.isEmpty(), "An undrawable diagonal arrow was accepted");
   tree.talents = {talent(1, 3, 0, {1}), talent(2, 1, 0, {2}, 1)};
@@ -139,6 +140,8 @@ void builds() {
   check(TalentLogic::cannotLearn(tree, build, 4, 10).isEmpty(), "A met prerequisite was refused");
   build[4] = 1;
   check(TalentLogic::cannotUnlearn(tree, build, 3).contains("depends on it"), "A prerequisite in use gave a point back");
+  check(TalentLogic::cannotUnlearn(tree, build, 1).isEmpty(), "A spare point could not be given back");
+  build[2] = 2; // exactly 10 points above the third row now
   check(TalentLogic::cannotUnlearn(tree, build, 1).contains("needs 10 points"), "A point holding a row open was given back");
   check(TalentLogic::cannotUnlearn(tree, build, 4).isEmpty(), "The last talent could not give its point back");
   auto edited = tree; edited.talents[2].ranks.resize(2);
@@ -180,16 +183,33 @@ void store(QString const& dbc) {
   check(s.serverCurrent() && s.modifiedTabs().isEmpty(), "A fresh store has edits");
   auto arms = originals[0];
   check(className(arms.classMask) == "Warrior" && arms.name == "Arms", "Warrior Arms is not the first tree");
+  // Move a talent nothing links to into the empty last row.
   auto edited = arms;
-  auto cell = TalentLogic::freeCell(edited, 1);
-  TalentLogic::move(edited, edited.talents[0].id, cell.y(), cell.x());
+  Id loose = 0;
+  for (auto const& t : edited.talents)
+    if (!t.prerequisite && std::none_of(edited.talents.begin(), edited.talents.end(), [&](auto const& o) { return o.prerequisite == t.id; })) { loose = t.id; break; }
+  QPoint cell(0, TalentRules::tiers - 1);
+  check(loose && !edited.at(cell.y(), cell.x()) && TalentLogic::move(edited, loose, cell.y(), cell.x()), "No talent to move");
+  for (auto const& p : TalentLogic::check(edited, TalentLogic::spellOwners(originals, edited.tab))) check(!p.error, "The moved tree has errors");
   s.save(edited);
+  // The same move with a talent put in an arrow's way is refused for the test.
+  auto blocked = edited;
+  for (auto const& t : blocked.talents) if (auto l = TalentLogic::link(blocked, t); l && l->path.size() == 2 && std::abs(l->path[1].y() - l->path[0].y()) > 1) {
+    auto in = QPoint(l->path[0].x(), l->path[0].y() + 1);
+    if (!blocked.at(in.y(), in.x())) { blocked.talents << talent(9999, in.y(), in.x(), {1}); break; }
+  }
+  if (blocked.find(9999)) {
+    s.save(blocked);
+    bool refused = false; try { s.installServer(); } catch (std::exception const&) { refused = true; }
+    check(refused, "A tree the game cannot draw was installed");
+    s.save(edited);
+  }
   check(s.modified(arms.tab) && !s.serverCurrent(), "An edit was not recorded");
   auto before = QFile(s.serverTable()); before.open(QIODevice::ReadOnly); auto original = before.readAll(); before.close();
   s.installServer();
   check(s.serverCurrent(), "The server table was not installed");
   auto installed = Wdbc::parse([&] { QFile f(s.serverTable()); f.open(QIODevice::ReadOnly); return f.readAll(); }());
-  int row = installed.find(edited.talents[0].id);
+  int row = installed.find(loose);
   check(row >= 0 && int(installed.cell(row, 2)) == cell.y() && int(installed.cell(row, 3)) == cell.x(), "The server table does not have the moved talent");
   check(s.originals()[0] == arms, "The originals changed after installing");
   check(s.clientTable(original).has_value(), "No client table for an edited tree");

@@ -60,6 +60,9 @@ own hash (`AccountService`, `AccountDialog.*`) and only exist in the local datab
   editors show them, and the loot, shop and trainer data of NPCs and objects (load, validate,
   save, drop simulation). No widgets; their checks are unit-tested in `test/creator/ServiceTests.cpp`.
 - `ItemBrowser.hpp/.cpp`: the reusable Item Browser, item tooltip and details card.
+- `TalentService.hpp/.cpp`: talent trees without widgets: Talent.dbc reading/writing, the game's layout
+  and arrow rules, checks, earliest levels, the build preview, comparison, the workspace store and the
+  local server's Talent.dbc. `TalentEditor.cpp`: the visual Talent Editor. Tested in `test/creator/TalentTests.cpp`.
 - `LootEditor.cpp`, `VendorEditor.cpp`, `TrainerEditor.cpp` (`ServiceEditors.hpp`), `EditorWidgets.*`:
   the visual editors and their shared pieces (money editor, drop target table, row problems).
 - `CreatorPreviews.hpp/.cpp`: NPC, object and item 3D previews, on the creature picker's orbit
@@ -438,13 +441,14 @@ Storage: `item_template`; `spell_template` and `spell_chain` (IDs from 1,000,000
 signed-mediumint limit `spell_chain` has). Local Changes lists `+ Item: …`, `+ Spell: … (Rank 2)`
 and `+ Spell (trainer lesson): …`; export and sync include the Creator spells and items the
 changes use (an item's spells, a quest's reward spell, a trainer's lessons, a spell's next rank).
-Not supported: custom models or icons, new cast-time/range rows, talents, custom classes,
-advanced spell scripting.
+Not supported: custom models or icons, new cast-time/range rows, custom classes,
+advanced spell scripting. Talents: see [Talent trees](#talent-trees).
 
 ## Client data
 
 Items need no client data (the client asks the server). Spells do: the client only shows and
-casts spells in its `Spell.dbc`. Creator writes your spells' rows from `spell_template` (the
+casts spells in its `Spell.dbc`. Edited talent trees need `Talent.dbc` in both the client (in the same
+test patch) and the local server (see [Talent trees](#talent-trees)). Creator writes your spells' rows from `spell_template` (the
 two share their columns, checked against all 27,917 bundled spells) into a test patch in the
 local client's `Data` folder: `patch-Z.mpq`, the last patch the 1.12 client loads, so it wins.
 
@@ -572,9 +576,14 @@ drops and items):
 
 ```bash
 cmake -S test/creator -B build-creator-tests
-cmake --build build-creator-tests --target change_tracker_tests ssh_tests service_tests
+cmake --build build-creator-tests --target change_tracker_tests ssh_tests service_tests talent_tests
 ctest --test-dir build-creator-tests --output-on-failure
 ```
+
+`talent_tests` covers Talent.dbc reading and writing, the game's arrow routing, every layout check,
+earliest levels, the build preview, comparison and templates; given the server's dbc folder (ctest passes
+`build/Creator/Runtime/mangosd/data/dbc`) it also checks that all 27 game trees pass the checks and that
+installing and restoring the server's Talent.dbc is byte-exact (on a temporary copy).
 
 `service_tests` covers loot validation, group chances, the drop simulator, vendor and trainer
 checks, dialogues (rows written and read back, validation, conditions, effects), client tables
@@ -671,3 +680,115 @@ interaction credit in the local client; walking and running on a multi-node patr
 insertion, dragging and reordering; stopping versus looping; and reload persistence.
 Full application build, visual rendering, client behavior and SSH execution were left
 for the developer to run.
+
+## Talent trees
+
+NPC card → **Library → Talents**, or right-click the world → **Create → Talent Trees…**. The editor is the
+game's talent window with editing unlocked: the class's three trees side by side on their own paintings
+(double-click a tree's title, or use its toolbar button, to zoom in), real icons, `0/5` rank badges,
+the game's arrows, and the points each row needs down the left side.
+
+**Edit Tree.** Drag a talent to move it (onto another talent: they swap; arrow keys move the selected one).
+Drag the handle under a talent — or Shift-drag the talent — onto the talent that should require it.
+Click an arrow to change the required talent, the points needed, or remove it. Right-click an empty slot:
+**From Existing Spell**, **Clone Existing Talent** (any class; the clone gets its own copies of the rank
+spells), **Create New Talent** (a new passive talent spell, set up like the game's). Right-click a talent
+for its icon, ranks, requirement, replace, duplicate and delete. Click a talent for its side panel:
+name, icon (searchable grid), every rank with **Open** (the Spell Editor), **Clone Previous Rank** (a copy
+with values raised one step: 1, 2, 3…), **Replace**, **Create Next Rank**, the requirement, the in-game
+tooltip at any rank, and how to reach it. Hovering lights up a talent's whole prerequisite path and shows
+the game's tooltip. Everything saves as you go; **Undo/Redo** (Ctrl+Z / Ctrl+Y) cover every tree edit.
+
+**Character Level and Test Build.** The level slider (10–60) sets the points (level 10 gives the first,
+each level one more). In **Test Build** clicking spends a point and right-clicking gives one back, with
+the game's rules: points left, 5 points per row in that tree, the prerequisite's points, the maximum rank;
+points that hold a row or a requirement open cannot be given back. Locked talents are grey, ones that can
+take a point green, maxed ones gold. Lowering the level gives back the points learned last. In Edit Tree,
+each talent shows its earliest level (`Lv 40`), recomputed on every change; the side panel shows the points,
+the tree points and the prerequisite path.
+
+**Compare with Original** marks new, moved (with where it was) and changed talents, removed talents and
+arrows, and lists the changes. **Clone Tree as Template** copies a tree into a template (in the class list):
+edit and test it like any tree; it never goes into the game until **Replace With Template** puts it into a
+class tree. **Reset From Original** puts the game's own tree back (Undo still works).
+
+**Test In Game…** checks the trees, puts them into the local server and test client, optionally sets the
+test character's level, resets its talents of this class and gives it the build shown, and starts WoW.
+
+### Implementation boundary
+
+The target is the Tortoise/VMaNGOS 1.12 server with Turtle's 1.18 client, whose `Talent.dbc` and
+`TalentTab.dbc` match the server's (checked when this was written). These rules are the client's and
+server's, not Creator's choices:
+
+| Fixed by the game | Value | Source |
+| --- | --- | --- |
+| Rows × columns | 8 × 4 | Turtle's `Blizzard_TalentUI` (`MAX_NUM_TALENT_TIERS`, `NUM_TALENT_COLUMNS`) |
+| Talents per tree | 20 | the frame's talent buttons (more: "Too many talents in talent frame!") |
+| Ranks | 1–5 | the server reads five rank spells (the table has room for nine) |
+| Points per row | 5 | client and server; **"points required" follows the row**, so it changes by moving |
+| Prerequisites | one, same tree, above or same row | the server reads the first; the client draws only these |
+| Arrows | the client's routing | straight, sideways, across-then-down, else down-then-across |
+| Talent points | level − 9 (51 at 60) | |
+
+In scope: moving, adding, cloning, replacing and deleting talents in the existing trees of the nine
+classes; ranks and their spells (through the Spell Editor and Creator spells, which reach the client's
+`Spell.dbc` as before); icons (of the rank spells); prerequisites; templates; the level simulator, build
+preview, reachability and comparison; local testing; exporting the server table.
+
+Not in scope, and why:
+
+- **New trees, renaming trees or their paintings, a fourth tree per class**: `TalentTab.dbc` is read
+  only; the server keeps three trees per class. Templates cover experimenting.
+- **Moving a talent to another tree**: clone it there (Clone Existing Talent) and delete the original.
+- **Other points per row, more rows or ranks, several prerequisites**: hard-coded in the client UI and
+  the server; changing them needs client UI and server code changes.
+- **Talents that need server scripts**: copies of game spells keep their effects, but scripted ones
+  (Deep Wounds' bleed, for example) are tied to the game spell's ID; the editor warns.
+- **Changing the game's own spells in place**: as everywhere in Creator, game spells are read-only.
+  Changing a talent's icon, name or values first copies its ranks into your spells (**Make Ranks
+  Editable**); the game's spells stay as they are.
+- **Production**: Sync to Production sends no talent data. **Export Server Table…** saves `Talent.dbc`
+  for the server's dbc folder; **Local changes → Export Client Patch…** includes it for players. Existing
+  characters keep the talent spells they learned: reset their talents after changing a tree.
+- **Live tooltip while editing a spell**: the Spell Editor stays a dialog with its own live tooltip; the
+  talent's tooltip updates when it closes.
+
+### Validation and error states
+
+Errors stop **Test In Game**, the server/client install of a local test and **Export Server Table**,
+because the game would misbehave; warnings do not. Talents with problems get a red (error) or amber
+(warning) frame and a `!` dot; the tree title counts them; the side panel and the tree overview list them
+(click one to select the talent).
+
+| Check | Kind | Shown as |
+| --- | --- | --- |
+| More than 20 talents in a tree | error (creating the 21st is refused) | tree problem |
+| Outside the 8 × 4 window, or two talents in one slot | error | talent |
+| No ranks, more than 5, or a rank without a spell | error | talent |
+| A rank spell missing from the local database | error (checked while the database runs) | talent; "missing" in the rank list |
+| A rank spell used twice, or by a talent of another tree | error (the server maps a spell to one talent) | talent |
+| Prerequisite not in the tree, below the talent, itself, or in a circle | error (refused when linking) | talent; red line while linking |
+| Requires more points than the prerequisite has ranks | error (lowering ranks lowers it) | talent |
+| An arrow the game cannot draw (a talent in its way) | error (in game: an error popup whenever the window opens) | dashed red arrow |
+| Cannot be learned by level 60, or its row cannot be opened with the talents above | warning | `unreachable` and a red cross |
+| A copied rank whose effects need server scripting | warning | talent |
+| Build over the level's points | shown | "Over budget" in the level bar |
+| Learning or giving back a point the game would refuse | refused | the reason in the status line |
+
+Other states: without the managed runtime the editor is disabled with a notice; if the server's tables
+cannot be read, a banner says why; with the local database stopped, layout editing works but names,
+icons, descriptions and spell changes wait for it (a banner, and each action that needs it says so). A
+failed save shows "Not saved" in red. Dropping outside the window, linking to an invalid talent, or adding
+to a full tree leaves the tree unchanged and says why.
+
+### Storage
+
+`Workspace/creator-talents.json` holds the edited trees (whole trees by TalentTab ID; a tree equal to the
+original is not stored) and the templates. The originals are the server's
+`Runtime/mangosd/data/dbc/Talent.dbc` (once Creator has replaced it: its backup in
+`Workspace/talents/original/`, checksum in `Workspace/talents/server.json`). Before a local test's restart
+Creator writes `Talent.dbc` there (the server reads it at startup); the client test patch gets the client's
+own `Talent.dbc` with the same trees. With no edited trees the server's own file is put back byte for
+byte. New talent IDs go above every ID in use. Talent rank spells get no `spell_chain` rows: the server
+builds talent rank chains from `Talent.dbc`.

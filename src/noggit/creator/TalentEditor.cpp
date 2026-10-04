@@ -263,6 +263,7 @@ public:
   void treeMenu(int index, QPoint at);
 private:
   struct Step { Id tab = 0; QString key; TalentTree before, after; };
+  static constexpr int allTrees = 1000; // the "All Trees" button's ID (Qt assigns its own for -1)
   TalentStore* _store = nullptr;
   QVector<TalentTree> _originals, _trees, _templates;
   QVector<TalentTree*> _visible;
@@ -865,7 +866,7 @@ void TalentEditor::showScope(QString const& scope) {
   delete _treeGroup; _treeGroup = new QButtonGroup(this);
   while (auto item = _treeButtonsLayout->takeAt(0)) { delete item->widget(); delete item; }
   if (_visible.isEmpty()) { refresh(); return; }
-  auto all = new QPushButton("All Trees"); all->setCheckable(true); all->setChecked(true); _treeButtonsLayout->addWidget(all); _treeGroup->addButton(all, -1);
+  auto all = new QPushButton("All Trees"); all->setCheckable(true); all->setChecked(true); _treeButtonsLayout->addWidget(all); _treeGroup->addButton(all, allTrees);
   connect(all, &QPushButton::clicked, this, [this] { focusTree(-1); });
   for (int i = 0; i < _visible.size(); ++i) {
     _views << new TreeView(*this, i, _canvas); _canvasLayout->addWidget(_views.back(), 1);
@@ -880,7 +881,7 @@ void TalentEditor::showScope(QString const& scope) {
 }
 void TalentEditor::layoutViews() {
   for (int i = 0; i < _views.size(); ++i) _views[i]->setVisible(_focus < 0 || _focus == i);
-  if (_treeGroup) if (auto* b = _treeGroup->button(_focus)) { QSignalBlocker block(b); b->setChecked(true); }
+  if (_treeGroup) if (auto* b = _treeGroup->button(_focus < 0 ? allTrees : _focus)) { QSignalBlocker block(b); b->setChecked(true); }
   if (_focus >= 0) _selectedTree = _focus;
   for (auto* v : _views) v->update();
   refreshPanel();

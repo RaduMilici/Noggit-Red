@@ -52,7 +52,7 @@ QString className(quint32 mask);
 struct TalentProblem { Id talent = 0; QString text; bool error = true; };
 // A prerequisite arrow routed the way the game draws it: through these cells, ending in an arrow into the talent.
 struct TalentLink {
-  enum class Arrow { Down, Left, Right };
+  enum class Arrow { Down, Left, Right }; // the way the arrow points into the talent
   Id from = 0, to = 0;
   QVector<QPoint> path; // (column, row) cells, from the prerequisite to the talent
   Arrow arrow = Arrow::Down;
