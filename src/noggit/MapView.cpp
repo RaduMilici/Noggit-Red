@@ -5,6 +5,7 @@
 #include <noggit/ui/quest/QuestChainDialog.hpp>
 #include <noggit/creator/NpcStudio.hpp>
 #include <noggit/creator/ServiceEditors.hpp>
+#include <noggit/creator/ContentEditors.hpp>
 #include <noggit/runtime/RuntimeManager.hpp>
 // This file is part of Noggit3, licensed under GNU General Public License (version 3).
 #include <noggit/rendering/vulkan/VkParticleFeed.hpp>
@@ -2311,6 +2312,8 @@ void MapView::setupCreatureModelPickerUi()
     actions.vendor = service([this](std::uint32_t entry) { return Noggit::Creator::editVendor(this, _world.get(), entry); });
     actions.trainer = service([this](std::uint32_t entry) { return Noggit::Creator::editTrainer(this, _world.get(), entry); });
     actions.dialogue = service([this](std::uint32_t entry) { return editCreatorDialogue(entry); });
+    actions.items = [this] { if (prepareCreatorChange()) { Noggit::Creator::openItemLibrary(this); refreshStudio(); } };
+    actions.spells = [this] { if (prepareCreatorChange()) { Noggit::Creator::openSpellLibrary(this); refreshStudio(); } };
     actions.testAtNpc = [this] { studioTestAtNpc(); };
     actions.testAtSpot = [this]
     {
@@ -19305,6 +19308,8 @@ void MapView::ShowContextMenu(QPoint pos)
     if(qApp->property("creatorRuntimeManaged").toBool()) {
       QMenu menu(this); auto create=menu.addMenu("Create");
       create->addAction("GameObject",this,[this] { creatorGameObject(); });
+      create->addAction("Item…",this,[this] { if(prepareCreatorChange()) Noggit::Creator::createItem(this); });
+      create->addAction("Spell…",this,[this] { if(prepareCreatorChange()) Noggit::Creator::createSpell(this); });
       if(_selected_creature_spawn_guid) menu.addAction("Edit Patrol",this,[this] { editCreatorPatrol(); });
       if(auto const* spawn=_selected_creature_spawn_guid?_world->findCreatureSpawn(*_selected_creature_spawn_guid):nullptr) {
         auto entry=spawn->entry;

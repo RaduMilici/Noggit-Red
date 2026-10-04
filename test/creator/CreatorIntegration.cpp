@@ -7,6 +7,8 @@
 #include <noggit/creator/VendorService.hpp>
 #include <noggit/creator/TrainerService.hpp>
 #include <noggit/creator/GossipService.hpp>
+#include <noggit/creator/SpellService.hpp>
+#include <noggit/creator/ItemDesignService.hpp>
 #include <noggit/runtime/RuntimeManager.hpp>
 #include <QCoreApplication>
 #include <QFileInfo>
@@ -227,6 +229,22 @@ void runChecks() {
     CreatureService::remove(twinEntry);
     check(query("SELECT entry FROM gossip_menu WHERE entry="+QString::number(copied.nodes[0].menu)).isEmpty()&&strip(GossipService::load(entry).nodes)==talk.nodes,
           "Deleting a clone left its dialogue or changed the original's");
+
+    // Spells and items: a teachable heal and its next rank, a potion that casts it, a cloned weapon.
+    auto heal=SpellService::blank(); SpellCatalog::apply(SpellCatalog::Template::Heal,heal,0);
+    heal.name="Creator test: Mending"; heal.rank="Rank 1"; heal.level=10; heal.teachable=true;
+    auto healId=SpellService::save(heal);
+    check(SpellService::load(healId).teachable&&!TrainerService::search("Creator test: Mending").isEmpty(),"A teachable spell is not offered to trainers");
+    auto nextId=SpellService::save(SpellService::nextRank(healId,16,1.5,100,0));
+    check(SpellService::chain(nextId).size()==2&&SpellService::load(nextId).previous==healId,"The next rank is not chained");
+    auto potion=ItemDesignService::blank(ItemDesignService::Template::Consumable); potion.name="Creator test: Draught"; potion.spells[0].spell=healId;
+    auto potionId=ItemDesignService::save(potion);
+    check(ItemDesignService::load(potionId).spells[0].spell==healId&&!SpellService::uses(healId).isEmpty(),"The potion does not cast the spell");
+    auto blade=ItemDesignService::clone(query("SELECT entry FROM item_template WHERE class=2 AND display_id>0 LIMIT 1")[0]["entry"].toUInt());
+    blade.name="Creator test: Blade"; auto bladeId=ItemDesignService::save(blade);
+    check(tracked(EntityType::Spell,healId)&&tracked(EntityType::Spell,nextId)&&tracked(EntityType::Item,potionId)&&tracked(EntityType::Item,bladeId),"Spells and items are not in Local Changes");
+    bool spellBlocked=false; try { SpellService::remove(healId); } catch(std::exception const&) { spellBlocked=true; }
+    check(spellBlocked,"A spell an item and a next rank use was deleted");
   }
 
   // Sync to Production's rollback: back up the footprint, apply a package that deletes, moves and creates

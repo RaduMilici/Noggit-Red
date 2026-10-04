@@ -2,6 +2,12 @@
 #include <noggit/creator/VendorService.hpp>
 #include <noggit/creator/TrainerService.hpp>
 #include <noggit/creator/GossipService.hpp>
+#include <noggit/creator/ClientDbc.hpp>
+#include <noggit/creator/ClientPatch.hpp>
+#include <noggit/creator/SpellService.hpp>
+#include <noggit/creator/ItemDesignService.hpp>
+#include <QtEndian>
+#include <cstring>
 #include <noggit/creator/ChangeTracker.hpp>
 #include <QCoreApplication>
 #include <QJsonArray>
@@ -307,13 +313,125 @@ void dialogueChanges() {
   check(covers("npc_text", "5100000") && covers("broadcast_text", "5200001") && covers("gossip_scripts", "5300000"), "Texts and scripts backed up");
   check(covers("conditions", "7000000") && covers("creator_content", "kind='gossip_menu'") && covers("creature_template", "1000001"), "Conditions, marks, NPC backed up");
 }
+
+// --- Client data, spells and items ---
+QByteArray wdbc(int columns, QVector<QVector<quint32>> const& rows, QByteArray strings = QByteArray(1, '\0')) {
+  QByteArray out("WDBC"); char b[4];
+  auto put = [&](quint32 v) { qToLittleEndian(v, b); out.append(b, 4); };
+  put(rows.size()); put(columns); put(columns * 4); put(strings.size());
+  for (auto const& r : rows) for (auto v : r) put(v);
+  return out + strings;
+}
+float asFloat(quint32 v) { float f; std::memcpy(&f, &v, 4); return f; }
+void clientTables() {
+  auto table = Wdbc::parse(wdbc(3, {{1, 10, 1}, {2, 20, 0}}, QByteArray("\0Old\0", 5)));
+  check(table.rows() == 2 && table.text(0, 2) == "Old" && table.text(1, 2).isEmpty(), "WDBC read");
+  table.put({3, 30, 0}, {{2, "New"}});
+  table.put({1, 11, 0}, {{2, "Changed"}});
+  auto again = Wdbc::parse(table.bytes());
+  check(again.rows() == 3 && again.cell(again.find(3), 1) == 30 && again.text(again.find(3), 2) == "New", "WDBC append");
+  check(again.cell(again.find(1), 1) == 11 && again.text(again.find(1), 2) == "Changed" && again.cell(again.find(2), 1) == 20, "WDBC replace");
+  bool rejected = false; try { Wdbc::parse("WDBC\1\0\0\0"); } catch (std::exception const&) { rejected = true; }
+  check(rejected, "Damaged WDBC accepted");
+  // Spell.dbc columns of the 1.12 client, as verified against the bundled spell_template.
+  Fields spell{{"entry", "1000001"}, {"castingTimeIndex", "14"}, {"effect1", "2"}, {"effectBasePoints1", "49"}, {"effectImplicitTargetA1", "6"},
+               {"spellIconId", "185"}, {"name", "Holy Smite"}, {"nameSubtext", "Rank 2"}, {"description", "Deals $s1 damage."}, {"auraDescription", ""},
+               {"dmgMultiplier1", "1"}, {"equippedItemClass", "-1"}, {"spellFamilyFlags", "4294967298"}, {"effectRealPointsPerLevel1", "0.5"}};
+  QHash<int, QString> strings;
+  auto record = SpellDbc::record(spell, strings);
+  check(record.size() == 173 && record[0] == 1000001 && record[18] == 14 && record[61] == 2 && record[76] == 49 && record[82] == 6 && record[117] == 185, "Spell.dbc integer columns");
+  check(record[58] == 0xFFFFFFFFu && asFloat(record[167]) == 1.0f && asFloat(record[73]) == 0.5f && record[161] == 2 && record[162] == 1, "Spell.dbc signed, float and 64-bit columns");
+  check(strings.value(120) == "Holy Smite" && strings.value(127) == "Holy Smite" && strings.value(129) == "Rank 2" && strings.value(138) == "Deals $s1 damage.", "Spell.dbc texts in every locale");
+  QVector<quint32> existing(173, 0); existing[0] = 61500;
+  auto patched = Wdbc::parse(ClientPatchService::spellTable(wdbc(173, {existing}), {spell}));
+  check(patched.rows() == 2 && patched.find(61500) == 0 && patched.text(patched.find(1000001), 120) == "Holy Smite", "Patched Spell.dbc keeps the client's rows");
+  bool layout = false; try { ClientPatchService::spellTable(wdbc(3, {{1, 2, 3}}), {spell}); } catch (std::exception const&) { layout = true; }
+  check(layout, "A Spell.dbc of another layout was patched");
+  check(ClientLists::seconds(2500) == "2.5 sec" && ClientLists::seconds(90000) == "1 min 30 sec" && ClientLists::seconds(0) == "Instant", "Readable times");
+  auto casts = ClientLists::castTimes(Wdbc::parse(wdbc(4, {{1, 0, 0, 0}, {16, 1500, 0, 1500}})));
+  check(casts.size() == 2 && casts[0].label == "Instant" && casts[1].label == "1.5 sec cast", "Cast time list");
+}
+SpellDesign spellOf(SpellCatalog::Template t) {
+  SpellDesign d; d.name = "Test"; d.editable = true; d.castTime = 1; d.range = 1;
+  for (auto column : {"entry", "effect1", "effect2", "effect3"}) d.row[column] = "0";
+  SpellCatalog::apply(t, d, 0); return d;
+}
+void spellRules() {
+  // The server's roll: base + baseDice .. base + dieSides; 0 or 1 sides is exactly base + baseDice.
+  Fields row{{"effect1", "2"}, {"effectBasePoints1", "49"}, {"effectBaseDice1", "1"}, {"effectDieSides1", "11"},
+             {"effect2", "6"}, {"effectApplyAuraName2", "22"}, {"effectBasePoints2", "-201"}, {"effectBaseDice2", "1"}, {"effectDieSides2", "1"}};
+  auto d = SpellService::fromRow(row);
+  check(d.effects[0].minValue == 50 && d.effects[0].maxValue == 60 && d.effects[1].minValue == -200 && d.effects[1].maxValue == -200, "Effect values read like the server rolls");
+  d.effects[0].minValue = 120; d.effects[0].maxValue = 140;
+  auto back = SpellService::fromRow(SpellService::toRow(d));
+  check(back.effects[0].minValue == 120 && back.effects[0].maxValue == 140 && back.effects[1].minValue == -200, "Effect values written back");
+  // Every template gives a valid spell once its referenced spell or creature exists.
+  SpellFacts facts; facts.spells = {133}; facts.creatures = {299};
+  for (auto const& t : SpellCatalog::templates()) {
+    auto s = spellOf(t.id);
+    if (SpellCatalog::inputs(s.effects[0]).trigger) s.effects[0].trigger = 133;
+    if (SpellCatalog::inputs(s.effects[0]).misc == SpellCatalog::Misc::Creature) s.effects[0].misc = 299;
+    for (auto const& p : SpellService::check(s, facts)) check(!p.error, qPrintable("Template " + t.label + ": " + p.text));
+    check(!SpellService::describe(s, 0, [](QString const&, Id) { return QString("X"); }).isEmpty(), "Template without a readable description");
+  }
+  auto summon = spellOf(SpellCatalog::Template::Summon);
+  check(std::any_of(SpellService::check(summon, facts).begin(), SpellService::check(summon, facts).end(), [](SpellProblem const& p) { return p.text.contains("creature"); }), "Summon without a creature accepted");
+  auto has = [](QVector<SpellProblem> const& list, QString const& text) { return std::any_of(list.begin(), list.end(), [&](SpellProblem const& p) { return p.error && p.text.contains(text); }); };
+  auto dot = spellOf(SpellCatalog::Template::DoT); dot.duration = 0; dot.effects[0].period = 0;
+  check(has(SpellService::check(dot, facts), "how long") && has(SpellService::check(dot, facts), "how often"), "Aura without duration / period accepted");
+  auto area = spellOf(SpellCatalog::Template::DirectDamage); area.effects[0].targetA = 22; area.effects[0].targetB = 15;
+  check(has(SpellService::check(area, facts), "radius"), "Area effect without radius accepted");
+  SpellDesign none; none.name = "Nothing";
+  check(has(SpellService::check(none, facts), "at least one effect"), "Spell without effects accepted");
+  auto ranked = spellOf(SpellCatalog::Template::Heal); ranked.entry = 10; ranked.previous = 11;
+  SpellFacts chain; chain.spells = {11}; chain.previousOf = {{11, 12}, {12, 10}};
+  check(has(SpellService::check(ranked, chain), "circle"), "Rank cycle accepted");
+  check(SpellService::suggestedDescription(spellOf(SpellCatalog::Template::DoT)).contains("$o1") && SpellCatalog::needsScripting(3, 0), "Description tokens / scripting marks");
+}
+void itemRules() {
+  ItemFacts facts; facts.spells = {2023};
+  for (auto const& t : ItemDesignService::templates()) {
+    ItemDesign d; d.editable = true; ItemDesignService::apply(t.id, d); d.name = t.label; d.display = 1;
+    if (t.id == ItemDesignService::Template::Consumable || t.id == ItemDesignService::Template::Trinket) d.spells[0].spell = 2023;
+    for (auto const& p : ItemDesignService::check(d, facts)) check(!p.error, qPrintable("Item template " + t.label + ": " + p.text));
+  }
+  ItemDesign sword; ItemDesignService::apply(ItemDesignService::Template::Weapon, sword); sword.name = "Sword"; sword.display = 1;
+  auto has = [](QVector<ItemProblem> const& list, QString const& text) { return std::any_of(list.begin(), list.end(), [&](ItemProblem const& p) { return p.error && p.text.contains(text); }); };
+  auto slow = sword; slow.delay = 0; check(has(ItemDesignService::check(slow, facts), "speed"), "Weapon without speed accepted");
+  auto worn = sword; worn.inventoryType = 5; check(has(ItemDesignService::check(worn, facts), "cannot be worn"), "Sword on the chest accepted");
+  auto stacked = sword; stacked.stackable = 5; check(has(ItemDesignService::check(stacked, facts), "do not stack"), "Stacking weapon accepted");
+  auto missing = sword; missing.spells[0].spell = 999; check(has(ItemDesignService::check(missing, facts), "does not exist"), "Missing item spell accepted");
+  auto nobody = sword; nobody.classes = 0; check(has(ItemDesignService::check(nobody, facts), "No class"), "Item nobody can use accepted");
+  Fields row{{"entry", "5"}, {"name", "Old"}, {"stat_type1", "7"}, {"stat_value1", "5"}, {"spellid_1", "2023"}, {"spelltrigger_1", "1"}, {"script_name", "keep"}};
+  auto d = ItemDesignService::fromRow(row); d.name = "New";
+  auto out = ItemDesignService::toRow(d);
+  check(out["name"] == "New" && out["stat_type1"] == "7" && out["stat_value1"] == "5" && out["spelltrigger_1"] == "1" && out["script_name"] == "keep", "Item row round trip keeps what the editor does not show");
+  check(!ItemDesignService::slotsFor(2, 1).isEmpty() && ItemDesignService::slotsFor(2, 1)[0].first == 17, "Two-handed axes are two-handed");
+}
+void spellChanges() {
+  TrackedChange c; c.type = EntityType::Spell; c.entity = 1000001; c.label = "Holy Smite (Rank 2)"; c.action = ChangeAction::Create;
+  c.after = {{"spell_template", QJsonArray{QJsonObject{{"entry", "1000001"}, {"name", "Holy Smite"}, {"effect1", "2"}}}},
+             {"spell_chain", QJsonArray{QJsonObject{{"spell_id", "1000001"}, {"prev_spell", "585"}, {"first_spell", "585"}, {"rank", "2"}, {"req_spell", "0"}}}}};
+  check(c.summary() == "+ Spell: Holy Smite (Rank 2)", "Spell summary");
+  auto sql = ChangeTracker::sql({c});
+  check(sql.contains("REPLACE INTO `spell_template` (") && sql.contains("DELETE FROM spell_chain WHERE spell_id=1000001;") && sql.contains("REPLACE INTO `spell_chain` (")
+        && sql.contains("INSERT IGNORE INTO creator_content(kind,entry) VALUES('spell',1000001);"), "Spell upsert");
+  auto gone = c; gone.action = ChangeAction::Delete; gone.before = c.after; gone.after = {};
+  auto removal = ChangeTracker::sql({gone});
+  check(removal.contains("kind='spell' AND entry=1000001)") && removal.contains("DELETE FROM spell_template WHERE entry=1000001 AND @owned>0;"), "Spell removal guarded");
+  auto scopes = ChangeTracker::footprint({c}, [](QString const&) { return QVector<Fields>{}; });
+  bool template_ = false, chain = false;
+  for (auto const& [t, where] : scopes) { template_ = template_ || (t == "spell_template" && where.contains("1000001")); chain = chain || (t == "spell_chain" && where.contains("1000001")); }
+  check(template_ && chain, "Spell rows not in the sync backup");
+}
 }
 int main(int argc, char** argv) {
   QCoreApplication app(argc, argv);
   try {
     lootValidation(); lootChances(); lootSimulation(); vendorChecks(); trainerChecks(); serviceChanges();
     dialogueRoundTrip(); dialogueChecks(); dialogueChanges();
-    QTextStream(stdout) << "Loot, vendor, trainer and dialogue tests passed\n";
+    clientTables(); spellRules(); itemRules(); spellChanges();
+    QTextStream(stdout) << "Loot, vendor, trainer, dialogue, client data, spell and item tests passed\n";
     return 0;
   } catch (std::exception const& e) { QTextStream(stderr) << e.what() << Qt::endl; return 1; }
 }

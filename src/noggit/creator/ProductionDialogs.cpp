@@ -81,6 +81,13 @@ bool confirmSync(QWidget* parent, ProductionProfile const& profile, ChangePackag
          ? QString("The world server is not restarted: the changes appear in game after its next restart.")
          : QString("The world server is restarted afterwards: players online are disconnected for a few minutes.")));
   note->setWordWrap(true); note->setTextFormat(Qt::PlainText); layout->addWidget(note);
+  // Spells also live in the client's Spell.dbc, which Sync does not send.
+  int spells = 0; for (auto const& c : package.changes) if (c.type == EntityType::Spell && c.action != ChangeAction::Delete) ++spells;
+  if (spells) {
+    auto client = new QLabel(QString("⚠ %1 %2 also need the client patch: Sync only changes the server. Players see and cast them once they have the patch "
+                                     "(Local changes → Client data → Export Client Patch…).").arg(spells).arg(spells == 1 ? "spell" : "spells"));
+    client->setWordWrap(true); client->setStyleSheet("color: #d08a00;"); layout->addWidget(client);
+  }
   auto buttons = new QDialogButtonBox(QDialogButtonBox::Cancel);
   auto sync = buttons->addButton("Sync", QDialogButtonBox::AcceptRole); sync->setAutoDefault(false);
   buttons->button(QDialogButtonBox::Cancel)->setDefault(true);

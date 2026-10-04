@@ -43,6 +43,7 @@ public:
   std::function<void(Id)> onActivated;                          // double-click / Enter
   std::function<void(std::optional<ItemInfo> const&)> onCurrent; // selection
   void select(Id entry);
+  void refresh() { search(); }
 private:
   void search();
   ItemFilter filter() const;

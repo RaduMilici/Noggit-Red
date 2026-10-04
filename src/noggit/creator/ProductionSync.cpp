@@ -20,7 +20,7 @@ void writeFile(QString const& path, QByteArray const& bytes) {
     throw std::runtime_error(("Cannot write " + path).toStdString());
 }
 QString title(EntityType type) {
-  return type == EntityType::Gossip ? "Dialogue" : type == EntityType::GameObject ? "GameObject" : type == EntityType::GameObjectSpawn ? "Object placement" : type == EntityType::Npc ? "NPC" : type == EntityType::Spawn ? "Placement" : type == EntityType::Item ? "Item" : "Quest";
+  return type == EntityType::Spell ? "Spell" : type == EntityType::Gossip ? "Dialogue" : type == EntityType::GameObject ? "GameObject" : type == EntityType::GameObjectSpawn ? "Object placement" : type == EntityType::Npc ? "NPC" : type == EntityType::Spawn ? "Placement" : type == EntityType::Item ? "Item" : "Quest";
 }
 // The server's message, in terms of the profile.
 QString databaseProblem(QString const& message, ProductionProfile const& profile) {

@@ -14,7 +14,7 @@ namespace Noggit::Creator {
 namespace {
 void require(bool b, QString const& message) { if (!b) throw std::runtime_error(message.toStdString()); }
 QString n(Id id) { return QString::number(id); }
-QStringList const typeNames{"npc", "spawn", "quest", "item", "gameobject", "object_spawn", "loot", "object_loot", "vendor", "trainer", "gossip"};
+QStringList const typeNames{"npc", "spawn", "quest", "item", "gameobject", "object_spawn", "loot", "object_loot", "vendor", "trainer", "gossip", "spell"};
 QStringList const actionNames{"CREATE", "UPDATE", "DELETE", "MOVE"};
 QStringList const relations{"creature_questrelation", "creature_involvedrelation"};
 // Everything that links a quest to its givers, enders and exploration spot, keyed by quest.
@@ -203,6 +203,11 @@ QString TrackedChange::summary() const {
     }
     QString mark = had.isEmpty() && !has.isEmpty() ? "+" : has.isEmpty() && !had.isEmpty() ? "-" : "~";
     return mark + (type == EntityType::Vendor ? " Vendor: " : type == EntityType::Trainer ? " Trainer: " : " Loot: ") + name;
+  }
+  if (type == EntityType::Spell) {
+    auto row = firstRow(action == ChangeAction::Delete ? before : after, "spell_template");
+    bool teaches = field(row, "effect1") == 36 && row["description"].toString().startsWith("Teaches");
+    return sign + (teaches ? " Spell (trainer lesson): " : " Spell: ") + name;
   }
   return sign + (type == EntityType::Npc ? " NPC: " : type == EntityType::Item ? " Item: " : type == EntityType::GameObject ? " GameObject: " : " Quest: ") + name;
 }
@@ -413,6 +418,14 @@ QJsonObject ChangeTracker::capture(QueryFunction const& query, EntityType type, 
     if (rows.isEmpty() || !label) return rows;
     auto names = query("SELECT name FROM creature_template WHERE entry=" + n(field(firstRow(rows, "creature"), "id")));
     if (!names.isEmpty()) *label = names[0]["name"].toString();
+  } else if (type == EntityType::Spell) {
+    add("spell_template", "entry=" + n(id));
+    if (rows.isEmpty()) return rows;
+    add("spell_chain", "spell_id=" + n(id));
+    if (label) {
+      auto main = firstRow(rows, "spell_template"); auto rank = main["nameSubtext"].toString();
+      *label = main["name"].toString() + (rank.isEmpty() ? QString() : " (" + rank + ")");
+    }
   } else if (type == EntityType::Item) {
     add("item_template", "entry=" + n(id));
     if (!rows.isEmpty() && label) *label = firstRow(rows, "item_template")["name"].toString();
@@ -493,6 +506,13 @@ QString ChangeTracker::sql(QVector<TrackedChange> const& changes) {
     out += "DELETE FROM quest_template WHERE entry=" + id + " AND @owned>0;\n";
     out += "DELETE FROM creator_content WHERE kind='quest' AND entry=" + id + ";\n";
   }
+  for (auto const& c : ordered(EntityType::Spell, true)) {
+    auto id = n(c.entity);
+    out += "\n-- Delete spell: " + oneLine(c.label) + " (#" + id + ")\n" + ownedGuard("spell", c.entity);
+    out += "DELETE FROM spell_chain WHERE spell_id=" + id + " AND @owned>0;\n";
+    out += "DELETE FROM spell_template WHERE entry=" + id + " AND @owned>0;\n";
+    out += "DELETE FROM creator_content WHERE kind='spell' AND entry=" + id + ";\n";
+  }
   for (auto const& c : ordered(EntityType::Item, true)) {
     auto id = n(c.entity);
     out += "\n-- Delete item: " + oneLine(c.label) + " (#" + id + ")\n" + ownedGuard("item", c.entity);
@@ -551,6 +571,13 @@ QString ChangeTracker::sql(QVector<TrackedChange> const& changes) {
     for (auto const& table : {"creature_equip_template", "creature_template", "npc_vendor", "npc_trainer", "creature_questrelation", "creature_involvedrelation"})
       if (legacy || (QString(table) != "npc_vendor" && QString(table) != "npc_trainer")) out += replaceRows(table, c.after[table].toArray());
     out += "INSERT IGNORE INTO creator_content(kind,entry) VALUES('npc'," + id + ");\n";
+  }
+  // Spells before what uses them (items, trainers, quests); their client rows are not part of this script.
+  for (auto const& c : ordered(EntityType::Spell, false)) {
+    auto id = n(c.entity);
+    out += "\n-- Spell: " + oneLine(c.label) + " (#" + id + ")\n" + replaceRows("spell_template", c.after["spell_template"].toArray());
+    out += "DELETE FROM spell_chain WHERE spell_id=" + id + ";\n" + replaceRows("spell_chain", c.after["spell_chain"].toArray());
+    out += "INSERT IGNORE INTO creator_content(kind,entry) VALUES('spell'," + id + ");\n";
   }
   for (auto const& c : ordered(EntityType::Item, false)) {
     out += "\n-- Item: " + oneLine(c.label) + " (#" + n(c.entity) + ")\n" + replaceRows("item_template", c.after["item_template"].toArray());
@@ -689,6 +716,9 @@ QVector<QPair<QString, QString>> ChangeTracker::footprint(QVector<TrackedChange>
       add("creature", "guid", {id});
       add("creature_movement", "id", {id});
       add("creature_movement_scripts", "id", values("creature_movement_scripts", "id"));
+    } else if (c.type == EntityType::Spell) {
+      add("spell_template", "entry", {id});
+      add("spell_chain", "spell_id", {id});
     } else if (c.type == EntityType::Item) {
       add("item_template", "entry", {id});
       if (c.action == ChangeAction::Delete)

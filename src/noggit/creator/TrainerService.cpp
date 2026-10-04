@@ -80,6 +80,9 @@ QHash<Id, SpellInfo> TrainerService::spells(QVector<Id> const& teaching) {
   return out;
 }
 QVector<SpellInfo> TrainerService::search(QString const& text, int limit) {
+  QVector<Id> teaching;
+  {
+  // Closed before spells() opens its own connection: two at once wait on the authoring lock.
   Database db;
   bool numeric = false; auto number = text.trimmed().toUInt(&numeric);
   QString match = numeric ? "(s.entry=" + n(number) + " OR t.entry=" + n(number) + ")" : "s.name LIKE " + db.quote('%' + text.trimmed() + '%');
@@ -91,7 +94,8 @@ QVector<SpellInfo> TrainerService::search(QString const& text, int limit) {
     auto learned = r["learned"].toUInt(); auto teach = r["teach"].toUInt(); bool used = r["used"].toInt();
     if (!best.contains(learned) || (used && !best[learned].second) || (used == best[learned].second && teach < best[learned].first)) best[learned] = {teach, used};
   }
-  QVector<Id> teaching; for (auto const& choice : best) teaching << choice.first;
+  for (auto const& choice : best) teaching << choice.first;
+  }
   auto infos = spells(teaching);
   QVector<SpellInfo> out(infos.begin(), infos.end());
   std::sort(out.begin(), out.end(), [](SpellInfo const& a, SpellInfo const& b) { return a.name != b.name ? a.name < b.name : a.level < b.level; });

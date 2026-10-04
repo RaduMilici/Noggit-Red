@@ -75,6 +75,10 @@ NpcStudio::NpcStudio(Actions actions, QWidget* parent) : QWidget(parent), _actio
   _trainer = tile("Trainer", Icon::graduationcap, "What it teaches, in a preview of the game's trainer window.", _actions.trainer, this);
   layout->addWidget(row({_loot, _vendor, _trainer}, this));
 
+  layout->addWidget(heading("Library", this));
+  layout->addWidget(row({tile("Items", Icon::shieldalt, "Make, clone and change items: weapons, armor, potions, quest items. Usable at once by loot, shops and quests.", _actions.items, this),
+                         tile("Spells", Icon::magic, "Make, clone and change spells and their ranks, with effect templates. Tested in your local client.", _actions.spells, this)}, this));
+
   _placementRow = new QWidget(this);
   auto placement = new QVBoxLayout(_placementRow); placement->setContentsMargins(0, 0, 0, 0); placement->setSpacing(4);
   placement->addWidget(heading("Selected placement", _placementRow));

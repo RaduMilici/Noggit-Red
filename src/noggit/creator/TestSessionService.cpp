@@ -41,6 +41,10 @@ void TestSessionService::testGameObject(QWidget* parent,Position const& p){begin
 void TestSessionService::testNpc(QWidget* parent,Position const& p){begin(parent,NpcTarget,0,p);}
 void TestSessionService::testQuest(QWidget* parent,Id quest){begin(parent,QuestTarget,quest);}
 void TestSessionService::testLocal(QWidget* parent){begin(parent,None,0);}
+void TestSessionService::testCharacter(QWidget* parent,TestOptions const& options) {
+  if(busy()){QMessageBox::information(parent,"Local test","A local test is already in progress. Finish or cancel it first.");return;}
+  _options=options;begin(parent,CharacterTarget,0);
+}
 void TestSessionService::testEntity(QWidget* parent,bool object,Id entry,TestOptions const& options) {
   if(busy()){QMessageBox::information(parent,"Local test","A local test is already in progress. Finish or cancel it first.");return;}
   _object=object;_options=options;begin(parent,EntityTarget,entry);
@@ -51,7 +55,7 @@ void TestSessionService::begin(QWidget* parent,Target target,Id id,Position posi
   try {
     require(!_runtime->stopping(),"Wait for the local runtime to finish stopping, then try again.");
     if(!Runtime::ClientManager::prepare(parent,Runtime::ClientManager::Profile::TestLocal))return;
-    if(target!=EntityTarget)_options={};
+    if(target!=EntityTarget&&target!=CharacterTarget)_options={};
     _target=target;_id=id;_position=position;_token.clear();_loginHint.clear();_character=_account=0;
     _phase=WaitDatabase;_status="Starting local database…";_deadline.start();_moduleDeadline.invalidate();emit changed();
     _runtime->start();_timer.start();
@@ -67,6 +71,13 @@ void TestSessionService::prepareRequest() {
     // A fresh installation has no login; offer one before launching WoW.
     if(AccountService::list().isEmpty())
       require(!createLocalAccount(_parent).isEmpty(),"Local test cancelled. Create a local account to log in to WoW.");
+    return;
+  }
+  if(_target==CharacterTarget) {
+    // No move: the character starts where it logged out, with its new items and spells.
+    auto character=chooseCharacter();
+    grant();
+    _loginHint="Log in as "+character["name"].toString()+" (local account "+character["username"].toString()+").";
     return;
   }
   if(_target==QuestTarget) {
@@ -106,6 +117,19 @@ void TestSessionService::prepareRequest() {
   _position.z+=0.5f;
   _position.orientation=std::fmod(_position.orientation,6.2831853f);
   if(_position.orientation<0)_position.orientation+=6.2831853f;
+  auto character=chooseCharacter();
+  grant();
+  _loginHint="Log in as "+character["name"].toString()+" (local account "+character["username"].toString()+"). The test expires in 15 minutes.";
+  _token=QUuid::createUuid().toString(QUuid::Id128);
+  _expires=QDateTime::currentSecsSinceEpoch()+900;
+  CreatorTest::Request request{_token.toStdString(),character["guid"].toUInt(),character["account"].toUInt(),_position.map,
+    _position.x,_position.y,_position.z,_position.orientation,_expires};
+  require(CreatorTest::valid(request,QDateTime::currentSecsSinceEpoch()),"The selected test location is invalid.");
+  std::ostringstream out;CreatorTest::write(out,request);
+  QFile::remove(_runtime->root()+"/Workspace/creator-test.ready");QFile::remove(_runtime->root()+"/Workspace/creator-test.result");
+  put(_runtime->root()+"/Workspace/creator-test.request",QByteArray::fromStdString(out.str()));
+}
+Fields TestSessionService::chooseCharacter() {
   QSettings settings(_runtime->root()+"/Workspace/runtime.ini",QSettings::IniFormat);
   auto name=settings.value("testCharacterName").toString();
   QVector<Fields> characters;
@@ -119,15 +143,41 @@ void TestSessionService::prepareRequest() {
   }
   auto character=characters[selected];settings.setValue("testCharacterName",character["name"].toString());
   _character=character["guid"].toUInt();_account=character["account"].toUInt();
-  _loginHint="Log in as "+character["name"].toString()+" (local account "+character["username"].toString()+"). The test expires in 15 minutes.";
-  _token=QUuid::createUuid().toString(QUuid::Id128);
-  _expires=QDateTime::currentSecsSinceEpoch()+900;
-  CreatorTest::Request request{_token.toStdString(),character["guid"].toUInt(),character["account"].toUInt(),_position.map,
-    _position.x,_position.y,_position.z,_position.orientation,_expires};
-  require(CreatorTest::valid(request,QDateTime::currentSecsSinceEpoch()),"The selected test location is invalid.");
-  std::ostringstream out;CreatorTest::write(out,request);
-  QFile::remove(_runtime->root()+"/Workspace/creator-test.ready");QFile::remove(_runtime->root()+"/Workspace/creator-test.result");
-  put(_runtime->root()+"/Workspace/creator-test.request",QByteArray::fromStdString(out.str()));
+  return character;
+}
+// Items and spells for the test character. Runs before the restart: the server takes the highest item GUID at
+// startup, so items written now never clash with ones it makes later. Local character database only.
+void TestSessionService::grant() { if(_character) grantTo(_character,_options); }
+void TestSessionService::grantTo(Id character,TestOptions const& _options) {
+  if(_options.items.isEmpty()&&_options.spells.isEmpty())return;
+  Database db;
+  auto guid=QString::number(character);
+  require(db.query("SELECT online FROM characters.characters WHERE guid="+guid+" AND online=0").size()==1,"The test character is still online; log out and try again.");
+  QSet<int> taken;
+  for(auto const& r:db.query("SELECT slot FROM characters.character_inventory WHERE guid="+guid+" AND bag=0"))taken.insert(r["slot"].toInt());
+  auto next=db.query("SELECT COALESCE(MAX(guid),0)+100 AS g FROM characters.item_instance")[0]["g"].toUInt();
+  int slot=23; // the backpack's 16 slots are 23..38
+  for(auto const& wanted:_options.items) {
+    auto item=wanted.first;auto count=wanted.second;
+    auto proto=db.query("SELECT stackable,max_durability,duration,spellcharges_1,spellcharges_2,spellcharges_3,spellcharges_4,spellcharges_5 FROM item_template WHERE entry="+QString::number(item));
+    require(!proto.isEmpty(),"The item to test no longer exists.");
+    int stack=std::max(1,proto[0]["stackable"].toInt()),left=std::max(1,count);
+    QString charges;for(int k=1;k<=5;++k)charges+=proto[0]["spellcharges_"+QString::number(k)].toString()+" ";
+    QString enchantments;for(int k=0;k<21;++k)enchantments+="0 ";
+    while(left>0) {
+      while(slot<=38&&taken.contains(slot))++slot;
+      require(slot<=38,"The test character's backpack is full. Make room in it (or test with another character) and try again.");
+      int amount=std::min(left,stack);left-=amount;
+      db.exec(QString("INSERT INTO characters.item_instance (guid,itemEntry,owner_guid,creatorGuid,giftCreatorGuid,count,duration,charges,flags,enchantments,randomPropertyId,transmogrifyId,durability,text,generated_loot) "
+                      "VALUES (%1,%2,%3,0,0,%4,%5,%6,0,%7,0,0,%8,0,0)").arg(next).arg(item).arg(guid).arg(amount).arg(proto[0]["duration"].toInt())
+                      .arg(db.quote(charges),db.quote(enchantments)).arg(proto[0]["max_durability"].toInt()));
+      db.exec(QString("INSERT INTO characters.character_inventory (guid,bag,slot,item,item_template) VALUES (%1,0,%2,%3,%4)").arg(guid).arg(slot).arg(next).arg(item));
+      taken.insert(slot);++next;
+    }
+  }
+  for(auto spell:_options.spells)
+    db.exec("INSERT IGNORE INTO characters.character_spell (guid,spell,active,disabled) VALUES ("+guid+","+QString::number(spell)+",1,0)");
+  db.commit();
 }
 void TestSessionService::tick() {
   if(_phase==Idle||_phase==Preparing)return;
@@ -147,7 +197,7 @@ void TestSessionService::tick() {
       // The world server is back and nobody has logged in yet: the character's saved state is ours to change.
       applyOptions();
       Runtime::ClientManager::launch(Runtime::ClientManager::Profile::TestLocal);
-      if(_token.isEmpty()){finish("Local client launched. Log in with your local account.");return;}
+      if(_token.isEmpty()){finish(_loginHint.isEmpty()?"Local client launched. Log in with your local account.":"Local client launched. "+_loginHint);return;}
       _phase=WaitLogin;_deadline.restart();_status=_loginHint;emit changed();return;
     }
     if(_phase==WaitLogin) {

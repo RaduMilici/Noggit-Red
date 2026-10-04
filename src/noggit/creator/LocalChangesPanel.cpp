@@ -3,6 +3,8 @@
 #include "ProductionDialogs.hpp"
 #include "ProductionProfile.hpp"
 #include "TestSessionService.hpp"
+#include "ClientPatch.hpp"
+#include <noggit/runtime/ClientManager.hpp>
 #include <noggit/runtime/RuntimeManager.hpp>
 #include <QCoreApplication>
 #include <QDesktopServices>
@@ -10,6 +12,8 @@
 #include <QDialogButtonBox>
 #include <QDir>
 #include <QFileDialog>
+#include <QFileInfo>
+#include <algorithm>
 #include <QFormLayout>
 #include <QHBoxLayout>
 #include <QLabel>
@@ -111,6 +115,59 @@ void addLocalChangesPanel(QMainWindow* window) {
   auto clear = new QPushButton("Clear Selected", panel), exportButton = new QPushButton("Export Changes", panel);
   auto fileRow = new QHBoxLayout; fileRow->addWidget(clear); fileRow->addWidget(exportButton);
   layout->addWidget(testLocal); layout->addLayout(syncRow); layout->addWidget(target); layout->addLayout(fileRow);
+  // Client data: tracked apart from the database changes above, used by the local test client only.
+  auto clientHeading = new QLabel("CLIENT DATA — LOCAL TEST CLIENT", panel); clientHeading->setStyleSheet("margin-top: 8px;");
+  auto clientList = new QListWidget(panel); clientList->setSelectionMode(QAbstractItemView::NoSelection); clientList->setMaximumHeight(110);
+  auto clientStatus = new QLabel(panel); clientStatus->setWordWrap(true); clientStatus->setStyleSheet("color: gray;");
+  auto updateClient = new QPushButton("Update Test Client", panel), restoreClient = new QPushButton("Restore Original", panel);
+  auto exportClient = new QPushButton("Export Client Patch…", panel);
+  updateClient->setToolTip("Put your spells into the local test client now (Test Locally does this too)");
+  restoreClient->setToolTip("Put the client's own files back (Play Production does this too)");
+  exportClient->setToolTip("Save the client patch with your spells, e.g. to hand to production players");
+  auto clientRow = new QHBoxLayout; clientRow->addWidget(updateClient); clientRow->addWidget(restoreClient); clientRow->addWidget(exportClient);
+  layout->addWidget(clientHeading); layout->addWidget(clientList); layout->addWidget(clientStatus); layout->addLayout(clientRow);
+  auto client = ClientPatchService::instance();
+  auto refreshClient = [=] {
+    clientList->clear();
+    if (!client) return;
+    if (!qApp->property("creatorDatabaseReady").toBool()) { clientStatus->setText("Start the local server to see client data changes."); return; }
+    auto status = client->status();
+    for (auto const& c : status.pending) new QListWidgetItem(c.summary() + (c.kind == ClientDataChange::Kind::Remove ? "  (removed)" : "  (not in the test client yet)"), clientList);
+    for (auto const& label : status.installedSpells) if (std::none_of(status.pending.begin(), status.pending.end(), [&](auto const& c) { return c.label == label; }))
+      new QListWidgetItem("✓ Spell.dbc: " + label, clientList);
+    clientList->setVisible(clientList->count() > 0);
+    QStringList lines;
+    if (!status.problem.isEmpty()) lines << status.problem;
+    else if (clientList->count() == 0) lines << "No client data changes. Spells you make are added to the test client's Spell.dbc.";
+    if (status.installed) lines << "Creator's test patch is in " + QDir::toNativeSeparators(status.patch) + ".";
+    if (!status.backup.isEmpty()) lines << "The client's own " + QFileInfo(status.backup).fileName() + " is backed up in " + QDir::toNativeSeparators(QFileInfo(status.backup).absolutePath())
+                                          + " and kept inside Creator's patch; it is put back before playing on production.";
+    lines << "Sync to Production does not send client data.";
+    clientStatus->setText(lines.join('\n'));
+    updateClient->setEnabled(status.problem.isEmpty() && !status.pending.isEmpty());
+    restoreClient->setEnabled(status.installed);
+    exportClient->setEnabled(status.problem.isEmpty() && !(status.installedSpells.isEmpty() && status.pending.isEmpty()));
+  };
+  auto clientAction = [=](auto action) {
+    try { action(); } catch (std::exception const& e) { QMessageBox::warning(panel, "Client data", e.what()); }
+    refreshClient();
+  };
+  QObject::connect(updateClient, &QPushButton::clicked, panel, [=] { clientAction([=] { client->install(); }); });
+  QObject::connect(restoreClient, &QPushButton::clicked, panel, [=] { clientAction([=] { client->restoreOriginal(); }); });
+  QObject::connect(exportClient, &QPushButton::clicked, panel, [=] {
+    auto path = QFileDialog::getSaveFileName(panel, "Export client patch", QDir(QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation)).filePath("patch-Z.mpq"),
+                                             "Client patch (*.mpq)", nullptr, QFileDialog::DontUseNativeDialog);
+    if (!path.isEmpty()) clientAction([=] { client->exportPatch(path); QMessageBox::information(panel, "Client data", "Saved " + QDir::toNativeSeparators(path)
+      + ".\n\nPlayers put it in their client's Data folder as patch-Z.mpq. It also contains the files of your own patch-Z, if you have one."); });
+  });
+  if (client) QObject::connect(client, &ClientPatchService::changed, panel, refreshClient);
+  // Test Locally installs the test client data; Play Production takes it out again.
+  Runtime::ClientManager::beforeLaunch = [](Runtime::ClientManager::Profile profile) {
+    auto* service = ClientPatchService::instance();
+    if (!service) return;
+    if (profile == Runtime::ClientManager::Profile::PlayProduction) { service->restoreOriginal(); return; }
+    if (!service->status().pending.isEmpty()) service->install();
+  };
   auto refresh = [=] {
     auto const& changes = tracker->changes();
     list->clear();
@@ -140,6 +197,8 @@ void addLocalChangesPanel(QMainWindow* window) {
   });
   QObject::connect(button, &QToolButton::clicked, panel, [panel] { panel->show(); panel->raise(); panel->activateWindow(); });
   QObject::connect(tracker, &ChangeTracker::changed, panel, refresh);
+  QObject::connect(tracker, &ChangeTracker::changed, panel, refreshClient);
+  QObject::connect(button, &QToolButton::clicked, panel, refreshClient);
   refresh();
   window->statusBar()->addPermanentWidget(button);
 }

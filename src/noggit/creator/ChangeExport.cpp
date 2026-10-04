@@ -31,6 +31,19 @@ QVector<QPair<EntityType, Id>> references(TrackedChange const& c) {
     out.push_back({c.type == EntityType::ObjectLoot ? EntityType::GameObject : EntityType::Npc, c.entity});
     auto table = c.type == EntityType::Loot ? "creature_loot_template" : c.type == EntityType::ObjectLoot ? "gameobject_loot_template" : "npc_vendor";
     if (c.type != EntityType::Trainer) for (auto const& row : rows(table)) out.push_back({EntityType::Item, number(row.toObject(), "item")});
+    else for (auto const& row : rows(table)) out.push_back({EntityType::Spell, number(row.toObject(), "spell")});
+    return out;
+  }
+  // A spell travels with the Creator spells it casts or follows, and the NPCs and items it summons or creates.
+  if (c.type == EntityType::Spell) {
+    auto spell = rows("spell_template").at(0).toObject();
+    for (int i = 1; i <= 3; ++i) {
+      auto effect = number(spell, "effect" + QString::number(i)), aura = number(spell, "effectApplyAuraName" + QString::number(i));
+      out.push_back({EntityType::Spell, number(spell, "effectTriggerSpell" + QString::number(i))});
+      if (effect == 28 || effect == 41 || (effect == 6 && aura == 56)) out.push_back({EntityType::Npc, number(spell, "effectMiscValue" + QString::number(i))});
+      if (effect == 24) out.push_back({EntityType::Item, number(spell, "effectItemType" + QString::number(i))});
+    }
+    for (auto const& row : rows("spell_chain")) out.push_back({EntityType::Spell, number(row.toObject(), "prev_spell")});
     return out;
   }
   // A dialogue travels with its NPC and the Creator quests and items its conditions and effects name.
@@ -45,10 +58,14 @@ QVector<QPair<EntityType, Id>> references(TrackedChange const& c) {
       if (number(row.toObject(), "command") == 7) out.push_back({EntityType::Quest, number(row.toObject(), "datalong")});
     return out;
   }
-  auto first = rows(c.type == EntityType::GameObject ? "gameobject_template" : c.type == EntityType::GameObjectSpawn ? "gameobject" : c.type == EntityType::Quest ? "quest_template" : c.type == EntityType::Npc ? "creature_template" : "creature").at(0).toObject();
+  auto first = rows(c.type == EntityType::GameObject ? "gameobject_template" : c.type == EntityType::GameObjectSpawn ? "gameobject" : c.type == EntityType::Quest ? "quest_template" : c.type == EntityType::Npc ? "creature_template" : c.type == EntityType::Item ? "item_template" : "creature").at(0).toObject();
   if (c.type == EntityType::GameObjectSpawn) out.push_back({EntityType::GameObject, number(first, "id")});
   if (c.type == EntityType::GameObject && (number(first,"type")==10 || number(first,"type")==3)) out.push_back({EntityType::Quest,number(first,number(first,"type")==10?"data1":"data8")});
   if (c.type == EntityType::Spawn) out.push_back({EntityType::Npc, number(first, "id")});
+  if (c.type == EntityType::Item)
+    for (int i = 1; i <= 5; ++i) out.push_back({EntityType::Spell, number(first, "spellid_" + QString::number(i))});
+  if (c.type == EntityType::Npc)
+    for (int i = 1; i <= 4; ++i) out.push_back({EntityType::Spell, number(first, "spell_id" + QString::number(i))});
   if (c.type == EntityType::Npc)
     for (auto const& row : rows("creature_equip_template"))
       for (int i = 1; i <= 3; ++i) out.push_back({EntityType::Item, number(row.toObject(), "equipentry" + QString::number(i))});
@@ -70,6 +87,7 @@ QVector<QPair<EntityType, Id>> references(TrackedChange const& c) {
     for (auto const& column : items) out.push_back({EntityType::Item, number(first, column)});
     for (auto const& row : rows("item_start_link")) out.push_back({EntityType::Item, number(row.toObject(), "entry")});
     for (auto column : {"PrevQuestId", "NextQuestId", "NextQuestInChain"}) out.push_back({EntityType::Quest, number(first, column)});
+    for (auto column : {"RewSpell", "RewSpellCast"}) out.push_back({EntityType::Spell, number(first, column)});
   }
   return out;
 }

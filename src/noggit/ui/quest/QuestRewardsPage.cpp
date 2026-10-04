@@ -157,11 +157,11 @@ namespace Noggit::Ui::Quest
     _spell = new EntryPicker(lookups().spells.get(), spells);
     _spell->setEnabled(!s.reward_spell_col.empty());
     _spell->setToolTip("A spell the player learns (shown as the quest reward).");
-    spell_form->addRow("Teaches", _spell);
+    spell_form->addRow("Teaches", browsable(_spell));
     _spell_cast = new EntryPicker(lookups().spells.get(), spells);
     _spell_cast->setEnabled(!s.reward_spell_cast_col.empty());
     _spell_cast->setToolTip("Cast on the player when handing the quest in (a buff, a teleport, ...).");
-    spell_form->addRow("Casts on the player", _spell_cast);
+    spell_form->addRow("Casts on the player", browsable(_spell_cast));
     cards()->addWidget(spells);
     cards()->addStretch();
     updateLimits();

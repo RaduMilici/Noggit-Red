@@ -2,6 +2,8 @@
 
 #include <noggit/ui/content/ContentSession.hpp>
 #include <noggit/creator/ItemBrowser.hpp>
+#include <noggit/creator/ContentEditors.hpp>
+#include <noggit/creator/SpellService.hpp>
 
 #include <noggit/ui/content/ClientData.hpp>
 
@@ -71,7 +73,47 @@ namespace Noggit::Ui::Content
                                         trigger.radius, trigger.quest, trigger.other_use});
       }
       session->_lookups = buildLookups(source);
-      session->_lookups->items->browse = [](QWidget* parent, std::uint32_t current) { return Creator::pickItem(parent, "Choose item", {}, current); };
+      // Items and spells made from these browsers are added to the lists right away.
+      auto* lookups = session->_lookups.get();
+      lookups->items->browse = [lookups](QWidget* parent, std::uint32_t current) -> std::optional<std::uint32_t>
+      {
+        auto const chosen = Creator::pickItem(parent, "Choose item", {}, current);
+        if (chosen)
+        {
+          try
+          {
+            if (auto const info = Creator::ItemService::get(*chosen))
+            {
+              lookups->addItem(*chosen, info->name, std::uint32_t(info->quality), info->display);
+            }
+          }
+          catch (...)
+          {
+          }
+        }
+        return chosen;
+      };
+      lookups->spells->browse = [lookups](QWidget* parent, std::uint32_t current) -> std::optional<std::uint32_t>
+      {
+        auto const chosen = Creator::pickSpell(parent, "Choose spell", current);
+        if (chosen)
+        {
+          try
+          {
+            for (auto const& found : Creator::SpellService::search(QString::number(*chosen), false, 5))
+            {
+              if (found.id == *chosen)
+              {
+                lookups->addSpell(*chosen, found.name);
+              }
+            }
+          }
+          catch (...)
+          {
+          }
+        }
+        return chosen;
+      };
     }
     catch (std::exception const& e)
     {

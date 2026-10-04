@@ -5,6 +5,9 @@ set(CMAKE_AUTOMOC ON)
 find_package(Qt5 REQUIRED COMPONENTS Core Network)
 find_path(MYSQL_INCLUDE_DIR mysql.h PATH_SUFFIXES mysql mariadb REQUIRED)
 find_library(MYSQL_LIBRARY NAMES mysqlclient mariadb REQUIRED)
+# Client patches (Spell.dbc in an MPQ) are written with the system StormLib, as Noggit itself links it.
+find_path(STORM_INCLUDE_DIR StormLib.h REQUIRED)
+find_library(STORM_LIBRARY NAMES storm StormLib REQUIRED)
 file(GLOB CONTENT_SOURCES CONFIGURE_DEPENDS
   ../../src/noggit/content/*.cpp ../../src/noggit/quest/*.cpp ../../src/noggit/item/*.cpp)
 add_executable(creator_integration CreatorIntegration.cpp ${CONTENT_SOURCES}
@@ -22,10 +25,15 @@ add_executable(creator_integration CreatorIntegration.cpp ${CONTENT_SOURCES}
   ../../src/noggit/creator/VendorService.cpp
   ../../src/noggit/creator/TrainerService.cpp
   ../../src/noggit/creator/GossipService.cpp
+  ../../src/noggit/creator/ClientDbc.cpp
+  ../../src/noggit/creator/ClientPatch.cpp
+  ../../src/noggit/creator/SpellCatalog.cpp
+  ../../src/noggit/creator/SpellService.cpp
+  ../../src/noggit/creator/ItemDesignService.cpp
   ../../src/noggit/runtime/RuntimeManager.cpp)
-target_include_directories(creator_integration PRIVATE ../../src ${MYSQL_INCLUDE_DIR})
+target_include_directories(creator_integration PRIVATE ../../src ${MYSQL_INCLUDE_DIR} ${STORM_INCLUDE_DIR})
 target_compile_definitions(creator_integration PRIVATE USE_MYSQL_UID_STORAGE)
-target_link_libraries(creator_integration PRIVATE Qt5::Core Qt5::Network ${MYSQL_LIBRARY})
+target_link_libraries(creator_integration PRIVATE Qt5::Core Qt5::Network ${MYSQL_LIBRARY} ${STORM_LIBRARY})
 
 # Local change tracking without a database: merging, persistence, crash recovery, SQL generation.
 enable_testing()
@@ -53,11 +61,16 @@ add_executable(service_tests ServiceTests.cpp
   ../../src/noggit/creator/TrainerService.cpp
   ../../src/noggit/creator/GossipService.cpp
   ../../src/noggit/creator/ItemService.cpp
+  ../../src/noggit/creator/ClientDbc.cpp
+  ../../src/noggit/creator/ClientPatch.cpp
+  ../../src/noggit/creator/SpellCatalog.cpp
+  ../../src/noggit/creator/SpellService.cpp
+  ../../src/noggit/creator/ItemDesignService.cpp
   ../../src/noggit/creator/Database.cpp
   ../../src/noggit/creator/SqlConnection.cpp
   ../../src/noggit/creator/ChangeTracker.cpp
   ../../src/noggit/runtime/RuntimeManager.cpp)
-target_include_directories(service_tests PRIVATE ../../src ${MYSQL_INCLUDE_DIR})
+target_include_directories(service_tests PRIVATE ../../src ${MYSQL_INCLUDE_DIR} ${STORM_INCLUDE_DIR})
 target_compile_definitions(service_tests PRIVATE USE_MYSQL_UID_STORAGE)
-target_link_libraries(service_tests PRIVATE Qt5::Core Qt5::Network ${MYSQL_LIBRARY})
+target_link_libraries(service_tests PRIVATE Qt5::Core Qt5::Network ${MYSQL_LIBRARY} ${STORM_LIBRARY})
 add_test(NAME services COMMAND service_tests)

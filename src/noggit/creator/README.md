@@ -389,6 +389,79 @@ backup covers every dialogue row and mark the sync can change. A Creator quest t
 completes is listed and synced with its event flag; the quest editor keeps that flag while a
 dialogue completes the quest.
 
+## Items and spells
+
+NPC card → **Library → Items / Spells**, right-click the world → **Create → Item… / Spell…**, or
+the **New / Clone / Open** buttons of the Item Browser and the spell picker, which every editor uses
+(Loot, Vendor, quest rewards, NPC weapons, item spells, triggered spells). Whatever is saved there
+can be picked at once. Game items and spells open read-only, with **Clone This Item / Spell**.
+
+**Item Editor.** New items start from **Clone Existing Item** (any game item: look, stats and
+effects) or a template — Weapon, Armor, Consumable, Quest Item, Crafting Material, Key,
+Trinket. The left side shows the 3D model and the game's tooltip as you type. Pages:
+*Basics* (name, description, quality, item and required level, kind and type, where it is
+worn — only slots that fit the kind —, binding, stacking and carry limit, vendor prices,
+**Use the Look of Another Item…** for the icon and model), *Combat* (armor, block, weapon
+damage, school and speed with damage per second, durability), *Stats* (up to ten, and six
+resistances), *Who can use it* (classes, races), *Spells* (when used — uses, used up,
+cooldown —, while worn, chance on hit with procs per minute). Every `item_template` column the
+editor does not show is kept as cloned. Checked: worn slot against the kind, weapon speed and
+damage, stacking worn items, missing spells, nobody able to use it; warned: sell above buy,
+stats on unworn items, missing durability or look. **Test Item…** puts one or more in your test
+character's backpack (and can set its level) and starts WoW where the character logged out.
+**Delete Item…** works for your items nothing uses.
+
+**Spell Editor.** **Clone Existing Spell**, or **Create Spell** from an effect template: Direct
+Damage, Heal, Damage/Healing over Time, Buff, Debuff, Stun, Root, Silence, Fear, Summon, Trigger
+Spell, Learn Spell, Energize — each set up the way most of the game's own spells of that kind
+are (target, range, duration, cast effects, icon). Pages: *Basics* (name, rank, school,
+description — **Write it for me** fills in `$s1` / `$o1` / `$d` —, buff tooltip, **Use the Cast
+Effects of…** another spell), *Casting* (cast time, cooldown and global cooldown, range, cost and
+power, target type for all effects, duration, stacks, crowd-control kind, proc chance, level),
+*Effects* (the three Vanilla effect slots: what it does, aura, who it affects, radius, amount
+range, tick time, the spell it casts or teaches, and the creature, stat, power, schools or item
+it needs), *Ranks & trainers*. Names are readable throughout; anything a cloned spell uses that
+the editor does not offer is kept and shown as "kept as copied". Dummy and script effects are
+marked **needs scripting support**. Cast times, durations, ranges and radii are the client's own
+rows (`SpellCastTimes`, `SpellDuration`, `SpellRange`, `SpellRadius`): new values would need
+server and client table changes, so they are chosen from what exists. The left side shows the
+in-game tooltip with the values filled in, and the spell's rank chain.
+
+**Ranks.** **Create Next Rank…** copies the spell with a new level, damage/healing (a percentage),
+cost and cooldown, and requires the current rank; it works on game spells too (Fireball's next
+rank joins Fireball's chain). Ranks are kept in `spell_chain` as the server expects (a first rank
+of yours gets its row). **Trainers can teach it** makes the teaching spell trainers list (a copy
+of how the game's trainers teach), so the Trainer Editor offers the spell. **Test Spell…** teaches
+the spell and its earlier ranks to your test character (General tab of the spellbook).
+
+Storage: `item_template`; `spell_template` and `spell_chain` (IDs from 1,000,000, below the
+signed-mediumint limit `spell_chain` has). Local Changes lists `+ Item: …`, `+ Spell: … (Rank 2)`
+and `+ Spell (trainer lesson): …`; export and sync include the Creator spells and items the
+changes use (an item's spells, a quest's reward spell, a trainer's lessons, a spell's next rank).
+Not supported: custom models or icons, new cast-time/range rows, talents, custom classes,
+advanced spell scripting.
+
+## Client data
+
+Items need no client data (the client asks the server). Spells do: the client only shows and
+casts spells in its `Spell.dbc`. Creator writes your spells' rows from `spell_template` (the
+two share their columns, checked against all 27,917 bundled spells) into a test patch in the
+local client's `Data` folder: `patch-Z.mpq`, the last patch the 1.12 client loads, so it wins.
+
+- A `patch-Z.mpq` the client already has is first backed up to `Workspace/client-data/original/`
+  (byte for byte, checksum recorded); Creator's patch contains all its files, and its
+  `Spell.dbc` is built on the client's (its rows, e.g. a hand-made spell, are kept). Replacing
+  your own patch later is noticed: it is backed up too, the older backup kept.
+- **Test Locally** (and Test Spell) updates the test patch when spells changed. **Play
+  Production** puts the client's own `patch-Z.mpq` back first (or removes Creator's).
+- **Local changes → Client data** lists what the test client does not have yet (`+ Spell.dbc:
+  Holy Smite (Rank 2)`), with **Update Test Client**, **Restore Original** and **Export Client
+  Patch…** (the patch to hand to players). The state is `Workspace/client-data/state.json`,
+  apart from Local Changes.
+- **Sync to Production does not send client data**; its confirmation warns when synced spells need
+  the patch. On Windows, replacing `patch-Z.mpq` needs the client closed (and fails while another
+  program has it open).
+
 ## Supported appearance and combat
 
 - Search existing NPCs by name, inspect levels/type/faction/look/role/equipment.
@@ -503,8 +576,11 @@ ctest --test-dir build-creator-tests --output-on-failure
 ```
 
 `service_tests` covers loot validation, group chances, the drop simulator, vendor and trainer
-checks, dialogues (rows written and read back, validation, conditions, effects), and their Local
-Changes summaries, sync SQL and backup footprint. `ssh_tests` covers SSH target validation, argument hardening, error classification,
+checks, dialogues (rows written and read back, validation, conditions, effects), client tables
+(WDBC reading and writing, the Spell.dbc layout, patched tables keeping the client's rows,
+readable cast times), spell values, templates and checks, item templates and checks, and their
+Local Changes summaries, sync SQL and backup footprint. It links the system StormLib
+(`libstorm-dev`). `ssh_tests` covers SSH target validation, argument hardening, error classification,
 host-key fingerprints and forgetting, and that names cannot break the generated SQL.
 
 Real database integration checks require a disposable, stopped copy of the bundle.
@@ -582,7 +658,8 @@ ctest --test-dir build-creator-tests -R '^change_tracker$' --output-on-failure
 
 The disposable-runtime `creator_integration` checks also cover GameObject placement and
 movement, a named interaction objective, walk/run/wait/loop persistence, repeated saves,
-and authoring an original NPC's patrol, and dialogues: a round trip with a condition, shop,
+and authoring an original NPC's patrol, spells and items (a teachable spell trainers find, its next
+rank, a potion casting it, a cloned weapon, deletion protection), and dialogues: a round trip with a condition, shop,
 training and a spell, unchanged saves keeping their rows, read-only game NPCs, a clone getting
 its own copy, deletion with the NPC, and the sync backup restoring every dialogue row. Use the
 disposable-copy instructions above;

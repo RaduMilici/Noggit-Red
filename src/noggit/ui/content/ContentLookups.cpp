@@ -128,7 +128,7 @@ namespace Noggit::Ui::Content
     layout->addWidget(picker, 1);
     auto* browse = new QToolButton(row);
     browse->setText("…");
-    browse->setToolTip("Browse items with icons, filters and previews");
+    browse->setToolTip("Browse with icons and previews, or make a new one there");
     browse->setEnabled(picker->isEnabled());
     layout->addWidget(browse);
     QObject::connect(browse, &QToolButton::clicked, picker, [picker]
@@ -185,6 +185,19 @@ namespace Noggit::Ui::Content
     else
     {
       quests->item(quests->rowOf(entry))->setText(label);
+    }
+  }
+
+  void ContentLookups::addSpell(std::uint32_t entry, QString const& name)
+  {
+    QString const label = QString("%1 (#%2)").arg(name).arg(entry);
+    if (spells->rowOf(entry) < 0)
+    {
+      spells->add(entry, label);
+    }
+    else
+    {
+      spells->item(spells->rowOf(entry))->setText(label);
     }
   }
 

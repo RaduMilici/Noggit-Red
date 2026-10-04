@@ -119,6 +119,7 @@ namespace Noggit::Ui::Content
     void addItem(std::uint32_t entry, QString const& name, std::uint32_t quality, std::uint32_t display);
     void addQuest(std::uint32_t entry, QString const& title, std::uint32_t level);
     void addCreature(std::uint32_t entry, QString const& name, std::uint32_t npc_flags);
+    void addSpell(std::uint32_t entry, QString const& name);
   };
 
   std::unique_ptr<ContentLookups> buildLookups(LookupSource const& source);

@@ -164,6 +164,7 @@ void ClientManager::launch(Profile profile) {
   QString realm=profile==Profile::TestLocal?"127.0.0.1:13724":s.value("productionRealm").toString();
   if(profile==Profile::TestLocal)require(RuntimeManager::instance()->status(2)=="Running","Wait for the local server to finish starting.");
   // Production deliberately has no save, restart, test request, or database operation.
+  if(beforeLaunch)beforeLaunch(profile);
   switchRealm(exe,realm);qint64 pid=0;
   require(QProcess::startDetached(binary,args,QFileInfo(exe).absolutePath(),&pid),"Could not launch the WoW client.");
   s.setValue("clientProcessId",pid);s.setValue("clientProcessIdentity",processIdentity(pid));

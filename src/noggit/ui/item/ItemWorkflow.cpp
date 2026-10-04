@@ -5,6 +5,8 @@
 #include <noggit/ui/content/ContentSession.hpp>
 #include <noggit/ui/content/ContentStyle.hpp>
 #include <noggit/ui/item/ItemEditorDialog.hpp>
+#include <noggit/creator/ContentEditors.hpp>
+#include <noggit/creator/ItemService.hpp>
 
 #include <QtWidgets/QHBoxLayout>
 #include <QtWidgets/QLabel>
@@ -170,14 +172,38 @@ namespace Noggit::Ui::Item
     buttons->addStretch();
     buttons->addWidget(close);
     root->addLayout(buttons);
+    // The full Item Editor; what it saves is added to this session's lists.
+    auto const listed = [&session](std::optional<std::uint32_t> saved)
+    {
+      if (!saved)
+      {
+        return false;
+      }
+      try
+      {
+        if (auto const info = Creator::ItemService::get(*saved))
+        {
+          session.lookups().addItem(*saved, info->name, std::uint32_t(info->quality), info->display);
+          session.setOwnItem(*saved, true);
+        }
+        else
+        {
+          session.setOwnItem(*saved, false); // deleted
+        }
+      }
+      catch (...)
+      {
+      }
+      return true;
+    };
     auto const edit_selected = [&]
     {
-      if (auto* item = list->currentItem(); item && editItem(session, &dialog, item->data(Qt::UserRole).toUInt()))
+      if (auto* item = list->currentItem(); item && listed(Creator::editItem(&dialog, item->data(Qt::UserRole).toUInt())))
       {
         fill();
       }
     };
-    QObject::connect(create, &QPushButton::clicked, &dialog, [&] { if (createItem(session, &dialog)) fill(); });
+    QObject::connect(create, &QPushButton::clicked, &dialog, [&] { if (listed(Creator::createItem(&dialog))) fill(); });
     QObject::connect(edit, &QPushButton::clicked, &dialog, edit_selected);
     QObject::connect(list, &QListWidget::itemDoubleClicked, &dialog, edit_selected);
     QObject::connect(close, &QPushButton::clicked, &dialog, &QDialog::accept);

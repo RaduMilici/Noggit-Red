@@ -1,4 +1,5 @@
 #include "ItemBrowser.hpp"
+#include "ContentEditors.hpp"
 #include "CreatorPreviews.hpp"
 #include <noggit/ui/content/ClientData.hpp>
 #include <noggit/ui/content/ContentLookups.hpp>
@@ -133,6 +134,18 @@ ItemBrowser::ItemBrowser(ItemFilter const& preset, bool compact, QWidget* parent
     top->addWidget(b); return b;
   };
   _grid = toggle(Ui::FontAwesome::Icons::th, "Icon grid"); _list = toggle(Ui::FontAwesome::Icons::list, "List");
+  // New items can be made right where one is needed (loot, shops, quest rewards, NPC weapons).
+  auto action = [&](QString const& text, Ui::FontAwesome::Icons icon, QString const& tip) {
+    auto b = new QToolButton(this); b->setText(text); b->setIcon(Ui::FontAwesomeIcon(icon)); b->setToolTip(tip);
+    b->setToolButtonStyle(Qt::ToolButtonTextBesideIcon); top->addWidget(b); return b;
+  };
+  auto create = action("New", Ui::FontAwesome::Icons::plus, "Make a new item: clone an existing one, or start from a template");
+  auto clone = action("Clone", Ui::FontAwesome::Icons::clone, "Make your own copy of the selected item");
+  auto open = action("Open", Ui::FontAwesome::Icons::edit, "Open the selected item in the Item Editor (game items open read-only)");
+  auto made = [this](std::optional<Id> id) { if (!id) return; search(); select(*id); };
+  connect(create, &QToolButton::clicked, this, [this, made] { made(createItem(this)); });
+  connect(clone, &QToolButton::clicked, this, [this, made] { made(cloneItem(this, current() ? current()->entry : 0)); });
+  connect(open, &QToolButton::clicked, this, [this, made] { if (auto c = current()) made(editItem(this, c->entry)); });
   auto views = new QButtonGroup(this); views->addButton(_grid); views->addButton(_list); views->setExclusive(true);
   _scope = new QTabBar(this); _scope->addTab("All items"); _scope->addTab("My items"); _scope->addTab("Recent");
   _scope->setCurrentIndex(int(preset.scope)); _scope->setExpanding(false); left->addWidget(_scope);
