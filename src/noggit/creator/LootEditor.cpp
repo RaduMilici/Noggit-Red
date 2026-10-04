@@ -223,7 +223,8 @@ private:
     _table->setCellWidget(i, MinColumn, min); _table->setCellWidget(i, MaxColumn, max);
 
     auto group = new QSpinBox; group->setRange(0, 127); group->setSpecialValueText("—"); group->setValue(r.group); group->setEnabled(!locked);
-    group->setToolTip("0 / —: rolled on its own. 1 or more: exactly one item of the group drops.");
+    group->setToolTip(r.reference ? "0 / —: roll the whole shared table. 1–127: roll only that group in the shared table."
+                                 : "0 / —: rolled on its own. 1–127: at most one item in the group drops.");
     connect(group, qOverload<int>(&QSpinBox::valueChanged), this, [this, i, always](int v) {
       if (_building) return;
       _loot.rows[i].group = v; always->setEnabled((v == 0 || _loot.rows[i].reference) && editable()); changed();
