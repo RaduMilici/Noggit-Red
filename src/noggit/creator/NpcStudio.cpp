@@ -77,7 +77,8 @@ NpcStudio::NpcStudio(Actions actions, QWidget* parent) : QWidget(parent), _actio
 
   layout->addWidget(heading("Library", this));
   layout->addWidget(row({tile("Items", Icon::shieldalt, "Make, clone and change items: weapons, armor, potions, quest items. Usable at once by loot, shops and quests.", _actions.items, this),
-                         tile("Spells", Icon::magic, "Make, clone and change spells and their ranks, with effect templates. Tested in your local client.", _actions.spells, this)}, this));
+                         tile("Spells", Icon::magic, "Make, clone and change spells and their ranks, with effect templates. Tested in your local client.", _actions.spells, this),
+                         tile("Talents", Icon::sitemap, "The class talent trees as the game's talent window: move, link, create and test talents at any level.", _actions.talents, this)}, this));
 
   _placementRow = new QWidget(this);
   auto placement = new QVBoxLayout(_placementRow); placement->setContentsMargins(0, 0, 0, 0); placement->setSpacing(4);

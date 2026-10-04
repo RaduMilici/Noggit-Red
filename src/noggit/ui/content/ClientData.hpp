@@ -9,6 +9,7 @@
 #include <noggit/ui/content/ContentLookups.hpp>
 
 #include <QtGui/QIcon>
+#include <QtGui/QPixmap>
 #include <QtCore/QString>
 
 #include <cstdint>
@@ -31,6 +32,8 @@ namespace Noggit::Ui::Content::ClientData
   QIcon itemIcon(std::uint32_t display);
   // A spell's icon (SpellIcon.dbc ID; empty icon when unknown).
   QIcon spellIcon(std::uint32_t icon);
+  // A client texture ("Interface\\TalentFrame\\WarriorArms-TopLeft.blp") at this size; null when the client lacks it.
+  QPixmap texture(QString const& path, int width, int height);
   // The model file name of a creature display ID ("" when the client has no such display).
   QString creatureModelName(std::uint32_t display);
 }

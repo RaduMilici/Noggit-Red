@@ -27,6 +27,7 @@ add_executable(creator_integration CreatorIntegration.cpp ${CONTENT_SOURCES}
   ../../src/noggit/creator/GossipService.cpp
   ../../src/noggit/creator/ClientDbc.cpp
   ../../src/noggit/creator/ClientPatch.cpp
+  ../../src/noggit/creator/TalentService.cpp
   ../../src/noggit/creator/SpellCatalog.cpp
   ../../src/noggit/creator/SpellService.cpp
   ../../src/noggit/creator/ItemDesignService.cpp
@@ -63,6 +64,7 @@ add_executable(service_tests ServiceTests.cpp
   ../../src/noggit/creator/ItemService.cpp
   ../../src/noggit/creator/ClientDbc.cpp
   ../../src/noggit/creator/ClientPatch.cpp
+  ../../src/noggit/creator/TalentService.cpp
   ../../src/noggit/creator/SpellCatalog.cpp
   ../../src/noggit/creator/SpellService.cpp
   ../../src/noggit/creator/ItemDesignService.cpp
@@ -74,3 +76,13 @@ target_include_directories(service_tests PRIVATE ../../src ${MYSQL_INCLUDE_DIR} 
 target_compile_definitions(service_tests PRIVATE USE_MYSQL_UID_STORAGE)
 target_link_libraries(service_tests PRIVATE Qt5::Core Qt5::Network ${MYSQL_LIBRARY} ${STORM_LIBRARY})
 add_test(NAME services COMMAND service_tests)
+
+# Talent trees without a database: Talent.dbc reading and writing, the game's arrow routing, layout checks,
+# earliest levels, the build preview, comparison, and (given the server's dbc folder) the store over real data.
+add_executable(talent_tests TalentTests.cpp
+  ../../src/noggit/creator/TalentService.cpp
+  ../../src/noggit/creator/ClientDbc.cpp
+  ../../src/noggit/runtime/RuntimeManager.cpp)
+target_include_directories(talent_tests PRIVATE ../../src)
+target_link_libraries(talent_tests PRIVATE Qt5::Core Qt5::Network)
+add_test(NAME talents COMMAND talent_tests ${CMAKE_CURRENT_SOURCE_DIR}/../../build/Creator/Runtime/mangosd/data/dbc)

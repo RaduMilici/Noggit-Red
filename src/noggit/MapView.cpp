@@ -2314,6 +2314,7 @@ void MapView::setupCreatureModelPickerUi()
     actions.dialogue = service([this](std::uint32_t entry) { return editCreatorDialogue(entry); });
     actions.items = [this] { if (prepareCreatorChange()) { Noggit::Creator::openItemLibrary(this); refreshStudio(); } };
     actions.spells = [this] { if (prepareCreatorChange()) { Noggit::Creator::openSpellLibrary(this); refreshStudio(); } };
+    actions.talents = [this] { if (prepareCreatorChange()) Noggit::Creator::openTalentEditor(this); };
     actions.testAtNpc = [this] { studioTestAtNpc(); };
     actions.testAtSpot = [this]
     {
@@ -19310,6 +19311,7 @@ void MapView::ShowContextMenu(QPoint pos)
       create->addAction("GameObject",this,[this] { creatorGameObject(); });
       create->addAction("Item…",this,[this] { if(prepareCreatorChange()) Noggit::Creator::createItem(this); });
       create->addAction("Spell…",this,[this] { if(prepareCreatorChange()) Noggit::Creator::createSpell(this); });
+      create->addAction("Talent Trees…",this,[this] { if(prepareCreatorChange()) Noggit::Creator::openTalentEditor(this); });
       if(_selected_creature_spawn_guid) menu.addAction("Edit Patrol",this,[this] { editCreatorPatrol(); });
       if(auto const* spawn=_selected_creature_spawn_guid?_world->findCreatureSpawn(*_selected_creature_spawn_guid):nullptr) {
         auto entry=spawn->entry;

@@ -616,6 +616,8 @@ std::optional<Id> editSpell(QWidget* parent, Id spell) {
   if (!spell) return std::nullopt;
   try { return run(parent, SpellService::load(spell)); } catch (std::exception const& e) { QMessageBox::warning(parent, "Spell", e.what()); return std::nullopt; }
 }
+QString spellTooltipText(SpellDesign const& d) { return filled(d); }
+std::optional<Id> pickSpellIcon(QWidget* parent, Id current) { return pickIcon(parent, current); }
 std::optional<Id> pickSpell(QWidget* parent, QString const& title, Id current) {
   QDialog dialog(parent); dialog.setWindowTitle(title); dialog.resize(760, 620);
   auto layout = new QVBoxLayout(&dialog);

@@ -122,7 +122,7 @@ void addLocalChangesPanel(QMainWindow* window) {
   auto clientStatus = new QLabel(panel); clientStatus->setWordWrap(true); clientStatus->setStyleSheet("color: gray;");
   auto updateClient = new QPushButton("Update Test Client", panel), restoreClient = new QPushButton("Restore Original", panel);
   auto exportClient = new QPushButton("Export Client Patch…", panel);
-  updateClient->setToolTip("Put your spells into the local test client now (Test Locally does this too)");
+  updateClient->setToolTip("Put your spells and talent trees into the local test client now (Test Locally does this too)");
   restoreClient->setToolTip("Put the client's own files back (Play Production does this too)");
   exportClient->setToolTip("Save the client patch with your spells, e.g. to hand to production players");
   auto clientRow = new QHBoxLayout; clientRow->addWidget(updateClient); clientRow->addWidget(restoreClient); clientRow->addWidget(exportClient);
@@ -136,18 +136,21 @@ void addLocalChangesPanel(QMainWindow* window) {
     for (auto const& c : status.pending) new QListWidgetItem(c.summary() + (c.kind == ClientDataChange::Kind::Remove ? "  (removed)" : "  (not in the test client yet)"), clientList);
     for (auto const& label : status.installedSpells) if (std::none_of(status.pending.begin(), status.pending.end(), [&](auto const& c) { return c.label == label; }))
       new QListWidgetItem("✓ Spell.dbc: " + label, clientList);
+    for (auto const& table : status.installedTables) if (std::none_of(status.pending.begin(), status.pending.end(), [&](auto const& c) { return table.startsWith(c.file + ":"); }))
+      new QListWidgetItem("✓ " + table, clientList);
     clientList->setVisible(clientList->count() > 0);
     QStringList lines;
     if (!status.problem.isEmpty()) lines << status.problem;
-    else if (clientList->count() == 0) lines << "No client data changes. Spells you make are added to the test client's Spell.dbc.";
+    else if (clientList->count() == 0) lines << "No client data changes. Spells you make are added to the test client's Spell.dbc, edited talent trees to its Talent.dbc.";
     if (status.installed) lines << "Creator's test patch is in " + QDir::toNativeSeparators(status.patch) + ".";
     if (!status.backup.isEmpty()) lines << "The client's own " + QFileInfo(status.backup).fileName() + " is backed up in " + QDir::toNativeSeparators(QFileInfo(status.backup).absolutePath())
                                           + " and kept inside Creator's patch; it is put back before playing on production.";
-    lines << "Sync to Production does not send client data.";
+    lines << "Sync to Production does not send client data" + QString(status.installedTables.isEmpty() && std::none_of(status.pending.begin(), status.pending.end(), [](auto const& c) { return c.file != "Spell.dbc"; })
+                                                                      ? "." : " or talent trees (production needs the server's Talent.dbc too: Talent Editor → Export Server Table).");
     clientStatus->setText(lines.join('\n'));
     updateClient->setEnabled(status.problem.isEmpty() && !status.pending.isEmpty());
     restoreClient->setEnabled(status.installed);
-    exportClient->setEnabled(status.problem.isEmpty() && !(status.installedSpells.isEmpty() && status.pending.isEmpty()));
+    exportClient->setEnabled(status.problem.isEmpty() && !(status.installedSpells.isEmpty() && status.installedTables.isEmpty() && status.pending.isEmpty()));
   };
   auto clientAction = [=](auto action) {
     try { action(); } catch (std::exception const& e) { QMessageBox::warning(panel, "Client data", e.what()); }

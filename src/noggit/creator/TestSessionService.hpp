@@ -15,6 +15,7 @@ struct TestOptions {
   bool developer = false; // lets the local account use developer commands such as .respawn
   QVector<QPair<Id, int>> items; // put in the test character's backpack: (item, count)
   QVector<Id> spells;            // taught to the test character
+  QVector<Id> unlearn;           // taken from the test character (talent spells: its talent points come back)
 };
 class TestSessionService final : public QObject {
   Q_OBJECT

@@ -1,6 +1,7 @@
 #include "TestSessionService.hpp"
 #include "Database.hpp"
 #include "SpellService.hpp"
+#include "TalentService.hpp"
 #include "AccountDialog.hpp"
 #include <noggit/runtime/RuntimeManager.hpp>
 #include <noggit/runtime/ClientManager.hpp>
@@ -65,6 +66,8 @@ void TestSessionService::begin(QWidget* parent,Target target,Id id,Position posi
 void TestSessionService::prepareRequest() {
   // Save callbacks belong to the world/editor. They run synchronously before any restart.
   require(_runtime->saveForTest(),"Local test cancelled because pending NPC changes could not be saved.");
+  // Edited talent trees: the world server reads Talent.dbc when it starts, so it goes in before the restart.
+  if(auto* talents=TalentStore::instance())if(!talents->serverCurrent())talents->installServer();
   if(_target==None || _target==CharacterTarget) {
     // Launches without a teleport must not replay an interrupted location test.
     auto path=_runtime->root()+"/Workspace/creator-test.request";
@@ -152,7 +155,7 @@ Fields TestSessionService::chooseCharacter() {
 // startup, so items written now never clash with ones it makes later. Local character database only.
 void TestSessionService::grant() { if(_character) grantTo(_character,_options); }
 void TestSessionService::grantTo(Id character,TestOptions const& _options) {
-  if(_options.items.isEmpty()&&_options.spells.isEmpty())return;
+  if(_options.items.isEmpty()&&_options.spells.isEmpty()&&_options.unlearn.isEmpty())return;
   for(auto spell:_options.spells)
     require(spell>0&&spell<=SpellService::idLimit,"The test spell ID must be between 1 and 65535. Clone older incompatible spells before testing.");
   Database db;
@@ -162,6 +165,11 @@ void TestSessionService::grantTo(Id character,TestOptions const& _options) {
   for(auto const& r:db.query("SELECT slot FROM characters.character_inventory WHERE guid="+guid+" AND bag=0"))taken.insert(r["slot"].toInt());
   auto next=db.query("SELECT COALESCE(MAX(guid),0)+100 AS g FROM characters.item_instance")[0]["g"].toUInt();
   QStringList statements; // Validate every item and reserve all slots before writing any rows.
+  if(!_options.unlearn.isEmpty()) {
+    // The server counts spent talent points from the talent spells a character knows: removing them refunds the points.
+    QStringList ids;for(auto spell:_options.unlearn)ids<<QString::number(spell);
+    statements.push_back("DELETE FROM characters.character_spell WHERE guid="+guid+" AND spell IN ("+ids.join(',')+")");
+  }
   int slot=23; // the backpack's 16 slots are 23..38
   for(auto const& wanted:_options.items) {
     auto item=wanted.first;auto count=wanted.second;

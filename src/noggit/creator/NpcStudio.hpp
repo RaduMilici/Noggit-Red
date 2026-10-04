@@ -16,7 +16,7 @@ public:
     std::function<void()> newHumanoid, newCreature, clone, edit, place, quests, chain, testAtNpc, testAtSpot;
     std::function<void()> duplicatePlacement, deletePlacement, locatePlacement, patrol;
     std::function<void()> loot, vendor, trainer, dialogue;
-    std::function<void()> items, spells;
+    std::function<void()> items, spells, talents;
   };
   struct Npc {
     Id entry = 0;

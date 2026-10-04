@@ -1,5 +1,6 @@
 #include "ClientPatch.hpp"
 #include "Database.hpp"
+#include "TalentService.hpp"
 #include <noggit/runtime/RuntimeManager.hpp>
 #include <StormLib.h>
 #include <QCryptographicHash>
@@ -67,7 +68,7 @@ QVector<Fields> creatorSpells() {
 }
 }
 QString ClientDataChange::summary() const {
-  return QString(kind == Kind::Add ? "+" : kind == Kind::Remove ? "-" : "~") + " Spell.dbc: " + label;
+  return QString(kind == Kind::Add ? "+" : kind == Kind::Remove ? "-" : "~") + " " + file + ": " + label;
 }
 ClientPatchService* ClientPatchService::instance() {
   auto runtime = Runtime::RuntimeManager::instance();
@@ -96,6 +97,17 @@ QStringList ClientPatchService::archives(QString const& data) {
   for (char c = 'A'; c <= 'Z'; ++c) names << QString("patch-%1.MPQ").arg(c);
   QStringList out;
   for (auto const& name : names) if (auto path = findFile(data, name); !path.isEmpty()) out << path;
+  return out;
+}
+QVector<ClientTable> ClientPatchService::creatorTables() {
+  QVector<ClientTable> out;
+  auto* talents = TalentStore::instance();
+  if (!talents || talents->modifiedTabs().isEmpty()) return out;
+  out.push_back({"Talent.dbc", talents->changeLabel(), talents->changeHash(), [talents](QByteArray const& base) {
+    auto table = talents->clientTable(base);
+    require(table.has_value(), "No talent trees are edited.");
+    return *table;
+  }});
   return out;
 }
 QByteArray ClientPatchService::spellTable(QByteArray const& base, QVector<Fields> const& spells) {
@@ -184,7 +196,7 @@ std::optional<Wdbc> ClientPatchService::table(QString const& file) const {
   auto data = dataFolder();
   return data.isEmpty() ? std::nullopt : table(data, file);
 }
-ClientDataStatus ClientPatchService::status(QString const& data, QVector<Fields> const& spells) const {
+ClientDataStatus ClientPatchService::status(QString const& data, QVector<Fields> const& spells, QVector<ClientTable> const& tables) const {
   ClientDataStatus s; s.data = data;
   if (data.isEmpty() || !QFileInfo(data).isDir()) { s.problem = "Choose the WoW client in Client Profiles to test spells locally."; return s; }
   auto state = loadState(_state, data);
@@ -206,19 +218,38 @@ ClientDataStatus ClientPatchService::status(QString const& data, QVector<Fields>
   }
   for (auto it = installed.begin(); it != installed.end(); ++it)
     if (!current.contains(it.key())) s.pending.push_back({ClientDataChange::Kind::Remove, it.key().toUInt(), it.value().toObject()["label"].toString()});
+  auto installedTables = s.installed ? state.json["tables"].toObject() : QJsonObject();
+  for (auto it = installedTables.begin(); it != installedTables.end(); ++it) s.installedTables << it.key() + ": " + it.value().toObject()["label"].toString();
+  for (auto const& table : tables) {
+    auto was = installedTables[table.file].toObject();
+    if (was.isEmpty()) s.pending.push_back({ClientDataChange::Kind::Add, 0, table.label, table.file});
+    else if (was["hash"].toString() != table.hash) s.pending.push_back({ClientDataChange::Kind::Change, 0, table.label, table.file});
+  }
+  for (auto it = installedTables.begin(); it != installedTables.end(); ++it)
+    if (std::none_of(tables.begin(), tables.end(), [&](auto const& t) { return t.file == it.key(); }))
+      s.pending.push_back({ClientDataChange::Kind::Remove, 0, it.value().toObject()["label"].toString(), it.key()});
   return s;
 }
 ClientDataStatus ClientPatchService::status() const {
   QVector<Fields> spells;
-  try { spells = creatorSpells(); } catch (std::exception const& e) { auto s = status(dataFolder(), {}); s.problem = QString::fromUtf8(e.what()); return s; }
-  return status(dataFolder(), spells);
+  QVector<ClientTable> tables;
+  try { spells = creatorSpells(); tables = creatorTables(); } catch (std::exception const& e) { auto s = status(dataFolder(), {}); s.problem = QString::fromUtf8(e.what()); return s; }
+  return status(dataFolder(), spells, tables);
 }
-QByteArray ClientPatchService::build(QString const& data, QVector<Fields> const& spells, QString const& output) const {
+QByteArray ClientPatchService::build(QString const& data, QVector<Fields> const& spells, QVector<ClientTable> const& tables, QString const& output) const {
   auto state = loadState(_state, data);
   auto sources = originalArchives(data, state);
   auto base = effective(sources, spellFile);
   require(base.has_value(), "The client has no Spell.dbc.");
   auto table = spellTable(*base, spells);
+  QVector<QPair<QByteArray, QByteArray>> generated{{spellFile.toLatin1(), table}};
+  for (auto const& extra : tables) {
+    auto name = "DBFilesClient\\" + extra.file;
+    auto own = effective(sources, name);
+    require(own.has_value(), "The client has no " + extra.file + ".");
+    generated.push_back({name.toLatin1(), extra.build(*own)});
+  }
+  auto ours = [&](QByteArray const& name) { return std::any_of(generated.begin(), generated.end(), [&](auto const& g) { return name.compare(g.first, Qt::CaseInsensitive) == 0; }); };
   // The client's own patch-Z, whose files Creator's version keeps.
   auto own = originalPatch(data, state);
   std::unique_ptr<Archive> original = own.isEmpty() ? nullptr : std::make_unique<Archive>(own);
@@ -229,7 +260,7 @@ QByteArray ClientPatchService::build(QString const& data, QVector<Fields> const&
     if (search) {
       do {
         QByteArray name(found.cFileName);
-        if (name.startsWith('(') || name.compare(spellFile.toLatin1(), Qt::CaseInsensitive) == 0) continue;
+        if (name.startsWith('(') || ours(name)) continue;
         auto bytes = original->read(QString::fromLatin1(name));
         require(bytes.has_value(), "Cannot read " + QString::fromLatin1(name) + " from the client's own " + patchName + ".");
         files.push_back({name, *bytes});
@@ -238,7 +269,7 @@ QByteArray ClientPatchService::build(QString const& data, QVector<Fields> const&
     }
     require(!files.isEmpty() || original->read(spellFile), "The client's own " + patchName + " has no file list, so Creator cannot keep its files. Rebuild it with a (listfile).");
   }
-  files.push_back({spellFile.toLatin1(), table});
+  files += generated;
   QFile::remove(output);
   HANDLE archive = nullptr;
   require(SFileCreateArchive(native(output).constData(), MPQ_CREATE_LISTFILE, DWORD(files.size() + 16), &archive), "Cannot create the test client patch.");
@@ -252,9 +283,9 @@ QByteArray ClientPatchService::build(QString const& data, QVector<Fields> const&
   if (!ok) { QFile::remove(output); throw std::runtime_error("Cannot write the test client patch."); }
   return table;
 }
-void ClientPatchService::install(QString const& data, QVector<Fields> const& spells) {
+void ClientPatchService::install(QString const& data, QVector<Fields> const& spells, QVector<ClientTable> const& tables) {
   require(!data.isEmpty() && QFileInfo(data).isDir(), "Choose the WoW client in Client Profiles first.");
-  if (spells.isEmpty()) { restoreOriginal(data); return; }
+  if (spells.isEmpty() && tables.isEmpty()) { restoreOriginal(data); return; }
   auto state = loadState(_state, data);
   auto patch = findFile(data, patchName);
   bool ours = !patch.isEmpty() && !state.installed().isEmpty() && sha(patch) == state.installed();
@@ -277,19 +308,20 @@ void ClientPatchService::install(QString const& data, QVector<Fields> const& spe
     patch = data + "/" + patchName;
   }
   auto fresh = patch + ".creator-new";
-  build(data, spells, fresh);
+  build(data, spells, tables, fresh);
   replace(fresh, patch);
-  QJsonObject installed;
+  QJsonObject installed, installedTables;
+  for (auto const& table : tables) installedTables[table.file] = QJsonObject{{"hash", table.hash}, {"label", table.label}};
   for (auto const& spell : spells) installed[spell.value("entry").toString()] = QJsonObject{{"hash", recordHash(spell)}, {"label", spellLabel(spell)}};
   state = loadState(_state, data);
-  state.json["installed"] = sha(patch); state.json["spells"] = installed; state.json["data"] = data;
+  state.json["installed"] = sha(patch); state.json["spells"] = installed; state.json["tables"] = installedTables; state.json["data"] = data;
   state.json["updated"] = QDateTime::currentDateTimeUtc().toString(Qt::ISODate);
   saveState(_state, data, state);
   emit changed();
 }
 void ClientPatchService::install() {
   auto data = dataFolder();
-  install(data, creatorSpells());
+  install(data, creatorSpells(), creatorTables());
 }
 void ClientPatchService::restoreOriginal(QString const& data) {
   if (data.isEmpty()) return;
@@ -306,7 +338,7 @@ void ClientPatchService::restoreOriginal(QString const& data) {
     } else require(QFile::remove(patch), "Cannot remove Creator's test patch from the client.");
   }
   if (!state.installed().isEmpty() || state.json.contains("spells")) {
-    state.json["installed"] = QString(); state.json.remove("spells");
+    state.json["installed"] = QString(); state.json.remove("spells"); state.json.remove("tables");
     saveState(_state, data, state);
     emit changed();
   }
@@ -315,8 +347,8 @@ void ClientPatchService::restoreOriginal() { restoreOriginal(dataFolder()); }
 void ClientPatchService::exportPatch(QString const& path) {
   auto data = dataFolder();
   require(!data.isEmpty(), "Choose the WoW client in Client Profiles first.");
-  auto spells = creatorSpells();
-  require(!spells.isEmpty(), "There are no Creator spells to export.");
-  build(data, spells, path);
+  auto spells = creatorSpells(); auto tables = creatorTables();
+  require(!spells.isEmpty() || !tables.isEmpty(), "There are no Creator spells or talent trees to export.");
+  build(data, spells, tables, path);
 }
 }

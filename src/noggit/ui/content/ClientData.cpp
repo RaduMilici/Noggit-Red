@@ -165,6 +165,21 @@ namespace Noggit::Ui::Content::ClientData
     return cache[icon] = result;
   }
 
+  QPixmap texture(QString const& path, int width, int height)
+  {
+    try
+    {
+      if (QPixmap* pixmap = BLPRenderer::getInstance().render_blp_to_pixmap(path.toStdString(), width, height))
+      {
+        return *pixmap;
+      }
+    }
+    catch (...)
+    {
+    }
+    return {};
+  }
+
   QString creatureModelName(std::uint32_t display)
   {
     try
