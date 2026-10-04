@@ -99,11 +99,12 @@ QVector<RowProblem> LootService::check(LootTable const& t, QSet<Id> const& exist
     auto key = n(r.item) + (t.owner.kind == LootOwner::Kind::Npc ? "/" + n(r.group) : QString());
     if (seen.contains(key)) add(i, "This item is already in the loot" + QString(t.owner.kind == LootOwner::Kind::Npc && r.group ? " in this group." : "."));
     else seen[key] = i;
-    if (!r.reference && r.group > 0 && !r.quest()) { if (r.chance > 0) explicitSum[r.group] += r.chance; else if (r.chance == 0) ++equalCount[r.group]; }
+    // Quest drops compete in their group like the server's, at their absolute chance.
+    if (!r.reference && r.group > 0) { if (r.chance != 0) explicitSum[r.group] += std::abs(r.chance); else ++equalCount[r.group]; }
   }
   for (int i = 0; i < t.rows.size(); ++i) {
     auto const& r = t.rows[i];
-    if (r.reference || r.group <= 0 || r.quest()) continue;
+    if (r.reference || r.group <= 0) continue;
     auto sum = explicitSum.value(r.group);
     if (sum > 100.0001) add(i, QString("Group %1's chances add up to %2%; at most 100% can drop.").arg(r.group).arg(sum, 0, 'g', 4));
     else if (r.chance == 0 && sum >= 99.9999) add(i, QString("Group %1's other items already use 100%, so this one never drops.").arg(r.group));

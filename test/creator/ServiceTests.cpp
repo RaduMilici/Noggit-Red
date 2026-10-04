@@ -100,6 +100,13 @@ void lootServerCompatibility() {
   result = LootService::simulate(t, {}, 10, 42);
   check(drops(1) == 10 && drops(2) == 0, "Quest drops must compete in their loot group");
   check(LootService::expectedChance(t.rows, 1) == 0, "Quest drop omitted from expected group chance");
+  check(has(LootService::check(t, {1, 2}, {}), 1, "never drops"), "Guaranteed quest drop not counted against its group");
+  t.rows = {row(1, -100, 1), row(2, 60, 1)};
+  check(has(LootService::check(t, {1, 2}, {}), 0, "add up to 160"), "Quest drop omitted from group chance total");
+  t.rows = {row(1, -40, 1), row(2, 60, 1)};
+  check(LootService::check(t, {1, 2}, {}).isEmpty(), "Quest drop within the group's 100% wrongly rejected");
+  t.rows = {row(1, -100), row(2, 100)};
+  check(LootService::check(t, {1, 2}, {}).isEmpty(), "Ungrouped quest drop wrongly counted in a group");
 }
 void vendorChecks() {
   Vendor v; v.sells = true;
