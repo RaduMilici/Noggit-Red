@@ -654,6 +654,12 @@ void testSpell(QWidget* parent, Id spell) {
     for (auto const& r : ranks) { if (r.entry == spell) break; earlier << r.entry; }
   } catch (...) {}
   auto spells = earlier; spells << spell;
+  for (auto id : spells) {
+    if (id <= SpellService::idLimit) continue;
+    QMessageBox::warning(parent, "Test Spell", "This spell or an earlier rank was created with an ID above 65535, which the 1.12 client cannot use in its spellbook. "
+                         "Use Clone Existing Spell to save a new copy with a compatible ID, then test that copy. Recreate any later ranks from the new copy.");
+    return;
+  }
   QDialog options(parent); options.setWindowTitle("Test Spell");
   auto layout = new QVBoxLayout(&options);
   auto text = new QLabel("Your local test character learns <b>" + (d.name + " " + d.rank).toHtmlEscaped() + "</b>"

@@ -317,6 +317,8 @@ QVector<SpellProblem> SpellService::check(SpellDesign const& d, SpellFacts const
   auto add = [&](int effect, QString const& text, bool error = true) { p.push_back({effect, text, error}); };
   if (d.name.trimmed().isEmpty()) add(-1, "Name the spell.");
   else if (d.name.size() > 100) add(-1, "Keep the name under 100 characters.");
+  if (d.entry > idLimit) add(-1, "This spell ID exceeds the client's limit of 65535. Clone the spell to create a compatible copy.");
+  if (d.previous > idLimit) add(-1, "The previous rank exceeds the client's spell ID limit of 65535. Clone that rank first.");
   if (d.level < 0 || d.level > 60) add(-1, "The level is 0 (none) to 60.");
   if (d.maxLevel && d.maxLevel < d.level) add(-1, "The maximum level is below the spell's level.");
   if (d.cost < 0 || d.costPercent < 0 || d.costPercent > 100) add(-1, "The cost cannot be negative; a percentage is 0 to 100.");

@@ -166,7 +166,9 @@ void addLocalChangesPanel(QMainWindow* window) {
     auto* service = ClientPatchService::instance();
     if (!service) return;
     if (profile == Runtime::ClientManager::Profile::PlayProduction) { service->restoreOriginal(); return; }
-    if (!service->status().pending.isEmpty()) service->install();
+    auto status = service->status();
+    if (!status.problem.isEmpty()) throw std::runtime_error(status.problem.toStdString());
+    if (!status.pending.isEmpty()) service->install();
   };
   auto refresh = [=] {
     auto const& changes = tracker->changes();

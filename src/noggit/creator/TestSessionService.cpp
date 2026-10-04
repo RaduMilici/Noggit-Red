@@ -1,5 +1,6 @@
 #include "TestSessionService.hpp"
 #include "Database.hpp"
+#include "SpellService.hpp"
 #include "AccountDialog.hpp"
 #include <noggit/runtime/RuntimeManager.hpp>
 #include <noggit/runtime/ClientManager.hpp>
@@ -64,10 +65,12 @@ void TestSessionService::begin(QWidget* parent,Target target,Id id,Position posi
 void TestSessionService::prepareRequest() {
   // Save callbacks belong to the world/editor. They run synchronously before any restart.
   require(_runtime->saveForTest(),"Local test cancelled because pending NPC changes could not be saved.");
-  if(_target==None) {
-    // A plain local launch must not replay a request left by an interrupted session.
+  if(_target==None || _target==CharacterTarget) {
+    // Launches without a teleport must not replay an interrupted location test.
     auto path=_runtime->root()+"/Workspace/creator-test.request";
     require(!QFileInfo::exists(path)||QFile::remove(path),"Cannot clear the previous local test request.");
+  }
+  if(_target==None) {
     // A fresh installation has no login; offer one before launching WoW.
     if(AccountService::list().isEmpty())
       require(!createLocalAccount(_parent).isEmpty(),"Local test cancelled. Create a local account to log in to WoW.");
@@ -150,6 +153,8 @@ Fields TestSessionService::chooseCharacter() {
 void TestSessionService::grant() { if(_character) grantTo(_character,_options); }
 void TestSessionService::grantTo(Id character,TestOptions const& _options) {
   if(_options.items.isEmpty()&&_options.spells.isEmpty())return;
+  for(auto spell:_options.spells)
+    require(spell>0&&spell<=SpellService::idLimit,"The test spell ID must be between 1 and 65535. Clone older incompatible spells before testing.");
   Database db;
   auto guid=QString::number(character);
   require(db.query("SELECT online FROM characters.characters WHERE guid="+guid+" AND online=0").size()==1,"The test character is still online; log out and try again.");
@@ -176,7 +181,7 @@ void TestSessionService::grantTo(Id character,TestOptions const& _options) {
     }
   }
   for(auto spell:_options.spells)
-    db.exec("INSERT IGNORE INTO characters.character_spell (guid,spell,active,disabled) VALUES ("+guid+","+QString::number(spell)+",1,0)");
+    db.exec("INSERT INTO characters.character_spell (guid,spell,active,disabled) VALUES ("+guid+","+QString::number(spell)+",1,0) ON DUPLICATE KEY UPDATE active=1,disabled=0");
   db.commit();
 }
 void TestSessionService::tick() {

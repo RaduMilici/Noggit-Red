@@ -234,8 +234,10 @@ void runChecks() {
     auto heal=SpellService::blank(); SpellCatalog::apply(SpellCatalog::Template::Heal,heal,0);
     heal.name="Creator test: Mending"; heal.rank="Rank 1"; heal.level=10; heal.teachable=true;
     auto healId=SpellService::save(heal);
+    check(healId>0&&healId<=65535&&SpellService::load(healId).teach<=65535,"Spell and teaching IDs must fit the client spellbook protocol");
     check(SpellService::load(healId).teachable&&!TrainerService::search("Creator test: Mending").isEmpty(),"A teachable spell is not offered to trainers");
     auto nextId=SpellService::save(SpellService::nextRank(healId,16,1.5,100,0));
+    check(nextId>0&&nextId<=65535,"Next rank ID must fit the client spellbook protocol");
     check(SpellService::chain(nextId).size()==2&&SpellService::load(nextId).previous==healId,"The next rank is not chained");
     auto potion=ItemDesignService::blank(ItemDesignService::Template::Consumable); potion.name="Creator test: Draught"; potion.spells[0].spell=healId;
     auto potionId=ItemDesignService::save(potion);

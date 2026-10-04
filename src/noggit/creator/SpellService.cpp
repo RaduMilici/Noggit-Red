@@ -10,6 +10,14 @@ QString n(qint64 value) { return QString::number(value); }
 void require(bool condition, QString const& message) { if (!condition) throw std::runtime_error(message.toStdString()); }
 constexpr int learnEffect = 36;
 constexpr Id teachTemplate = 483; // Fireball (Rank 2)'s teaching spell: how trainers teach a class spell
+// Spell IDs have a tighter limit than other Creator content. Ignore old, incompatible
+// IDs above the wire limit when finding the next ID; never overwrite an existing spell.
+Id allocateSpell(Database& db) {
+  auto rows = db.query("SELECT COALESCE(MAX(entry),0) AS maximum FROM spell_template WHERE entry<=" + n(SpellService::idLimit));
+  auto next = rows[0]["maximum"].toUInt() + 1;
+  require(next <= SpellService::idLimit, "No spell IDs remain in the 1.12 client's supported range (1–65535).");
+  return next;
+}
 QString owned(QString const& column) { return column + " IN (SELECT entry FROM creator_content WHERE kind='spell')"; }
 Fields row(Database& db, Id entry) {
   auto rows = db.query("SELECT * FROM spell_template WHERE entry=" + n(entry));
@@ -207,7 +215,7 @@ Id SpellService::save(SpellDesign const& d) {
   Database db;
   Id entry = d.entry;
   if (entry) require(db.owned("spell", entry), "Game spells are read-only here. Clone it, or create its next rank, to make your own.");
-  else entry = db.allocate("spell_template", "entry", idLimit);
+  else entry = allocateSpell(db);
   auto spell = toRow(d); spell["entry"] = n(entry);
   write(db, spell);
   relink(db, entry, d.previous);
@@ -221,7 +229,7 @@ Id SpellService::save(SpellDesign const& d) {
       if (templates.isEmpty()) templates = db.query("SELECT * FROM spell_template WHERE effect1=" + n(learnEffect) + " AND effectImplicitTargetA1=1 AND attributes=256 LIMIT 1");
       require(!templates.isEmpty(), "No teaching spell to copy was found, so trainers cannot teach this spell.");
       lesson = templates[0];
-      lesson["entry"] = n(db.allocate("spell_template", "entry", idLimit));
+      lesson["entry"] = n(allocateSpell(db));
       lesson["script_name"] = "";
     }
     lesson["name"] = spell["name"]; lesson["nameSubtext"] = spell["nameSubtext"];

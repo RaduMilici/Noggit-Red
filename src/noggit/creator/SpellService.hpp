@@ -52,7 +52,7 @@ struct SpellFacts {
 // Only Creator spells can be changed; game spells can be cloned or get a next rank.
 class SpellService {
 public:
-  static constexpr Id idLimit = 8388607; // spell_chain stores spells as signed mediumint
+  static constexpr Id idLimit = 65535; // The 1.12 spellbook protocol transmits spell IDs as uint16
   static QVector<Choice> search(QString const& text, bool own = false, int limit = 400); // detail: rank and school
   static QVector<SpellListEntry> browse(QString const& text, bool own = false, int limit = 400);
   static QVector<Choice> quests(QString const& text); // for "complete a quest" effects
