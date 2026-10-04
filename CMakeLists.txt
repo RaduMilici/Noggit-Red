@@ -121,7 +121,7 @@ SET(NOGGIT_MYSQL_SEARCH_ROOTS
 )
 
 IF(USE_SQL)
-  FIND_LIBRARY(MYSQL_LIBRARY NAMES libmysql mariadb libmariadb
+  FIND_LIBRARY(MYSQL_LIBRARY NAMES libmysql mysqlclient mariadb libmariadb
               HINTS ${NOGGIT_MYSQL_SEARCH_ROOTS}
               PATH_SUFFIXES lib lib/x64_release windows/lib/x64_release)
   FIND_FILE(MYSQL_RUNTIME_LIBRARY NAMES libmysql.dll libmySQL.dll
