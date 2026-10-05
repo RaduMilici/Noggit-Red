@@ -1,0 +1,48 @@
+# Runs after all Creator files and Qt plugins have been staged.
+set(root "${CMAKE_INSTALL_PREFIX}")
+set(suffix "@CMAKE_EXECUTABLE_SUFFIX@")
+set(executables "${root}/Noggit/noggit${suffix}"
+    "${root}/Runtime/realmd/realmd${suffix}" "${root}/Runtime/mangosd/mangosd${suffix}"
+    "${root}/Runtime/MariaDB/bin/mariadbd${suffix}" "${root}/Runtime/MariaDB/bin/mariadb${suffix}")
+file(GLOB_RECURSE plugins "${root}/Noggit/plugins/*.so" "${root}/Noggit/*.dll")
+if("@CMAKE_SYSTEM_NAME@" STREQUAL "Windows")
+  set(CMAKE_GET_RUNTIME_DEPENDENCIES_PLATFORM windows+pe)
+  set(CMAKE_GET_RUNTIME_DEPENDENCIES_TOOL dumpbin)
+  set(CMAKE_GET_RUNTIME_DEPENDENCIES_COMMAND "@CREATOR_DUMPBIN@")
+  set(pre_exclude "api-ms-.*" "ext-ms-.*")
+  set(post_exclude "[Ww][Ii][Nn][Dd][Oo][Ww][Ss][/\\\\][Ss][Yy][Ss][Tt][Ee][Mm]32")
+else()
+  set(pre_exclude "ld-linux.*" "lib(c|m|pthread|dl|rt|resolv)\\.so.*")
+  set(post_exclude "ld-linux.*")
+endif()
+file(GET_RUNTIME_DEPENDENCIES EXECUTABLES ${executables} MODULES ${plugins}
+    DIRECTORIES "${root}/Runtime/lib" "${root}/Runtime/MariaDB/lib"
+      "${root}/Runtime/realmd" "${root}/Runtime/mangosd" "@_qt_bin_dir@" "@CREATOR_QT_LIBS@"
+    PRE_EXCLUDE_REGEXES ${pre_exclude} POST_EXCLUDE_REGEXES ${post_exclude}
+    RESOLVED_DEPENDENCIES_VAR resolved UNRESOLVED_DEPENDENCIES_VAR unresolved
+    CONFLICTING_DEPENDENCIES_PREFIX conflicts)
+if(unresolved)
+  message(FATAL_ERROR "Creator dependencies are incomplete: ${unresolved}")
+endif()
+foreach(name IN LISTS conflicts_FILENAMES)
+  set(expected "")
+  foreach(candidate IN LISTS conflicts_${name})
+    file(SHA256 "${candidate}" digest)
+    if(expected AND NOT digest STREQUAL expected)
+      message(FATAL_ERROR "Creator contains incompatible versions of ${name}: ${conflicts_${name}}")
+    endif()
+    set(expected "${digest}")
+  endforeach()
+  list(GET conflicts_${name} 0 candidate)
+  list(APPEND resolved "${candidate}")
+endforeach()
+foreach(library IN LISTS resolved)
+  if("@CMAKE_SYSTEM_NAME@" STREQUAL "Windows")
+    # Each Windows process resolves DLLs beside its own executable.
+    foreach(destination Noggit Runtime/realmd Runtime/mangosd Runtime/MariaDB/bin)
+      file(INSTALL "${library}" DESTINATION "${root}/${destination}" TYPE SHARED_LIBRARY)
+    endforeach()
+  else()
+    file(INSTALL "${library}" DESTINATION "${root}/Runtime/lib" TYPE SHARED_LIBRARY FOLLOW_SYMLINK_CHAIN)
+  endif()
+endforeach()

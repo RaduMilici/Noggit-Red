@@ -752,6 +752,9 @@ public:
     std::vector<std::pair<std::size_t, std::string>> texture_overrides;
   };
   std::vector<CreaturePreviewAttachment> resolveCreaturePreviewAttachments(CreatureSpawnOverlay const& spawn);
+  // The standalone models of an item look (weapons, shields, held items, helms, shoulders), with their
+  // textures, for item previews. Empty for items only drawn as body textures (chests, gloves, ...).
+  static std::vector<CreaturePreviewAttachment> resolveItemDisplayModels(std::uint32_t item_display, std::uint32_t inventory_type);
 
   // Wander-distance visualization (creature editor): while the wander_distance field is focused,
   // WorldRender draws a ground ring of this radius (yards) at this center. nullopt = off.

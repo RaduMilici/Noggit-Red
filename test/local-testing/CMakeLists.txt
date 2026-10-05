@@ -1,0 +1,17 @@
+cmake_minimum_required(VERSION 3.16)
+project(CreatorLocalTesting LANGUAGES CXX)
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_AUTOMOC ON)
+find_package(Qt5 REQUIRED COMPONENTS Core Widgets Network)
+enable_testing()
+add_executable(protocol_tests ProtocolTests.cpp)
+add_test(NAME protocol_tests COMMAND protocol_tests)
+find_path(MYSQL_INCLUDE_DIR mysql.h PATH_SUFFIXES mysql mariadb REQUIRED)
+find_library(MYSQL_LIBRARY NAMES mysqlclient mariadb REQUIRED)
+# Client profiles create local accounts through the Creator database services.
+add_executable(client_tests ClientTests.cpp ../../src/noggit/runtime/ClientManager.cpp ../../src/noggit/runtime/RuntimeManager.cpp
+  ../../src/noggit/creator/Services.cpp ../../src/noggit/creator/GossipService.cpp ../../src/noggit/creator/Database.cpp ../../src/noggit/creator/SqlConnection.cpp ../../src/noggit/creator/ChangeTracker.cpp ../../src/noggit/creator/AccountDialog.cpp)
+target_include_directories(client_tests PRIVATE ../../src ${MYSQL_INCLUDE_DIR})
+target_compile_definitions(client_tests PRIVATE USE_MYSQL_UID_STORAGE)
+target_link_libraries(client_tests PRIVATE Qt5::Core Qt5::Widgets Qt5::Network ${MYSQL_LIBRARY})
+add_test(NAME client_tests COMMAND client_tests)

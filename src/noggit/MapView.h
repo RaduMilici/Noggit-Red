@@ -2,6 +2,8 @@
 
 #pragma once
 
+#include <QtCore/QSet>
+#include <functional>
 #include <math/ray.hpp>
 #include <noggit/Misc.h>
 #include <noggit/Selection.h>
@@ -60,6 +62,19 @@ class QToolBar;
 class QListWidgetItem;
 class QPushButton;
 class QTreeWidget;
+class QLabel;
+
+namespace Noggit::Ui::Content
+{
+  class ContentSession;
+}
+
+#include <noggit/creator/AuthoringDialogs.hpp>
+
+namespace Noggit::Creator
+{
+  class NpcStudio;
+}
 
 namespace Noggit::Ui::Windows
 {
@@ -158,6 +173,14 @@ private:
   glm::vec3 _cursor_pos;
   QPoint _drag_start_pos;
   QPoint _right_click_pos;
+  int _right_drag_travel = 0; // mouse travel while the right button is held: a turn, not a click
+  std::function<void(glm::vec3 const&)> _world_pick;
+  QLabel* _world_pick_hint = nullptr;
+  Noggit::Creator::NpcStudio* _npc_studio = nullptr;
+  std::optional<std::uint32_t> _studio_entry;
+  QString _studio_name;
+  QSet<std::uint32_t> _creator_npcs; // NPCs made in Noggit (refreshed on entering creature mode)
+  std::function<void(std::optional<std::uint32_t>)> _reload_creature_picker;
   float _cursorRotation;
   bool look, freelook;
   bool ui_hidden = false;
@@ -919,6 +942,40 @@ private:
   QString buildDirtyCreatureSpawnSql(bool rebase_state);
   QString buildDirtyGameObjectSpawnSql(bool rebase_state);
   void saveDirtyCreatureSpawns();
+  bool prepareCreatorChange();
+  void reloadCreatorContent(std::optional<std::uint32_t> select = std::nullopt);
+  // Quest browser (focused on an NPC's quests when given), and an NPC's quest chain diagram.
+  void openQuests(std::uint32_t focus_npc);
+  void openQuestChain(std::uint32_t npc);
+  std::unique_ptr<Noggit::Ui::Content::ContentSession> openContentSession();
+
+  // NPC Studio (creature mode, Creator runtime): the NPC card in the bottom panel and its actions.
+  void showStudioNpc(std::uint32_t entry, QString const& name);
+  void refreshStudio();
+  void creatorGameObject();
+  void reloadCreatorObjects();
+  void editCreatorPatrol();
+  bool editCreatorDialogue(std::uint32_t entry);
+  void refreshCreatorPatrol();
+  QPoint patrolScreen(int index) const;
+  Noggit::Creator::Patrol _creator_patrol, _saved_creator_patrol;
+  std::uint32_t _patrol_guid = 0;
+  QWidget* _patrol_overlay = nullptr;
+  QListWidget* _patrol_list = nullptr;
+  int _patrol_drag = -1;
+  bool _patrol_add = false;
+  bool _patrol_default_run = false;
+  int _patrol_insert = -1;
+  void studioCreate(Noggit::Creator::NpcKind kind);
+  void studioEdit();
+  void studioPlace(std::uint32_t entry);
+  void studioTestAtNpc();
+  void studioDuplicatePlacement();
+  void studioRemovePlacement();
+  Noggit::Creator::Position serverPosition(glm::vec3 const& position, float client_orientation) const;
+  // The next left click in the world picks a point (placing an NPC, testing at a spot); Esc cancels.
+  void beginWorldPick(QString const& hint, std::function<void(glm::vec3 const&)> done);
+  void endWorldPick();
   void jumpToCreatureListItem(QListWidgetItem* item);
   // Delete (Del) the selected creature spawn(s): marks them pending_delete (DELETE on SQL export,
   // hidden from view/browser) and records them so Ctrl+Z restores the most recent batch.

@@ -4519,6 +4519,28 @@ std::vector<World::CreaturePreviewAttachment> World::resolveCreaturePreviewAttac
   return out;
 }
 
+std::vector<World::CreaturePreviewAttachment> World::resolveItemDisplayModels(std::uint32_t item_display, std::uint32_t inventory_type)
+{
+  char const* component = nullptr;
+  switch (inventory_type)
+  {
+    case 1: component = "head"; break;
+    case 3: component = "shoulder"; break;
+    case 14: component = "shield"; break;
+    case 13: case 15: case 17: case 21: case 22: case 23: case 25: case 26: component = "weapon"; break;
+    default: return {};
+  }
+  std::vector<CreatureAttachmentModelSpec> specs;
+  // Helms ship per race and sex; a human male one stands in for the preview.
+  append_item_attachment_specs(specs, item_display, component, 0, inventory_type == 3 ? 1 : -1, 1, 0);
+  std::vector<CreaturePreviewAttachment> out;
+  for (auto& spec : specs)
+  {
+    out.push_back({spec.attachment_id, std::move(spec.model_path), std::move(spec.texture_overrides)});
+  }
+  return out;
+}
+
 std::vector<std::pair<std::size_t, std::string>> World::applyCreatureSpawnModelAppearance(CreatureSpawnOverlay const& spawn,
                                                                                          ModelInstance& model_instance,
                                                                                          Noggit::NoggitRenderContext context) const

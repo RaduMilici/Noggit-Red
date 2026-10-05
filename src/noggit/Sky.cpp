@@ -685,7 +685,8 @@ SkyParam::SkyParam(int paramId, Noggit::NoggitRenderContext context)
             // (the citadel vanished under the zone light) and never applied the flag-1 day mapping or
             // the flag-2 overlay rule.
             this->skybox_id = skybox_id;
-            skybox_flags = skybox_rec.getInt(LightSkyboxDB::flags);
+            // 1.12 LightSkybox.dbc has no flags column (ID and file name only)
+            skybox_flags = gLightSkyboxDB.getFieldCount() > LightSkyboxDB::flags ? skybox_rec.getInt(LightSkyboxDB::flags) : 0;
         }
     }
     catch (...)

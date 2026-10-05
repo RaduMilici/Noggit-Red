@@ -3,6 +3,11 @@ This software is open source software licensed under GPL3, as found in
 the COPYING file.
 
 # BUILDING #
+For a portable Creator package containing MariaDB, the realm/world servers and
+their runtime dependencies, use the [Windows and Ubuntu packaging instructions](etc/creator-test/PACKAGING.md).
+The ordinary editor build below does not assemble that package. Game-derived data
+can be added later; end users do not install a separate database or server.
+
 This project requires CMake to be built. 
 
 It also requires the

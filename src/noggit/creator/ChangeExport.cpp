@@ -1,0 +1,180 @@
+#include "ChangeExport.hpp"
+#include "Database.hpp"
+#include <noggit/runtime/RuntimeManager.hpp>
+#include <QCryptographicHash>
+#include <QDir>
+#include <QFile>
+#include <QFileInfo>
+#include <QDateTime>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QRegularExpression>
+#include <QSaveFile>
+#include <QPair>
+#include <QSet>
+#include <cstdlib>
+#include <stdexcept>
+namespace Noggit::Creator {
+namespace {
+void require(bool b, QString const& message) { if (!b) throw std::runtime_error(message.toStdString()); }
+void writeFile(QString const& path, QByteArray const& bytes) {
+  QSaveFile file(path);
+  require(file.open(QIODevice::WriteOnly) && file.write(bytes) == bytes.size() && file.commit(), "Cannot write the change package.");
+}
+Id number(QJsonObject const& row, QString const& column) { return Id(std::abs(row[column].toString().toInt())); }
+// The NPCs, items and quests a change's after-state refers to.
+QVector<QPair<EntityType, Id>> references(TrackedChange const& c) {
+  QVector<QPair<EntityType, Id>> out;
+  auto rows = [&](QString const& table) { return c.after[table].toArray(); };
+  // Loot, vendor and trainer travel with their owner and the Creator items they hand out.
+  if (c.type == EntityType::Loot || c.type == EntityType::ObjectLoot || c.type == EntityType::Vendor || c.type == EntityType::Trainer) {
+    out.push_back({c.type == EntityType::ObjectLoot ? EntityType::GameObject : EntityType::Npc, c.entity});
+    auto table = c.type == EntityType::Loot ? "creature_loot_template" : c.type == EntityType::ObjectLoot ? "gameobject_loot_template" : "npc_vendor";
+    if (c.type != EntityType::Trainer) for (auto const& row : rows(table)) out.push_back({EntityType::Item, number(row.toObject(), "item")});
+    else for (auto const& row : rows(table)) out.push_back({EntityType::Spell, number(row.toObject(), "spell")});
+    return out;
+  }
+  // A spell travels with the Creator spells it casts or follows, and the NPCs and items it summons or creates.
+  if (c.type == EntityType::Spell) {
+    auto spell = rows("spell_template").at(0).toObject();
+    for (int i = 1; i <= 3; ++i) {
+      auto effect = number(spell, "effect" + QString::number(i)), aura = number(spell, "effectApplyAuraName" + QString::number(i));
+      out.push_back({EntityType::Spell, number(spell, "effectTriggerSpell" + QString::number(i))});
+      if (effect == 28 || effect == 41 || (effect == 6 && aura == 56)) out.push_back({EntityType::Npc, number(spell, "effectMiscValue" + QString::number(i))});
+      if (effect == 24) out.push_back({EntityType::Item, number(spell, "effectItemType" + QString::number(i))});
+    }
+    for (auto const& row : rows("spell_chain")) out.push_back({EntityType::Spell, number(row.toObject(), "prev_spell")});
+    return out;
+  }
+  // A dialogue travels with its NPC and the Creator quests and items its conditions and effects name.
+  if (c.type == EntityType::Gossip) {
+    out.push_back({EntityType::Npc, c.entity});
+    for (auto const& row : rows("conditions")) {
+      auto type = row.toObject()["type"].toString().toInt();
+      if (type == 8 || type == 9) out.push_back({EntityType::Quest, number(row.toObject(), "value1")});
+      if (type == 2) out.push_back({EntityType::Item, number(row.toObject(), "value1")});
+    }
+    for (auto const& row : rows("gossip_scripts"))
+      if (number(row.toObject(), "command") == 7) out.push_back({EntityType::Quest, number(row.toObject(), "datalong")});
+    return out;
+  }
+  auto first = rows(c.type == EntityType::GameObject ? "gameobject_template" : c.type == EntityType::GameObjectSpawn ? "gameobject" : c.type == EntityType::Quest ? "quest_template" : c.type == EntityType::Npc ? "creature_template" : c.type == EntityType::Item ? "item_template" : "creature").at(0).toObject();
+  if (c.type == EntityType::GameObjectSpawn) out.push_back({EntityType::GameObject, number(first, "id")});
+  if (c.type == EntityType::GameObject && (number(first,"type")==10 || number(first,"type")==3)) out.push_back({EntityType::Quest,number(first,number(first,"type")==10?"data1":"data8")});
+  if (c.type == EntityType::Spawn) out.push_back({EntityType::Npc, number(first, "id")});
+  if (c.type == EntityType::Item)
+    for (int i = 1; i <= 5; ++i) out.push_back({EntityType::Spell, number(first, "spellid_" + QString::number(i))});
+  if (c.type == EntityType::Npc)
+    for (int i = 1; i <= 4; ++i) out.push_back({EntityType::Spell, number(first, "spell_id" + QString::number(i))});
+  if (c.type == EntityType::Npc)
+    for (auto const& row : rows("creature_equip_template"))
+      for (int i = 1; i <= 3; ++i) out.push_back({EntityType::Item, number(row.toObject(), "equipentry" + QString::number(i))});
+  if (c.type == EntityType::Quest) {
+    for (auto table : {"creature_questrelation", "creature_involvedrelation"})
+      for (auto const& row : rows(table)) out.push_back({EntityType::Npc, number(row.toObject(), "id")});
+    for (auto table : {"gameobject_questrelation", "gameobject_involvedrelation"})
+      for (auto const& row : rows(table)) out.push_back({EntityType::GameObject, number(row.toObject(), "id")});
+    for (int i = 1; i <= 4; ++i)
+      if (first["ReqCreatureOrGOId" + QString::number(i)].toString().toInt() < 0) out.push_back({EntityType::GameObject, number(first, "ReqCreatureOrGOId" + QString::number(i))});
+    for (int i = 1; i <= 4; ++i)
+      if (first["ReqCreatureOrGOId" + QString::number(i)].toString().toInt() > 0) out.push_back({EntityType::Npc, number(first, "ReqCreatureOrGOId" + QString::number(i))});
+    for (auto table : {"quest_start_scripts", "quest_end_scripts"})
+      for (auto const& row : rows(table))
+        if (number(row.toObject(), "command") == 10) out.push_back({EntityType::Npc, number(row.toObject(), "datalong")}); // summon
+    QStringList items{"SrcItemId"};
+    for (int i = 1; i <= 4; ++i) items << "ReqItemId" + QString::number(i) << "RewItemId" + QString::number(i);
+    for (int i = 1; i <= 6; ++i) items << "RewChoiceItemId" + QString::number(i);
+    for (auto const& column : items) out.push_back({EntityType::Item, number(first, column)});
+    for (auto const& row : rows("item_start_link")) out.push_back({EntityType::Item, number(row.toObject(), "entry")});
+    for (auto column : {"PrevQuestId", "NextQuestId", "NextQuestInChain"}) out.push_back({EntityType::Quest, number(first, column)});
+    for (auto column : {"RewSpell", "RewSpellCast"}) out.push_back({EntityType::Spell, number(first, column)});
+  }
+  return out;
+}
+QJsonObject sourceVersion(Database& db) {
+  QJsonObject source;
+  QFile info(Runtime::RuntimeManager::instance()->root() + "/Runtime/creator-runtime.json");
+  if (info.open(QIODevice::ReadOnly)) {
+    auto runtime = QJsonDocument::fromJson(info.readAll()).object();
+    for (auto key : {"server", "database", "platform"}) if (runtime.contains(key)) source[key] = runtime[key];
+  }
+  // Tortoise records applied world updates; the newest one identifies the content revision.
+  try {
+    auto rows = db.query("SELECT Id,Name,AppliedAt FROM migrations ORDER BY Id DESC LIMIT 1");
+    if (!rows.isEmpty())
+      source["contentVersion"] = QJsonObject{{"migration", rows[0]["Name"].toString()}, {"migrationId", rows[0]["Id"].toString()}, {"appliedAt", rows[0]["AppliedAt"].toString()}};
+  } catch (std::exception const&) { /* not available on this database */ }
+  return source;
+}
+}
+QString ExportService::folderName(QString const& packageName) {
+  return packageName.trimmed().replace(QRegularExpression("[^\\p{L}\\p{N}_]+"), "-").remove(QRegularExpression("^-+|-+$"));
+}
+ChangePackage ExportService::build(QVector<TrackedChange> const& changes) {
+  require(!changes.isEmpty(), "There are no local changes.");
+  ChangePackage package; package.changes = changes; package.tracked = changes.size();
+  auto& all = package.changes;
+  Database db;
+  // Creator content the changes refer to travels with the package (and what that refers to, in turn);
+  // the game's own content exists on every compatible database.
+  QSet<QPair<int, Id>> known;
+  for (auto const& c : changes) known.insert({int(c.type), c.entity});
+  for (int i = 0; i < all.size(); ++i) {
+    for (auto const& [type, id] : references(all[i])) {
+      if (!id || known.contains({int(type), id})) continue;
+      known.insert({int(type), id});
+      if (!db.owned(toString(type), id)) continue;
+      TrackedChange d; d.type = type; d.entity = id; d.action = ChangeAction::Create;
+      d.after = ChangeTracker::capture([&db](QString const& sql) { return db.query(sql); }, type, id, &d.label);
+      if (!d.after.isEmpty()) all.push_back(d);
+    }
+  }
+  for (auto const& c : all) package.owned.push_back(db.owned(toString(c.type), c.entity));
+  package.source = sourceVersion(db);
+  package.sql = ChangeTracker::sql(all);
+  return package;
+}
+QJsonObject ExportService::localSource() { Database db; return sourceVersion(db); }
+QJsonObject ChangePackage::manifest(QString const& name, QString const& author) const {
+  QJsonArray entities;
+  for (int i = 0; i < changes.size(); ++i) {
+    auto const& c = changes[i];
+    entities.append(QJsonObject{{"type", toString(c.type)}, {"id", double(c.entity)}, {"action", toString(c.action)},
+                                {"name", c.label}, {"includedAsDependency", i >= tracked}});
+  }
+  return {
+    {"format", 1}, {"generator", "Noggit Creator"}, {"name", name.trimmed()}, {"author", author.trimmed()},
+    {"created", QDateTime::currentDateTimeUtc().toString(Qt::ISODate)}, {"source", source}, {"entities", entities},
+    {"files", QJsonObject{{"changes.sql", QJsonObject{{"sha256", QString(QCryptographicHash::hash(sql.toUtf8(), QCryptographicHash::Sha256).toHex())}}}}}};
+}
+void ExportService::write(ChangePackage const& package, QString const& name, QString const& author, QString const& target,
+                          QJsonObject const& manifestExtra, QMap<QString, QByteArray> const& extra) {
+  require(!QFileInfo::exists(target), "A package named \"" + QFileInfo(target).fileName() + "\" already exists in that folder. Choose another name or folder.");
+  auto manifest = package.manifest(name, author);
+  for (auto it = manifestExtra.begin(); it != manifestExtra.end(); ++it) manifest[it.key()] = it.value();
+  // Build beside the target and rename, so a failed write never leaves a half-written package.
+  QFileInfo info(target);
+  auto partial = info.dir().filePath("." + info.fileName() + ".partial");
+  QDir(partial).removeRecursively();
+  try {
+    require(QDir().mkpath(partial), "Cannot create the package folder.");
+    writeFile(partial + "/manifest.json", QJsonDocument(manifest).toJson());
+    writeFile(partial + "/changes.sql", package.sql.toUtf8());
+    for (auto it = extra.begin(); it != extra.end(); ++it) writeFile(partial + "/" + it.key(), it.value());
+    require(QDir().rename(partial, target), "Cannot create the package folder.");
+  } catch (...) { QDir(partial).removeRecursively(); throw; }
+}
+ExportResult ExportService::exportChanges(QString const& name, QString const& author, QString const& folder, QVector<TrackedChange> const& changes) {
+  require(!changes.isEmpty(), "There are no local changes to export.");
+  auto title = name.trimmed();
+  require(!title.isEmpty() && title.size() <= 80, "Enter a package name of up to 80 characters.");
+  auto directory = folderName(title);
+  require(!directory.isEmpty(), "Use at least one letter or number in the package name.");
+  require(QFileInfo(folder).isDir(), "Choose an existing folder for the package.");
+  auto target = QDir(folder).filePath(directory);
+  require(!QFileInfo::exists(target), "A package named \"" + directory + "\" already exists in that folder. Choose another name or folder.");
+  auto package = build(changes);
+  write(package, title, author, target);
+  return {target, package.tracked, int(package.changes.size()) - package.tracked};
+}
+}

@@ -121,7 +121,7 @@ SET(NOGGIT_MYSQL_SEARCH_ROOTS
 )
 
 IF(USE_SQL)
-  FIND_LIBRARY(MYSQL_LIBRARY NAMES libmysql mariadb libmariadb
+  FIND_LIBRARY(MYSQL_LIBRARY NAMES libmysql mysqlclient mariadb libmariadb
               HINTS ${NOGGIT_MYSQL_SEARCH_ROOTS}
               PATH_SUFFIXES lib lib/x64_release windows/lib/x64_release)
   FIND_FILE(MYSQL_RUNTIME_LIBRARY NAMES libmysql.dll libmySQL.dll
@@ -501,7 +501,9 @@ IF(NOGGIT_LOGTOCONSOLE AND WIN32)
   SET_PROPERTY(TARGET noggit APPEND PROPERTY COMPILE_DEFINITIONS $<$<CONFIG:Debug>:"_CONSOLE">)
 ENDIF()
 
-includePlatform("pack")
+if(NOT CREATOR_RUNTIME_BUNDLE)
+  includePlatform("pack")
+endif()
 
 # Disable warnings
 if(WIN32)
@@ -570,3 +572,5 @@ if(${FAST_BUILD_NOGGIT_JUMBO})
   set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/src/external/imguizmo/ImSequencer.cpp" PROPERTIES SKIP_UNITY_BUILD_INCLUSION TRUE)
   set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/src/noggit/rendering/WorldRender.cpp" PROPERTIES SKIP_UNITY_BUILD_INCLUSION TRUE)
 endif()
+# Optional self-contained Creator release layout; normal Noggit builds remain supported.
+include(cmake/CreatorRuntime.cmake)

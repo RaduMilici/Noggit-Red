@@ -1,3 +1,12 @@
+#include <noggit/creator/TestSessionService.hpp>
+#include <noggit/creator/AuthoringDialogs.hpp>
+#include <noggit/ui/content/ContentSession.hpp>
+#include <noggit/ui/quest/QuestBrowserDialog.hpp>
+#include <noggit/ui/quest/QuestChainDialog.hpp>
+#include <noggit/creator/NpcStudio.hpp>
+#include <noggit/creator/ServiceEditors.hpp>
+#include <noggit/creator/ContentEditors.hpp>
+#include <noggit/runtime/RuntimeManager.hpp>
 // This file is part of Noggit3, licensed under GNU General Public License (version 3).
 #include <noggit/rendering/vulkan/VkParticleFeed.hpp>
 #include <noggit/rendering/RenderDiagnostics.hpp>
@@ -15,6 +24,8 @@ namespace Noggit { void printStacktrace(); }   // error_handling.cpp (StackWalke
 #include <psapi.h> // GetProcessMemoryInfo (mem-diag)
 #endif
 #include <noggit/World.h>
+#include <noggit/ui/tools/PreviewRenderer/CreaturePreviewViewer.hpp>
+using Noggit::Ui::Tools::CreaturePreviewModelViewer;
 #include <noggit/rendering/vulkan/VulkanBackend.hpp> // [VULKAN PHASE 0] interop proof of life (win32-gated inside)
 #include <noggit/map_index.hpp>
 #include <noggit/uid_storage.hpp>
@@ -296,43 +307,6 @@ namespace
     }
   };
 
-  // Bind-pose attachment lookup for the picker preview (copy of WorldRender's find_attachment_def:
-  // direct lookup, classic-layout sanity fallback scan).
-  ModelAttachmentDef const* preview_find_attachment_def(Model const* model, int attachment_id)
-  {
-    if (!model || attachment_id < 0
-        || static_cast<std::size_t>(attachment_id) >= model->_attachment_lookup.size())
-    {
-      return nullptr;
-    }
-    auto const lookup = model->_attachment_lookup[attachment_id];
-    auto const attachment_is_sane = [model](ModelAttachmentDef const& attachment)
-    {
-      return attachment.bone < model->header.nBones
-          && std::isfinite(attachment.pos.x)
-          && std::isfinite(attachment.pos.y)
-          && std::isfinite(attachment.pos.z);
-    };
-    if (lookup >= 0 && static_cast<std::size_t>(lookup) < model->_attachments.size())
-    {
-      auto const& attachment = model->_attachments[lookup];
-      if (!model->usesClassicLayout() || attachment_is_sane(attachment))
-      {
-        return &attachment;
-      }
-    }
-    if (model->usesClassicLayout())
-    {
-      for (auto const& attachment : model->_attachments)
-      {
-        if (static_cast<int>(attachment.id) == attachment_id && attachment_is_sane(attachment))
-        {
-          return &attachment;
-        }
-      }
-    }
-    return nullptr;
-  }
 
   // Creature editor: wander_distance spinner that reports keyboard focus, so the map view can show
   // the wander-radius ground ring exactly while the field is highlighted/being edited.
@@ -378,6 +352,7 @@ namespace
 #include <QProgressDialog>
 #include <QProcess>
 #include <QDialogButtonBox>
+#include <QSignalBlocker>
 #include <QCoreApplication>
 #include <QOpenGLExtraFunctions> // [VULKAN phase A] glFenceSync/glClientWaitSync for the GL->VK hard sync
 #include <noggit/MapHeaders.h>    // [VULKAN phase B] MCLYFlags for the textured-terrain feed
@@ -591,400 +566,6 @@ namespace
     }
   }
 
-  // NPC/GO picker 3D preview with an ORBIT camera: the camera hangs on a fixed "pole" aimed at the
-  // model's center -- dragging (either button) spins around the model (yaw/pitch), the wheel zooms
-  // along the pole, and every new model auto-frames as close as the near plane and the frustum
-  // allow. The base class's free-fly camera (WASD + look) is fully disabled here; the asset
-  // browser keeps it.
-  class CreaturePreviewModelViewer final : public Noggit::Ui::Tools::AssetBrowser::ModelViewer
-  {
-  public:
-    explicit CreaturePreviewModelViewer(QWidget* parent = nullptr)
-      : Noggit::Ui::Tools::AssetBrowser::ModelViewer(parent, Noggit::NoggitRenderContext::ASSET_BROWSER)
-    {
-      // The WORLD view gets its antialiasing from its own multisampled offscreen FBO
-      // (render/msaa, WorldRender::setupBloom) -- not from the widget framebuffer -- so preview
-      // widgets were rendering with ZERO samples and every model edge aliased. Request the same
-      // MSAA level on this widget's backing framebuffer (must happen before the widget is realized).
-      {
-        int msaa = QSettings().value("render/msaa", 4).toInt();
-        // Dev-only override for the VK parity harness: GL renders 4x MSAA by default while the VK
-        // backend is still single-sampled, so every silhouette differs. NOGGIT_MSAA isolates that.
-        if (char const* env_msaa = std::getenv("NOGGIT_MSAA"))
-          msaa = std::atoi(env_msaa);
-        if (msaa != 0 && msaa != 2 && msaa != 4 && msaa != 8)
-        {
-          msaa = 4;
-        }
-        if (msaa > 0)
-        {
-          QSurfaceFormat fmt = format();
-          fmt.setSamples(msaa);
-          setFormat(fmt);
-        }
-      }
-
-      // Re-frame on widget resizes (the fit depends on the aspect ratio); keep the user's zoom
-      // unless they were sitting at the default.
-      connect(this, &Noggit::Ui::Tools::AssetBrowser::ModelViewer::resized, [this]
-      {
-        bool const at_default_zoom = std::abs(_orbit_distance - _fit_distance) < 0.01f;
-        refitCamera(at_default_zoom);
-      });
-    }
-
-    std::function<void()> on_double_click;
-
-    void setModel(std::string const& filename) override
-    {
-      _preview_attachment_ids.clear(); // the base setModel replaces the instance list
-      Noggit::Ui::Tools::AssetBrowser::ModelViewer::setModel(filename);
-      refitCamera(true);
-    }
-
-    void setCreatureSpawnPreview(World& world, World::CreatureSpawnOverlay const& spawn)
-    {
-      setModel(spawn.model_path);
-      if (_model_instances.empty())
-      {
-        return;
-      }
-
-      auto& instance = _model_instances.front();
-      instance.scale = std::clamp(spawn.template_scale * spawn.model_scale,
-                                  ModelInstance::min_scale(),
-                                  ModelInstance::max_scale());
-      instance.dir = glm::vec3(0.0f, spawn.orientation, 0.0f);
-      instance.updateTransformMatrix();
-      world.applyCreatureSpawnModelAppearance(spawn, instance, _context);
-      instance.recalcExtents();
-
-      // Attachments (helm / shoulders / weapons): the world draws these as separate models on the
-      // body's attachment points -- without them a helmeted NPC previews BALD (the helmet rule hid
-      // the hair, and nothing drew the helmet: Lakeshire Guard 10037). Bind pose: bone matrices are
-      // identity, so the point is just parent_transform x translate(fixCoordSystem(attachment.pos)).
-      for (auto const& spec : world.resolveCreaturePreviewAttachments(spawn))
-      {
-        try
-        {
-          auto& att = _model_instances.emplace_back(BlizzardArchive::Listfile::FileKey(spec.model_path), _context);
-          att.model->wait_until_loaded();
-          if (att.model->loading_failed())
-          {
-            _model_instances.pop_back();
-            continue;
-          }
-          for (auto const& tex : spec.texture_overrides)
-          {
-            att.setReplaceTexture(tex.first, tex.second);
-          }
-          // Express the placement through pos/dir/scale (NOT setTransformMatrix): the draw path's
-          // lazy recalcExtents rebuilds the matrix from these, which wiped a directly-set matrix
-          // and dropped every attachment to the body's origin (helmets at the feet). For this
-          // rigid composition the two forms are identical: body x T(att) == T(body x att_point) x
-          // R(body yaw) x S(body scale).
-          auto& body = _model_instances.front();
-          glm::vec3 att_point = body.pos;
-          if (auto const* def = preview_find_attachment_def(body.model.get(), spec.attachment_id))
-          {
-            att_point = glm::vec3(body.transformMatrix() * glm::vec4(fixCoordSystem(def->pos), 1.0f));
-          }
-          att.pos = att_point;
-          att.dir = body.dir;
-          att.scale = body.scale;
-          att.updateTransformMatrix();
-          att.recalcExtents();
-          _preview_attachment_ids.push_back(spec.attachment_id);
-        }
-        catch (...)
-        {
-          // missing/broken attachment model -> preview the body alone
-        }
-      }
-
-      // Face the creature from a three-quarter front view, slightly above: the camera's look yaw
-      // is opposite the model's facing.
-      _orbit_yaw = spawn.orientation + 205.0f;
-      _orbit_pitch = 12.0f;
-      refitCamera(true);
-    }
-
-  protected:
-    // attachment_id per extra instance (_model_instances[1..]), parallel order
-    std::vector<int> _preview_attachment_ids;
-
-    // Animate the attachments with the body's skeleton: re-anchor each on its parent bone's CURRENT
-    // matrix every frame, exactly like the world's attachment draw -- the bind-pose-only placement
-    // left helmets/weapons frozen mid-air while the body idled. Uses the bone matrices the body's
-    // previous draw computed (one frame of lag, invisible). setRenderAnchor feeds the shader
-    // directly, so the lazy extent/transform rebuilds can't clobber it.
-    void tick(float dt) override
-    {
-      Noggit::Ui::Tools::AssetBrowser::ModelViewer::tick(dt);
-      if (_model_instances.size() < 2 || _preview_attachment_ids.empty())
-      {
-        return;
-      }
-      auto& body = _model_instances.front();
-      if (!body.model->finishedLoading() || body.model->bone_matrices.empty())
-      {
-        return;
-      }
-      for (std::size_t i = 1; i < _model_instances.size() && i - 1 < _preview_attachment_ids.size(); ++i)
-      {
-        auto& att = _model_instances[i];
-        auto const* def = preview_find_attachment_def(body.model.get(), _preview_attachment_ids[i - 1]);
-        if (!def)
-        {
-          continue;
-        }
-        glm::mat4x4 att_local = glm::translate(glm::mat4x4(1.0f), fixCoordSystem(def->pos));
-        if (def->bone >= 0 && static_cast<std::size_t>(def->bone) < body.model->bone_matrices.size())
-        {
-          att_local = body.model->bone_matrices[def->bone] * att_local;
-        }
-        glm::mat4x4 const world = body.transformMatrix() * att_local;
-        glm::mat4x4 rel = world;
-        rel[3] = glm::vec4(glm::vec3(world[3]) - body.pos, 1.0f);
-        att.setRenderAnchor(body.pos, rel);
-      }
-    }
-
-    // --- orbit ("pole") camera state ---
-    float _orbit_yaw = 25.0f;       // camera look yaw, degrees
-    float _orbit_pitch = 12.0f;     // degrees above horizontal
-    float _orbit_distance = 12.0f;  // pole length
-    float _fit_distance = 12.0f;    // the auto-framed default zoom
-    float _scene_radius = 1.0f;     // fit-box worst-case horizontal half-extent
-    float _scene_half_height = 1.0f;
-    float _orbit_height_offset = 0.0f; // vertical pivot pan (middle-drag); pole stays centered in XZ
-    glm::vec3 _orbit_center = glm::vec3(0.0f);
-    bool _orbiting = false;
-    bool _panning = false;
-
-    void applyOrbitCamera()
-    {
-      _orbit_pitch = std::clamp(_orbit_pitch, -80.0f, 80.0f);
-      _camera.yaw(math::degrees(_orbit_yaw));
-      _camera.pitch(math::degrees(_orbit_pitch));
-      // The camera always LOOKS at the (vertically pannable) pivot; backing up along its own view
-      // direction is the pole (the same trick PreviewRenderer::resetCamera uses to frame a scene).
-      _camera.position = _orbit_center + glm::vec3(0.0f, _orbit_height_offset, 0.0f);
-      _camera.move_forward_factor(-1.0f, _orbit_distance);
-    }
-
-    // The box the auto-framing fits. The instance extents union the header's anim-padded bounding
-    // box with the collision box (weapon-swing/effect space -- often 2-3x the visible mesh), which
-    // framed models tiny in lots of empty space; and header boxes themselves are unreliable
-    // per-model (dragonkin/whelps author huge or degenerate ones -- The Beast, Lost Whelp,
-    // Rivendare all framed far). Ground truth = the MESH: the bind-pose vertex AABB transformed by
-    // the instance (Model::_vertices are already in the noggit frame from load-time
-    // fixCoordSystem). Fallbacks: collision box -> bounding box -> scene extents (WMO previews).
-    std::vector<glm::vec3> fitExtents()
-    {
-      if (!_model_instances.empty())
-      {
-        // front() = the previewed BODY (attachment instances are appended after it)
-        auto const& inst = _model_instances.front();
-        if (inst.model->finishedLoading() && !inst.model->loading_failed())
-        {
-          glm::mat4x4 const mat = inst.transformMatrix();
-
-          if (!inst.model->_vertices.empty())
-          {
-            glm::vec3 wmin(std::numeric_limits<float>::max());
-            glm::vec3 wmax(std::numeric_limits<float>::lowest());
-            std::size_t used = 0;
-            for (auto const& v : inst.model->_vertices)
-            {
-              if (!std::isfinite(v.position.x) || !std::isfinite(v.position.y) || !std::isfinite(v.position.z))
-              {
-                continue;
-              }
-              glm::vec3 const world = glm::vec3(mat * glm::vec4(v.position, 1.0f));
-              wmin = glm::min(wmin, world);
-              wmax = glm::max(wmax, world);
-              ++used;
-            }
-            if (used > 2 && wmin.x < wmax.x && wmin.y < wmax.y && wmin.z < wmax.z)
-            {
-              return {wmin, wmax};
-            }
-          }
-
-          auto const& hdr = inst.model->header;
-          auto const finite_box = [](glm::vec3 const& a, glm::vec3 const& b)
-          {
-            return std::isfinite(a.x) && std::isfinite(a.y) && std::isfinite(a.z)
-                && std::isfinite(b.x) && std::isfinite(b.y) && std::isfinite(b.z)
-                && a.x < b.x && a.y < b.y && a.z < b.z;
-          };
-          glm::vec3 bmin(0.0f), bmax(0.0f);
-          bool have_box = false;
-          if (finite_box(hdr.collision_box_min, hdr.collision_box_max))
-          {
-            bmin = hdr.collision_box_min;
-            bmax = hdr.collision_box_max;
-            have_box = true;
-          }
-          if (!have_box && finite_box(hdr.bounding_box_min, hdr.bounding_box_max))
-          {
-            bmin = hdr.bounding_box_min;
-            bmax = hdr.bounding_box_max;
-            have_box = true;
-          }
-          if (have_box)
-          {
-            glm::vec3 wmin(std::numeric_limits<float>::max());
-            glm::vec3 wmax(std::numeric_limits<float>::lowest());
-            for (int i = 0; i < 8; ++i)
-            {
-              glm::vec3 const corner((i & 1) ? bmax.x : bmin.x,
-                                     (i & 2) ? bmax.y : bmin.y,
-                                     (i & 4) ? bmax.z : bmin.z);
-              glm::vec3 const world = glm::vec3(mat * glm::vec4(misc::transform_model_box_coords(corner), 1.0f));
-              wmin = glm::min(wmin, world);
-              wmax = glm::max(wmax, world);
-            }
-            return {wmin, wmax};
-          }
-        }
-      }
-      return calcSceneExtents();
-    }
-
-    // Recompute the model's fit box and the auto-framed distance. reset_zoom snaps the pole back
-    // to the default fit (and clears the vertical pan); otherwise the current zoom is kept.
-    void refitCamera(bool reset_zoom)
-    {
-      auto const extents = fitExtents();
-      auto const valid = [](glm::vec3 const& v)
-      {
-        return std::isfinite(v.x) && std::isfinite(v.y) && std::isfinite(v.z);
-      };
-      glm::vec3 half(1.0f);
-      if (!valid(extents[0]) || !valid(extents[1])
-          || extents[0].x > extents[1].x
-          || extents[0].y > extents[1].y
-          || extents[0].z > extents[1].z)
-      {
-        _orbit_center = glm::vec3(0.0f);
-      }
-      else
-      {
-        _orbit_center = (extents[0] + extents[1]) * 0.5f;
-        half = glm::max((extents[1] - extents[0]) * 0.5f, glm::vec3(0.05f));
-      }
-      // Worst-case horizontal half-extent while orbiting = the XZ half-diagonal; vertical = half.y.
-      _scene_half_height = half.y;
-      _scene_radius = std::max(std::sqrt(half.x * half.x + half.z * half.z), 0.25f);
-
-      // Default zoom = "as close as possible without clipping or cropping": per-axis box fit (a
-      // tall thin creature closes in until its HEIGHT fills the frame, instead of a conservative
-      // bounding-sphere fit), plus the box's front depth, and never inside the near plane (1.0).
-      float const fov_y = _camera.fov()._;
-      float const aspect = std::max(aspect_ratio(), 0.2f);
-      float const fov_x = 2.0f * std::atan(std::tan(fov_y * 0.5f) * aspect);
-      float const dist_v = _scene_half_height / std::max(std::tan(fov_y * 0.5f), 0.05f);
-      float const dist_h = _scene_radius / std::max(std::tan(fov_x * 0.5f), 0.05f);
-      float fit = (std::max(dist_v, dist_h) + _scene_radius) * 1.03f;
-      fit = std::max(fit, _scene_radius + 0.15f);
-      if (!std::isfinite(fit))
-      {
-        fit = _scene_radius * 2.0f + 2.0f;
-      }
-      _fit_distance = fit;
-      if (reset_zoom)
-      {
-        _orbit_distance = fit;
-        _orbit_height_offset = 0.0f;
-      }
-      else
-      {
-        _orbit_distance = std::clamp(_orbit_distance, minZoom(), maxZoom());
-        _orbit_height_offset = std::clamp(_orbit_height_offset,
-                                          -2.0f * _scene_half_height, 2.0f * _scene_half_height);
-      }
-      applyOrbitCamera();
-    }
-
-    // Near plane is 0.05 in the preview projection -- allow zooming nearly to the surface.
-    float minZoom() const { return std::max(0.12f, _scene_radius * 0.05f); }
-    float maxZoom() const { return std::max(_fit_distance * 5.0f, minZoom() + 1.0f); }
-
-    void mousePressEvent(QMouseEvent* event) override
-    {
-      if (event->button() == Qt::LeftButton)
-      {
-        _orbiting = true;
-      }
-      else if (event->button() == Qt::RightButton || event->button() == Qt::MiddleButton)
-      {
-        _panning = true; // right (or middle) drag = vertical pivot pan
-      }
-      _last_mouse_pos = event->pos();
-      event->accept();
-    }
-
-    void mouseReleaseEvent(QMouseEvent* event) override
-    {
-      if (event->button() == Qt::LeftButton)
-      {
-        _orbiting = false;
-      }
-      else if (event->button() == Qt::RightButton || event->button() == Qt::MiddleButton)
-      {
-        _panning = false;
-      }
-      event->accept();
-    }
-
-    void mouseMoveEvent(QMouseEvent* event) override
-    {
-      QLineF const relative_movement(_last_mouse_pos, event->pos());
-      if (_orbiting)
-      {
-        // Grab-the-model sense: dragging right spins the model rightward (camera orbits left).
-        _orbit_yaw -= static_cast<float>(relative_movement.dx()) * 0.4f;
-        _orbit_pitch += static_cast<float>(relative_movement.dy()) * 0.4f;
-        applyOrbitCamera();
-      }
-      else if (_panning)
-      {
-        // Vertical pivot pan ONLY (middle-drag): slide the whole pole up/down so a zoomed-in shot
-        // can re-center on the head/torso -- the model tracks the cursor 1:1 at the pivot plane.
-        float const world_per_pixel =
-          2.0f * std::tan(_camera.fov()._ * 0.5f) * _orbit_distance / std::max(height(), 1);
-        _orbit_height_offset += static_cast<float>(relative_movement.dy()) * world_per_pixel;
-        _orbit_height_offset = std::clamp(_orbit_height_offset,
-                                          -2.0f * _scene_half_height, 2.0f * _scene_half_height);
-        applyOrbitCamera();
-      }
-      _last_mouse_pos = event->pos();
-      event->accept();
-    }
-
-    void wheelEvent(QWheelEvent* event) override
-    {
-      float const step = event->angleDelta().y() > 0 ? 1.0f / 1.12f : 1.12f;
-      _orbit_distance = std::clamp(_orbit_distance * step, minZoom(), maxZoom());
-      applyOrbitCamera();
-      event->accept();
-    }
-
-    // The pole replaces free-fly entirely: no WASD/arrow-key flying in the picker preview.
-    void keyPressEvent(QKeyEvent* event) override { event->accept(); }
-    void keyReleaseEvent(QKeyEvent* event) override { event->accept(); }
-
-    void mouseDoubleClickEvent(QMouseEvent* event) override
-    {
-      if (on_double_click)
-      {
-        on_double_click();
-      }
-      event->accept();
-    }
-  };
 
   // A QMenu that stays open when a CHECKABLE item is clicked, so the Seasonal Events dropdown can toggle
   // several events without reopening each time. Non-checkable items (All / None) and outside clicks close
@@ -1282,6 +863,12 @@ void MapView::set_editing_mode(editing_mode mode)
         break;
       case editing_mode::creature:
         _show_creature_browser.set(true);
+        if (qApp->property("creatorRuntimeManaged").toBool())
+        {
+          try { _creator_npcs = Noggit::Creator::CreatureService::ownedEntries(); }
+          catch (std::exception const&) { /* the local database is not running yet */ }
+          refreshStudio();
+        }
         if (!_world->hasCreatureSpawnsLoaded())
         {
           _world->reloadCreatureSpawns();
@@ -1304,6 +891,10 @@ void MapView::set_editing_mode(editing_mode mode)
   MoveObj = false;
   _world->reset_selection();
   _rotation_editor_need_update = true;
+  if (_world_pick)
+  {
+    endWorldPick();
+  }
 
   if (!ui_hidden)
   {
@@ -2292,10 +1883,10 @@ void MapView::setupCreatureActionsUi()
   layout->setSpacing(5);
 
   auto reload_button = new QPushButton("Reload Spawns", _creature_actions_overlay);
-  auto save_button = new QPushButton("Export SQL", _creature_actions_overlay);
+  auto save_button = new QPushButton(qApp->property("creatorRuntimeManaged").toBool() ? "Save NPC placements" : "Export SQL", _creature_actions_overlay);
   auto revert_button = new QPushButton("Discard Pending", _creature_actions_overlay);
   auto pending_button = new QPushButton("Pending \xE2\x96\xBE", _creature_actions_overlay);
-  pending_button->setToolTip("Show the list of pending creature updates waiting for SQL export.");
+  pending_button->setToolTip("Show pending NPC placement changes.");
   layout->addWidget(reload_button);
   layout->addWidget(save_button);
   layout->addWidget(revert_button);
@@ -2352,7 +1943,7 @@ void MapView::setupCreatureActionsUi()
       }
       QString const name = QString::fromStdString(spawn.name.empty() ? std::string("<unnamed>") : spawn.name);
       _creature_pending_list->addItem(
-        QString("[%1] guid %2  entry %3  %4").arg(action).arg(spawn.guid).arg(spawn.entry).arg(name));
+        qApp->property("creatorRuntimeManaged").toBool() ? QString("[%1] %2").arg(action,name) : QString("[%1] guid %2  entry %3  %4").arg(action).arg(spawn.guid).arg(spawn.entry).arg(name));
       ++count;
     }
     if (count == 0)
@@ -2455,6 +2046,11 @@ void MapView::setupCreatureModelPickerUi()
   filter_layout->addWidget(boss_only);
   filter_layout->addWidget(civilian_only);
   filter_layout->addWidget(trainer_only);
+  bool const creator = qApp->property("creatorRuntimeManaged").toBool();
+  auto mine_only = new QCheckBox("Only my NPCs", filter_panel);
+  mine_only->setToolTip("Show only NPCs made in Noggit (shown in bold).");
+  mine_only->setVisible(creator);
+  filter_layout->addWidget(mine_only);
   filter_layout->addStretch();
 
   auto splitter = new QSplitter(Qt::Horizontal, container);
@@ -2685,6 +2281,66 @@ void MapView::setupCreatureModelPickerUi()
   splitter->setSizes({380, 130, 520, 520, 240});
   root_layout->addWidget(splitter, 1);
 
+  // Creator: the NPC card replaces the raw GUID / entry / display form.
+  if (creator)
+  {
+    using Noggit::Creator::NpcKind;
+    Noggit::Creator::NpcStudio::Actions actions;
+    actions.newHumanoid = [this] { studioCreate(NpcKind::Humanoid); };
+    actions.newCreature = [this] { studioCreate(NpcKind::Creature); };
+    actions.clone = [this] { studioCreate(NpcKind::Clone); };
+    actions.edit = [this] { studioEdit(); };
+    actions.place = [this] { if (_studio_entry) studioPlace(*_studio_entry); };
+    actions.quests = [this] { if (_studio_entry && prepareCreatorChange()) { openQuests(*_studio_entry); reloadCreatorContent(_selected_creature_spawn_guid); refreshStudio(); } };
+    actions.chain = [this] { if (_studio_entry) openQuestChain(*_studio_entry); };
+    actions.patrol = [this] { editCreatorPatrol(); };
+    auto service = [this](auto edit)
+    {
+      return [this, edit]
+      {
+        if (!_studio_entry || !prepareCreatorChange())
+        {
+          return;
+        }
+        if (edit(*_studio_entry))
+        {
+          refreshStudio();
+        }
+      };
+    };
+    actions.loot = service([this](std::uint32_t entry) { return Noggit::Creator::editLoot(this, _world.get(), {Noggit::Creator::LootOwner::Kind::Npc, entry}); });
+    actions.vendor = service([this](std::uint32_t entry) { return Noggit::Creator::editVendor(this, _world.get(), entry); });
+    actions.trainer = service([this](std::uint32_t entry) { return Noggit::Creator::editTrainer(this, _world.get(), entry); });
+    actions.dialogue = service([this](std::uint32_t entry) { return editCreatorDialogue(entry); });
+    actions.items = [this] { if (prepareCreatorChange()) { Noggit::Creator::openItemLibrary(this); refreshStudio(); } };
+    actions.spells = [this] { if (prepareCreatorChange()) { Noggit::Creator::openSpellLibrary(this); refreshStudio(); } };
+    actions.talents = [this] { if (prepareCreatorChange()) Noggit::Creator::openTalentEditor(this); };
+    actions.testAtNpc = [this] { studioTestAtNpc(); };
+    actions.testAtSpot = [this]
+    {
+      beginWorldPick("Click where you want to start testing", [this](glm::vec3 const& position)
+      {
+        if (auto* tests = Noggit::Creator::TestSessionService::instance())
+        {
+          tests->testHere(this, serverPosition(position, _camera.yaw()._));
+        }
+      });
+    };
+    actions.duplicatePlacement = [this] { studioDuplicatePlacement(); };
+    actions.deletePlacement = [this] { studioRemovePlacement(); };
+    actions.locatePlacement = [this]
+    {
+      if (auto const* spawn = _selected_creature_spawn_guid ? _world->findCreatureSpawn(*_selected_creature_spawn_guid) : nullptr)
+      {
+        focus_camera_on_target(spawn->pos);
+      }
+    };
+    _npc_studio = new Noggit::Creator::NpcStudio(std::move(actions), splitter);
+    splitter->insertWidget(splitter->indexOf(spawn_box), _npc_studio);
+    spawn_box->hide();
+    refreshStudio();
+  }
+
   // Extended-field change handlers: edits write through to the SELECTED spawn (marking it dirty for
   // the SQL export); while authoring a New spawn the values are captured by Add Pending Spawn.
   auto on_ext_changed = [this]()
@@ -2799,7 +2455,7 @@ void MapView::setupCreatureModelPickerUi()
   // CreatureDisplayInfo.CreatureModelScale (D), the object-scale fallback used when
   // creature_template.scale is 0 (server ObjectMgr.cpp:1436). Final render = (template.scale or D) * M.
   // D is a fallback, NOT an extra multiplier -- do not fold it into model_scale.
-  auto resolve_display_model = [&](std::uint32_t display_id,
+  auto resolve_display_model = [normalize_picker_path](std::uint32_t display_id,
                                    std::uint32_t& model_id,
                                    std::string& model_path,
                                    float& model_scale,
@@ -2829,9 +2485,14 @@ void MapView::setupCreatureModelPickerUi()
 
   auto template_entries = std::make_shared<std::vector<TemplatePickerEntry>>();
 
+  auto template_error = std::make_shared<std::string>();
+  // Reloaded after Creator makes, edits or deletes an NPC, so the list always shows them.
+  auto load_templates = [=]()
+  {
+    template_entries->clear();
 #ifdef USE_MYSQL_UID_STORAGE
-  std::string template_error;
-  auto records = mysql::getCreatureTemplates(25000, &template_error);
+  template_error->clear();
+  auto records = mysql::getCreatureTemplates(200000, template_error.get());
   template_entries->reserve(records.size());
   for (auto const& record : records)
   {
@@ -2863,8 +2524,10 @@ void MapView::setupCreatureModelPickerUi()
     template_entries->push_back(std::move(entry));
   }
 #else
-  std::string template_error = "Build does not include MySQL support.";
+  *template_error = "Build does not include MySQL support.";
 #endif
+  };
+  load_templates();
 
   // Populate the type dropdown with every distinct creature type present in the loaded list.
   {
@@ -2955,6 +2618,10 @@ void MapView::setupCreatureModelPickerUi()
     {
       return false;
     }
+    if (mine_only->isChecked() && !_creator_npcs.contains(entry.entry))
+    {
+      return false;
+    }
     return true;
   };
 
@@ -2985,6 +2652,12 @@ void MapView::setupCreatureModelPickerUi()
       {
         row->setForeground(0, QColor(135, 135, 135));
       }
+      if (_creator_npcs.contains(entry.entry))
+      {
+        QFont font = row->font(0);
+        font.setBold(true);
+        row->setFont(0, font);
+      }
     }
 
     _creature_model_tree->sortItems(0, Qt::AscendingOrder);
@@ -2995,9 +2668,9 @@ void MapView::setupCreatureModelPickerUi()
                           .arg(visible_count)
                           .arg(visible_count == 1 ? "y" : "ies")
                           .arg(previewable_count);
-      if (!template_error.empty())
+      if (!template_error->empty())
       {
-        message = QString("Template load failed: %1").arg(QString::fromStdString(template_error));
+        message = QString("Template load failed: %1").arg(QString::fromStdString(*template_error));
       }
       _creature_model_picker_status->setText(message);
     }
@@ -3031,6 +2704,7 @@ void MapView::setupCreatureModelPickerUi()
     }
 
     *selected_template = *found;
+    showStudioNpc(found->entry, QString::fromStdString(found->name));
     guid_field->setText(QString::number(suggested_guid()));
     entry_field->setText(QString::number(found->entry));
     display_field->setText(QString::number(found->display_id));
@@ -3204,11 +2878,31 @@ void MapView::setupCreatureModelPickerUi()
   connect(boss_only, &QCheckBox::stateChanged, rebuild_template_tree);
   connect(civilian_only, &QCheckBox::stateChanged, rebuild_template_tree);
   connect(trainer_only, &QCheckBox::stateChanged, rebuild_template_tree);
+  connect(mine_only, &QCheckBox::stateChanged, rebuild_template_tree);
   connect(search_box, &QLineEdit::textChanged, rebuild_template_tree);
   connect(add_button, &QPushButton::clicked, add_pending_spawn);
-  preview->on_double_click = add_pending_spawn;
+  // Double-clicking the preview places the NPC (Creator: only NPCs made in Noggit can be placed).
+  preview->on_double_click = creator ? std::function<void()>([this] { if (_studio_entry && _creator_npcs.contains(*_studio_entry)) studioPlace(*_studio_entry); })
+                                     : std::function<void()>(add_pending_spawn);
 
   rebuild_template_tree();
+
+  _reload_creature_picker = [=](std::optional<std::uint32_t> select)
+  {
+    load_templates();
+    rebuild_template_tree();
+    if (!select)
+    {
+      return;
+    }
+    select_template_entry(*select);
+    auto const rows = _creature_model_tree->findItems(QString("%1 - ").arg(*select), Qt::MatchStartsWith);
+    if (!rows.isEmpty())
+    {
+      _creature_model_tree->setCurrentItem(rows.front());
+      _creature_model_tree->scrollToItem(rows.front());
+    }
+  };
 
   _creature_model_picker_dock->setWidget(container);
   _main_window->addDockWidget(Qt::BottomDockWidgetArea, _creature_model_picker_dock);
@@ -3525,6 +3219,13 @@ void MapView::setupGameObjectModelPickerUi()
   spawn_layout->addRow("Entry:", entry_field);
   spawn_layout->addRow("Display:", display_field);
   spawn_layout->addRow(add_button);
+  if(qApp->property("creatorRuntimeManaged").toBool()) {
+    guid_field->hide(); entry_field->hide(); display_field->hide(); add_button->hide();
+    for(auto label:{spawn_layout->labelForField(guid_field),spawn_layout->labelForField(entry_field),spawn_layout->labelForField(display_field)}) if(label) label->hide();
+    spawn_box->setTitle("GameObject Studio");
+    auto intro=new QLabel("Choose an appearance, design your object, then click in the world to place it."); intro->setWordWrap(true); spawn_layout->addRow(intro);
+    auto create=new QPushButton("Create GameObject…"); spawn_layout->addRow(create); connect(create,&QPushButton::clicked,this,[this] { creatorGameObject(); });
+  }
 
   splitter->addWidget(list_column);
   splitter->addWidget(filter_panel);
@@ -3920,7 +3621,8 @@ void MapView::setupGameObjectModelPickerUi()
   connect(type_filter, qOverload<int>(&QComboBox::currentIndexChanged), rebuild_template_tree);
   connect(search_box, &QLineEdit::textChanged, rebuild_template_tree);
   connect(add_button, &QPushButton::clicked, add_pending_spawn);
-  preview->on_double_click = add_pending_spawn;
+  preview->on_double_click = qApp->property("creatorRuntimeManaged").toBool()
+    ? std::function<void()>([this] { creatorGameObject(); }) : std::function<void()>(add_pending_spawn);
 
   rebuild_template_tree();
 
@@ -5794,6 +5496,7 @@ QString MapView::creature_spawn_item_text(World::CreatureSpawnOverlay const& spa
   }
 
   auto const name = QString::fromStdString(spawn.name.empty() ? std::string("<unnamed>") : spawn.name);
+  if (qApp->property("creatorRuntimeManaged").toBool()) return prefix + name;
   return QString("%1%2 [entry %3] guid %4").arg(prefix).arg(name).arg(spawn.entry).arg(spawn.guid);
 }
 
@@ -6059,6 +5762,15 @@ std::size_t MapView::selectedCreatureSpawnCount() const
 
 void MapView::setSelectedCreatureSpawn(std::optional<std::uint32_t> guid, bool update_browser)
 {
+  // The NPC card follows the world selection.
+  if (_npc_studio && guid)
+  {
+    if (auto const* spawn = _world->findCreatureSpawn(*guid))
+    {
+      _studio_entry = spawn->entry;
+      _studio_name = QString::fromStdString(spawn->name);
+    }
+  }
   _selected_creature_spawn_guid = guid;
 
   // Collect the spawns whose selected flag actually flips: their row text carries a "[selected]"
@@ -6108,6 +5820,7 @@ void MapView::setSelectedCreatureSpawn(std::optional<std::uint32_t> guid, bool u
   }
 
   refreshCreatureEditorKnobs();
+  refreshStudio();
 }
 
 void MapView::addCreatureSpawnToSelection(std::uint32_t guid, bool update_browser)
@@ -6461,6 +6174,7 @@ void MapView::updateCreatureSpawnHover(QPoint const& global_pos)
   }
 
   QString name = QString::fromStdString(spawn->name.empty() ? std::string("<unnamed>") : spawn->name);
+  if (qApp->property("creatorRuntimeManaged").toBool()) { QToolTip::showText(global_pos, name, this); return; }
   QToolTip::showText(global_pos, QString("%1\nGUID: %2\nEntry: %3")
                                .arg(name)
                                .arg(spawn->guid)
@@ -6508,7 +6222,7 @@ bool MapView::tryStartCreatureSpawnDrag()
   }
 
   _dragging_creature_spawn = true;
-  _main_window->statusBar()->showMessage(QString("Dragging %1 creature spawn(s). Release mouse, then use Export SQL.")
+  _main_window->statusBar()->showMessage(QString("Dragging %1 creature spawn(s). Release mouse, then save placements.")
                                            .arg(_creature_drag_initial_positions.size()), 4000);
   return true;
 }
@@ -7561,8 +7275,360 @@ QString MapView::buildDirtyCreatureSpawnSql(bool rebase_state)
   return sql;
 }
 
+bool MapView::prepareCreatorChange()
+{
+  if (Noggit::Project::CurrentProject::get()->projectVersion != Noggit::Project::ProjectVersion::CLASSIC)
+  {
+    QMessageBox::information(this, "Creator", "Open a Vanilla / Tortoise project to author local content.");
+    return false;
+  }
+  if (_world->dirtyGameObjectSpawnCount())
+  {
+    QMessageBox::information(this, "Creator", "Save or discard pending gameobject placements before refreshing NPC content.");
+    return false;
+  }
+  if (_world->dirtyCreatureSpawnCount()) saveDirtyCreatureSpawns();
+  return !_world->dirtyCreatureSpawnCount();
+}
+
+void MapView::reloadCreatorContent(std::optional<std::uint32_t> select)
+{
+  makeCurrent();
+  OpenGL::context::scoped_setter const guard(::gl, context());
+  _selected_creature_spawn_guid.reset();
+  _creature_undo_ops.clear();
+  _world->reloadCreatureSpawns();
+  _world->setDrawCreatureSpawns(true);
+  rebuildCreatureBrowserList(false);
+  // The selected NPC may just have been deleted.
+  auto const& spawns = _world->creatureSpawns();
+  if (select && std::any_of(spawns.begin(), spawns.end(), [&](auto const& spawn) { return spawn.guid == *select; }))
+    setSelectedCreatureSpawn(select);
+  updateDatabaseStatus();
+  _needs_redraw = true;
+}
+
+std::unique_ptr<Noggit::Ui::Content::ContentSession> MapView::openContentSession()
+{
+  auto session = Noggit::Ui::Content::ContentSession::open(this);
+  if (session)
+  {
+    // "Nearest to my cursor" and summon positions: the last world position under the cursor.
+    session->cursor_position = [this]() -> std::optional<Noggit::Ui::Content::WorldPosition>
+    {
+      auto const server = client_to_server_creature_position(_cursor_pos, _world->mapIndex.hasAGlobalWMO());
+      return Noggit::Ui::Content::WorldPosition{static_cast<std::uint32_t>(_world->getMapID()), server.x, server.y,
+                                                server.z, client_to_server_creature_orientation(_camera.yaw()._)};
+    };
+  }
+  return session;
+}
+
+void MapView::openQuestChain(std::uint32_t npc)
+{
+  auto session = openContentSession();
+  if (!session)
+  {
+    return;
+  }
+  // The chain the NPC's first quest is in (quests it gives first, then ones it takes).
+  std::uint32_t quest = 0;
+  for (bool starts : {true, false})
+  {
+    for (auto const& link : session->quests().links)
+    {
+      if (!quest && link.starts == starts && link.giver.kind == Noggit::Quest::Giver::Kind::Npc && link.giver.entry == npc)
+      {
+        quest = link.quest;
+      }
+    }
+  }
+  if (!quest)
+  {
+    QMessageBox::information(this, "Quest chain", QString("%1 has no quests yet. Use Quests to make one.").arg(_studio_name));
+    return;
+  }
+  Noggit::Ui::Quest::QuestChainDialog chain(*session, quest, this);
+  chain.exec();
+  refreshStudio();
+}
+
+Noggit::Creator::Position MapView::serverPosition(glm::vec3 const& position, float client_orientation) const
+{
+  auto const p = client_to_server_creature_position(position, _world->mapIndex.hasAGlobalWMO());
+  return {static_cast<unsigned>(_world->getMapID()), p.x, p.y, p.z, client_to_server_creature_orientation(client_orientation)};
+}
+
+void MapView::beginWorldPick(QString const& hint, std::function<void(glm::vec3 const&)> done)
+{
+  _world_pick = std::move(done);
+  if (!_world_pick_hint)
+  {
+    _world_pick_hint = new QLabel(this);
+    _world_pick_hint->setAttribute(Qt::WA_TransparentForMouseEvents);
+    _world_pick_hint->setStyleSheet("background: rgba(20, 24, 32, 215); color: white; border-radius: 8px;"
+                                    "padding: 8px 16px; font-size: 11pt; font-weight: bold;");
+  }
+  _world_pick_hint->setText(hint + "     Esc cancels");
+  _world_pick_hint->adjustSize();
+  _world_pick_hint->move((width() - _world_pick_hint->width()) / 2, 48);
+  _world_pick_hint->show();
+  _world_pick_hint->raise();
+  setCursor(Qt::CrossCursor);
+  setFocus();
+}
+
+void MapView::endWorldPick()
+{
+  _world_pick = nullptr;
+  if (_world_pick_hint)
+  {
+    _world_pick_hint->hide();
+  }
+  unsetCursor();
+}
+
+void MapView::showStudioNpc(std::uint32_t entry, QString const& name)
+{
+  _studio_entry = entry;
+  _studio_name = name;
+  refreshStudio();
+}
+
+void MapView::refreshStudio()
+{
+  if (!_npc_studio)
+  {
+    return;
+  }
+  if (!_studio_entry)
+  {
+    _npc_studio->setNpc(std::nullopt);
+  }
+  else
+  {
+    auto const& spawns = _world->creatureSpawns();
+    auto const placements = std::count_if(spawns.begin(), spawns.end(), [&](auto const& spawn) { return spawn.entry == *_studio_entry; });
+    // "Humanoid · Elite · Quest giver, Vendor · 2 placements here"
+    QStringList details;
+    if (auto const info = _creature_template_filter_info.find(*_studio_entry); info != _creature_template_filter_info.end())
+    {
+      auto const& npc = info->second;
+      if (npc.creature_type)
+      {
+        details << creature_type_label(npc.creature_type);
+      }
+      QStringList const ranks{"", "Elite", "Rare elite", "Boss", "Rare"};
+      if (npc.rank && npc.rank < static_cast<std::uint32_t>(ranks.size()))
+      {
+        details << ranks[npc.rank];
+      }
+      QStringList roles;
+      for (auto const& [flag, role] : std::initializer_list<std::pair<std::uint32_t, char const*>>{
+             {0x2u, "Quest giver"}, {0x4u, "Vendor"}, {0x10u, "Trainer"}, {0x1u, "Gossip"}})
+      {
+        if (npc.npc_flags & flag)
+        {
+          roles << role;
+        }
+      }
+      if (!roles.isEmpty())
+      {
+        details << roles.join(", ");
+      }
+    }
+    details << (placements ? QString("%1 placement%2 here").arg(placements).arg(placements == 1 ? "" : "s") : QString("Not placed here"));
+    details << QString("#%1").arg(*_studio_entry);
+    _npc_studio->setNpc(Noggit::Creator::NpcStudio::Npc{*_studio_entry, _studio_name, details.join("  ·  "),
+                                                        _creator_npcs.contains(*_studio_entry), placements > 0});
+  }
+  auto const* selected = _selected_creature_spawn_guid ? _world->findCreatureSpawn(*_selected_creature_spawn_guid) : nullptr;
+  _npc_studio->setPlacement(selected ? std::optional<std::uint32_t>(selected->guid) : std::nullopt);
+}
+
+void MapView::studioCreate(Noggit::Creator::NpcKind kind)
+{
+  if (!prepareCreatorChange())
+  {
+    return;
+  }
+  auto const source = kind == Noggit::Creator::NpcKind::Clone && _studio_entry ? *_studio_entry : 0u;
+  auto const entry = Noggit::Creator::createNpc(this, _world.get(), kind, source);
+  if (!entry)
+  {
+    return;
+  }
+  _creator_npcs.insert(*entry);
+  if (_reload_creature_picker)
+  {
+    _reload_creature_picker(*entry); // lists and selects it, filling the NPC card
+  }
+  studioPlace(*entry);
+}
+
+void MapView::studioEdit()
+{
+  if (!_studio_entry || !prepareCreatorChange())
+  {
+    return;
+  }
+  auto const entry = *_studio_entry;
+  if (!Noggit::Creator::editNpc(this, _world.get(), entry))
+  {
+    return;
+  }
+  bool const deleted = [&]
+  {
+    try { Noggit::Creator::CreatureService::load(entry); return false; }
+    catch (std::exception const&) { return true; }
+  }();
+  if (deleted)
+  {
+    _creator_npcs.remove(entry);
+    _studio_entry.reset();
+  }
+  reloadCreatorContent();
+  if (_reload_creature_picker)
+  {
+    _reload_creature_picker(deleted ? std::nullopt : std::optional<std::uint32_t>(entry));
+  }
+  refreshStudio();
+}
+
+void MapView::studioPlace(std::uint32_t entry)
+{
+  beginWorldPick(QString("Click where %1 should stand").arg(_studio_entry == entry ? _studio_name : QString("the NPC")),
+                 [this, entry](glm::vec3 const& position)
+  {
+    if (!prepareCreatorChange())
+    {
+      return;
+    }
+    try
+    {
+      auto const npc = Noggit::Creator::CreatureService::load(entry);
+      // Facing the camera, so the new NPC greets whoever placed it.
+      auto const ids = Noggit::Creator::SpawnService::save(
+        {{0, entry, serverPosition(position, _camera.yaw()._ + 180.0f), npc.respawn, false, true}});
+      reloadCreatorContent(ids.value(0));
+      refreshStudio();
+      _main_window->statusBar()->showMessage(QString("%1 placed. Use Test to see it in game.").arg(npc.name), 6000);
+    }
+    catch (std::exception const& e)
+    {
+      QMessageBox::warning(this, "Place NPC", e.what());
+    }
+  });
+}
+
+void MapView::studioTestAtNpc()
+{
+  auto* tests = Noggit::Creator::TestSessionService::instance();
+  if (!tests || !_studio_entry)
+  {
+    return;
+  }
+  // The selected placement of this NPC, else its first one in the loaded world.
+  World::CreatureSpawnOverlay const* spawn = _selected_creature_spawn_guid ? _world->findCreatureSpawn(*_selected_creature_spawn_guid) : nullptr;
+  if (!spawn || spawn->entry != *_studio_entry)
+  {
+    spawn = nullptr;
+    for (auto const& candidate : _world->creatureSpawns())
+    {
+      if (candidate.entry == *_studio_entry)
+      {
+        spawn = &candidate;
+        break;
+      }
+    }
+  }
+  if (spawn)
+  {
+    tests->testNpc(this, serverPosition(spawn->pos, spawn->orientation));
+  }
+}
+
+void MapView::studioDuplicatePlacement()
+{
+  auto const* spawn = _selected_creature_spawn_guid ? _world->findCreatureSpawn(*_selected_creature_spawn_guid) : nullptr;
+  if (!spawn)
+  {
+    return;
+  }
+  auto const entry = spawn->entry;
+  auto const respawn = static_cast<int>(spawn->ext.spawntimesecs_min);
+  auto const orientation = spawn->orientation;
+  beginWorldPick(QString("Click where the copy of %1 should stand").arg(QString::fromStdString(spawn->name)),
+                 [this, entry, respawn, orientation](glm::vec3 const& position)
+  {
+    if (!prepareCreatorChange())
+    {
+      return;
+    }
+    try
+    {
+      auto const ids = Noggit::Creator::SpawnService::save({{0, entry, serverPosition(position, orientation), respawn, false, true}});
+      reloadCreatorContent(ids.value(0));
+      refreshStudio();
+    }
+    catch (std::exception const& e)
+    {
+      QMessageBox::warning(this, "Duplicate placement", e.what());
+    }
+  });
+}
+
+void MapView::studioRemovePlacement()
+{
+  auto const* spawn = _selected_creature_spawn_guid ? _world->findCreatureSpawn(*_selected_creature_spawn_guid) : nullptr;
+  if (!spawn || QMessageBox::question(this, "Remove placement",
+        QString("Remove this placement of %1 from the world? The NPC itself is kept.").arg(QString::fromStdString(spawn->name)),
+        QMessageBox::Yes | QMessageBox::No, QMessageBox::No) != QMessageBox::Yes)
+  {
+    return;
+  }
+  deleteSelectedCreatureSpawns();
+  saveDirtyCreatureSpawns();
+  refreshStudio();
+}
+
+void MapView::openQuests(std::uint32_t focus_npc)
+{
+  if (auto session = openContentSession())
+  {
+    Noggit::Ui::Quest::QuestBrowserDialog browser(*session, focus_npc, this);
+    browser.exec();
+  }
+}
+
 void MapView::saveDirtyCreatureSpawns()
 {
+  if (qApp->property("creatorRuntimeManaged").toBool())
+  {
+    try
+    {
+      if (_world->dirtyGameObjectSpawnCount())
+        throw std::runtime_error("Save or discard pending gameobject placements before saving NPC placements.");
+      QVector<Noggit::Creator::SpawnEdit> edits;
+      for (auto const& spawn : _world->creatureSpawns())
+      {
+        if (!spawn.dirty) continue;
+        auto p = client_to_server_creature_position(spawn.pos, _world->mapIndex.hasAGlobalWMO());
+        edits.push_back({spawn.guid, spawn.entry,
+          {static_cast<unsigned>(_world->getMapID()), p.x, p.y, p.z, client_to_server_creature_orientation(spawn.orientation)},
+          static_cast<int>(spawn.ext.spawntimesecs_min), spawn.pending_delete, spawn.pending_create});
+      }
+      if (!edits.isEmpty())
+      {
+        Noggit::Creator::SpawnService::save(edits);
+        reloadCreatorContent();
+        _main_window->statusBar()->showMessage("NPC placements saved locally. Use Test Locally to see changes in game.", 6000);
+      }
+    }
+    catch (std::exception const& e) { QMessageBox::warning(this, "Save NPC placements", e.what()); }
+    return;
+  }
+
   auto dirty_count = _world->dirtyCreatureSpawnCount();
   if (dirty_count == 0)
   {
@@ -8638,6 +8704,17 @@ QString MapView::buildDirtyGameObjectSpawnSql(bool rebase_state)
 
 void MapView::saveDirtyGameObjectSpawns()
 {
+  if(qApp->property("creatorRuntimeManaged").toBool()) {
+    try {
+      if(_world->dirtyCreatureSpawnCount()) throw std::runtime_error("Save or discard pending NPC placements first.");
+      QVector<Noggit::Creator::SpawnEdit> edits;
+      for(auto const& s:_world->gameObjectSpawns()) if(s.dirty)
+        edits.push_back({s.guid,s.entry,serverPosition(s.pos,s.orientation),120,s.pending_delete,s.pending_create});
+      if(edits.isEmpty()) return;
+      Noggit::Creator::GameObjectService::placements(edits); reloadCreatorObjects();
+    } catch(std::exception const& e) { QMessageBox::warning(this,"Save GameObjects",e.what()); }
+    return;
+  }
   auto dirty_count = _world->dirtyGameObjectSpawnCount();
   if (dirty_count == 0)
   {
@@ -8734,6 +8811,7 @@ namespace
 
 void MapView::applyDirtyCreatureSpawnsToDb()
 {
+  if(qApp->property("creatorRuntimeManaged").toBool()) { saveDirtyCreatureSpawns(); return; }
   auto dirty_count = _world->dirtyCreatureSpawnCount();
   if (dirty_count == 0)
   {
@@ -8783,6 +8861,7 @@ void MapView::applyDirtyCreatureSpawnsToDb()
 
 void MapView::applyDirtyGameObjectSpawnsToDb()
 {
+  if(qApp->property("creatorRuntimeManaged").toBool()) { saveDirtyGameObjectSpawns(); return; }
   auto dirty_count = _world->dirtyGameObjectSpawnCount();
   if (dirty_count == 0)
   {
@@ -9755,10 +9834,17 @@ MapView::MapView( math::degrees camera_yaw0
       , [=] { _main_window->statusBar()->removeWidget(_status_database); }
   );
 
-  setContextMenuPolicy(Qt::CustomContextMenu);
+  // The context menu opens on right-button RELEASE without a drag (mouseReleaseEvent): Qt's default opens
+  // it on press on Linux, which swallowed every right-drag camera turn.
+  setContextMenuPolicy(Qt::PreventContextMenu);
 
-  connect(this, SIGNAL(customContextMenuRequested(const QPoint&)),
-      this, SLOT(ShowContextMenu(const QPoint&)));
+  if (auto runtime = Noggit::Runtime::RuntimeManager::instance())
+    connect(runtime, &Noggit::Runtime::RuntimeManager::beforeLocalTest, this, [this](bool* proceed)
+    {
+      if (_world->dirtyCreatureSpawnCount()) saveDirtyCreatureSpawns();
+      if (_world->dirtyCreatureSpawnCount()) *proceed = false;
+    }, Qt::DirectConnection);
+
 
   moving = strafing = updown = lookat = turn = 0.0f;
 
@@ -17775,6 +17861,15 @@ bool MapView::eventFilter(QObject* obj, QEvent* e)
 
 void MapView::keyPressEvent (QKeyEvent *event)
 {
+  if(_patrol_guid && (event->key()==Qt::Key_Delete || event->key()==Qt::Key_Backspace)) {
+    auto i=_patrol_list->currentRow(); if(i>=0) { _creator_patrol.points.removeAt(i); refreshCreatorPatrol(); } return;
+  }
+  if (_world_pick && event->key() == Qt::Key_Escape)
+  {
+    endWorldPick();
+    return;
+  }
+
   // Creature / GameObject tools: X raises, Z lowers the selected spawn(s). Handled before the hotkey
   // loop so X/Z don't trigger their menu shortcuts (e.g. texture browser) while editing spawns.
   // PLAIN key (or Shift for the coarse step) only -- Ctrl/Alt/Meta combos fall through so Ctrl+Z /
@@ -18158,10 +18253,20 @@ void MapView::focusOutEvent (QFocusEvent*)
 
 void MapView::mouseMoveEvent (QMouseEvent* event)
 {
+  if(_patrol_drag>=0) {
+    makeCurrent(); OpenGL::context::scoped_setter const guard(::gl,context());
+    _last_mouse_pos=event->pos();
+    if(auto hit=surface_pos_under_cursor()) { auto& p=_creator_patrol.points[_patrol_drag].position; auto orientation=p.orientation; p=serverPosition(*hit,0); p.orientation=orientation; _patrol_overlay->update(); }
+    return;
+  }
   //! \todo:  move the function call requiring a context in tick ?
   makeCurrent();
   OpenGL::context::scoped_setter const _ (::gl, context());
   QLineF const relative_movement (_last_mouse_pos, event->pos());
+  if (rightMouse)
+  {
+    _right_drag_travel += static_cast<int>(std::abs(relative_movement.dx()) + std::abs(relative_movement.dy()));
+  }
 
   // [game mode] LMB orbit: rotate the VIEW around the character; facing untouched. Same drag feel
   // as the RMB look (matching signs of add_to_yaw/add_to_pitch, which subtract their argument).
@@ -18562,6 +18667,32 @@ void MapView::mousePressEvent(QMouseEvent* event)
     }
   }
 
+  if(_patrol_guid && event->button()==Qt::LeftButton) {
+    _last_mouse_pos=event->pos();
+    for(int i=0;i<_creator_patrol.points.size();++i) if((patrolScreen(i)-event->pos()).manhattanLength()<24) {
+      _patrol_drag=i; _patrol_list->setCurrentRow(i); return;
+    }
+    if(_patrol_add) if(auto hit=surface_pos_under_cursor()) {
+      Noggit::Creator::Waypoint w; w.position=serverPosition(*hit,0); w.position.orientation=100;
+      w.run=_patrol_default_run;
+      int index=_patrol_insert<0?_creator_patrol.points.size():std::min(_patrol_insert,_creator_patrol.points.size());
+      _creator_patrol.points.insert(index,w); _patrol_insert=-1; refreshCreatorPatrol(); _patrol_list->setCurrentRow(index);
+    }
+    return;
+  }
+  // A pending "click in the world" (place an NPC, test at a spot) takes the next left click.
+  if (_world_pick && event->button() == Qt::LeftButton)
+  {
+    _last_mouse_pos = event->pos();
+    if (auto const hit = surface_pos_under_cursor())
+    {
+      auto const done = std::move(_world_pick);
+      endWorldPick();
+      done(*hit);
+    }
+    return;
+  }
+
   switch (event->button())
   {
   case Qt::LeftButton:
@@ -18637,6 +18768,7 @@ void MapView::mousePressEvent(QMouseEvent* event)
   if (rightMouse)
   {
     _right_click_pos = event->pos();
+    _right_drag_travel = 0;
     look = true;
   }
 }
@@ -18743,6 +18875,7 @@ void MapView::wheelEvent (QWheelEvent* event)
 
 void MapView::mouseReleaseEvent (QMouseEvent* event)
 {
+  if(_patrol_guid && event->button()==Qt::LeftButton) { _patrol_drag=-1; return; }
   makeCurrent();
   OpenGL::context::scoped_setter const _(::gl, context());
 
@@ -18934,13 +19067,7 @@ void MapView::mouseReleaseEvent (QMouseEvent* event)
     if (_display_mode == display_mode::in_2D)
       updown = 0;
 
-    // // may need to be done in constructor of widget
-    // this->setContextMenuPolicy(Qt::CustomContextMenu); 
-    // connect(this, SIGNAL(customContextMenuRequested(const QPoint&)),
-    //     this, SLOT(ShowContextMenu(const QPoint&)));
-
-
-
+    ShowContextMenu(event->pos());
     break;
 
   case Qt::MiddleButton:
@@ -19173,15 +19300,60 @@ void MapView::onSettingsSave()
 void MapView::ShowContextMenu(QPoint pos) 
 {
     // QApplication::startDragDistance() is 10
-    auto mouse_moved = QApplication::startDragDistance() < (_right_click_pos - pos).manhattanLength();;
+    auto mouse_moved = QApplication::startDragDistance() < std::max(_right_drag_travel, (_right_click_pos - pos).manhattanLength());
 
     // don't show context menu if dragging mouse
     if (mouse_moved || ImGuizmo::IsUsing())
         return;
 
+    if(qApp->property("creatorRuntimeManaged").toBool()) {
+      QMenu menu(this); auto create=menu.addMenu("Create");
+      create->addAction("GameObject",this,[this] { creatorGameObject(); });
+      create->addAction("Item…",this,[this] { if(prepareCreatorChange()) Noggit::Creator::createItem(this); });
+      create->addAction("Spell…",this,[this] { if(prepareCreatorChange()) Noggit::Creator::createSpell(this); });
+      create->addAction("Talent Trees…",this,[this] { if(prepareCreatorChange()) Noggit::Creator::openTalentEditor(this); });
+      if(_selected_creature_spawn_guid) menu.addAction("Edit Patrol",this,[this] { editCreatorPatrol(); });
+      if(auto const* spawn=_selected_creature_spawn_guid?_world->findCreatureSpawn(*_selected_creature_spawn_guid):nullptr) {
+        auto entry=spawn->entry;
+        menu.addAction("Edit Dialogue…",this,[this,entry] { if(prepareCreatorChange() && editCreatorDialogue(entry)) refreshStudio(); });
+      }
+      if(_selected_gameobject_spawn_guid) {
+        auto guid=*_selected_gameobject_spawn_guid;
+        auto spawn=_world->findGameObjectSpawn(guid);
+        if(spawn) {
+          auto entry=spawn->entry; auto position=spawn->pos; auto orientation=spawn->orientation;
+          menu.addAction("Edit GameObject",this,[this,entry,guid] {
+            if(!prepareCreatorChange()) return;
+            if(auto d=Noggit::Creator::designGameObject(this,entry,guid)) try { Noggit::Creator::GameObjectService::save(*d); reloadCreatorObjects(); } catch(std::exception const& e) { QMessageBox::warning(this,"GameObject",e.what()); }
+          });
+          menu.addAction("Edit Loot…",this,[this,entry] {
+            if(!prepareCreatorChange()) return;
+            Noggit::Creator::editLoot(this,_world.get(),{Noggit::Creator::LootOwner::Kind::Object,entry});
+          });
+          menu.addAction("Locate in world",this,[this,position] { focus_camera_on_target(position); });
+          menu.addAction("Duplicate GameObject",this,[this,entry,guid] {
+            if(!prepareCreatorChange()) return;
+            try { auto d=Noggit::Creator::GameObjectService::load(entry,guid); beginWorldPick("Click to place the duplicate",[this,d](glm::vec3 const& p) { try { Noggit::Creator::GameObjectService::save(d,serverPosition(p,0)); reloadCreatorObjects(); } catch(std::exception const& e) { QMessageBox::warning(this,"Duplicate",e.what()); } }); } catch(std::exception const& e) { QMessageBox::warning(this,"Duplicate",e.what()); }
+          });
+          menu.addAction("Delete GameObject",this,[this,guid,entry,position,orientation] { if(!prepareCreatorChange()) return; try { Noggit::Creator::GameObjectService::placements({{guid,entry,serverPosition(position,orientation),120,true,false}}); reloadCreatorObjects(); } catch(std::exception const& e) { QMessageBox::warning(this,"Delete",e.what()); } });
+          menu.addAction("Save object placements",this,[this] { saveDirtyGameObjectSpawns(); });
+          menu.addAction("Test GameObject",this,[this,guid] {
+            saveDirtyGameObjectSpawns();
+            if(_world->dirtyGameObjectSpawnCount()) return;
+            if(auto s=_world->findGameObjectSpawn(guid)) if(auto tests=Noggit::Creator::TestSessionService::instance()) tests->testGameObject(this,serverPosition(s->pos,s->orientation));
+          });
+        }
+      }
+      menu.exec(mapToGlobal(pos)); return;
+    }
+    // Only object editing has a context menu; NPC and gameobject work happens in their panels.
+    if (terrainMode != editing_mode::object)
+        return;
+
     // TODO : build the menu only once, store it and instead use setVisible ?
 
     QMenu* menu = new QMenu(this);
+    menu->setAttribute(Qt::WA_DeleteOnClose);
 
     // Undo
     QAction action_undo("Undo", this);
@@ -19596,6 +19768,115 @@ void MapView::ShowContextMenu(QPoint pos)
 
         menu->exec(mapToGlobal(pos)); // synch
         // menu->popup(mapToGlobal(pos)); // asynch, needs to be preloaded to work
-    };
+    }
+}
 
+namespace {
+class PatrolDialog final : public QDialog {
+public:
+  using QDialog::QDialog;
+  std::function<bool()> canClose;
+  void reject() override { if(!canClose || canClose()) QDialog::reject(); }
+};
+class PatrolCanvas final : public QWidget {
+public:
+  std::function<void(QPainter&)> draw;
+  explicit PatrolCanvas(QWidget* parent):QWidget(parent) { setAttribute(Qt::WA_TransparentForMouseEvents); setAttribute(Qt::WA_NoSystemBackground); }
+  void paintEvent(QPaintEvent*) override { QPainter p(this); p.setRenderHint(QPainter::Antialiasing); if(draw) draw(p); }
+};
+}
+void MapView::reloadCreatorObjects() {
+  makeCurrent(); OpenGL::context::scoped_setter const guard(::gl,context());
+  _selected_gameobject_spawn_guid.reset(); _gameobject_undo_ops.clear();
+  auto npc=_selected_creature_spawn_guid;
+  _world->reloadCreatureSpawns(); _world->setDrawGameObjectSpawns(true);
+  rebuildCreatureBrowserList(false); setSelectedCreatureSpawn(npc);
+  rebuildGameObjectBrowserList(false); refreshGameObjectEditorKnobs(); _needs_redraw=true;
+}
+void MapView::creatorGameObject() {
+  if(!prepareCreatorChange()) return;
+  if(auto d=Noggit::Creator::designGameObject(this)) {
+    set_editing_mode(editing_mode::gameobject);
+    beginWorldPick("Click to place "+d->name,[this,d](glm::vec3 const& p) {
+      try { Noggit::Creator::GameObjectService::save(*d,serverPosition(p,0)); reloadCreatorObjects(); }
+      catch(std::exception const& e) { QMessageBox::warning(this,"Create GameObject",e.what()); }
+    });
+  }
+}
+QPoint MapView::patrolScreen(int index) const {
+  auto p=_creator_patrol.points[index].position;
+  auto v=server_to_client_creature_position(p.x,p.y,p.z,_world->mapIndex.hasAGlobalWMO()); v.y+=0.3f;
+  auto screen=glm::project(v,model_view(),projection(),glm::vec4(0,0,width(),height()));
+  if(screen.z<0||screen.z>1) return {-10000,-10000};
+  return {int(screen.x),height()-int(screen.y)};
+}
+void MapView::refreshCreatorPatrol() {
+  auto selected=_patrol_list->currentRow(); _patrol_list->clear();
+  for(int i=0;i<_creator_patrol.points.size();++i) { auto const& w=_creator_patrol.points[i]; _patrol_list->addItem(QString("%1    %2     ·     %3 s pause").arg(i+1,2,10,QChar('0')).arg(w.run?"Run":"Walk").arg(w.waitMs/1000.0)); }
+  if(selected>=0) _patrol_list->setCurrentRow(std::min(selected,_patrol_list->count()-1));
+  _patrol_overlay->update();
+}
+bool MapView::editCreatorDialogue(std::uint32_t entry) {
+  auto session=openContentSession();
+  return session && Noggit::Creator::editDialogue(this,_world.get(),entry,*session);
+}
+void MapView::editCreatorPatrol() {
+  if(_patrol_guid) return;
+  if(_world->dirtyCreatureSpawnCount() || _world->dirtyGameObjectSpawnCount()) {
+    QMessageBox::information(this,"Edit Patrol","Save or discard pending placements before editing a patrol."); return;
+  }
+  if(!_selected_creature_spawn_guid) { QMessageBox::information(this,"Edit Patrol","Select an NPC placement in the world first."); return; }
+  auto guid=*_selected_creature_spawn_guid;
+  try { _creator_patrol=Noggit::Creator::PatrolService::load(guid); }
+  catch(std::exception const& e) { QMessageBox::warning(this,"Patrol",e.what()); return; }
+  if(_creator_patrol.points.isEmpty()) if(auto spawn=_world->findCreatureSpawn(guid)) {
+    Noggit::Creator::Waypoint first; first.position=serverPosition(spawn->pos,spawn->orientation); first.position.orientation=100; _creator_patrol.points.push_back(first);
+  }
+  _patrol_default_run=!_creator_patrol.points.isEmpty()&&_creator_patrol.points.front().run;
+  _saved_creator_patrol=_creator_patrol;
+  _patrol_guid=guid; _patrol_add=true;
+  auto panel=new PatrolDialog(this,Qt::Tool); panel->setAttribute(Qt::WA_DeleteOnClose); panel->setWindowTitle("Patrol Studio"); panel->resize(350,620);
+  panel->setStyleSheet("QDialog {background:#202936;color:#eef4ff;} QLabel {color:#eef4ff;} QPushButton {padding:9px;border-radius:6px;background:#34455d;color:white;} QPushButton:checked {background:#187e9c;} QListWidget {background:#16202d;color:#eef4ff;border:0;border-radius:8px;padding:8px;} QListWidget::item {padding:9px;} QListWidget::item:selected {background:#187e9c;}");
+  panel->canClose=[this,panel] {
+    if(_creator_patrol==_saved_creator_patrol) return true;
+    auto answer=QMessageBox::question(panel,"Unsaved patrol","Save this patrol before closing?",QMessageBox::Save|QMessageBox::Discard|QMessageBox::Cancel,QMessageBox::Save);
+    if(answer==QMessageBox::Cancel) return false;
+    if(answer==QMessageBox::Save) try { Noggit::Creator::PatrolService::save(_patrol_guid,_creator_patrol); } catch(std::exception const& e) { QMessageBox::warning(panel,"Save patrol",e.what()); return false; }
+    return true;
+  };
+  auto layout=new QVBoxLayout(panel); layout->setSpacing(10);
+  auto title=new QLabel("<h2>Draw a patrol</h2>Click terrain to add. Drag numbered nodes to move."); title->setWordWrap(true); layout->addWidget(title);
+  auto speed=new QComboBox; speed->addItems({"Walk · entire path","Run · entire path"}); speed->setCurrentIndex(_patrol_default_run); layout->addWidget(speed);
+  auto canvas=new PatrolCanvas(this); _patrol_overlay=canvas; canvas->setGeometry(rect()); canvas->show(); canvas->raise();
+  canvas->draw=[this](QPainter& p) {
+    if(!_patrol_guid || !_patrol_list) return;
+    p.setPen(QPen(QColor("#42cbe5"),3));
+    for(int i=1;i<_creator_patrol.points.size();++i) { auto a=patrolScreen(i-1),b=patrolScreen(i); if(a.x()>-9999&&b.x()>-9999) p.drawLine(a,b); }
+    if(_creator_patrol.loop&&_creator_patrol.points.size()>1) { auto a=patrolScreen(0),b=patrolScreen(_creator_patrol.points.size()-1); if(a.x()>-9999&&b.x()>-9999) { p.setPen(QPen(QColor("#42cbe5"),2,Qt::DashLine)); p.drawLine(a,b); } }
+    for(int i=0;i<_creator_patrol.points.size();++i) { auto at=patrolScreen(i); p.setPen(QPen(Qt::white,2)); p.setBrush(i==_patrol_list->currentRow()?QColor("#efac49"):QColor("#187e9c")); p.drawEllipse(at,14,14); p.drawText(QRect(at-QPoint(14,14),QSize(28,28)),Qt::AlignCenter,QString::number(i+1)); }
+  };
+  auto timer=new QTimer(panel); timer->setInterval(33); connect(timer,&QTimer::timeout,canvas,[this,canvas] { canvas->setGeometry(rect()); canvas->update(); }); timer->start();
+  _patrol_list=new QListWidget; layout->addWidget(_patrol_list,1);
+  auto button=[&](QString text,auto fn) { auto b=new QPushButton(text); layout->addWidget(b); connect(b,&QPushButton::clicked,panel,fn); return b; };
+  auto add=button("Add waypoints · click terrain",[this] { _patrol_add=!_patrol_add; }); add->setCheckable(true); add->setChecked(true);
+  button("Insert after selected",[this,add] { if(_patrol_list->currentRow()>=0) { _patrol_insert=_patrol_list->currentRow()+1; _patrol_add=true; add->setChecked(true); } });
+  button("Delete selected node",[this] { int i=_patrol_list->currentRow(); if(i>=0) { _creator_patrol.points.removeAt(i); refreshCreatorPatrol(); } });
+  auto row=new QHBoxLayout; layout->addLayout(row);
+  for(int delta:{-1,1}) { auto b=new QPushButton(delta<0?"Move earlier":"Move later"); row->addWidget(b); connect(b,&QPushButton::clicked,panel,[this,delta] { int i=_patrol_list->currentRow(),j=i+delta; if(i>=0&&j>=0&&j<_creator_patrol.points.size()) { _creator_patrol.points.swapItemsAt(i,j); refreshCreatorPatrol(); _patrol_list->setCurrentRow(j); } }); }
+  auto form=new QFormLayout; layout->addLayout(form);
+  auto nodeSpeed=new QComboBox; nodeSpeed->addItems({"Walk","Run"}); form->addRow("From selected node",nodeSpeed);
+  auto wait=new QDoubleSpinBox; wait->setRange(0,3600); wait->setSuffix(" s"); form->addRow("Wait at node",wait);
+  auto angle=new QDoubleSpinBox; angle->setRange(-1,360); angle->setSpecialValueText("Face travel direction"); angle->setValue(-1); angle->setSuffix("°"); form->addRow("Facing",angle);
+  auto loop=new QCheckBox("Loop path"); loop->setChecked(_creator_patrol.loop); layout->addWidget(loop);
+  connect(loop,&QCheckBox::toggled,panel,[this](bool v) { _creator_patrol.loop=v; });
+  connect(speed,qOverload<int>(&QComboBox::activated),panel,[this](int v) { _patrol_default_run=v; for(auto& w:_creator_patrol.points) w.run=v; refreshCreatorPatrol(); });
+  connect(_patrol_list,&QListWidget::currentRowChanged,panel,[this,nodeSpeed,wait,angle](int i) { if(i<0)return; QSignalBlocker a(nodeSpeed),b(wait),c(angle); auto w=_creator_patrol.points[i]; nodeSpeed->setCurrentIndex(w.run); wait->setValue(w.waitMs/1000.0); angle->setValue(w.position.orientation==100?-1:w.position.orientation*180/3.14159265); });
+  connect(nodeSpeed,qOverload<int>(&QComboBox::activated),panel,[this](int v) { int i=_patrol_list->currentRow(); if(i>=0) { _creator_patrol.points[i].run=v; refreshCreatorPatrol(); } });
+  connect(wait,qOverload<double>(&QDoubleSpinBox::valueChanged),panel,[this](double v) { int i=_patrol_list->currentRow(); if(i>=0) _creator_patrol.points[i].waitMs=int(v*1000); });
+  connect(angle,qOverload<double>(&QDoubleSpinBox::valueChanged),panel,[this](double v) { int i=_patrol_list->currentRow(); if(i>=0) _creator_patrol.points[i].position.orientation=v<0?100:v*3.14159265/180; });
+  button("Save patrol locally",[this] { try { Noggit::Creator::PatrolService::save(_patrol_guid,_creator_patrol); _saved_creator_patrol=_creator_patrol; _main_window->statusBar()->showMessage("Patrol saved · ready to test and sync",5000); } catch(std::exception const& e) { QMessageBox::warning(this,"Save patrol",e.what()); } });
+  button("Save & Test NPC",[this] { try { Noggit::Creator::PatrolService::save(_patrol_guid,_creator_patrol); _saved_creator_patrol=_creator_patrol; if(auto s=_world->findCreatureSpawn(_patrol_guid)) if(auto tests=Noggit::Creator::TestSessionService::instance()) tests->testNpc(this,serverPosition(s->pos,s->orientation)); } catch(std::exception const& e) { QMessageBox::warning(this,"Test patrol",e.what()); } });
+  button("Close",[panel] { panel->close(); });
+  connect(panel,&QDialog::finished,this,[this,canvas,timer] { timer->stop(); canvas->hide(); _patrol_guid=0; _patrol_drag=-1; _patrol_add=false; _patrol_insert=-1; _patrol_list=nullptr; _patrol_overlay=nullptr; canvas->deleteLater(); });
+  refreshCreatorPatrol(); panel->show();
 }
