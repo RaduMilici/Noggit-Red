@@ -1,4 +1,5 @@
 #include <noggit/runtime/RuntimeManager.hpp>
+#include <QProgressDialog>
 // This file is part of Noggit3, licensed under GNU General Public License (version 3).
 #include <noggit/application/NoggitApplication.hpp>
 #include <noggit/AsyncLoader.h>
@@ -691,6 +692,24 @@ int main(int argc, char *argv[])
   auto runtime = new Noggit::Runtime::RuntimeManager(runtime_root, &q_application);
   QObject::connect(&q_application, &QCoreApplication::aboutToQuit,
                    runtime, &Noggit::Runtime::RuntimeManager::shutdown);
+  auto dataProgress = new QProgressDialog("Downloading game data…", "Cancel", 0, 100);
+  dataProgress->setWindowTitle("Creator setup");
+  dataProgress->setAutoClose(false);
+  dataProgress->setAutoReset(false);
+  dataProgress->setMinimumDuration(0);
+  dataProgress->hide();
+  QObject::connect(runtime, &Noggit::Runtime::RuntimeManager::gameDataProgress,
+                   dataProgress, [dataProgress](qint64 received, qint64 total) {
+    dataProgress->setLabelText(QString("Downloading game data: %1 / %2 MB\nCompleted files are kept if you cancel.")
+        .arg(received / (1024 * 1024)).arg(total / (1024 * 1024)));
+    dataProgress->setValue(total ? int(received * 100 / total) : 0);
+    if (received < total) dataProgress->show();
+  });
+  QObject::connect(dataProgress, &QProgressDialog::canceled, runtime, &Noggit::Runtime::RuntimeManager::stop);
+  QObject::connect(runtime, &Noggit::Runtime::RuntimeManager::changed, dataProgress, [runtime, dataProgress] {
+    if (!runtime->status(2).startsWith("Downloading")) dataProgress->hide();
+  });
+  QObject::connect(&q_application, &QCoreApplication::aboutToQuit, dataProgress, &QObject::deleteLater);
   if (QSettings(runtime->root() + "/Workspace/runtime.ini", QSettings::IniFormat)
         .value("autostart", true).toBool())
     QTimer::singleShot(0, runtime, &Noggit::Runtime::RuntimeManager::start);

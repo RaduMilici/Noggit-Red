@@ -1,5 +1,6 @@
 #include "Ssh.hpp"
 #include <QCryptographicHash>
+#include <QCoreApplication>
 #include <QDir>
 #include <QElapsedTimer>
 #include <QFile>
@@ -15,6 +16,11 @@ namespace {
 QRegularExpression const hostPattern("^[A-Za-z0-9][A-Za-z0-9._:-]*$");
 QRegularExpression const userPattern("^[A-Za-z0-9_][A-Za-z0-9._-]*$");
 QString program(QString const& name) {
+  auto bundled = QDir(QCoreApplication::applicationDirPath()).absoluteFilePath("../Runtime/OpenSSH/" + name);
+#ifdef Q_OS_WIN
+  bundled += ".exe";
+#endif
+  if (QFileInfo(bundled).isExecutable()) return bundled;
   auto path = QStandardPaths::findExecutable(name);
   if (path.isEmpty()) throw Error(Problem::NotInstalled, explain(Problem::NotInstalled, {}));
   return path;

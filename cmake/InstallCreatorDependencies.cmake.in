@@ -4,6 +4,7 @@ set(suffix "@CMAKE_EXECUTABLE_SUFFIX@")
 set(executables "${root}/Noggit/noggit${suffix}"
     "${root}/Runtime/realmd/realmd${suffix}" "${root}/Runtime/mangosd/mangosd${suffix}"
     "${root}/Runtime/MariaDB/bin/mariadbd${suffix}" "${root}/Runtime/MariaDB/bin/mariadb${suffix}")
+list(APPEND executables "${root}/Runtime/OpenSSH/ssh${suffix}" "${root}/Runtime/OpenSSH/ssh-keyscan${suffix}")
 file(GLOB_RECURSE plugins "${root}/Noggit/plugins/*.so" "${root}/Noggit/*.dll")
 if("@CMAKE_SYSTEM_NAME@" STREQUAL "Windows")
   set(CMAKE_GET_RUNTIME_DEPENDENCIES_PLATFORM windows+pe)
@@ -17,7 +18,7 @@ else()
 endif()
 file(GET_RUNTIME_DEPENDENCIES EXECUTABLES ${executables} MODULES ${plugins}
     DIRECTORIES "${root}/Runtime/lib" "${root}/Runtime/MariaDB/lib"
-      "${root}/Runtime/realmd" "${root}/Runtime/mangosd" "@_qt_bin_dir@" "@CREATOR_QT_LIBS@"
+      "${root}/Runtime/realmd" "${root}/Runtime/mangosd" "${root}/Runtime/OpenSSH" "@_qt_bin_dir@" "@CREATOR_QT_LIBS@"
     PRE_EXCLUDE_REGEXES ${pre_exclude} POST_EXCLUDE_REGEXES ${post_exclude}
     RESOLVED_DEPENDENCIES_VAR resolved UNRESOLVED_DEPENDENCIES_VAR unresolved
     CONFLICTING_DEPENDENCIES_PREFIX conflicts)
@@ -39,7 +40,7 @@ endforeach()
 foreach(library IN LISTS resolved)
   if("@CMAKE_SYSTEM_NAME@" STREQUAL "Windows")
     # Each Windows process resolves DLLs beside its own executable.
-    foreach(destination Noggit Runtime/realmd Runtime/mangosd Runtime/MariaDB/bin)
+    foreach(destination Noggit Runtime/realmd Runtime/mangosd Runtime/MariaDB/bin Runtime/OpenSSH)
       file(INSTALL "${library}" DESTINATION "${root}/${destination}" TYPE SHARED_LIBRARY)
     endforeach()
   else()

@@ -117,3 +117,9 @@ The persistent LOCAL SERVER dock is replaced by three small status-bar lights
 transition, gray means Stopped; a red outline indicates a runtime error. Hover for
 text status, or click to open the controls, client profiles and test progress.
 The controls popup stays closed until requested and takes no editor side space.
+
+Portable releases may ship `Runtime/game-data.json` instead of `mangosd/data`.
+The runtime downloads its pinned HTTPS files before launching services, validates
+SHA-256 and size, and uses `Workspace/GameData/<manifest-hash>` as DataDir.
+Cancel/retry retains completed files; subsequent launches work offline. See
+[packaging](../../../etc/creator-test/PACKAGING.md) for R2 upload and release commands.

@@ -10,6 +10,7 @@
 
 namespace Noggit::Runtime
 {
+class GameDataDownload;
 // Owns only children launched by this instance; never discovers or kills system services.
 class RuntimeManager final : public QObject
 {
@@ -32,6 +33,7 @@ public slots:
   void testLocally();
 signals:
   void changed();
+  void gameDataProgress(qint64 received, qint64 total);
   void aboutToShutdown();
   void beforeLocalTest(bool* proceed);
 private:
@@ -47,6 +49,7 @@ private:
   std::array<RuntimeProcess, 3> _processes;
   std::array<QString, 3> _status{{"Stopped", "Stopped", "Stopped"}};
   RuntimeProcess _probe;
+  std::unique_ptr<GameDataDownload> _gameData;
   QTimer _timer;
   QElapsedTimer _deadline;
   std::unique_ptr<QLockFile> _lock;

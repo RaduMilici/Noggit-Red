@@ -137,7 +137,9 @@ The agent did not perform these live acceptance checks. Existing limitations:
   Wine (`Runtime/Wine/bin/wine`), a Bottles bottle (Flatpak `com.usebottles.bottles`
   or native `bottles-cli`, launched with `run -b <bottle> -e <client>`), or `wine`
   from PATH. A Flatpak Bottles needs filesystem access to the client folder. This
-  repository does not supply Wine or client assets. Windows launches the client directly.
+  release packager supplies portable Wine and extracted server data (see
+  [PACKAGING.md](PACKAGING.md)); the user supplies the game client. Windows launches
+  the client directly.
 - Client process tracking covers Creator launches; Wine launchers that fork away
   and externally launched clients may require the designer to close WoW manually.
 - NPC offsets use the saved position plus a small offset; near walls, ledges, or

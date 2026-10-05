@@ -255,6 +255,27 @@ def prepare_seed(database, source, seed, workspace):
                 process.terminate()
                 process.wait(timeout=30)
 
+# Require each kind of server data, including navigation tiles (not just headers).
+GAME_DATA_PATTERNS = {"dbc": ("*.dbc",), "maps": ("*.map",),
+                      "vmaps": ("*.vmtree", "*.vmtile", "*.vmo"),
+                      "mmaps": ("*.mmap", "*.mmtile")}
+
+def validate_game_data(data):
+    for folder, patterns in GAME_DATA_PATTERNS.items():
+        for pattern in patterns:
+            if not any(p.is_file() and p.stat().st_size > 0 for p in (data / folder).glob(pattern)):
+                raise RuntimeError(f"Incomplete extracted game data: {folder}/{pattern} in {data}")
+
+def validate_tools(ssh, wine):
+    suffix = ".exe" if sys.platform == "win32" else ""
+    for name in ("ssh", "ssh-keyscan"):
+        if not (ssh / (name + suffix)).is_file():
+            raise RuntimeError(f"Portable OpenSSH directory is missing {name}{suffix}")
+    if sys.platform == "linux":
+        if wine is None or not (wine / "bin/wine").is_file() or not (wine / "bin/wineserver").is_file():
+            raise RuntimeError("Ubuntu packages require --wine: a relocatable Wine runtime with bin/wine and bin/wineserver")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--server-source", type=Path, help="Matching Tortoise checkout; otherwise fetch pinned source")
@@ -263,7 +284,11 @@ def main():
     parser.add_argument("--server-install", type=Path, help="Already built server installation; otherwise build it")
     parser.add_argument("--ace-root", type=Path, help="Windows build dependency, not needed by end users")
     parser.add_argument("--generator", default="Visual Studio 16 2019" if sys.platform == "win32" else None)
-    parser.add_argument("--data", type=Path, help="Optional extracted maps/dbc/vmaps/mmaps")
+    assets = parser.add_mutually_exclusive_group(required=True)
+    assets.add_argument("--data", type=Path, help="Offline bundle: extracted dbc/maps/vmaps/mmaps")
+    assets.add_argument("--data-manifest", type=Path, help="Small bundle: pinned HTTPS game-data download manifest")
+    parser.add_argument("--ssh", type=Path, required=True, help="Portable OpenSSH directory containing ssh and ssh-keyscan, dependencies and licenses")
+    parser.add_argument("--wine", type=Path, help="Ubuntu: complete relocatable Wine runtime supporting the 32-bit game client")
     args = parser.parse_args()
     if sys.platform not in MARIADB or platform.machine().lower() not in ("amd64", "x86_64"):
         parser.error("Only Windows x64 and Ubuntu x86_64 are supported")
@@ -272,6 +297,13 @@ def main():
     output, cache = args.output.resolve(), args.cache.resolve()
     if output.exists():
         parser.error("Output already exists; choose a new folder to preserve databases")
+    # Reject incomplete inputs before downloads, builds, or database initialization.
+    if args.data_manifest:
+        from prepare_game_data import validate_manifest
+        validate_manifest(json.loads(args.data_manifest.read_text(encoding="utf-8")))
+    else:
+        validate_game_data(args.data.resolve())
+    validate_tools(args.ssh.resolve(), args.wine.resolve() if args.wine else None)
     cache.mkdir(parents=True, exist_ok=True)
     source = args.server_source.resolve() if args.server_source else cache / "tortoise-source"
     if not args.server_source:
@@ -336,8 +368,15 @@ def main():
             for old, new in SCHEMAS.items():
                 text = text.replace("`" + old + "`", "`" + new + "`")
             sql.write_text(text, encoding="utf-8")
-        if args.data:
-            shutil.copytree(args.data, stage / "mangosd/data")
+        if args.data_manifest:
+            shutil.copy2(args.data_manifest, stage / "game-data.json")
+        else:
+            for folder in GAME_DATA_PATTERNS:
+                shutil.copytree(args.data / folder, stage / "mangosd/data" / folder)
+            validate_game_data(stage / "mangosd/data")
+        shutil.copytree(args.ssh, stage / "OpenSSH", symlinks=True)
+        if sys.platform == "linux":
+            shutil.copytree(args.wine, stage / "Wine", symlinks=True)
         seed = stage / "DatabaseSeed"
         workspace = cache / "preparation-logs" / str(time.time_ns())
         workspace.mkdir(parents=True)

@@ -1,4 +1,5 @@
 #include "RuntimeManager.hpp"
+#include "GameDataDownload.hpp"
 #include <QCoreApplication>
 #include <QDir>
 #include <QDirIterator>
@@ -44,6 +45,17 @@ RuntimeManager::RuntimeManager(QString root, QObject* parent)
   : QObject(parent), _root(QDir(root).absolutePath())
 {
   setObjectName("localRuntime");
+  _gameData = std::make_unique<GameDataDownload>(_root);
+  _gameData->progress = [this](qint64 received, qint64 total) {
+    state(2, QString("Downloading game data: %1%").arg(total ? received * 100 / total : 0));
+    emit gameDataProgress(received, total);
+  };
+  _gameData->finished = [this](QString error) {
+    if (!_active || _shuttingDown) return;
+    if (!error.isEmpty()) { fail(error); return; }
+    state(2, "Stopped");
+    _timer.start(); launch(0);
+  };
   if (QFileInfo::exists(path("Runtime/creator-runtime.json")))
     qApp->setProperty("creatorRuntimeManaged", true);
   auto environment = QProcessEnvironment::systemEnvironment();
@@ -63,7 +75,7 @@ RuntimeManager::RuntimeManager(QString root, QObject* parent)
         if (_active) {
           if (i == 2 && code != 0 && QFileInfo::exists(path("Runtime/creator-runtime.json"))
               && QDir(path("Runtime/mangosd/data/maps")).entryList({"*.map"}, QDir::Files).isEmpty())
-            fail("Game data is missing. Add extracted maps, dbc, vmaps and mmaps under Runtime/mangosd/data. See Workspace/logs.");
+            fail("The Creator bundle is missing game data. Re-extract a complete Creator package. See Workspace/logs.");
           else
             fail(QString("%1 exited (code %2). See Workspace/logs.").arg(programs[i]).arg(code));
         }
@@ -169,7 +181,7 @@ bool RuntimeManager::prepare()
         set("WorldDatabase.Info", "\"127.0.0.1;13306;creator;creator-local;mangos\"");
         set("CharacterDatabase.Info", "\"127.0.0.1;13306;creator;creator-local;characters\"");
         set("LogsDatabase.Info", "\"127.0.0.1;13306;creator;creator-local;logs\"");
-        set("DataDir", "\"../Runtime/mangosd/data\"");
+        set("DataDir", '"' + _gameData->dataPath() + '"');
         set("WorldServerPort", "18085"); set("RealmID", "1");
         QFile manifest(path("Runtime/creator-runtime.json"));
         bool updateDatabase = manifest.open(QIODevice::ReadOnly)
@@ -192,7 +204,9 @@ void RuntimeManager::start()
   _error.clear();
   if (!prepare()) { _lock.reset(); emit changed(); return; }
   qApp->setProperty("creatorRuntimeManaged", true);
-  _active = true; _timer.start(); launch(0);
+  _active = true;
+  state(2, "Checking game data");
+  _gameData->start();
 }
 void RuntimeManager::launch(int i)
 {
@@ -235,6 +249,7 @@ void RuntimeManager::poll()
 void RuntimeManager::fail(QString const& message) { _error = message; _restart = false; stop(); }
 void RuntimeManager::stop()
 {
+  _gameData->cancel();
   _testWhenRunning = false;
   _restart = false;
   if (_stopping >= 0) return;
@@ -275,6 +290,7 @@ void RuntimeManager::restart() { if (_shuttingDown) return; stop(); _restart = t
 void RuntimeManager::shutdown()
 {
   if (_shuttingDown) return;
+  _gameData->cancel();
   emit aboutToShutdown();
   _shuttingDown = true; _restart = false; _testWhenRunning = false;
   _starting = -1; // A pending database probe must not launch realmd during shutdown.
