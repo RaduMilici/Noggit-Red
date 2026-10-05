@@ -1,3 +1,6 @@
+#if defined(_WIN32) && defined(USE_MYSQL_UID_STORAGE)
+#include <winsock2.h>
+#endif
 #include "SqlConnection.hpp"
 #include <stdexcept>
 #ifdef USE_MYSQL_UID_STORAGE

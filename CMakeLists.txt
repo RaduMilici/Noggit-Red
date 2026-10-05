@@ -501,7 +501,9 @@ IF(NOGGIT_LOGTOCONSOLE AND WIN32)
   SET_PROPERTY(TARGET noggit APPEND PROPERTY COMPILE_DEFINITIONS $<$<CONFIG:Debug>:"_CONSOLE">)
 ENDIF()
 
-includePlatform("pack")
+if(NOT CREATOR_RUNTIME_BUNDLE)
+  includePlatform("pack")
+endif()
 
 # Disable warnings
 if(WIN32)

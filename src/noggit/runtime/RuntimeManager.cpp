@@ -9,6 +9,8 @@
 #include <QTcpSocket>
 #include <QRegularExpression>
 #include <QProcessEnvironment>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <stdexcept>
 
 namespace Noggit::Runtime
@@ -58,7 +60,13 @@ RuntimeManager::RuntimeManager(QString root, QObject* parent)
       [this, i](int code, QProcess::ExitStatus) {
         if (_shuttingDown) return;
         if (_stopping >= 0) return;
-        if (_active) fail(QString("%1 exited (code %2). See Workspace/logs.").arg(programs[i]).arg(code));
+        if (_active) {
+          if (i == 2 && code != 0 && QFileInfo::exists(path("Runtime/creator-runtime.json"))
+              && QDir(path("Runtime/mangosd/data/maps")).entryList({"*.map"}, QDir::Files).isEmpty())
+            fail("Game data is missing. Add extracted maps, dbc, vmaps and mmaps under Runtime/mangosd/data. See Workspace/logs.");
+          else
+            fail(QString("%1 exited (code %2). See Workspace/logs.").arg(programs[i]).arg(code));
+        }
       });
     connect(&p, &QProcess::errorOccurred, this, [this, i](QProcess::ProcessError e) {
       if (!_shuttingDown && _stopping < 0 && e == QProcess::FailedToStart)
@@ -163,8 +171,14 @@ bool RuntimeManager::prepare()
         set("LogsDatabase.Info", "\"127.0.0.1;13306;creator;creator-local;logs\"");
         set("DataDir", "\"../Runtime/mangosd/data\"");
         set("WorldServerPort", "18085"); set("RealmID", "1");
-        set("Database.AutoUpdate.Enabled", "0");
+        QFile manifest(path("Runtime/creator-runtime.json"));
+        bool updateDatabase = manifest.open(QIODevice::ReadOnly)
+            && QJsonDocument::fromJson(manifest.readAll()).object().value("databaseUpdates").toBool();
+        set("Database.AutoUpdate.Enabled", updateDatabase ? "1" : "0");
+        if (updateDatabase)
+          set("Database.AutoUpdate.Path", '"' + path("Runtime/database_updates") + '"');
         set("HttpApi.Enable", "0");
+        set("AutoCommit.Minutes", "0");
         set("Console.Enable", "1"); set("Ra.Enable", "0"); set("SOAP.Enabled", "0");
       }
       put("Workspace/" + name + ".conf", config.toUtf8());
