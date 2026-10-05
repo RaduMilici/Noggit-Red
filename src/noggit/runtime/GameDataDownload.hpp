@@ -57,7 +57,7 @@ public:
       bool safe = parts.size() == 2 && QStringList{"dbc", "maps", "vmaps", "mmaps"}.contains(parts[0]);
       for (auto ch : path) safe &= (ch.isLetterOrNumber() && ch.unicode() < 128) || QString("/._-").contains(ch);
       if (!safe || parts.last() == "." || parts.last() == ".." || paths.contains(path.toLower())
-          || size <= 0 || size > 1024.0 * 1024 * 1024 || size != qint64(size)
+          || size < 0 || size > 1024.0 * 1024 * 1024 || size != qint64(size)
           || sha.size() != 64 || QByteArray::fromHex(sha.toLatin1()).size() != 32) {
         finished("Unsafe or invalid game-data manifest entry."); return;
       }

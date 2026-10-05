@@ -79,6 +79,29 @@ class PackagingTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "Unsafe"):
                 game_data.validate_manifest(manifest)
 
+    def test_manifest_deduplicates_identical_case_variants(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.populate_data(root)
+            (root / "dbc/FIXTURE.dbc").write_bytes(b"fixture")
+            if (root / "dbc/FIXTURE.dbc").samefile(root / "dbc/fixture.dbc"):
+                self.skipTest("Requires a case-sensitive filesystem")
+            manifest = game_data.create_manifest(root, "https://assets.example/")
+            self.assertEqual(sum(f["path"].lower() == "dbc/fixture.dbc" for f in manifest["files"]), 1)
+            (root / "dbc/FIXTURE.dbc").write_bytes(b"different")
+            with self.assertRaisesRegex(ValueError, "Conflicting"):
+                game_data.create_manifest(root, "https://assets.example/")
+
+    def test_manifest_preserves_empty_extracted_files(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.populate_data(root)
+            (root / "dbc/CharacterCreateCameras.dbc").touch()
+            manifest = game_data.create_manifest(root, "https://assets.example/")
+            entry = next(f for f in manifest["files"] if f["path"] == "dbc/CharacterCreateCameras.dbc")
+            self.assertEqual(entry["size"], 0)
+            self.assertEqual(entry["sha256"], hashlib.sha256(b"").hexdigest())
+
     def test_manifest_requires_all_data_groups_and_https(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

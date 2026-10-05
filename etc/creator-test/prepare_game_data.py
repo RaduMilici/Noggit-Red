@@ -24,7 +24,7 @@ def validate_manifest(manifest):
         if not re.fullmatch(r"(dbc|maps|vmaps|mmaps)/[A-Za-z0-9_.-]+", path) or path.split('/')[-1] in (".", "..") or path.lower() in seen:
             raise ValueError("Unsafe or duplicate game-data path: " + path)
         seen.add(path.lower())
-        if not re.fullmatch(r"[0-9a-f]{64}", entry.get("sha256", "")) or type(entry.get("size")) is not int or not 0 < entry["size"] <= 1024**3:
+        if not re.fullmatch(r"[0-9a-f]{64}", entry.get("sha256", "")) or type(entry.get("size")) is not int or not 0 <= entry["size"] <= 1024**3:
             raise ValueError("Invalid game-data size or hash: " + path)
     from prepare_runtime import GAME_DATA_PATTERNS
     from fnmatch import fnmatchcase
@@ -37,6 +37,7 @@ def validate_manifest(manifest):
 def create_manifest(data, base_url):
     validate_game_data(data)
     files = []
+    names = {}
     for folder in ("dbc", "maps", "vmaps", "mmaps"):
         for path in sorted((data / folder).iterdir()):
             if not path.is_file() or path.is_symlink():
@@ -45,8 +46,16 @@ def create_manifest(data, base_url):
             with path.open("rb") as stream:
                 for chunk in iter(lambda: stream.read(1024 * 1024), b""):
                     digest.update(chunk)
-            files.append({"path": path.relative_to(data).as_posix(), "size": path.stat().st_size,
-                          "sha256": digest.hexdigest()})
+            entry = {"path": path.relative_to(data).as_posix(), "size": path.stat().st_size,
+                     "sha256": digest.hexdigest()}
+            key = entry["path"].lower()
+            if key in names:
+                previous = names[key]
+                if (entry["size"], entry["sha256"]) != (previous["size"], previous["sha256"]):
+                    raise ValueError("Conflicting case-insensitive game-data paths: " + entry["path"])
+                continue  # Windows cannot store both spellings; identical content needs one entry.
+            names[key] = entry
+            files.append(entry)
     manifest = {"format": 1, "baseUrl": base_url.rstrip('/') + '/', "files": files}
     validate_manifest(manifest)
     return manifest

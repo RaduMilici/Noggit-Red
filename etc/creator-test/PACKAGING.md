@@ -24,15 +24,42 @@ zlib, Qt5 and the libraries needed by the portable MariaDB executable (including
 libaio and ncurses). Build on the oldest Ubuntu release the package supports;
 glibc and the OS loader remain platform dependencies and are not bundled.
 
+## One-script Windows build
+
+After pulling the code, double-click `etc/creator-test/build-windows.cmd`.
+It detects Visual Studio 2019/2022, imports its x64 compiler environment, finds
+Qt5 under `C:/Qt` (or asks for its location), updates Git submodules, downloads
+checksum-verified portable OpenSSH, prepares the server/database, builds Noggit,
+and runs CPack. The resulting ZIP is in `packages`. The window stays open so
+errors remain readable. A failed command stops packaging immediately.
+
+Install the build prerequisites described above first. The script uses the
+repository’s `etc/creator-test/game-data.json` automatically; no files need to be
+copied from Linux. This manifest contains file sizes and hashes, not the game assets.
+The assets must be uploaded to the manifest's public URL before users launch.
+
+Optional command-line overrides (from the repository in Command Prompt):
+
+```bat
+etc\creator-test\build-windows.cmd --qt "D:\Qt\5.15.2\msvc2019_64" --manifest "D:\game-data.json" --jobs 4
+```
+
+Prepared runtimes are reused when the manifest, preparation code, module and
+selected toolchain match. Changed inputs create a new runtime directory; existing
+databases are not overwritten. Builds are incremental. The helper pins Microsoft's
+OpenSSH `10.0.0.0p2-Preview` ZIP and verifies its SHA-256 before extraction. It does
+not install a database or SSH service. Neither the build nor Windows execution
+has been verified by running this helper on Linux.
+
 ## Prepare the server and database
 
-First generate and publish the game-data manifest as described below.
+The checked-in manifest is ready to use. Upload its matching assets as described below.
 
 From this repository, on either platform:
 
 ```sh
 python etc/creator-test/prepare_runtime.py --output build-runtime/Runtime \
-  --data-manifest build-runtime/game-data.json --ssh /path/to/portable-openssh
+  --data-manifest etc/creator-test/game-data.json --ssh /path/to/portable-openssh
 # Ubuntu: also add --wine /path/to/portable-wine
 ```
 
@@ -51,7 +78,9 @@ Ubuntu also requires `--wine`. Downloads and server builds are cached in
 
 ## Publish the game data once
 
-Generate the manifest (this reads all 3.9 GB to hash it):
+The repository includes the manifest for the current assets. Only when updating
+the assets, generate a replacement (this reads all 3.9 GB to hash it), review it,
+and replace `etc/creator-test/game-data.json`:
 
 ```sh
 python3 etc/creator-test/prepare_game_data.py \
