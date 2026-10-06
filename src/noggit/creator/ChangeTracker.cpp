@@ -315,8 +315,9 @@ QJsonObject ChangeTracker::capture(QueryFunction const& query, EntityType type, 
     if (rows.isEmpty()) return rows;
     auto main = firstRow(rows, "creature_template");
     if (auto equipment = field(main, "equipment_id")) add("creature_equip_template", "entry=" + n(equipment));
-    // Its own combat spell list (Creator keys it by the NPC entry; a shared game list is not part of the NPC).
-    if (field(main, "spell_list_id") == id) add("creature_spells", "entry=" + n(id));
+    // Its own combat spell list (a Creator 'spell_list'; a game list it points to is not part of the NPC).
+    if (auto list = field(main, "spell_list_id"); list && !query("SELECT entry FROM creator_content WHERE kind='spell_list' AND entry=" + n(list)).isEmpty())
+      add("creature_spells", "entry=" + n(list));
     // Vendor and trainer rows are Vendor and Trainer changes.
     // Relations to Creator quests belong to those quests' own changes.
     for (auto const& table : relations) add(table, "id=" + n(id) + creatorOnlyQuests());
@@ -556,7 +557,8 @@ QString ChangeTracker::sql(QVector<TrackedChange> const& changes) {
     out += "DELETE FROM creature WHERE id=" + id + " AND @owned>0;\n";
     out += "DELETE FROM npc_vendor WHERE entry=" + id + " AND @owned>0;\n";
     out += "DELETE FROM npc_trainer WHERE entry=" + id + " AND @owned>0;\n";
-    if (c.before.contains("creature_spells")) out += "DELETE FROM creature_spells WHERE entry=" + id + " AND @owned>0;\n";
+    for (auto const& list : ids(c.before["creature_spells"].toArray(), "entry"))
+      out += "DELETE FROM creature_spells WHERE entry=" + list + " AND @owned>0;\nDELETE FROM creator_content WHERE kind='spell_list' AND entry=" + list + " AND @owned>0;\n";
     for (auto const& table : relations) out += "DELETE FROM " + table + " WHERE id=" + id + " AND @owned>0;\n";
     if (auto equipment = field(firstRow(c.before, "creature_template"), "equipment_id"); equipment >= 1000000)
       out += "DELETE FROM creature_equip_template WHERE entry=" + n(equipment) + " AND @owned>0 AND NOT EXISTS (SELECT 1 FROM creature_template WHERE equipment_id=" + n(equipment) + " AND entry<>" + id + ");\n";
@@ -572,8 +574,11 @@ QString ChangeTracker::sql(QVector<TrackedChange> const& changes) {
     if (legacy) out += "DELETE FROM npc_vendor WHERE entry=" + id + ";\nDELETE FROM npc_trainer WHERE entry=" + id + ";\n";
     for (auto const& table : relations) out += "DELETE FROM " + table + " WHERE id=" + id + creatorOnlyQuests() + ";\n";
     // The NPC's own combat spell list is replaced whole (removed when the edit dropped every spell).
-    if (c.before.contains("creature_spells") || c.after.contains("creature_spells"))
-      out += "DELETE FROM creature_spells WHERE entry=" + id + ";\n" + replaceRows("creature_spells", c.after["creature_spells"].toArray());
+    for (auto const& list : ids(c.before["creature_spells"].toArray(), "entry"))
+      out += "DELETE FROM creature_spells WHERE entry=" + list + ";\nDELETE FROM creator_content WHERE kind='spell_list' AND entry=" + list + ";\n";
+    out += replaceRows("creature_spells", c.after["creature_spells"].toArray());
+    for (auto const& list : ids(c.after["creature_spells"].toArray(), "entry"))
+      out += "INSERT IGNORE INTO creator_content(kind,entry) VALUES('spell_list'," + list + ");\n";
     for (auto const& table : {"creature_equip_template", "creature_template", "npc_vendor", "npc_trainer", "creature_questrelation", "creature_involvedrelation"})
       if (legacy || (QString(table) != "npc_vendor" && QString(table) != "npc_trainer")) out += replaceRows(table, c.after[table].toArray());
     out += "INSERT IGNORE INTO creator_content(kind,entry) VALUES('npc'," + id + ");\n";
@@ -693,7 +698,8 @@ QVector<QPair<QString, QString>> ChangeTracker::footprint(QVector<TrackedChange>
       add("creature_equip_template", "entry", values("creature_template", "equipment_id"));
       add("npc_vendor", "entry", {id});
       add("npc_trainer", "entry", {id});
-      add("creature_spells", "entry", {id});
+      add("creature_spells", "entry", values("creature_spells", "entry"));
+      owned("spell_list", values("creature_spells", "entry"));
       for (auto const& table : relations) add(table, "id", {id});
       if (c.action == ChangeAction::Delete) {
         QStringList guids;

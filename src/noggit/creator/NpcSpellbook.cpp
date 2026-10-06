@@ -9,6 +9,7 @@
 #include <QGroupBox>
 #include <QHBoxLayout>
 #include <QLabel>
+#include <QMessageBox>
 #include <QPushButton>
 #include <QSignalBlocker>
 #include <QSpinBox>
@@ -27,6 +28,8 @@ QString targetName(int target) {
     case CombatSpell::LastThreat: return "Last on its threat list";
     case CombatSpell::RandomEnemy: return "A random enemy";
     case CombatSpell::RandomNotTank: return "A random enemy, not its target";
+    case CombatSpell::InjuredAlly: return "An injured ally";
+    case CombatSpell::AllyMissingBuff: return "An ally without its effect";
     default: return QString("Target type %1").arg(target);
   }
 }
@@ -39,8 +42,9 @@ int defaultTarget(SpellDesign const* d) {
   if (!d) return CombatSpell::Victim;
   for (auto const& e : d->effects) {
     if (!e.type) continue;
-    // Heal (10), energize (30), or a positive self aura target (1: caster).
-    if (e.type == 10 || e.type == 30 || e.targetA == 1) return CombatSpell::Self;
+    // Heals (10) go to injured allies, like the game's healers; energize (30) and caster-targeted (1) spells on itself.
+    if (e.type == 10) return CombatSpell::InjuredAlly;
+    if (e.type == 30 || e.targetA == 1) return CombatSpell::Self;
     return CombatSpell::Victim;
   }
   return CombatSpell::Victim;
@@ -114,9 +118,13 @@ NpcSpellbook::NpcSpellbook(QVector<CombatSpell> spells, QWidget* parent) : QWidg
 
   auto form = new QFormLayout; details->addLayout(form);
   _target = new QComboBox(_details);
-  for (int t : {int(CombatSpell::Victim), int(CombatSpell::Self), int(CombatSpell::RandomEnemy), int(CombatSpell::RandomNotTank), int(CombatSpell::SecondThreat), int(CombatSpell::LastThreat)})
+  for (int t : {int(CombatSpell::Victim), int(CombatSpell::Self), int(CombatSpell::RandomEnemy), int(CombatSpell::RandomNotTank), int(CombatSpell::SecondThreat), int(CombatSpell::LastThreat),
+                int(CombatSpell::InjuredAlly), int(CombatSpell::AllyMissingBuff)})
     _target->addItem(targetName(t), t);
   form->addRow("Cast on", _target);
+  _health = new QSpinBox(_details); _health->setRange(0, 100); _health->setSuffix(" %"); _health->setSpecialValueText("Any missing health");
+  _health->setToolTip("Heals an ally whose health is below this.");
+  form->addRow("When health is below", _health);
   _chance = new QSpinBox(_details); _chance->setRange(1, 100); _chance->setSuffix(" %"); _chance->setToolTip("Rolled each time the timer is ready.");
   form->addRow("Chance", _chance);
   auto pair = [&](QSpinBox*& a, QSpinBox*& b, QString const& label, QString const& tip) {
@@ -133,7 +141,10 @@ NpcSpellbook::NpcSpellbook(QVector<CombatSpell> spells, QWidget* parent) : QWidg
   _melee = new QCheckBox("Only in melee range", _details);
   _notMelee = new QCheckBox("Only out of melee range", _details);
   _ranged = new QCheckBox("Main ranged spell: keeps its distance and casts this", _details);
-  for (auto* c : {_interrupt, _auraMissing, _melee, _notMelee, _ranged}) details->addWidget(c);
+  _casting = new QCheckBox("Only while its target is casting (interrupts)", _details);
+  _instant = new QCheckBox("Cast instantly, at no cost", _details);
+  _instant->setToolTip("A triggered cast: no cast time and no mana, rage or energy.");
+  for (auto* c : {_interrupt, _auraMissing, _melee, _notMelee, _ranged, _casting, _instant}) details->addWidget(c);
   details->addStretch();
 
   connect(_change, &QPushButton::clicked, this, [this] {
@@ -159,9 +170,9 @@ NpcSpellbook::NpcSpellbook(QVector<CombatSpell> spells, QWidget* parent) : QWidg
   connect(_earlier, &QPushButton::clicked, this, [move] { move(-1); });
   connect(_later, &QPushButton::clicked, this, [move] { move(1); });
   connect(_target, qOverload<int>(&QComboBox::currentIndexChanged), this, [this] { edited(_target); });
-  for (auto* s : {_chance, _firstMin, _firstMax, _repeatMin, _repeatMax})
+  for (auto* s : {_chance, _firstMin, _firstMax, _repeatMin, _repeatMax, _health})
     connect(s, qOverload<int>(&QSpinBox::valueChanged), this, [this, s] { edited(s); });
-  for (auto* c : {_interrupt, _auraMissing, _melee, _notMelee, _ranged})
+  for (auto* c : {_interrupt, _auraMissing, _melee, _notMelee, _ranged, _casting, _instant})
     connect(c, &QCheckBox::toggled, this, [this, c] { edited(c); });
 
   refreshSlots();
@@ -222,17 +233,29 @@ void NpcSpellbook::showSelected() {
   _melee->setChecked(s.flags & CombatSpell::OnlyInMelee);
   _notMelee->setChecked(s.flags & CombatSpell::NotInMelee);
   _ranged->setChecked(s.flags & CombatSpell::Ranged);
+  _casting->setChecked(s.flags & CombatSpell::TargetCasting);
+  _instant->setChecked(s.flags & CombatSpell::Triggered);
+  bool const heal = s.target == CombatSpell::InjuredAlly;
+  _health->setValue(heal ? std::clamp(s.param2, 0, 100) : 50);
+  _health->setEnabled(heal);
   _updating = false;
   _earlier->setEnabled(_selected > 0); _later->setEnabled(_selected + 1 < _spells.size());
 }
 void NpcSpellbook::assign(int slot, Id spell) {
   if (slot < 0 || slot > _spells.size() || slot >= Npc::maxCombatSpells) return;
+  if (spell > SpellService::idLimit) {
+    QMessageBox::information(this, "Spellbook", QString("This spell's ID (%1) is above %2: an NPC's spell list cannot hold it. Clone it to get a usable ID.")
+                                                  .arg(spell).arg(SpellService::idLimit));
+    refreshSlots(); return;
+  }
   if (slot == _spells.size()) {
     CombatSpell s; s.spell = spell; s.target = defaultTarget(info(spell));
     if (s.target == CombatSpell::Self) s.flags |= CombatSpell::AuraNotPresent; // don't keep recasting a buff
+    if (s.target == CombatSpell::InjuredAlly) s.param2 = 50;
     _spells.push_back(s);
   } else {
     _spells[slot].spell = spell;
+    if (_spells[slot].target == CombatSpell::AllyMissingBuff) _spells[slot].param2 = int(spell);
   }
   refreshSlots(); select(slot);
 }
@@ -248,13 +271,23 @@ void NpcSpellbook::edited(QObject* source) {
   if (source == _repeatMax && _repeatMin->value() > _repeatMax->value()) { QSignalBlocker b(_repeatMin); _repeatMin->setValue(_repeatMax->value()); }
   s.firstMin = _firstMin->value(); s.firstMax = _firstMax->value();
   s.repeatMin = _repeatMin->value(); s.repeatMax = _repeatMax->value();
-  int flags = s.flags & ~(CombatSpell::InterruptCast | CombatSpell::AuraNotPresent | CombatSpell::OnlyInMelee | CombatSpell::NotInMelee | CombatSpell::Ranged);
+  int flags = s.flags & ~(CombatSpell::InterruptCast | CombatSpell::AuraNotPresent | CombatSpell::OnlyInMelee | CombatSpell::NotInMelee | CombatSpell::Ranged
+                          | CombatSpell::TargetCasting | CombatSpell::Triggered);
   if (_interrupt->isChecked()) flags |= CombatSpell::InterruptCast;
   if (_auraMissing->isChecked()) flags |= CombatSpell::AuraNotPresent;
   if (_melee->isChecked()) flags |= CombatSpell::OnlyInMelee;
   if (_notMelee->isChecked()) flags |= CombatSpell::NotInMelee;
   if (_ranged->isChecked()) flags |= CombatSpell::Ranged;
+  if (_casting->isChecked()) flags |= CombatSpell::TargetCasting;
+  if (_instant->isChecked()) flags |= CombatSpell::Triggered;
   s.flags = flags;
+  // Target parameters: a heal's health threshold; the aura a buff looks for (this spell's own). Other targets
+  // keep what they were loaded with when unchanged, and use none once picked here.
+  if (source == _target || source == _health) {
+    s.param1 = 0;
+    s.param2 = s.target == CombatSpell::InjuredAlly ? _health->value() : s.target == CombatSpell::AllyMissingBuff ? int(s.spell) : 0;
+  }
+  _health->setEnabled(s.target == CombatSpell::InjuredAlly);
   auto* slot = _slots[_selected];
   auto const* d = info(s.spell);
   QString name = d ? d->name + (d->rank.isEmpty() ? QString() : " (" + d->rank + ")") : QString("Missing spell %1").arg(s.spell);

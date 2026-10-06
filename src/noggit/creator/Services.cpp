@@ -1,6 +1,7 @@
 #include "Services.hpp"
 #include "Database.hpp"
 #include "GossipService.hpp"
+#include "SpellService.hpp"
 #include <noggit/runtime/RuntimeManager.hpp>
 #include <QJsonDocument>
 #include <QJsonArray>
@@ -48,42 +49,56 @@ QVector<CombatSpell> readSpellList(Database& db, Id list) {
     auto col=[&](char const* name) { return r.value(QString(name)+"_"+QString::number(i)).toInt(); };
     CombatSpell s; s.spell=Id(col("spellId")); if(!s.spell) continue;
     s.chance=col("probability"); s.target=col("castTarget"); s.flags=col("castFlags");
+    s.param1=col("targetParam1"); s.param2=col("targetParam2"); s.script=Id(col("scriptId"));
     s.firstMin=col("delayInitialMin"); s.firstMax=col("delayInitialMax"); s.repeatMin=col("delayRepeatMin"); s.repeatMax=col("delayRepeatMax");
     spells.push_back(s);
   }
   return spells;
 }
-// Replaces the NPC's own list (entry == the NPC entry). Returns the spell_list_id to store (0: none).
-Id writeSpellList(Database& db, Id entry, QString const& name, QVector<CombatSpell> const& spells) {
+// Writes the NPC's combat spell list and returns the spell_list_id to store (0: none). Lists are shared by ID
+// and the game's go up to millions, so a Creator list gets its own ID (marked 'spell_list' in creator_content)
+// and only such a list is ever replaced or removed; `current` (the NPC's spell_list_id) is reused when it is one.
+Id writeSpellList(Database& db, Id current, QString const& name, QVector<CombatSpell> const& spells) {
   bool const table=hasSpellLists(db);
   require(table||spells.isEmpty(),"This server has no creature_spells table, so NPCs cannot have combat spells.");
   if(!table) return 0;
   require(spells.size()<=Npc::maxCombatSpells,QString("An NPC can have at most %1 combat spells.").arg(Npc::maxCombatSpells));
   for(auto const& s:spells) {
+    // creature_spells stores spell IDs as smallint unsigned.
+    require(s.spell<=SpellService::idLimit,QString("Spell %1 has an ID above %2, which an NPC's spell list cannot hold.").arg(s.spell).arg(SpellService::idLimit));
     require(!db.query("SELECT entry FROM spell_template WHERE entry="+n(s.spell)).isEmpty(),QString("Combat spell %1 does not exist.").arg(s.spell));
     require(s.chance>=1&&s.chance<=100,"A combat spell's chance must be between 1 and 100%.");
-    require(s.firstMin>=0&&s.firstMin<=s.firstMax&&s.repeatMin>=0&&s.repeatMin<=s.repeatMax,"A combat spell's timing is invalid: minimum above maximum.");
+    require(s.firstMin>=0&&s.firstMin<=s.firstMax&&s.firstMax<=65535&&s.repeatMin>=0&&s.repeatMin<=s.repeatMax&&s.repeatMax<=65535,"A combat spell's timing is invalid: minimum above maximum.");
   }
-  db.snapshot("creature_spells","entry",entry);
-  db.exec("DELETE FROM creature_spells WHERE entry="+n(entry));
-  if(spells.isEmpty()) return 0;
-  // Every column is written (scriptId_N and the like too, as 0) so strict NOT NULL columns never fail,
+  Id list=current&&db.owned("spell_list",current)?current:0;
+  if(spells.isEmpty()) {
+    if(list) {
+      db.snapshot("creature_spells","entry",list); db.exec("DELETE FROM creature_spells WHERE entry="+n(list));
+      db.snapshot("creator_content","entry",list); db.exec("DELETE FROM creator_content WHERE kind='spell_list' AND entry="+n(list));
+    }
+    return 0;
+  }
+  if(!list) list=db.allocate("creature_spells","entry",0xfffffffe);
+  db.snapshot("creature_spells","entry",list);
+  db.exec("DELETE FROM creature_spells WHERE entry="+n(list));
+  // Every column is written (scriptId_N and the like too) so strict NOT NULL columns never fail,
   // but only those this server's table has.
   QSet<QString> columns; for(auto const& c:db.query("SHOW COLUMNS FROM creature_spells")) columns.insert(c["Field"].toString());
   Fields row;
   auto set=[&](QString const& column, QVariant const& value) { if(columns.contains(column)) row[column]=value; };
-  set("entry",entry); set("name",name.left(100));
+  set("entry",list); set("name",name.left(100));
   for(int i=0;i<Npc::maxCombatSpells;++i) {
     CombatSpell s=i<spells.size()?spells[i]:CombatSpell{0,100,CombatSpell::Victim,0,0,0,0,0};
     auto k=[&](char const* col) { return QString(col)+"_"+QString::number(i+1); };
     set(k("spellId"),s.spell); set(k("probability"),s.chance); set(k("castTarget"),s.target);
-    set(k("targetParam1"),0); set(k("targetParam2"),0); set(k("castFlags"),s.flags);
+    set(k("targetParam1"),s.param1); set(k("targetParam2"),s.param2); set(k("castFlags"),s.flags);
     set(k("delayInitialMin"),s.firstMin); set(k("delayInitialMax"),s.firstMax); set(k("delayRepeatMin"),s.repeatMin); set(k("delayRepeatMax"),s.repeatMax);
-    set(k("scriptId"),0);
+    set(k("scriptId"),s.script);
   }
   require(row.contains("entry")&&row.contains("spellId_1"),"This server's creature_spells table has an unknown layout.");
   db.insert("creature_spells",row);
-  return entry;
+  db.snapshot("creator_content","entry",list); db.mark("spell_list",list);
+  return list;
 }
 }
 QVector<Choice> CreatureService::search(QString const& text, bool ownedOnly) {
@@ -165,7 +180,7 @@ Id CreatureService::save(Npc const& d, std::optional<Position> const& place, Id*
     db.insert("creature_equip_template",{{"entry",equipment},{"equipentry1",d.equipment[0]},{"equipentry2",d.equipment[1]},{"equipentry3",d.equipment[2]}});
     values["equipment_id"]=equipment;
   }
-  values["spell_list_id"]=writeSpellList(db,entry,d.name.trimmed(),d.spells);
+  values["spell_list_id"]=writeSpellList(db,d.entry?one(db,"creature_template",entry)["spell_list_id"].toUInt():0,d.name.trimmed(),d.spells);
   db.snapshot("creature_template","entry",entry);
   if(d.entry) update(db,"creature_template","entry",entry,values);
   else { values["entry"]=entry; db.insert("creature_template",values); }
@@ -221,7 +236,10 @@ void CreatureService::remove(Id entry) {
     db.snapshot(table,key,entry); db.exec("DELETE FROM "+QString(table)+" WHERE "+key+"="+id);
   }
   // Its own combat spell list (always keyed by its entry).
-  if(row.value("spell_list_id").toUInt()==entry) { db.snapshot("creature_spells","entry",entry); db.exec("DELETE FROM creature_spells WHERE entry="+id); }
+  if(auto list=row.value("spell_list_id").toUInt(); list&&db.owned("spell_list",list)) {
+    db.snapshot("creature_spells","entry",list); db.exec("DELETE FROM creature_spells WHERE entry="+n(list));
+    db.snapshot("creator_content","entry",list); db.exec("DELETE FROM creator_content WHERE kind='spell_list' AND entry="+n(list));
+  }
   // Creator allocates a private equipment row per save; shared original rows are left alone.
   auto equipment=row["equipment_id"].toUInt();
   if(equipment>=1000000&&db.query("SELECT entry FROM creature_template WHERE equipment_id="+n(equipment)+" AND entry<>"+id+" LIMIT 1").isEmpty()) {

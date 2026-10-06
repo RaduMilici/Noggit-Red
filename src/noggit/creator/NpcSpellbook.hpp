@@ -35,7 +35,8 @@ private:
   QLabel *_tooltip = nullptr, *_status = nullptr;
   QPushButton *_change = nullptr, *_open = nullptr, *_remove = nullptr, *_earlier = nullptr, *_later = nullptr;
   QComboBox* _target = nullptr;
-  QSpinBox *_chance = nullptr, *_firstMin = nullptr, *_firstMax = nullptr, *_repeatMin = nullptr, *_repeatMax = nullptr;
+  QSpinBox *_chance = nullptr, *_firstMin = nullptr, *_firstMax = nullptr, *_repeatMin = nullptr, *_repeatMax = nullptr, *_health = nullptr;
   QCheckBox *_interrupt = nullptr, *_auraMissing = nullptr, *_melee = nullptr, *_notMelee = nullptr, *_ranged = nullptr;
+  QCheckBox *_casting = nullptr, *_instant = nullptr;
 };
 }

@@ -491,13 +491,22 @@ local client's `Data` folder: `patch-Z.mpq`, the last patch the 1.12 client load
 - **Spellbook** tab: up to eight combat spells in priority order, as a two-page
   spellbook with icons and tooltips. Any spell can be added, or a custom one made in
   the Spell Editor (**Create Custom Spell…**; game spells open read-only, and their
-  clone takes the slot). Per spell: cast on (itself, its target, a random enemy, a
-  random enemy other than its target, second or last on threat), chance, first-cast
-  delay and repeat timer (random ranges, seconds), and conditions (interrupt its
-  cast, only if the target lacks the effect, only in / out of melee, main ranged
-  spell). Stored as the NPC's own `creature_spells` row (`spell_list_id` = its
-  entry), cast by the server's default AI; cloning with the combat group copies the
-  list. Local changes, export and sync carry the row and the Creator spells it uses.
+  clone takes the slot). Spell IDs must be at most 65535 (`creature_spells` stores
+  them as smallint). Per spell: cast on (itself, its target, a random enemy, a random
+  enemy other than its target, second or last on threat, an injured ally below a
+  health %, an ally without its effect), chance, first-cast delay and repeat timer
+  (random ranges, seconds), and conditions (interrupt its cast, only if the target
+  lacks the effect, only in / out of melee, main ranged spell, only while the target
+  casts, cast instantly at no cost). Target and flag values were checked against the
+  local world's lists (0: Thrash, 5: Fear, 15: heals, 17: wards; 8: Fireball, 32:
+  curses, 256: Kick). New heals default to injured allies below 50%.
+  Stored as a `creature_spells` row with its own ID (allocated above every list, since
+  game list IDs reach millions) and marked `spell_list` in `creator_content`; only such
+  a list is replaced or removed, never a game list an NPC was cloned from. Cast by the
+  server's default AI, as for the 1,087 game creatures with a list and no script.
+  Cloning with the combat group copies the list; target parameters and script IDs
+  are kept. Local changes, export and sync carry the row, its mark and the Creator
+  spells it uses.
 - **Loot** tab: a summary and the Loot editor; for a new NPC it saves the NPC first.
   Visible equipment does not import player combat stats. Guard uses native guard
   behavior; Vendor/Trainer roles have no inventory/lesson editing, but clone options

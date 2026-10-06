@@ -20,12 +20,18 @@ struct Position { unsigned map = 0; float x = 0, y = 0, z = 0, orientation = 0; 
 // The server's default AI casts these in combat. Times are seconds.
 struct CombatSpell {
   // castTarget values (the server's script target types) Creator offers.
-  enum Target { Self = 0, Victim = 1, SecondThreat = 2, LastThreat = 3, RandomEnemy = 4, RandomNotTank = 5 };
-  // castFlags Creator offers.
-  enum Flag { InterruptCast = 0x01, Ranged = 0x08, AuraNotPresent = 0x20, OnlyInMelee = 0x40, NotInMelee = 0x80 };
+  // Checked against the local world's lists: 0 for self casts (Thrash, Defensive Stance), 5 for Fear / Sleep,
+  // 15 for heals (targetParam2: below this health %), 17 for wards (targetParam2: the aura to look for).
+  enum Target { Self = 0, Victim = 1, SecondThreat = 2, LastThreat = 3, RandomEnemy = 4, RandomNotTank = 5,
+                InjuredAlly = 15, AllyMissingBuff = 17 };
+  // castFlags Creator offers (checked the same way: 8 on Fireball / Shoot, 32 on curses, 256 on Kick / Pummel).
+  enum Flag { InterruptCast = 0x01, Triggered = 0x02, Ranged = 0x08, AuraNotPresent = 0x20, OnlyInMelee = 0x40, NotInMelee = 0x80,
+              TargetCasting = 0x100 };
   Id spell = 0;
   int chance = 100, target = Victim, flags = 0;
   int firstMin = 0, firstMax = 5, repeatMin = 10, repeatMax = 15;
+  int param1 = 0, param2 = 0; // targetParam1/2, meaning depends on the target (kept as loaded)
+  Id script = 0;              // scriptId, kept as loaded (a cloned game list may use one)
   bool operator==(CombatSpell const&) const = default;
 };
 struct Npc {
