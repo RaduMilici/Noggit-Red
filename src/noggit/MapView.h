@@ -181,6 +181,7 @@ private:
   QString _studio_name;
   QSet<std::uint32_t> _creator_npcs; // NPCs made in Noggit (refreshed on entering creature mode)
   std::function<void(std::optional<std::uint32_t>)> _reload_creature_picker;
+  std::function<void(std::optional<std::uint32_t>)> _reload_gameobject_picker;
   float _cursorRotation;
   bool look, freelook;
   bool ui_hidden = false;
@@ -821,6 +822,10 @@ private:
   bool _dragging_gameobject_spawn = false;
   std::optional<glm::vec3> _gameobject_drag_anchor_pos;
   std::vector<SpawnDragState> _gameobject_drag_initial_positions;
+  // Spawn drags (creature + gameobject) only start moving once the cursor leaves the press point by
+  // QApplication::startDragDistance(), so a plain click-to-select doesn't snap the spawn to the cursor.
+  QPoint _spawn_drag_press_pos;
+  bool _spawn_drag_moved = false;
 
   Noggit::Ui::Tools::ToolPanel* _tool_panel_dock;
 
@@ -953,7 +958,8 @@ private:
   void showStudioNpc(std::uint32_t entry, QString const& name);
   void refreshStudio();
   void creatorGameObject();
-  void reloadCreatorObjects();
+  // template_entry: a gameobject_template Creator just wrote -> also refresh the model picker and select it.
+  void reloadCreatorObjects(std::optional<std::uint32_t> template_entry = std::nullopt);
   void editCreatorPatrol();
   bool editCreatorDialogue(std::uint32_t entry);
   void refreshCreatorPatrol();

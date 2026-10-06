@@ -3280,7 +3280,7 @@ void MapView::setupGameObjectModelPickerUi()
     return path;
   };
 
-  auto resolve_display_model = [&](std::uint32_t display_id, std::string& model_path)
+  auto resolve_display_model = [normalize_picker_path](std::uint32_t display_id, std::string& model_path)
   {
     try
     {
@@ -3296,46 +3296,63 @@ void MapView::setupGameObjectModelPickerUi()
   };
 
   auto template_entries = std::make_shared<std::vector<TemplatePickerEntry>>();
+  auto template_error = std::make_shared<std::string>();
 
-#ifdef USE_MYSQL_UID_STORAGE
-  std::string template_error;
-  auto records = mysql::getGameObjectTemplates(25000, &template_error);
-  template_entries->reserve(records.size());
-  for (auto const& record : records)
+  // (Re)loads gameobject_template. Kept as a member so Creator authoring (which writes new templates
+  // straight to the DB) can refresh the picker afterwards -- otherwise new entries never show up here.
+  auto load_templates = [=]()
   {
-    TemplatePickerEntry entry;
-    entry.entry = record.entry;
-    entry.type = record.type;
-    entry.display_id = record.display_id;
-    entry.name = record.name;
-    entry.template_scale = record.template_scale;
-    if (entry.display_id)
+    template_entries->clear();
+    template_error->clear();
+#ifdef USE_MYSQL_UID_STORAGE
+    auto records = mysql::getGameObjectTemplates(25000, template_error.get());
+    template_entries->reserve(records.size());
+    for (auto const& record : records)
     {
-      resolve_display_model(entry.display_id, entry.path);
+      TemplatePickerEntry entry;
+      entry.entry = record.entry;
+      entry.type = record.type;
+      entry.display_id = record.display_id;
+      entry.name = record.name;
+      entry.template_scale = record.template_scale;
+      if (entry.display_id)
+      {
+        resolve_display_model(entry.display_id, entry.path);
+      }
+      template_entries->push_back(std::move(entry));
     }
-    template_entries->push_back(std::move(entry));
-  }
 #else
-  std::string template_error = "Build does not include MySQL support.";
+    *template_error = "Build does not include MySQL support.";
 #endif
 
-  // Populate the type dropdown with every distinct gameobject type present in the loaded list.
-  {
     std::set<std::uint32_t> distinct_types;
     for (auto const& entry : *template_entries)
     {
       distinct_types.insert(entry.type);
     }
-    for (auto const type : distinct_types)  // std::set keeps them sorted
-    {
-      type_filter->addItem(QString("%1 (%2)").arg(gameobject_type_label(type)).arg(type),
-                           static_cast<qulonglong>(type));
-    }
-  }
 
-  // Share the gameobject template type info with the current-map browser so it can offer the same Type
-  // filter, and populate its Type combo identically.
-  {
+    // Repopulate a Type combo with every distinct type (index 0 = "All types"), keeping its selection.
+    auto fill_type_combo = [&](QComboBox* combo)
+    {
+      QSignalBlocker blocker(combo);
+      auto const current = combo->currentData();
+      while (combo->count() > 1)
+      {
+        combo->removeItem(1);
+      }
+      for (auto const type : distinct_types)  // std::set keeps them sorted
+      {
+        combo->addItem(QString("%1 (%2)").arg(gameobject_type_label(type)).arg(type),
+                       static_cast<qulonglong>(type));
+      }
+      int const index = current.isValid() ? combo->findData(current) : 0;
+      combo->setCurrentIndex(index >= 0 ? index : 0);
+    };
+
+    fill_type_combo(type_filter);
+
+    // Share the gameobject template type info with the current-map browser so it can offer the same
+    // Type filter, and populate its Type combo identically.
     _gameobject_template_filter_type.clear();
     for (auto const& entry : *template_entries)
     {
@@ -3343,20 +3360,11 @@ void MapView::setupGameObjectModelPickerUi()
     }
     if (_gameobject_browser_type_filter)
     {
-      std::set<std::uint32_t> distinct_types;
-      for (auto const& entry : *template_entries)
-      {
-        distinct_types.insert(entry.type);
-      }
-      QSignalBlocker blocker(_gameobject_browser_type_filter);
-      for (auto const type : distinct_types)
-      {
-        _gameobject_browser_type_filter->addItem(
-          QString("%1 (%2)").arg(gameobject_type_label(type)).arg(type), static_cast<qulonglong>(type));
-      }
+      fill_type_combo(_gameobject_browser_type_filter);
     }
     rebuildGameObjectBrowserList(true);
-  }
+  };
+  load_templates();
 
   auto selected_template = std::make_shared<std::optional<TemplatePickerEntry>>();
 
@@ -3427,9 +3435,9 @@ void MapView::setupGameObjectModelPickerUi()
                           .arg(visible_count)
                           .arg(visible_count == 1 ? "y" : "ies")
                           .arg(previewable_count);
-      if (!template_error.empty())
+      if (!template_error->empty())
       {
-        message = QString("Template load failed: %1").arg(QString::fromStdString(template_error));
+        message = QString("Template load failed: %1").arg(QString::fromStdString(*template_error));
       }
       _gameobject_model_picker_status->setText(message);
     }
@@ -3625,6 +3633,23 @@ void MapView::setupGameObjectModelPickerUi()
     ? std::function<void()>([this] { creatorGameObject(); }) : std::function<void()>(add_pending_spawn);
 
   rebuild_template_tree();
+
+  _reload_gameobject_picker = [=](std::optional<std::uint32_t> select)
+  {
+    load_templates();
+    rebuild_template_tree();
+    if (!select)
+    {
+      return;
+    }
+    select_template_entry(*select);
+    auto const rows = _gameobject_model_tree->findItems(QString("%1 - ").arg(*select), Qt::MatchStartsWith);
+    if (!rows.isEmpty())
+    {
+      _gameobject_model_tree->setCurrentItem(rows.front());
+      _gameobject_model_tree->scrollToItem(rows.front());
+    }
+  };
 
   _gameobject_model_picker_dock->setWidget(container);
   _main_window->addDockWidget(Qt::BottomDockWidgetArea, _gameobject_model_picker_dock);
@@ -18305,6 +18330,16 @@ void MapView::mouseMoveEvent (QMouseEvent* event)
   // is written back to _cursor_pos so the aim circle tracks the drag too.
   if ((_dragging_creature_spawn || _dragging_gameobject_spawn) && leftMouse)
   {
+    if (!_spawn_drag_moved)
+    {
+      if ((event->pos() - _spawn_drag_press_pos).manhattanLength() < QApplication::startDragDistance())
+      {
+        _last_mouse_pos = event->pos();
+        return;
+      }
+      _spawn_drag_moved = true;
+    }
+
     if (auto const surface = surface_pos_under_cursor())
     {
       _cursor_pos = *surface;
@@ -18717,6 +18752,12 @@ void MapView::mousePressEvent(QMouseEvent* event)
 
   default:
     break;
+  }
+
+  if (leftMouse)
+  {
+    _spawn_drag_press_pos = event->pos();
+    _spawn_drag_moved = false;
   }
 
   if (leftMouse && terrainMode == editing_mode::creature)
@@ -19324,7 +19365,7 @@ void MapView::ShowContextMenu(QPoint pos)
           auto entry=spawn->entry; auto position=spawn->pos; auto orientation=spawn->orientation;
           menu.addAction("Edit GameObject",this,[this,entry,guid] {
             if(!prepareCreatorChange()) return;
-            if(auto d=Noggit::Creator::designGameObject(this,entry,guid)) try { Noggit::Creator::GameObjectService::save(*d); reloadCreatorObjects(); } catch(std::exception const& e) { QMessageBox::warning(this,"GameObject",e.what()); }
+            if(auto d=Noggit::Creator::designGameObject(this,entry,guid)) try { reloadCreatorObjects(Noggit::Creator::GameObjectService::save(*d)); } catch(std::exception const& e) { QMessageBox::warning(this,"GameObject",e.what()); }
           });
           menu.addAction("Edit Loot…",this,[this,entry] {
             if(!prepareCreatorChange()) return;
@@ -19333,7 +19374,7 @@ void MapView::ShowContextMenu(QPoint pos)
           menu.addAction("Locate in world",this,[this,position] { focus_camera_on_target(position); });
           menu.addAction("Duplicate GameObject",this,[this,entry,guid] {
             if(!prepareCreatorChange()) return;
-            try { auto d=Noggit::Creator::GameObjectService::load(entry,guid); beginWorldPick("Click to place the duplicate",[this,d](glm::vec3 const& p) { try { Noggit::Creator::GameObjectService::save(d,serverPosition(p,0)); reloadCreatorObjects(); } catch(std::exception const& e) { QMessageBox::warning(this,"Duplicate",e.what()); } }); } catch(std::exception const& e) { QMessageBox::warning(this,"Duplicate",e.what()); }
+            try { auto d=Noggit::Creator::GameObjectService::load(entry,guid); beginWorldPick("Click to place the duplicate",[this,d](glm::vec3 const& p) { try { reloadCreatorObjects(Noggit::Creator::GameObjectService::save(d,serverPosition(p,0))); } catch(std::exception const& e) { QMessageBox::warning(this,"Duplicate",e.what()); } }); } catch(std::exception const& e) { QMessageBox::warning(this,"Duplicate",e.what()); }
           });
           menu.addAction("Delete GameObject",this,[this,guid,entry,position,orientation] { if(!prepareCreatorChange()) return; try { Noggit::Creator::GameObjectService::placements({{guid,entry,serverPosition(position,orientation),120,true,false}}); reloadCreatorObjects(); } catch(std::exception const& e) { QMessageBox::warning(this,"Delete",e.what()); } });
           menu.addAction("Save object placements",this,[this] { saveDirtyGameObjectSpawns(); });
@@ -19785,12 +19826,13 @@ public:
   void paintEvent(QPaintEvent*) override { QPainter p(this); p.setRenderHint(QPainter::Antialiasing); if(draw) draw(p); }
 };
 }
-void MapView::reloadCreatorObjects() {
+void MapView::reloadCreatorObjects(std::optional<std::uint32_t> template_entry) {
   makeCurrent(); OpenGL::context::scoped_setter const guard(::gl,context());
   _selected_gameobject_spawn_guid.reset(); _gameobject_undo_ops.clear();
   auto npc=_selected_creature_spawn_guid;
   _world->reloadCreatureSpawns(); _world->setDrawGameObjectSpawns(true);
   rebuildCreatureBrowserList(false); setSelectedCreatureSpawn(npc);
+  if(template_entry && _reload_gameobject_picker) _reload_gameobject_picker(template_entry);
   rebuildGameObjectBrowserList(false); refreshGameObjectEditorKnobs(); _needs_redraw=true;
 }
 void MapView::creatorGameObject() {
@@ -19798,7 +19840,7 @@ void MapView::creatorGameObject() {
   if(auto d=Noggit::Creator::designGameObject(this)) {
     set_editing_mode(editing_mode::gameobject);
     beginWorldPick("Click to place "+d->name,[this,d](glm::vec3 const& p) {
-      try { Noggit::Creator::GameObjectService::save(*d,serverPosition(p,0)); reloadCreatorObjects(); }
+      try { reloadCreatorObjects(Noggit::Creator::GameObjectService::save(*d,serverPosition(p,0))); }
       catch(std::exception const& e) { QMessageBox::warning(this,"Create GameObject",e.what()); }
     });
   }
