@@ -1,6 +1,6 @@
 {
   "format": 1,
-  "baseUrl": "https://pub-61be48bf4c0f4d208f849304433124c9.r2.dev/",
+  "baseUrl": "https://wow-extracted-data.radumilici.workers.dev/",
   "files": [
     {
       "path": "dbc/AnimationData.dbc",

@@ -1,0 +1,9 @@
+{
+  "name": "noggit-game-data",
+  "main": "worker.mjs",
+  "compatibility_date": "2026-10-06",
+  "workers_dev": true,
+  "r2_buckets": [
+    { "binding": "GAME_DATA", "bucket_name": "wow-extracted-data" }
+  ]
+}
