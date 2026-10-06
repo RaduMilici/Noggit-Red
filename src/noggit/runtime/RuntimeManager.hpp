@@ -34,6 +34,7 @@ public slots:
 signals:
   void changed();
   void gameDataProgress(qint64 received, qint64 total);
+  void gameDataMessage(QString message);
   void aboutToShutdown();
   void beforeLocalTest(bool* proceed);
 private:

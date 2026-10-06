@@ -12,6 +12,10 @@
 #include <QSaveFile>
 #include <QSet>
 #include <QTimer>
+#include <QDateTime>
+#include <QElapsedTimer>
+#include <algorithm>
+#include <vector>
 #include <functional>
 #include <memory>
 
@@ -21,19 +25,26 @@ namespace Noggit::Runtime {
 class GameDataDownload : public QObject {
 public:
   explicit GameDataDownload(QString root, QObject* parent = nullptr, QNetworkAccessManager* network = nullptr)
-    : QObject(parent), _root(std::move(root)), _network(network ? network : new QNetworkAccessManager(this)),
-      _hash(QCryptographicHash::Sha256) {}
+    : QObject(parent), _root(std::move(root)), _network(network ? network : new QNetworkAccessManager(this)) {}
   ~GameDataDownload() override { cancel(); }
   std::function<void(qint64, qint64)> progress;
   std::function<void(QString)> finished;
+  std::function<void(QString)> message;
   QString dataPath() const {
     QFile file(_root + "/Runtime/game-data.json");
     if (!file.open(QIODevice::ReadOnly)) return _root + "/Runtime/mangosd/data";
     return _root + "/Workspace/GameData/" + QCryptographicHash::hash(file.readAll(), QCryptographicHash::Sha256).toHex();
   }
   void cancel() {
-    if (_reply) { _reply->disconnect(this); _reply->abort(); _reply->deleteLater(); _reply = nullptr; }
-    _output.reset(); _running = false;
+    _running = false; ++_generation;
+    for (auto const& job : _jobs) {
+      if (job->reply) {
+        job->reply->disconnect(this);
+        job->reply->abort(); job->reply->deleteLater(); job->reply = nullptr;
+      }
+      job->output.reset();
+    }
+    _jobs.clear();
   }
   void start() {
     cancel();
@@ -73,83 +84,150 @@ public:
         if (!path.isEmpty()) _receipts.insert(path, record.value("sha256"));
       }
     }
-    _running = true;
-    next();
+    _running = true; _progressClock.start();
+    reportProgress(true);
+    pump();
   }
 private:
+  // Four bounded streams share Qt's event loop; no worker threads touch the UI.
+  static constexpr int parallelDownloads = 4;
+  struct Job {
+    QJsonObject entry;
+    QString relative, target;
+    qint64 size = 0, received = 0;
+    int attempts = 0;
+    QNetworkReply* reply = nullptr;
+    QCryptographicHash hash{QCryptographicHash::Sha256};
+    std::unique_ptr<QSaveFile> output;
+  };
   void complete(QString error) {
     cancel();
     if (finished) finished(error);
   }
-  void next() {
+  void reportProgress(bool force = false) {
+    if (!_running || (!force && _progressClock.elapsed() < 100)) return;
+    _progressClock.restart();
+    qint64 received = _done;
+    for (auto const& job : _jobs) received += job->received;
+    if (progress) progress(received, _total);
+  }
+  void pump() {
     if (!_running) return;
-    while (_index < _files.size()) {
-      auto entry = _files[_index].toObject();
+    while (_index < _files.size() && _jobs.size() < parallelDownloads) {
+      auto entry = _files[_index++].toObject();
       auto relative = entry.value("path").toString();
       auto size = qint64(entry.value("size").toDouble());
       auto target = _destination + '/' + relative;
       if (_receipts.value(relative).toString() == entry.value("sha256").toString()
           && QFileInfo(target).isFile() && QFileInfo(target).size() == size) {
-        _done += size; ++_index; continue;
+        _done += size; continue;
       }
       if (!QDir().mkpath(QFileInfo(target).absolutePath())) { complete("Cannot create game-data directory."); return; }
-      _output = std::make_unique<QSaveFile>(target);
-      if (!_output->open(QIODevice::WriteOnly)) { complete("Cannot write game data: " + _output->errorString()); return; }
-      _hash.reset(); _received = 0;
-      QNetworkRequest request(_base.resolved(QUrl(relative)));
-      request.setAttribute(QNetworkRequest::RedirectPolicyAttribute, QNetworkRequest::NoLessSafeRedirectPolicy);
-      request.setRawHeader("Accept-Encoding", "identity");
-      _reply = _network->get(request);
-      _reply->setReadBufferSize(1024 * 1024);
-      auto timeout = new QTimer(_reply); timeout->setSingleShot(true); timeout->start(60000);
-      connect(timeout, &QTimer::timeout, _reply, &QNetworkReply::abort);
-      connect(_reply, &QIODevice::readyRead, this, [this, size, timeout] {
-        timeout->start(60000);
-        auto bytes = _reply->readAll();
-        _received += bytes.size();
-        if (_received > size || _output->write(bytes) != bytes.size()) {
-          complete("Game-data download exceeded its expected size or disk write failed. Free space and retry."); return;
-        }
-        _hash.addData(bytes);
-        if (progress) progress(_done + _received, _total);
-      });
-      connect(_reply, &QNetworkReply::finished, this, [this, relative, size, entry] {
-        auto reply = _reply; _reply = nullptr; reply->deleteLater();
-        if (reply->error() != QNetworkReply::NoError || reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt() != 200) {
-          complete("Game-data download failed: " + reply->errorString() + ". Click Start to retry; completed files are kept."); return;
-        }
-        if (_received != size || _hash.result().toHex() != entry.value("sha256").toString().toLatin1()) {
-          complete("Game-data integrity check failed. Click Start to retry."); return;
-        }
-        if (!_output->commit()) { complete("Cannot save downloaded game data. Check free disk space."); return; }
-        _output.reset();
-        _receipts.insert(relative, entry.value("sha256"));
-        // Append a small receipt per file instead of rewriting the entire inventory.
-        // A leading newline isolates any incomplete record left by an interrupted write.
-        QFile receipt(_destination + "/verified.jsonl");
-        auto bytes = '\n' + QJsonDocument(QJsonObject{{"path", relative}, {"sha256", entry.value("sha256")}})
-            .toJson(QJsonDocument::Compact) + '\n';
-        if (!receipt.open(QIODevice::WriteOnly | QIODevice::Append) || receipt.write(bytes) != bytes.size() || !receipt.flush()) {
-          complete("Cannot save game-data download progress."); return;
-        }
-        _done += size; ++_index;
-        next();
-      });
-      return;
+      auto job = std::make_shared<Job>();
+      job->entry = entry; job->relative = relative; job->target = target; job->size = size;
+      _jobs.push_back(job);
+      attempt(job);
+      if (!_running) return;
     }
-    if (progress) progress(_total, _total);
-    complete({});
+    reportProgress(_jobs.empty());
+    if (_index == _files.size() && _jobs.empty() && _running) complete({});
+  }
+  bool consume(std::shared_ptr<Job> const& job) {
+    // Error pages are not game data, and must not be written or size-checked.
+    if (job->reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt() != 200) {
+      job->reply->readAll(); return true;
+    }
+    auto bytes = job->reply->readAll();
+    job->received += bytes.size();
+    if (job->received > job->size) {
+      complete("Game-data download exceeded its expected size: " + job->relative); return false;
+    }
+    if (job->output->write(bytes) != bytes.size()) {
+      complete("Cannot write game data: " + job->relative + ". Check free disk space."); return false;
+    }
+    job->hash.addData(bytes);
+    reportProgress();
+    return _running;
+  }
+  void attempt(std::shared_ptr<Job> const& job) {
+    if (!_running) return;
+    ++job->attempts; job->received = 0; job->hash.reset();
+    job->output = std::make_unique<QSaveFile>(job->target);
+    if (!job->output->open(QIODevice::WriteOnly)) {
+      complete("Cannot write game data: " + job->output->errorString()); return;
+    }
+    QNetworkRequest request(_base.resolved(QUrl(job->relative)));
+    request.setAttribute(QNetworkRequest::RedirectPolicyAttribute, QNetworkRequest::NoLessSafeRedirectPolicy);
+    request.setRawHeader("Accept-Encoding", "identity");
+    job->reply = _network->get(request);
+    job->reply->setReadBufferSize(1024 * 1024);
+    auto generation = _generation;
+    auto timeout = new QTimer(job->reply); timeout->setSingleShot(true); timeout->start(60000);
+    connect(timeout, &QTimer::timeout, job->reply, &QNetworkReply::abort);
+    connect(job->reply, &QIODevice::readyRead, this, [this, job, timeout, generation] {
+      if (!_running || generation != _generation) return;
+      timeout->start(60000); consume(job);
+    });
+    connect(job->reply, &QNetworkReply::finished, this, [this, job, generation] {
+      if (!_running || generation != _generation) return;
+      if (!consume(job) || generation != _generation) return;
+      auto reply = job->reply; job->reply = nullptr; reply->deleteLater();
+      auto http = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+      if (reply->error() != QNetworkReply::NoError || http != 200) {
+        auto retryable = http == 0 || http == 200 || http == 408 || http == 429 || http >= 500;
+        if (retryable) {
+          int seconds = qMin(30, 1 << qMin(job->attempts - 1, 5));
+          bool numeric = false;
+          auto retryAfter = reply->rawHeader("Retry-After");
+          auto requested = retryAfter.toLongLong(&numeric);
+          if (!numeric) {
+            auto date = QDateTime::fromString(QString::fromLatin1(retryAfter), Qt::RFC2822Date);
+            requested = date.isValid() ? QDateTime::currentDateTimeUtc().secsTo(date) : 0;
+          }
+          seconds = int(qBound<qint64>(seconds, qMax<qint64>(seconds, requested), 300));
+          job->output.reset(); job->received = 0;
+          if (message) message(QString("Retrying %1 automatically in %2 seconds (attempt %3).")
+              .arg(job->relative).arg(seconds).arg(job->attempts + 1));
+          if (!_running || generation != _generation) return;
+          QTimer::singleShot(seconds * 1000, this, [this, job, generation] {
+            if (_running && generation == _generation) attempt(job);
+          });
+          return;
+        }
+        complete(QString("Game-data download failed: %1 (HTTP %2): %3. Completed files are kept.")
+            .arg(job->relative).arg(http).arg(reply->errorString()));
+        return;
+      }
+      if (job->received != job->size || job->hash.result().toHex() != job->entry.value("sha256").toString().toLatin1()) {
+        complete("Game-data integrity check failed: " + job->relative + ". Completed files are kept."); return;
+      }
+      if (!job->output->commit()) { complete("Cannot save downloaded game data. Check free disk space."); return; }
+      job->output.reset();
+      _receipts.insert(job->relative, job->entry.value("sha256"));
+      QFile receipt(_destination + "/verified.jsonl");
+      auto bytes = '\n' + QJsonDocument(QJsonObject{{"path", job->relative}, {"sha256", job->entry.value("sha256")}})
+          .toJson(QJsonDocument::Compact) + '\n';
+      if (!receipt.open(QIODevice::WriteOnly | QIODevice::Append) || receipt.write(bytes) != bytes.size() || !receipt.flush()) {
+        complete("Cannot save game-data download progress."); return;
+      }
+      _done += job->size;
+      _jobs.erase(std::remove(_jobs.begin(), _jobs.end(), job), _jobs.end());
+      // Queue the refill so progress callbacks and cancellation cannot reenter this job.
+      QTimer::singleShot(0, this, [this, generation] {
+        if (_running && generation == _generation) pump();
+      });
+    });
   }
   QString _root, _destination;
   QNetworkAccessManager* _network;
-  QNetworkReply* _reply = nullptr;
-  QCryptographicHash _hash;
-  std::unique_ptr<QSaveFile> _output;
+  std::vector<std::shared_ptr<Job>> _jobs;
+  QElapsedTimer _progressClock;
   QUrl _base;
   QJsonArray _files;
   QJsonObject _receipts;
   int _index = 0;
-  qint64 _total = 0, _done = 0, _received = 0;
+  quint64 _generation = 0;
+  qint64 _total = 0, _done = 0;
   bool _running = false;
 };
 }

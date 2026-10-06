@@ -1,5 +1,5 @@
 #include <noggit/runtime/RuntimeManager.hpp>
-#include <QProgressDialog>
+#include <noggit/runtime/GameDataProgressDialog.hpp>
 // This file is part of Noggit3, licensed under GNU General Public License (version 3).
 #include <noggit/application/NoggitApplication.hpp>
 #include <noggit/AsyncLoader.h>
@@ -692,22 +692,19 @@ int main(int argc, char *argv[])
   auto runtime = new Noggit::Runtime::RuntimeManager(runtime_root, &q_application);
   QObject::connect(&q_application, &QCoreApplication::aboutToQuit,
                    runtime, &Noggit::Runtime::RuntimeManager::shutdown);
-  auto dataProgress = new QProgressDialog("Downloading game data…", "Cancel", 0, 100);
-  dataProgress->setWindowTitle("Creator setup");
-  dataProgress->setAutoClose(false);
-  dataProgress->setAutoReset(false);
-  dataProgress->setMinimumDuration(0);
-  dataProgress->hide();
+  auto dataProgress = new Noggit::Runtime::GameDataProgressDialog;
   QObject::connect(runtime, &Noggit::Runtime::RuntimeManager::gameDataProgress,
                    dataProgress, [dataProgress](qint64 received, qint64 total) {
-    dataProgress->setLabelText(QString("Downloading game data: %1 / %2 MB\nCompleted files are kept if you cancel.")
-        .arg(received / (1024 * 1024)).arg(total / (1024 * 1024)));
-    dataProgress->setValue(total ? int(received * 100 / total) : 0);
-    if (received < total) dataProgress->show();
+    dataProgress->updateProgress(received, total);
   });
-  QObject::connect(dataProgress, &QProgressDialog::canceled, runtime, &Noggit::Runtime::RuntimeManager::stop);
+  dataProgress->canceled = [runtime] { runtime->stop(); };
+  QObject::connect(runtime, &Noggit::Runtime::RuntimeManager::gameDataMessage,
+                   dataProgress, &Noggit::Runtime::GameDataProgressDialog::updateMessage);
   QObject::connect(runtime, &Noggit::Runtime::RuntimeManager::changed, dataProgress, [runtime, dataProgress] {
-    if (!runtime->status(2).startsWith("Downloading")) dataProgress->hide();
+    if (dataProgress->downloading() && !runtime->status(2).startsWith("Downloading")) {
+      if (!runtime->error().isEmpty()) dataProgress->showError(runtime->error());
+      else dataProgress->finish();
+    }
   });
   QObject::connect(&q_application, &QCoreApplication::aboutToQuit, dataProgress, &QObject::deleteLater);
   if (QSettings(runtime->root() + "/Workspace/runtime.ini", QSettings::IniFormat)

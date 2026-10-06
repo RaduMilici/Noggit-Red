@@ -50,6 +50,7 @@ RuntimeManager::RuntimeManager(QString root, QObject* parent)
     state(2, QString("Downloading game data: %1%").arg(total ? received * 100 / total : 0));
     emit gameDataProgress(received, total);
   };
+  _gameData->message = [this](QString message) { emit gameDataMessage(message); };
   _gameData->finished = [this](QString error) {
     if (!_active || _shuttingDown) return;
     if (!error.isEmpty()) { fail(error); return; }

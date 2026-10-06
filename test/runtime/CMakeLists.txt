@@ -30,3 +30,8 @@ set_tests_properties(indicator_test PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offs
 add_executable(game_data_download_tests GameDataDownloadTests.cpp)
 target_link_libraries(game_data_download_tests PRIVATE Qt5::Core Qt5::Network)
 add_test(NAME game_data_download_tests COMMAND game_data_download_tests)
+
+add_executable(game_data_progress_dialog_tests GameDataProgressDialogTests.cpp)
+target_link_libraries(game_data_progress_dialog_tests PRIVATE Qt5::Core Qt5::Widgets)
+add_test(NAME game_data_progress_dialog_tests COMMAND game_data_progress_dialog_tests)
+set_tests_properties(game_data_progress_dialog_tests PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")

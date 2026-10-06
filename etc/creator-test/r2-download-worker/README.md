@@ -38,8 +38,12 @@ existing partial cache will not automatically carry over to the new manifest.
 
 The Worker streams bodies without buffering the full file and supports GET, HEAD,
 and single HTTP byte ranges. Range support is available for future resumable clients;
-Noggit's current downloader still retries only when the user starts it again and
-does not resume a partial file. Changing hosting alone does not fix that behavior.
+Noggit downloads four files concurrently and automatically retries temporary network
+failures, HTTP 408/429, and server errors with increasing delays. It honors Retry-After
+(up to five minutes) and preserves verified completed files. It does not yet resume
+partial files; a failed file starts again. Closing the progress window leaves the
+download running; the explicit Cancel button stops it. Disk, integrity, and permanent
+HTTP errors remain visible instead of silently closing the progress window.
 
 Workers Free has a 100,000-request daily limit shared by Workers on the account.
 With the current 12,054-file manifest, about eight full installations per day fit
