@@ -484,8 +484,21 @@ local client's `Data` folder: `patch-Z.mpq`, the last patch the 1.12 client load
   Other armor is baked into existing looks; independent armor-slot editing and
   arbitrary player item-set conversion are not supported.
 - Apply existing NPC looks as named outfits, or save/reuse custom local presets.
-- Class profiles offer editable health/resource/damage defaults, without spell AI.
-  Mana above zero selects Mana; at zero, Rogue uses Energy and other classes Rage.
+- Class profiles offer editable health/resource/damage defaults. **Resource** is
+  chosen explicitly: Mana (with its pool), Rage or Energy. The server derives it from
+  the stored values (mana above zero selects Mana; at zero, Rogue uses Energy and
+  other classes Rage), so Energy switches the profile to Rogue and Rage away from it.
+- **Spellbook** tab: up to eight combat spells in priority order, as a two-page
+  spellbook with icons and tooltips. Any spell can be added, or a custom one made in
+  the Spell Editor (**Create Custom Spell…**; game spells open read-only, and their
+  clone takes the slot). Per spell: cast on (itself, its target, a random enemy, a
+  random enemy other than its target, second or last on threat), chance, first-cast
+  delay and repeat timer (random ranges, seconds), and conditions (interrupt its
+  cast, only if the target lacks the effect, only in / out of melee, main ranged
+  spell). Stored as the NPC's own `creature_spells` row (`spell_list_id` = its
+  entry), cast by the server's default AI; cloning with the combat group copies the
+  list. Local changes, export and sync carry the row and the Creator spells it uses.
+- **Loot** tab: a summary and the Loot editor; for a new NPC it saves the NPC first.
   Visible equipment does not import player combat stats. Guard uses native guard
   behavior; Vendor/Trainer roles have no inventory/lesson editing, but clone options
   can copy existing inventories/lessons.

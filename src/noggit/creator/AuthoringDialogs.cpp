@@ -2,6 +2,8 @@
 #include "CreatorPreviews.hpp"
 #include "ItemBrowser.hpp"
 #include "Database.hpp"
+#include "NpcSpellbook.hpp"
+#include "ServiceEditors.hpp"
 #include <QToolButton>
 #include <noggit/DBC.h>
 #include <noggit/World.h>
@@ -148,10 +150,11 @@ bool npcDialog(QWidget* parent,World* world,Npc draft,int mode,Id* saved) {
   if(selected>=0){updating=true;race->setCurrentIndex(race->findData(catalog[selected].race));sex->setCurrentIndex(catalog[selected].sex);updating=false;}
   populate();
   auto combatPage=new QWidget; auto combatLayout=new QVBoxLayout(combatPage); auto form=new QFormLayout;combatLayout->addLayout(form);
-  combatLayout->addWidget(note("Combat values are independent of visible equipment. Class profiles provide starting values, not spellcasting AI. Vendor and Trainer roles mark the NPC only; inventories and lessons are outside this stage.",&dialog));
+  combatLayout->addWidget(note("Combat values are independent of visible equipment. Class profiles fill in starting values; the spells it casts are on the Spellbook tab. Vendor and Trainer roles mark the NPC only; inventories and lessons are edited from the NPC card.",&dialog));
   auto klass=new QComboBox; klass->addItems({"Warrior","Mage","Rogue","Paladin"}); form->addRow("Class profile",klass);
-  auto power=new QLabel;form->addRow("Resource",power);
-  auto level=spin(form,"Level",draft.level,1,63);auto health=spin(form,"Health",draft.health,1,100000000);auto mana=spin(form,"Mana",draft.mana,0,100000000);
+  auto power=new QComboBox;power->addItems({"Mana","Rage","Energy"});form->addRow("Resource",power);
+  power->setToolTip("Mana uses the pool below. Rage and Energy use the game's fixed 100-point pools (Energy is the Rogue profile's resource).");
+  auto level=spin(form,"Level",draft.level,1,63);auto health=spin(form,"Health",draft.health,1,100000000);auto mana=spin(form,"Mana pool",draft.mana,0,100000000);
   auto faction=new QComboBox; auto factions=AppearanceService::factions();
   for(auto const& f:factions)faction->addItem(f.name+" — "+f.detail,f.id);faction->setCurrentIndex(faction->findData(draft.faction));form->addRow("Faction",faction);
   auto reaction=new QComboBox;reaction->addItems({"Use selected faction","Friendly to both sides","Neutral","Hostile to both sides"});form->addRow("Disposition",reaction);
@@ -164,13 +167,44 @@ bool npcDialog(QWidget* parent,World* world,Npc draft,int mode,Id* saved) {
   auto armor=spin(advancedForm,"Armor",draft.armor,0,16777215);auto attack=spin(advancedForm,"Attack interval (milliseconds)",std::max(100,draft.attackMs),100,60000);
   auto damageMin=new QDoubleSpinBox,damageMax=new QDoubleSpinBox;for(auto s:{damageMin,damageMax})s->setRange(0,10000000);damageMin->setValue(draft.damageMin);damageMax->setValue(draft.damageMax);advancedForm->addRow("Minimum damage",damageMin);advancedForm->addRow("Maximum damage",damageMax);
   auto movement=new QComboBox;movement->addItems({"Stay here","Wander nearby"});movement->setCurrentIndex(draft.movement==1?1:0);advancedForm->addRow("Movement",movement);
-  auto classDefaults=[&]{int c=klass->currentIndex();draft.unitClass=c==0?1:c==1?8:c==2?4:2;power->setText(draft.mana>0?"Mana":c==2?"Energy":"Rage");};
+  // The server picks the resource from these: mana above zero means Mana; with none, the Rogue class (4) uses
+  // Energy and every other class Rage. So Energy needs the Rogue profile and Rage any other.
+  auto classDefaults=[&]{int c=klass->currentIndex();draft.unitClass=c==0?1:c==1?8:c==2?4:2;};
+  auto powerChanged=[&]{
+    int p=power->currentIndex(); mana->setEnabled(p==0);
+    if(p==0&&mana->value()<1) mana->setValue(std::max(1,level->value()*65));
+    mana->setMinimum(p==0?1:0);
+    int wanted=p==2?2:(p==1&&klass->currentIndex()==2)?0:-1; // Energy: Rogue; Rage: not Rogue
+    if(wanted>=0){QSignalBlocker b(klass);klass->setCurrentIndex(wanted);classDefaults();}
+  };
   {QSignalBlocker b(klass);klass->setCurrentIndex(draft.unitClass==8?1:draft.unitClass==4?2:draft.unitClass==2?3:0);}classDefaults();
-  QObject::connect(klass,QOverload<int>::of(&QComboBox::currentIndexChanged),&dialog,[&]{classDefaults();int l=level->value();health->setValue(l*(klass->currentIndex()==1?55:85));mana->setValue((klass->currentIndex()==1||klass->currentIndex()==3)?l*65:0);damageMin->setValue(l*1.5);damageMax->setValue(l*2.5);});
-  QObject::connect(mana,QOverload<int>::of(&QSpinBox::valueChanged),&dialog,[&](int value){power->setText(value>0?"Mana":draft.unitClass==4?"Energy":"Rage");});
-  mana->setToolTip("Mana above zero uses Mana. With zero Mana, Rogue uses Energy and other profiles use Rage.");
+  {QSignalBlocker b(power);power->setCurrentIndex(draft.mana>0?0:draft.unitClass==4?2:1);}powerChanged();
+  QObject::connect(power,QOverload<int>::of(&QComboBox::currentIndexChanged),&dialog,[&]{powerChanged();});
+  QObject::connect(klass,QOverload<int>::of(&QComboBox::currentIndexChanged),&dialog,[&]{
+    classDefaults();int c=klass->currentIndex(),l=level->value();health->setValue(l*(c==1?55:85));damageMin->setValue(l*1.5);damageMax->setValue(l*2.5);
+    {QSignalBlocker b(power);power->setCurrentIndex(c==1||c==3?0:c==2?2:1);}
+    if(c==1||c==3)mana->setValue(l*65);
+    powerChanged();
+  });
   QObject::connect(role,QOverload<int>::of(&QComboBox::currentIndexChanged),&dialog,[&](int r){if(r==5)rank->setCurrentIndex(1);if(r==6)rank->setCurrentIndex(4);if(r==4)reaction->setCurrentIndex(3);});
   tabs->addTab(combatPage,"Combat / Role");
+  auto spellbook=new NpcSpellbook(draft.spells,&dialog);
+  tabs->addTab(spellbook,"Spellbook");
+  auto lootPage=new QWidget; auto lootLayout=new QVBoxLayout(lootPage);
+  auto lootSummary=note("",&dialog); lootLayout->addWidget(lootSummary);
+  auto lootButton=new QPushButton; lootLayout->addWidget(lootButton,0,Qt::AlignLeft);
+  lootLayout->addWidget(note("The Loot editor sets the items it drops, their chances and quantities, and its money, with a drop simulator.",&dialog));
+  lootLayout->addStretch();
+  tabs->addTab(lootPage,"Loot");
+  auto money=[](qint64 copper){QStringList parts;if(copper>=10000)parts<<QString("%1g").arg(copper/10000);if(copper%10000>=100)parts<<QString("%1s").arg(copper%10000/100);if(copper%100||parts.isEmpty())parts<<QString("%1c").arg(copper%100);return parts.join(' ');};
+  auto refreshLoot=[&]{
+    if(!draft.entry){lootSummary->setText("Nothing yet. Loot belongs to a saved NPC: the button saves this NPC first, then opens the Loot editor.");lootButton->setText("Save NPC && Edit Loot…");return;}
+    lootButton->setText("Edit Loot…");
+    try{auto table=LootService::load({LootOwner::Kind::Npc,draft.entry});
+      lootSummary->setText(table.rows.isEmpty()&&!table.moneyMax?QString("Drops nothing yet."):QString("%1 drop %2 · money %3 to %4").arg(table.rows.size()).arg(table.rows.size()==1?"row":"rows").arg(money(table.moneyMin)).arg(money(table.moneyMax)));
+    }catch(std::exception const& e){lootSummary->setText(QString::fromUtf8(e.what()));}
+  };
+  refreshLoot();
   auto buttons=new QDialogButtonBox(QDialogButtonBox::Save|QDialogButtonBox::Cancel);layout->addWidget(buttons);
   QObject::connect(buttons,&QDialogButtonBox::rejected,&dialog,&QDialog::reject);
   if(draft.entry) {
@@ -180,11 +214,21 @@ bool npcDialog(QWidget* parent,World* world,Npc draft,int mode,Id* saved) {
       try{CreatureService::remove(draft.entry);dialog.accept();}catch(std::exception const& e){error(&dialog,e);}
     });
   }
-  QObject::connect(buttons,&QDialogButtonBox::accepted,&dialog,[&]{try {
+  bool stored=false; // saved at least once (Loot saves a new NPC before opening its editor)
+  auto saveDraft=[&]()->bool{try {
     draft.name=name->text();draft.level=level->value();draft.health=health->value();draft.mana=mana->isEnabled()?mana->value():0;draft.armor=armor->value();draft.attackMs=attack->value();draft.damageMin=damageMin->value();draft.damageMax=damageMax->value();draft.faction=faction->currentData().toUInt();draft.rank=rank->currentIndex();draft.role=role->currentIndex();draft.type=type->currentIndex();draft.respawn=respawn->value();draft.movement=movement->currentIndex();
-    auto entry=CreatureService::save(draft);if(saved)*saved=entry;dialog.accept();
-  }catch(std::exception const& e){error(&dialog,e);}});
-  return dialog.exec()==QDialog::Accepted;
+    draft.spells=spellbook->spells();
+    auto entry=CreatureService::save(draft);if(saved)*saved=entry;stored=true;
+    if(!draft.entry){draft.entry=entry;dialog.setWindowTitle("Edit NPC");}
+    return true;
+  }catch(std::exception const& e){error(&dialog,e);return false;}};
+  QObject::connect(buttons,&QDialogButtonBox::accepted,&dialog,[&]{if(saveDraft())dialog.accept();});
+  QObject::connect(lootButton,&QPushButton::clicked,&dialog,[&]{
+    if(!draft.entry&&!saveDraft())return;
+    editLoot(&dialog,world,{LootOwner::Kind::Npc,draft.entry});
+    refreshLoot();
+  });
+  return dialog.exec()==QDialog::Accepted||stored;
 }
 }
 std::optional<Id> createNpc(QWidget* parent,World* world,NpcKind kind,Id source) {
@@ -195,7 +239,7 @@ std::optional<Id> createNpc(QWidget* parent,World* world,NpcKind kind,Id source)
       auto original=CreatureService::load(source);
       QDialog options(parent);options.setWindowTitle("Clone "+original.name);auto form=new QVBoxLayout(&options);
       form->addWidget(note("The original NPC will remain unchanged. Choose what to copy:",&options));
-      std::array<QCheckBox*,6> copy;QStringList groups{"Appearance","Base stats","Faction","Equipment","Basic combat configuration","Movement defaults"};
+      std::array<QCheckBox*,6> copy;QStringList groups{"Appearance","Base stats","Faction","Equipment","Combat configuration and spellbook","Movement defaults"};
       for(int i=0;i<6;++i){copy[i]=new QCheckBox(groups[i]);copy[i]->setChecked(true);form->addWidget(copy[i]);}
       std::array<QCheckBox*,5> relations;QStringList relationNames{"Loot","Vendor inventory","Trainer spells","Gossip","Quests"};
       for(int i=0;i<5;++i){relations[i]=new QCheckBox(relationNames[i]);form->addWidget(relations[i]);}
@@ -219,7 +263,7 @@ std::optional<Id> createNpc(QWidget* parent,World* world,NpcKind kind,Id source)
       if(draft.stats){draft.level=original.level;draft.health=std::max(1,original.health);draft.mana=original.mana;draft.armor=original.armor;draft.rank=original.rank;}
       if(draft.allegiance)draft.faction=original.faction;
       if(draft.weapons)draft.equipment=original.equipment;
-      if(draft.combat){draft.unitClass=original.unitClass;draft.damageMin=original.damageMin;draft.damageMax=original.damageMax;draft.attackMs=std::max(100,original.attackMs);}
+      if(draft.combat){draft.unitClass=original.unitClass;draft.damageMin=original.damageMin;draft.damageMax=original.damageMax;draft.attackMs=std::max(100,original.attackMs);draft.spells=original.spells;}
       if(draft.motion)draft.movement=original.movement==1?1:0;
       mode=original.type==7?1:2;
     }

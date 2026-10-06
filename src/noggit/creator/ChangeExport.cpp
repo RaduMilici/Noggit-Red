@@ -66,6 +66,9 @@ QVector<QPair<EntityType, Id>> references(TrackedChange const& c) {
     for (int i = 1; i <= 5; ++i) out.push_back({EntityType::Spell, number(first, "spellid_" + QString::number(i))});
   if (c.type == EntityType::Npc)
     for (int i = 1; i <= 4; ++i) out.push_back({EntityType::Spell, number(first, "spell_id" + QString::number(i))});
+  if (c.type == EntityType::Npc) // Creator spells its combat spell list casts
+    for (auto const& row : rows("creature_spells"))
+      for (int i = 1; i <= Npc::maxCombatSpells; ++i) out.push_back({EntityType::Spell, number(row.toObject(), "spellId_" + QString::number(i))});
   if (c.type == EntityType::Npc)
     for (auto const& row : rows("creature_equip_template"))
       for (int i = 1; i <= 3; ++i) out.push_back({EntityType::Item, number(row.toObject(), "equipentry" + QString::number(i))});

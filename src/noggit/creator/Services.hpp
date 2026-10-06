@@ -16,13 +16,27 @@ struct Choice { Id id = 0; QString name, detail; };
 // A problem shown beside its row in a list editor (row -1: the whole list). Errors block saving; warnings do not.
 struct RowProblem { int row = -1; QString text; bool error = true; };
 struct Position { unsigned map = 0; float x = 0, y = 0, z = 0, orientation = 0; bool operator==(Position const&) const = default; };
+// One spell of an NPC's combat spell list (vmangos `creature_spells`, referenced by creature_template.spell_list_id).
+// The server's default AI casts these in combat. Times are seconds.
+struct CombatSpell {
+  // castTarget values (the server's script target types) Creator offers.
+  enum Target { Self = 0, Victim = 1, SecondThreat = 2, LastThreat = 3, RandomEnemy = 4, RandomNotTank = 5 };
+  // castFlags Creator offers.
+  enum Flag { InterruptCast = 0x01, Ranged = 0x08, AuraNotPresent = 0x20, OnlyInMelee = 0x40, NotInMelee = 0x80 };
+  Id spell = 0;
+  int chance = 100, target = Victim, flags = 0;
+  int firstMin = 0, firstMax = 5, repeatMin = 10, repeatMax = 15;
+  bool operator==(CombatSpell const&) const = default;
+};
 struct Npc {
+  static constexpr int maxCombatSpells = 8; // creature_spells has eight slots
   Id entry = 0, source = 0, display = 0, faction = 35;
   QString name;
   int level = 1, health = 100, mana = 0, armor = 0, rank = 0, unitClass = 1;
   int type = 7, respawn = 120, role = 0, movement = 0, attackMs = 2000;
   double damageMin = 1, damageMax = 2;
   std::array<Id, 3> equipment{};
+  QVector<CombatSpell> spells; // saved as the NPC's own list (spell_list_id = entry); empty: none
   // Whitelisted copying. Gameplay associations require explicit opt-in; scripts are excluded.
   bool appearance = true, stats = true, allegiance = true, weapons = true, combat = true, motion = true;
   bool loot = false, vendor = false, trainer = false, gossip = false, quests = false;
