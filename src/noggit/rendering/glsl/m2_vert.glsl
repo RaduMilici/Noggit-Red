@@ -134,7 +134,10 @@ vec2 get_texture_uv(int tex_unit_lookup, vec3 vert, vec3 norm, mat4 tex_matrix)
 // offset of its model's bone block (inst_tex.z, in mat4 units) and that model's bone count (inst_tex.w). w==0
 // means a static/bind-pose model. All instances of one model share one block (unison sway, as the per-model
 // animate() already produces), so z/w are constant across a command.
-layout(std430, binding = 0) readonly buffer BatchedBones { mat4 b_batched_bones[]; };
+// PORTABILITY: no `readonly` (GLSL 4.20 / image_load_store) and no `binding =` (GLSL 4.20 / 420pack) -- this is a
+// #version 330 shader and strict drivers (AMD) reject both ("unexpected BUFFER"), throwing at program creation.
+// An unqualified storage block's binding defaults to 0, which is where WorldRender binds the bone SSBO.
+layout(std430) buffer BatchedBones { mat4 b_batched_bones[]; };
 #endif
 
 mat4 get_bone_matrix(uint bone_index)
