@@ -24,6 +24,16 @@ bool writeFile(QString const& name, QByteArray const& data)
   QSaveFile file(name);
   return file.open(QIODevice::WriteOnly) && file.write(data) == data.size() && file.commit();
 }
+// The final console line usually names why a server quit; testers can relay it without the full log.
+QString lastLogLine(QString const& name)
+{
+  QFile file(name);
+  if (!file.open(QIODevice::ReadOnly)) return {};
+  file.seek(qMax<qint64>(0, file.size() - 4096));
+  QStringList lines = QString::fromUtf8(file.readAll()).split('\n', Qt::SkipEmptyParts);
+  while (!lines.isEmpty() && lines.last().trimmed().isEmpty()) lines.removeLast();
+  return lines.isEmpty() ? QString() : lines.last().trimmed().left(300);
+}
 void copyTree(QString const& source, QString const& target)
 {
   QDirIterator it(source, QDir::AllEntries | QDir::NoDotAndDotDot, QDirIterator::Subdirectories);
@@ -74,11 +84,15 @@ RuntimeManager::RuntimeManager(QString root, QObject* parent)
         if (_shuttingDown) return;
         if (_stopping >= 0) return;
         if (_active) {
+          // Downloaded bundles keep maps under Workspace/GameData/<hash>, not Runtime/mangosd/data.
           if (i == 2 && code != 0 && QFileInfo::exists(path("Runtime/creator-runtime.json"))
-              && QDir(path("Runtime/mangosd/data/maps")).entryList({"*.map"}, QDir::Files).isEmpty())
+              && QDir(_gameData->dataPath() + "/maps").entryList({"*.map"}, QDir::Files).isEmpty())
             fail("The Creator bundle is missing game data. Re-extract a complete Creator package. See Workspace/logs.");
-          else
-            fail(QString("%1 exited (code %2). See Workspace/logs.").arg(programs[i]).arg(code));
+          else {
+            QString last = lastLogLine(path("Workspace/logs/" + QString::number(i) + ".log"));
+            fail(QString("%1 exited (code %2)%3 See Workspace/logs/%4.log.").arg(programs[i]).arg(code)
+              .arg(last.isEmpty() ? QString(".") : ": " + last + "\n").arg(i));
+          }
         }
       });
     connect(&p, &QProcess::errorOccurred, this, [this, i](QProcess::ProcessError e) {
