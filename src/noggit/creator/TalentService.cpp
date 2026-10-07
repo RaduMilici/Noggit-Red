@@ -1,4 +1,5 @@
 #include "TalentService.hpp"
+#include <noggit/runtime/GameDataDownload.hpp>
 #include <noggit/runtime/RuntimeManager.hpp>
 #include <QCryptographicHash>
 #include <QDateTime>
@@ -375,7 +376,7 @@ void TalentStore::store(QJsonObject const& json) {
   emit changed();
 }
 QString TalentStore::serverTable() const {
-  auto folder = _root + "/Runtime/mangosd/data/dbc";
+  auto folder = Runtime::GameDataDownload::dataPath(_root) + "/dbc";
   for (auto const& entry : QDir(folder).entryList(QDir::Files)) if (entry.compare("Talent.dbc", Qt::CaseInsensitive) == 0) return folder + "/" + entry;
   return folder + "/Talent.dbc";
 }

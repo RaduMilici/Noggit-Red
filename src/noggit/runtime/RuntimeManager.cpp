@@ -24,6 +24,15 @@ bool writeFile(QString const& name, QByteArray const& data)
   QSaveFile file(name);
   return file.open(QIODevice::WriteOnly) && file.write(data) == data.size() && file.commit();
 }
+void stopRealm(QProcess& process)
+{
+#ifdef Q_OS_WIN
+  // terminate() posts WM_CLOSE, which console programs ignore; realmd keeps no unsaved state.
+  process.kill();
+#else
+  process.terminate();
+#endif
+}
 // The final console line usually names why a server quit; testers can relay it without the full log.
 QString lastLogLine(QString const& name)
 {
@@ -288,7 +297,7 @@ void RuntimeManager::stopNext()
     else if (_stopping == 0) {
       _probe.start(executable("Runtime/MariaDB/bin/mariadb"),
         {"--defaults-file=" + path("Workspace/client.cnf"), "--connect-timeout=1", "--execute=SHUTDOWN"});
-    } else p.terminate();
+    } else stopRealm(p);
   }
 }
 bool RuntimeManager::saveForTest() { bool proceed=true; emit beforeLocalTest(&proceed); return proceed; }
@@ -320,7 +329,7 @@ void RuntimeManager::shutdown()
       _probe.start(executable("Runtime/MariaDB/bin/mariadb"),
         {"--defaults-file=" + path("Workspace/client.cnf"), "--connect-timeout=1", "--execute=SHUTDOWN"});
       if (!_probe.waitForFinished(3000)) { _probe.kill(); _probe.waitForFinished(1000); }
-    } else p.terminate();
+    } else stopRealm(p);
     if (!p.waitForFinished(15000)) { p.kill(); p.waitForFinished(3000); }
   }
   _lock.reset();

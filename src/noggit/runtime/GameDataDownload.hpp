@@ -30,10 +30,12 @@ public:
   std::function<void(qint64, qint64)> progress;
   std::function<void(QString)> finished;
   std::function<void(QString)> message;
-  QString dataPath() const {
-    QFile file(_root + "/Runtime/game-data.json");
-    if (!file.open(QIODevice::ReadOnly)) return _root + "/Runtime/mangosd/data";
-    return _root + "/Workspace/GameData/" + QCryptographicHash::hash(file.readAll(), QCryptographicHash::Sha256).toHex();
+  QString dataPath() const { return dataPath(_root); }
+  // The server's DataDir: bundled data, or the download cache of a manifest release.
+  static QString dataPath(QString const& root) {
+    QFile file(root + "/Runtime/game-data.json");
+    if (!file.open(QIODevice::ReadOnly)) return root + "/Runtime/mangosd/data";
+    return root + "/Workspace/GameData/" + QCryptographicHash::hash(file.readAll(), QCryptographicHash::Sha256).toHex();
   }
   void cancel() {
     _running = false; ++_generation;
@@ -118,8 +120,10 @@ private:
       auto relative = entry.value("path").toString();
       auto size = qint64(entry.value("size").toDouble());
       auto target = _destination + '/' + relative;
+      // A receipt is written only after a verified atomic commit. Later local edits
+      // (Creator installs its own Talent.dbc) are intentional and must survive restarts.
       if (_receipts.value(relative).toString() == entry.value("sha256").toString()
-          && QFileInfo(target).isFile() && QFileInfo(target).size() == size) {
+          && QFileInfo(target).isFile()) {
         _done += size; continue;
       }
       if (!QDir().mkpath(QFileInfo(target).absolutePath())) { complete("Cannot create game-data directory."); return; }
