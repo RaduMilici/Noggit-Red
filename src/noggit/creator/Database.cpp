@@ -92,18 +92,44 @@ void Database::track(EntityType type, Id id) {
 // and published after, so Local Changes never lists a save that was rolled back.
 void Database::commit() {
   auto tracker=ChangeTracker::instance();
-  if (tracker && !_tracked.isEmpty()) {
-    QVector<TrackedChange> changes;
+  auto history=_replaying?nullptr:HistoryStore::instance();
+  QVector<TrackedChange> changes;
+  if ((tracker || history) && !_tracked.isEmpty()) {
     for (auto const& t : _tracked) {
       TrackedChange c; c.type=t.type; c.entity=t.id; c.before=t.before;
       c.after=ChangeTracker::capture([this](QString const& sql){return query(sql);},t.type,t.id,&c.label);
       if (c.label.isEmpty()) c.label=t.label;
       changes.push_back(c);
     }
-    tracker->stage(changes);
+  }
+  if (tracker && !changes.isEmpty()) tracker->stage(changes);
+  // The History step: the journal's before-images and the same rows as this save leaves them.
+  HistoryStep step;
+  if (history && !_undo.isEmpty()) {
+    try {
+      step.before=_undo; step.after=HistoryStore::read([this](QString const& sql){return query(sql);},_undo);
+      QVector<TrackedChange> labelled;
+      for (auto c : changes) if (auto action=ChangeTracker::derive(c.type,c.before,c.after)) { c.action=*action; labelled.push_back(c); }
+      step.label=_label.isEmpty()?HistoryStore::label(labelled):_label;
+      for (int i=0;i<_tracked.size();++i) step.entities.push_back({_tracked[i].type,_tracked[i].id,i<changes.size()?changes[i].label:_tracked[i].label});
+    } catch (std::exception const&) { history=nullptr; } // the save itself must not fail over its history
   }
   if (!_undo.isEmpty() && !QFile::remove(_journal)) { if (tracker) tracker->discard(); fail("Cannot finish the local save."); }
   _committed=true;
   if (tracker) tracker->promote();
+  if (history && !step.before.isEmpty() && !HistoryStore::same(step.before,step.after)) {
+    try { history->record(step); } catch (std::exception const&) { /* the save is done; only its undo step is missing */ }
+  }
+}
+void Database::replay(QJsonArray const& image, QVector<HistoryEntity> const& entities, QString const& recordAs) {
+  _replaying=recordAs.isEmpty(); _label=recordAs;
+  for (auto const& e : entities) track(e.type,e.id);
+  for (auto const& v : image) {
+    auto entry=v.toObject();
+    if (entry.contains("where")) snapshotWhere(entry["table"].toString(),entry["where"].toString());
+    else snapshot(entry["table"].toString(),entry["key"].toString(),Id(entry["id"].toDouble()));
+  }
+  restore(image);
+  commit();
 }
 }

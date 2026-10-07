@@ -20,7 +20,9 @@ gives that NPC the quest-giver role.
    cancels). **Place** (or double-clicking the preview) places it again.
 4. Click an NPC in the world to select it. Drag to move; while dragging, scroll to
    rotate (Shift: larger steps, Ctrl: 45-degree steps). The card's placement buttons
-   duplicate (click where the copy goes), remove, or locate that placement.
+   duplicate (click where the copy goes), remove, or locate that placement. Placements
+   save themselves a moment after you let go: there is nothing pending to save or discard.
+   **Ctrl+Z** / **Ctrl+Y** undo and redo anything, in any tool. See [History](#history-and-the-removed-drawer).
 5. **Quests** opens the quest browser on the NPC's quests, **Chain** its quest chain
    diagram. See [Quests](#quests).
 6. **Test in game → At this NPC** or **At a spot** (click anywhere in the world) saves,
@@ -56,6 +58,11 @@ own hash (`AccountService`, `AccountDialog.*`) and only exist in the local datab
 - `ChangeTracker.hpp/.cpp`: Local Changes list, persistence, net-change merging, SQL generation.
 - `ChangeExport.hpp/.cpp`: change package export (`manifest.json`, `changes.sql`).
 - `LocalChangesPanel.hpp/.cpp`: status-bar "Local changes" button and panel.
+- `History.hpp/.cpp`: the persistent step log (`HistoryStore`); `Database::commit` records each save,
+  `Database::replay` applies a step's rows for undo/redo. Unit-tested in `test/creator/HistoryTests.cpp`.
+- `Timeline.hpp/.cpp`: the one undo order across History steps and Noggit's map actions (`ActionManager`).
+- `HistoryPanel.hpp/.cpp`, `RemovedDrawer.hpp/.cpp`, `Toast.hpp/.cpp`: the History dock, the Removed
+  drawer and its store, and non-blocking messages over the 3D view.
 - `ItemService`, `LootService`, `VendorService`, `TrainerService` (`.hpp/.cpp`): items as the
   editors show them, and the loot, shop and trainer data of NPCs and objects (load, validate,
   save, drop simulation). No widgets; their checks are unit-tested in `test/creator/ServiceTests.cpp`.
@@ -110,6 +117,39 @@ not misleading SQL transactions. `Workspace/creator-recovery.json` restores an
 interrupted save on the next Creator database operation. Keep this file with its
 matching database. The worldserver reads new content after restart. This journal
 is not a general migration or backup system.
+
+## History and the Removed drawer
+
+Every change is kept as a step, so designers can experiment and go back to any point.
+
+- **One undo for everything.** Ctrl+Z / Ctrl+Y (also Ctrl+Shift+Z) walk a single timeline in
+  every tool: saves of NPCs, quests, items, dialogue, loot and placements, and map edits
+  (scenery placed, moved or removed, terrain, textures, water). A toast names what was undone,
+  with a button to redo it.
+- **Autosave.** NPC and GameObject placements are saved to the local database once they stop
+  changing (drag released, wheel or number field settled). A placement that cannot be saved
+  (an original NPC, which must be cloned first) is put back where it was and the reason shown.
+  Newly placed or duplicated GameObjects stay selected, ready to drag or delete.
+- **History** (Edit → History and Removed…, Ctrl+H, or **History** on the NPC/object toolbar):
+  the steps newest first. Click a step to go back to it; undone steps stay listed, greyed, until
+  something new is done. **Save point…** names the current moment; **Go to ▾** returns to one.
+- **Removed**: everything deleted, newest first: scenery (trees, rocks, buildings) and NPC and
+  object placements. **Bring back** puts it exactly where it was (as a new, undoable step; a
+  placement whose number was reused gets a new one), **Show me** flies the camera there,
+  **Forget** drops it from the list. Deleting shows a toast with **Undo**.
+- **Before undoing** a database step, the rows are compared with how that step left them. If
+  something changed them since, Noggit asks before replacing the newer change.
+
+Storage: database steps live in `Workspace/creator-history/` (`index.json`, one `step-N.json`
+per step with the rows before and after it, in the recovery journal's format). Doing something
+new after undoing moves the undone steps to `creator-history/discarded/<time>/`, never deleting
+them. Database steps are kept across sessions; map edits (Noggit's own undo, 200 steps) only for
+the session, but removed scenery stays in the Removed drawer (`Workspace/creator-removed.json`,
+last 500 things). Undo and redo are ordinary journaled saves, so Local Changes and Sync follow
+them: undoing back to the original state removes the entry.
+
+Not in History: talent trees and client patches (they are files, not database rows), and
+changes made outside Noggit.
 
 ## Local changes and export
 

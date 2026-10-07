@@ -12,6 +12,7 @@ file(GLOB CONTENT_SOURCES CONFIGURE_DEPENDS
   ../../src/noggit/content/*.cpp ../../src/noggit/quest/*.cpp ../../src/noggit/item/*.cpp)
 add_executable(creator_integration CreatorIntegration.cpp ${CONTENT_SOURCES}
   ../../src/noggit/creator/Database.cpp
+  ../../src/noggit/creator/History.cpp
   ../../src/noggit/creator/SqlConnection.cpp
   ../../src/noggit/creator/Ssh.cpp
   ../../src/noggit/creator/ProductionProfile.cpp
@@ -45,6 +46,16 @@ target_include_directories(change_tracker_tests PRIVATE ../../src)
 target_link_libraries(change_tracker_tests PRIVATE Qt5::Core Qt5::Network)
 add_test(NAME change_tracker COMMAND change_tracker_tests)
 
+# The History timeline without a database: recording, undo/redo, conflicts, archiving undone steps,
+# save points, persistence and step labels.
+add_executable(history_tests HistoryTests.cpp
+  ../../src/noggit/creator/History.cpp
+  ../../src/noggit/creator/ChangeTracker.cpp
+  ../../src/noggit/runtime/RuntimeManager.cpp)
+target_include_directories(history_tests PRIVATE ../../src)
+target_link_libraries(history_tests PRIVATE Qt5::Core Qt5::Network)
+add_test(NAME history COMMAND history_tests)
+
 # SSH command building, error classification, host keys, and SQL comment safety; no server needed.
 add_executable(ssh_tests SshTests.cpp
   ../../src/noggit/creator/Ssh.cpp
@@ -69,6 +80,7 @@ add_executable(service_tests ServiceTests.cpp
   ../../src/noggit/creator/SpellService.cpp
   ../../src/noggit/creator/ItemDesignService.cpp
   ../../src/noggit/creator/Database.cpp
+  ../../src/noggit/creator/History.cpp
   ../../src/noggit/creator/SqlConnection.cpp
   ../../src/noggit/creator/ChangeTracker.cpp
   ../../src/noggit/runtime/RuntimeManager.cpp)

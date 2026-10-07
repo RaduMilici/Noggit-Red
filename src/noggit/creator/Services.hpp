@@ -60,8 +60,10 @@ class GameObjectService {
 public:
   static QVector<Choice> search(QString const& text);
   static GameObject load(Id entry, Id guid = 0);
-  static Id save(GameObject const&, std::optional<Position> place = std::nullopt);
-  static void placements(QVector<SpawnEdit> const&);
+  // A placement is added at `place` when given (its guid in *spawn).
+  static Id save(GameObject const&, std::optional<Position> place = std::nullopt, Id* spawn = nullptr);
+  // The guids of the kept placements, in edit order (created ones get their new guid).
+  static QVector<Id> placements(QVector<SpawnEdit> const&);
 };
 struct Waypoint { Position position; int waitMs = 0; bool run = false; QVector<Fields> scripts; bool operator==(Waypoint const&) const = default; };
 struct Patrol { QVector<Waypoint> points; bool loop = true; bool operator==(Patrol const&) const = default; };

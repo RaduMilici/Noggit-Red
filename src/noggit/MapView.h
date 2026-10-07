@@ -55,6 +55,7 @@ class QLineEdit;
 class QGroupBox;
 class QListWidget;
 class QVBoxLayout;
+class QHBoxLayout;
 class QMenu;
 class QWindow;
 class QToolButton;
@@ -74,6 +75,9 @@ namespace Noggit::Ui::Content
 namespace Noggit::Creator
 {
   class NpcStudio;
+  class Timeline;
+  class HistoryPanel;
+  struct RemovedThing;
 }
 
 namespace Noggit::Ui::Windows
@@ -959,7 +963,8 @@ private:
   void refreshStudio();
   void creatorGameObject();
   // template_entry: a gameobject_template Creator just wrote -> also refresh the model picker and select it.
-  void reloadCreatorObjects(std::optional<std::uint32_t> template_entry = std::nullopt);
+  // select: the gameobject placement to select afterwards (default: keep the current one if it still exists).
+  void reloadCreatorObjects(std::optional<std::uint32_t> template_entry = std::nullopt, std::optional<std::uint32_t> select = std::nullopt);
   void editCreatorPatrol();
   bool editCreatorDialogue(std::uint32_t entry);
   void refreshCreatorPatrol();
@@ -1044,6 +1049,26 @@ private:
   void saveDirtyGameObjectSpawns();
   void jumpToGameObjectListItem(QListWidgetItem* item);
   void deleteSelectedGameObjectSpawns();
+
+  // Creator History (Creator runtime only): one timeline for database saves and map edits, autosaved
+  // NPC/object placements, save points and the Removed drawer.
+  void setupCreatorHistory();
+  // Replaces the Reload/Save/Discard/Pending buttons of a spawn overlay with History / Removed.
+  void addCreatorHistoryButtons(QWidget* overlay, QHBoxLayout* layout, std::initializer_list<QWidget*> replaced);
+  void showCreatorHistory(bool removed);
+  // After undo/redo or bringing something back: reload the placements shown, keeping the selection.
+  void reloadCreatorWorld();
+  void restoreRemovedScenery(Noggit::Creator::RemovedThing const& thing);
+  void showRemovedThing(Noggit::Creator::RemovedThing const& thing);
+  // Saves edited placements once they settle (no drag, no wheel turning since the last check).
+  void autosaveCreatorSpawns();
+  bool creatorUndo(bool redo);
+  Noggit::Creator::Timeline* _timeline = nullptr;
+  Noggit::Creator::HistoryPanel* _history_panel = nullptr;
+  QDockWidget* _history_dock = nullptr;
+  QTimer* _creator_autosave = nullptr;
+  double _autosave_signature = 0.0;
+  bool _creator_saving = false;
 
   // SQL apply / reset tooling (see setupAssistMenu): apply pending spawn changes or a .sql file to
   // the project's connected database, or rebuild the database from folders of base .sql dumps.

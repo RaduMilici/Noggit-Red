@@ -4,6 +4,12 @@
 #include <noggit/ui/quest/QuestBrowserDialog.hpp>
 #include <noggit/ui/quest/QuestChainDialog.hpp>
 #include <noggit/creator/NpcStudio.hpp>
+#include <noggit/creator/History.hpp>
+#include <noggit/creator/HistoryPanel.hpp>
+#include <noggit/creator/RemovedDrawer.hpp>
+#include <noggit/creator/Timeline.hpp>
+#include <noggit/creator/Toast.hpp>
+#include <noggit/ui/FontAwesome.hpp>
 #include <noggit/creator/ServiceEditors.hpp>
 #include <noggit/creator/ContentEditors.hpp>
 #include <noggit/runtime/RuntimeManager.hpp>
@@ -1891,6 +1897,7 @@ void MapView::setupCreatureActionsUi()
   layout->addWidget(save_button);
   layout->addWidget(revert_button);
   layout->addWidget(pending_button);
+  addCreatorHistoryButtons(_creature_actions_overlay, layout, {reload_button, save_button, revert_button, pending_button});
 
   // Toggleable dropdown listing every pending change (new / moved / deleted) awaiting SQL export.
   _creature_pending_popup = new QWidget(this, Qt::Popup);
@@ -3684,6 +3691,7 @@ void MapView::setupGameObjectActionsUi()
   layout->addWidget(save_button);
   layout->addWidget(revert_button);
   layout->addWidget(pending_button);
+  addCreatorHistoryButtons(_gameobject_actions_overlay, layout, {reload_button, save_button, revert_button, pending_button});
 
   // Toggleable dropdown listing every pending change (moved / deleted) awaiting SQL export.
   _gameobject_pending_popup = new QWidget(this, Qt::Popup);
@@ -4385,6 +4393,12 @@ void MapView::setupEditMenu()
   edit_menu->addSeparator();
   ADD_ACTION (edit_menu, "Undo", "Ctrl+Z", [this]
   {
+    // Creator runtime: one timeline (database saves and map edits) whatever tool is active.
+    if (_timeline)
+    {
+      creatorUndo(false);
+      return;
+    }
     // In the spawn tools Ctrl+Z is DEDICATED to creature/gameobject edits: it walks only their own
     // undo stack (moves, additions, deletions) and NEVER falls through to the terrain/water/object
     // ActionManager history -- an empty stack is simply "nothing to undo" in these modes.
@@ -4406,7 +4420,18 @@ void MapView::setupEditMenu()
     }
     NOGGIT_ACTION_MGR->undo();
   });
-  ADD_ACTION (edit_menu, "Redo", "Ctrl+Shift+Z", [this] { NOGGIT_ACTION_MGR->redo(); });
+  ADD_ACTION (edit_menu, "Redo", "Ctrl+Shift+Z", [this] { if (_timeline) creatorUndo(true); else NOGGIT_ACTION_MGR->redo(); });
+  if (_timeline)
+  {
+    // Ctrl+Y as well, the redo most designers know (not a second menu entry).
+    auto redo_y = new QAction("Redo", _main_window);
+    redo_y->setShortcut(QKeySequence("Ctrl+Y"));
+    _main_window->addAction(redo_y);
+    connect(redo_y, &QAction::triggered, this, [this] { if (!NOGGIT_CUR_ACTION) creatorUndo(true); });
+    connect(this, &QObject::destroyed, redo_y, &QObject::deleteLater);
+    ADD_ACTION (edit_menu, "History and Removed…", "Ctrl+H", [this] { showCreatorHistory(false); });
+    ADD_ACTION_NS (edit_menu, "Add Save Point…", [this] { showCreatorHistory(false); if (_history_panel) _history_panel->addSavepoint(); });
+  }
 }
 
 void MapView::setupAssistMenu()
@@ -7307,13 +7332,10 @@ bool MapView::prepareCreatorChange()
     QMessageBox::information(this, "Creator", "Open a Vanilla / Tortoise project to author local content.");
     return false;
   }
-  if (_world->dirtyGameObjectSpawnCount())
-  {
-    QMessageBox::information(this, "Creator", "Save or discard pending gameobject placements before refreshing NPC content.");
-    return false;
-  }
+  // Placements autosave; finish any that are still settling before an editor reads the database.
+  if (_world->dirtyGameObjectSpawnCount()) saveDirtyGameObjectSpawns();
   if (_world->dirtyCreatureSpawnCount()) saveDirtyCreatureSpawns();
-  return !_world->dirtyCreatureSpawnCount();
+  return !_world->dirtyCreatureSpawnCount() && !_world->dirtyGameObjectSpawnCount();
 }
 
 void MapView::reloadCreatorContent(std::optional<std::uint32_t> select)
@@ -7626,14 +7648,63 @@ void MapView::openQuests(std::uint32_t focus_npc)
   }
 }
 
+namespace
+{
+  // The database guid a saved placement ended up with: pending creates get new guids, removed ones none.
+  // `saved` lists the kept placements in edit order, as SpawnService::save / GameObjectService::placements return them.
+  std::optional<std::uint32_t> savedSpawnGuid(QVector<Noggit::Creator::SpawnEdit> const& edits,
+                                              QVector<Noggit::Creator::Id> const& saved,
+                                              std::optional<std::uint32_t> guid)
+  {
+    if (!guid) return std::nullopt;
+    int kept = 0;
+    for (auto const& edit : edits)
+    {
+      if (edit.remove) { if (edit.guid == *guid) return std::nullopt; continue; }
+      if (edit.guid == *guid) return kept < saved.size() ? std::optional<std::uint32_t>(saved[kept]) : std::nullopt;
+      ++kept;
+    }
+    return guid; // not edited: its guid is unchanged
+  }
+
+  // After a Creator save: the edited placements now match the database. Pending creates take their new
+  // guids (`saved`, in spawn order like the edits), removed ones leave the overlay. No full reload needed.
+  template <typename Spawns>
+  void rebaseSavedSpawns(Spawns& spawns, QVector<Noggit::Creator::Id> const& saved)
+  {
+    int kept = 0;
+    for (auto& spawn : spawns)
+    {
+      if (!spawn.dirty || spawn.pending_delete) continue;
+      if (spawn.pending_create && kept < saved.size()) spawn.guid = saved[kept];
+      ++kept;
+      spawn.pending_create = false;
+      spawn.dirty = false;
+      spawn.original_pos = spawn.pos;
+      spawn.original_orientation = spawn.orientation;
+      if constexpr (requires { spawn.original_ext = spawn.ext; }) spawn.original_ext = spawn.ext;
+    }
+    spawns.erase(std::remove_if(spawns.begin(), spawns.end(), [](auto const& spawn) { return spawn.pending_delete; }), spawns.end());
+  }
+
+  // "Removed Grut" / "Removed 3 placements" for the deletion toast.
+  template <typename Spawns>
+  QString removedSummary(Spawns const& spawns)
+  {
+    QString name; int count = 0;
+    for (auto const& spawn : spawns)
+      if (spawn.dirty && spawn.pending_delete && !spawn.pending_create) { ++count; name = QString::fromStdString(spawn.name); }
+    if (!count) return {};
+    return count == 1 && !name.isEmpty() ? "Removed " + name : QString("Removed %1 placements").arg(count);
+  }
+}
+
 void MapView::saveDirtyCreatureSpawns()
 {
   if (qApp->property("creatorRuntimeManaged").toBool())
   {
     try
     {
-      if (_world->dirtyGameObjectSpawnCount())
-        throw std::runtime_error("Save or discard pending gameobject placements before saving NPC placements.");
       QVector<Noggit::Creator::SpawnEdit> edits;
       for (auto const& spawn : _world->creatureSpawns())
       {
@@ -7645,12 +7716,32 @@ void MapView::saveDirtyCreatureSpawns()
       }
       if (!edits.isEmpty())
       {
-        Noggit::Creator::SpawnService::save(edits);
-        reloadCreatorContent();
-        _main_window->statusBar()->showMessage("NPC placements saved locally. Use Test Locally to see changes in game.", 6000);
+        auto removed = removedSummary(_world->creatureSpawns());
+        auto saved = Noggit::Creator::SpawnService::save(edits);
+        auto select = savedSpawnGuid(edits, saved, _selected_creature_spawn_guid);
+        {
+          makeCurrent();
+          OpenGL::context::scoped_setter const guard(::gl, context());
+          rebaseSavedSpawns(_world->creatureSpawns(), saved);
+        }
+        _creature_undo_ops.clear(); // the History timeline undoes saved placements
+        setSelectedCreatureSpawn(select && _world->findCreatureSpawn(*select) ? select : std::nullopt);
+        scheduleCreatureBrowserRebuild();
+        refreshCreatureEditorKnobs();
+        _needs_redraw = true;
+        if (!removed.isEmpty() && _timeline)
+        {
+          auto cursor = _timeline->cursor();
+          Noggit::Creator::toast(this, removed, "Undo", [this, cursor] { if (_timeline && _timeline->cursor() == cursor) creatorUndo(false); else showCreatorHistory(true); });
+        }
       }
     }
-    catch (std::exception const& e) { QMessageBox::warning(this, "Save NPC placements", e.what()); }
+    catch (std::exception const& e)
+    {
+      // Put the placements back as they are in the database, so the same failing save is not retried.
+      discardPendingCreatureSpawns();
+      QMessageBox::warning(this, "NPC placement", e.what());
+    }
     return;
   }
 
@@ -8731,13 +8822,26 @@ void MapView::saveDirtyGameObjectSpawns()
 {
   if(qApp->property("creatorRuntimeManaged").toBool()) {
     try {
-      if(_world->dirtyCreatureSpawnCount()) throw std::runtime_error("Save or discard pending NPC placements first.");
       QVector<Noggit::Creator::SpawnEdit> edits;
       for(auto const& s:_world->gameObjectSpawns()) if(s.dirty)
         edits.push_back({s.guid,s.entry,serverPosition(s.pos,s.orientation),120,s.pending_delete,s.pending_create});
       if(edits.isEmpty()) return;
-      Noggit::Creator::GameObjectService::placements(edits); reloadCreatorObjects();
-    } catch(std::exception const& e) { QMessageBox::warning(this,"Save GameObjects",e.what()); }
+      auto removed=removedSummary(_world->gameObjectSpawns());
+      auto saved=Noggit::Creator::GameObjectService::placements(edits);
+      auto select=savedSpawnGuid(edits,saved,_selected_gameobject_spawn_guid);
+      { makeCurrent(); OpenGL::context::scoped_setter const guard(::gl,context()); rebaseSavedSpawns(_world->gameObjectSpawns(),saved); }
+      _gameobject_undo_ops.clear(); // the History timeline undoes saved placements
+      setSelectedGameObjectSpawn(select && _world->findGameObjectSpawn(*select) ? select : std::nullopt);
+      scheduleGameObjectBrowserRebuild(); refreshGameObjectEditorKnobs(); _needs_redraw=true;
+      if(!removed.isEmpty() && _timeline) {
+        auto cursor=_timeline->cursor();
+        Noggit::Creator::toast(this,removed,"Undo",[this,cursor] { if(_timeline && _timeline->cursor()==cursor) creatorUndo(false); else showCreatorHistory(true); });
+      }
+    } catch(std::exception const& e) {
+      // Put the placements back as they are in the database, so the same failing save is not retried.
+      discardPendingGameObjectSpawns();
+      QMessageBox::warning(this,"GameObject placement",e.what());
+    }
     return;
   }
   auto dirty_count = _world->dirtyGameObjectSpawnCount();
@@ -9714,6 +9818,7 @@ void MapView::createGUI()
   LogDebug << "MapView::createGUI setupMinimap done" << std::endl;
   setupFileMenu();
   LogDebug << "MapView::createGUI setupFileMenu done" << std::endl;
+  setupCreatorHistory();
   setupEditMenu();
   LogDebug << "MapView::createGUI setupEditMenu done" << std::endl;
   setupViewMenu();
@@ -19374,10 +19479,10 @@ void MapView::ShowContextMenu(QPoint pos)
           menu.addAction("Locate in world",this,[this,position] { focus_camera_on_target(position); });
           menu.addAction("Duplicate GameObject",this,[this,entry,guid] {
             if(!prepareCreatorChange()) return;
-            try { auto d=Noggit::Creator::GameObjectService::load(entry,guid); beginWorldPick("Click to place the duplicate",[this,d](glm::vec3 const& p) { try { reloadCreatorObjects(Noggit::Creator::GameObjectService::save(d,serverPosition(p,0))); } catch(std::exception const& e) { QMessageBox::warning(this,"Duplicate",e.what()); } }); } catch(std::exception const& e) { QMessageBox::warning(this,"Duplicate",e.what()); }
+            try { auto d=Noggit::Creator::GameObjectService::load(entry,guid); beginWorldPick("Click to place the duplicate",[this,d](glm::vec3 const& p) { try { Noggit::Creator::Id guid=0; auto entry=Noggit::Creator::GameObjectService::save(d,serverPosition(p,0),&guid); reloadCreatorObjects(entry,guid); } catch(std::exception const& e) { QMessageBox::warning(this,"Duplicate",e.what()); } }); } catch(std::exception const& e) { QMessageBox::warning(this,"Duplicate",e.what()); }
           });
-          menu.addAction("Delete GameObject",this,[this,guid,entry,position,orientation] { if(!prepareCreatorChange()) return; try { Noggit::Creator::GameObjectService::placements({{guid,entry,serverPosition(position,orientation),120,true,false}}); reloadCreatorObjects(); } catch(std::exception const& e) { QMessageBox::warning(this,"Delete",e.what()); } });
-          menu.addAction("Save object placements",this,[this] { saveDirtyGameObjectSpawns(); });
+          // Same as Del: autosaved, with an Undo toast, and kept in the Removed drawer.
+          menu.addAction("Delete GameObject",this,[this] { deleteSelectedGameObjectSpawns(); });
           menu.addAction("Test GameObject",this,[this,guid] {
             saveDirtyGameObjectSpawns();
             if(_world->dirtyGameObjectSpawnCount()) return;
@@ -19826,21 +19931,26 @@ public:
   void paintEvent(QPaintEvent*) override { QPainter p(this); p.setRenderHint(QPainter::Antialiasing); if(draw) draw(p); }
 };
 }
-void MapView::reloadCreatorObjects(std::optional<std::uint32_t> template_entry) {
+void MapView::reloadCreatorObjects(std::optional<std::uint32_t> template_entry, std::optional<std::uint32_t> select) {
   makeCurrent(); OpenGL::context::scoped_setter const guard(::gl,context());
+  if(!select) select=_selected_gameobject_spawn_guid;
+  // Saving gives pending placements database guids, so the old undo ops can no longer be replayed.
   _selected_gameobject_spawn_guid.reset(); _gameobject_undo_ops.clear();
   auto npc=_selected_creature_spawn_guid;
   _world->reloadCreatureSpawns(); _world->setDrawGameObjectSpawns(true);
-  rebuildCreatureBrowserList(false); setSelectedCreatureSpawn(npc);
+  rebuildCreatureBrowserList(false); setSelectedCreatureSpawn(npc && _world->findCreatureSpawn(*npc) ? npc : std::nullopt);
   if(template_entry && _reload_gameobject_picker) _reload_gameobject_picker(template_entry);
-  rebuildGameObjectBrowserList(false); refreshGameObjectEditorKnobs(); _needs_redraw=true;
+  rebuildGameObjectBrowserList(false);
+  // Keep (or move to) the placement being worked on, so it can be dragged or deleted right away.
+  if(select && _world->findGameObjectSpawn(*select)) setSelectedGameObjectSpawn(select);
+  refreshGameObjectEditorKnobs(); _needs_redraw=true;
 }
 void MapView::creatorGameObject() {
   if(!prepareCreatorChange()) return;
   if(auto d=Noggit::Creator::designGameObject(this)) {
     set_editing_mode(editing_mode::gameobject);
     beginWorldPick("Click to place "+d->name,[this,d](glm::vec3 const& p) {
-      try { reloadCreatorObjects(Noggit::Creator::GameObjectService::save(*d,serverPosition(p,0))); }
+      try { Noggit::Creator::Id guid=0; auto entry=Noggit::Creator::GameObjectService::save(*d,serverPosition(p,0),&guid); reloadCreatorObjects(entry,guid); }
       catch(std::exception const& e) { QMessageBox::warning(this,"Create GameObject",e.what()); }
     });
   }
@@ -19921,4 +20031,185 @@ void MapView::editCreatorPatrol() {
   button("Close",[panel] { panel->close(); });
   connect(panel,&QDialog::finished,this,[this,canvas,timer] { timer->stop(); canvas->hide(); _patrol_guid=0; _patrol_drag=-1; _patrol_add=false; _patrol_insert=-1; _patrol_list=nullptr; _patrol_overlay=nullptr; canvas->deleteLater(); });
   refreshCreatorPatrol(); panel->show();
+}
+
+// ---------------------------------------------------------------------------------------------------
+// Creator History: one timeline, autosaved placements, save points and the Removed drawer.
+// ---------------------------------------------------------------------------------------------------
+void MapView::setupCreatorHistory()
+{
+  if (!qApp->property("creatorRuntimeManaged").toBool() || !Noggit::Creator::HistoryStore::instance())
+    return;
+  using namespace Noggit::Creator;
+  NOGGIT_ACTION_MGR->setLimit(200);
+  RemovedStore::instance(); // from now on, deletions are kept for the Removed drawer
+
+  _timeline = new Timeline(this, [this] { reloadCreatorWorld(); }, this);
+  // Placements still settling are saved first, so they are their own step (and the one undone now).
+  _timeline->setPrepare([this]
+  {
+    return !(_world->dirtyGameObjectSpawnCount() || _world->dirtyCreatureSpawnCount()) || prepareCreatorChange();
+  });
+  connect(_timeline, &Timeline::sceneryRemoved, this, [this](Noggit::Action const* action)
+  {
+    if (auto store = RemovedStore::instance()) store->scenery(action, _world->getMapID(), true);
+    auto cursor = _timeline->cursor();
+    toast(this, Timeline::describe(action), "Undo", [this, cursor]
+    {
+      if (_timeline->cursor() == cursor) creatorUndo(false); else showCreatorHistory(true);
+    });
+  });
+  connect(_timeline, &Timeline::sceneryRestored, this, [this](Noggit::Action const* action)
+  {
+    if (auto store = RemovedStore::instance()) store->scenery(action, _world->getMapID(), false);
+  });
+
+  RemovedDrawer::Actions removed;
+  removed.restoreScenery = [this](RemovedThing const& thing) { restoreRemovedScenery(thing); };
+  removed.show = [this](RemovedThing const& thing) { showRemovedThing(thing); };
+  removed.afterDatabase = [this] { reloadCreatorWorld(); };
+  removed.currentMap = [this] { return static_cast<unsigned>(_world->getMapID()); };
+  _history_panel = new HistoryPanel(_timeline, std::move(removed), this);
+
+  _history_dock = new QDockWidget("History", _main_window);
+  _history_dock->setObjectName("creatorHistoryDock");
+  _history_dock->setFeatures(QDockWidget::DockWidgetMovable | QDockWidget::DockWidgetFloatable | QDockWidget::DockWidgetClosable);
+  _history_dock->setWidget(_history_panel);
+  _history_dock->setMinimumWidth(320);
+  _main_window->addDockWidget(Qt::LeftDockWidgetArea, _history_dock);
+  _history_dock->hide();
+  connect(this, &QObject::destroyed, _history_dock, &QObject::deleteLater);
+
+  // Placements save themselves a moment after they stop changing: there is no pending state to manage.
+  _creator_autosave = new QTimer(this);
+  _creator_autosave->setInterval(300);
+  connect(_creator_autosave, &QTimer::timeout, this, &MapView::autosaveCreatorSpawns);
+  _creator_autosave->start();
+
+  if (auto store = HistoryStore::instance(); !store->warning().isEmpty())
+    QTimer::singleShot(1500, this, [this, message = store->warning()] { toast(this, message, {}, {}, 10000); });
+}
+
+void MapView::addCreatorHistoryButtons(QWidget* overlay, QHBoxLayout* layout, std::initializer_list<QWidget*> replaced)
+{
+  if (!qApp->property("creatorRuntimeManaged").toBool())
+    return;
+  for (auto* widget : replaced) widget->hide();
+  auto history = new QPushButton(Noggit::Ui::FontAwesomeIcon(Noggit::Ui::FontAwesome::Icons::history), "History", overlay);
+  history->setToolTip("Everything you changed, in order. Click a step to go back to it. (Ctrl+H)");
+  auto removed = new QPushButton(Noggit::Ui::FontAwesomeIcon(Noggit::Ui::FontAwesome::Icons::trashalt), "Removed", overlay);
+  removed->setToolTip("Everything you deleted, ready to bring back.");
+  layout->addWidget(history);
+  layout->addWidget(removed);
+  connect(history, &QPushButton::clicked, this, [this] { showCreatorHistory(false); });
+  connect(removed, &QPushButton::clicked, this, [this] { showCreatorHistory(true); });
+}
+
+void MapView::showCreatorHistory(bool removed)
+{
+  if (!_history_dock) return;
+  _history_dock->show();
+  _history_dock->raise();
+  if (removed) _history_panel->showRemoved(); else _history_panel->showHistory();
+}
+
+void MapView::reloadCreatorWorld()
+{
+  // Reloads NPC and object placements from the local database, keeping both selections where they still exist.
+  reloadCreatorObjects(std::nullopt, _selected_gameobject_spawn_guid);
+  refreshStudio();
+  updateDatabaseStatus();
+}
+
+void MapView::restoreRemovedScenery(Noggit::Creator::RemovedThing const& thing)
+{
+  if (thing.map != static_cast<unsigned>(_world->getMapID()))
+    throw std::runtime_error("Open the map it was on to bring it back.");
+  makeCurrent();
+  OpenGL::context::scoped_setter const guard(::gl, context());
+  auto const path = thing.file.toStdString();
+  BlizzardArchive::Listfile::FileKey key = !path.empty() && thing.fileDataId ? BlizzardArchive::Listfile::FileKey(path, thing.fileDataId)
+                                         : !path.empty() ? BlizzardArchive::Listfile::FileKey(path)
+                                         : BlizzardArchive::Listfile::FileKey(thing.fileDataId);
+  glm::vec3 const pos(thing.x, thing.y, thing.z), dir(thing.rx, thing.ry, thing.rz);
+  // An ordinary map edit: it joins the timeline as "Placed ..." and can be undone.
+  NOGGIT_ACTION_MGR->beginAction(this, Noggit::ActionFlags::eOBJECTS_ADDED);
+  SceneObject* object = thing.wmo
+    ? static_cast<SceneObject*>(_world->addWMOAndGetInstance(key, pos, dir))
+    : static_cast<SceneObject*>(_world->addM2AndGetInstance(key, pos, static_cast<float>(thing.scale), dir, nullptr, true));
+  NOGGIT_ACTION_MGR->endAction();
+  if (object)
+  {
+    _world->reset_selection();
+    _world->add_to_selection(object);
+  }
+  _needs_redraw = true;
+  Noggit::Creator::toast(this, "Brought back " + thing.label);
+}
+
+void MapView::showRemovedThing(Noggit::Creator::RemovedThing const& thing)
+{
+  auto const target = thing.kind == Noggit::Creator::RemovedThing::Kind::Scenery
+    ? glm::vec3(thing.x, thing.y, thing.z)
+    : server_to_client_creature_position(static_cast<float>(thing.x), static_cast<float>(thing.y), static_cast<float>(thing.z),
+                                         _world->mapIndex.hasAGlobalWMO());
+  focus_camera_on_target(target);
+  _needs_redraw = true;
+}
+
+void MapView::autosaveCreatorSpawns()
+{
+  // Never mid-gesture: a drag, a held button, a dialog, or a Noggit action in progress.
+  if (_creator_saving || _dragging_creature_spawn || _dragging_gameobject_spawn
+      || QApplication::mouseButtons() != Qt::NoButton || NOGGIT_CUR_ACTION || QApplication::activeModalWidget())
+  {
+    _autosave_signature = 0.0;
+    return;
+  }
+  // A fingerprint of the edited placements: save once it is unchanged between two checks (wheel/spinbox settled).
+  double signature = 0.0;
+  auto add = [&signature](auto const& spawns, double salt)
+  {
+    for (auto const& s : spawns)
+      if (s.dirty)
+        signature += salt + s.guid * 1e-3 + s.pos.x + s.pos.y * 3.0 + s.pos.z * 7.0 + s.orientation * 11.0 + (s.pending_delete ? 13.0 : 0.0);
+  };
+  add(_world->creatureSpawns(), 1.0);
+  add(_world->gameObjectSpawns(), 2.0);
+  if (signature == 0.0)
+    return;
+  if (signature != _autosave_signature)
+  {
+    _autosave_signature = signature;
+    return;
+  }
+  _autosave_signature = 0.0;
+  _creator_saving = true;
+  if (_world->dirtyGameObjectSpawnCount()) saveDirtyGameObjectSpawns();
+  if (_world->dirtyCreatureSpawnCount()) saveDirtyCreatureSpawns();
+  _creator_saving = false;
+}
+
+bool MapView::creatorUndo(bool redo)
+{
+  if (!_timeline || NOGGIT_CUR_ACTION)
+    return false;
+  // Save placements still settling first (the timeline would too): they become the step undone now,
+  // and the label below must name it.
+  bool const settling = _world->dirtyGameObjectSpawnCount() || _world->dirtyCreatureSpawnCount();
+  if (settling && !prepareCreatorChange())
+    return false;
+  auto const& entries = _timeline->entries();
+  int const index = redo ? _timeline->cursor() : _timeline->cursor() - 1;
+  if (index < 0 || index >= entries.size())
+  {
+    Noggit::Creator::toast(this, redo ? "Nothing to redo" : "Nothing to undo", {}, {}, 2000);
+    return false;
+  }
+  auto const label = entries[index].label;
+  bool const done = redo ? _timeline->redo() : _timeline->undo();
+  if (done)
+    Noggit::Creator::toast(this, (redo ? "Redone: " : "Undone: ") + label, redo ? "Undo" : "Redo", [this, redo] { creatorUndo(!redo); }, 3500);
+  _needs_redraw = true;
+  return done;
 }

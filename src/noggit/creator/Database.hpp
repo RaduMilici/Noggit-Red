@@ -1,6 +1,7 @@
 #pragma once
 #include "Services.hpp"
 #include "ChangeTracker.hpp"
+#include "History.hpp"
 #include <QJsonArray>
 #include <memory>
 #include <optional>
@@ -29,6 +30,11 @@ public:
   void snapshotWhere(QString const& table, QString const& where);
   // Record an entity in Local Changes. Call before modifying it; the after-state is captured on commit.
   void track(EntityType type, Id id);
+  // Names this save in the History timeline (default: derived from the tracked changes).
+  void setLabel(QString const& label) { _label = label; }
+  // Puts an image's rows back (undo/redo of a History step), journaled and tracked like any save, then commits.
+  // Recorded as a new History step only when named (bringing a removed thing back).
+  void replay(QJsonArray const& image, QVector<HistoryEntity> const& entities, QString const& recordAs = {});
   void commit();
 private:
   struct Impl;
@@ -37,7 +43,8 @@ private:
   QVector<Tracked> _tracked;
   QJsonArray _undo;
   QString _journal;
-  bool _committed = false;
+  QString _label;
+  bool _committed = false, _replaying = false;
   void restore(QJsonArray const&);
   void persist();
 };

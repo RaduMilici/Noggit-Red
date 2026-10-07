@@ -321,7 +321,7 @@ GameObject GameObjectService::load(Id entry, Id guid) {
   if(guid) { auto p=one(db,"gameobject",guid,"guid"); d.state=p["state"].toInt(); d.respawn=p["spawntimesecsmin"].toInt(); }
   return d;
 }
-Id GameObjectService::save(GameObject const& d, std::optional<Position> place) {
+Id GameObjectService::save(GameObject const& d, std::optional<Position> place, Id* spawn) {
   require(!d.name.trimmed().isEmpty() && d.name.size()<=100 && d.display && std::isfinite(d.size) && d.size>0 && d.size<=100,"Choose a model, name and valid size.");
   require(d.state>=0 && d.state<=2 && d.respawn>=0,"Invalid state or respawn time.");
   Database db;
@@ -344,6 +344,7 @@ Id GameObjectService::save(GameObject const& d, std::optional<Position> place) {
     auto guid=db.allocate("gameobject","guid",0xfffffffe); db.track(EntityType::GameObjectSpawn,guid); db.snapshot("gameobject","guid",guid);
     db.insert("gameobject",{{"guid",guid},{"id",entry},{"map",p.map},{"position_x",p.x},{"position_y",p.y},{"position_z",p.z},{"orientation",p.orientation},{"rotation2",std::sin(p.orientation/2)},{"rotation3",std::cos(p.orientation/2)},{"state",d.state},{"spawntimesecsmin",d.respawn},{"spawntimesecsmax",d.respawn}});
     db.snapshot("creator_content","entry",guid); db.mark("object_spawn",guid);
+    if(spawn) *spawn=guid;
   }
   if(d.entry) for(auto const& r:db.query("SELECT guid FROM gameobject WHERE id="+n(entry))) {
     auto guid=r["guid"].toUInt(); db.track(EntityType::GameObjectSpawn,guid); db.snapshot("gameobject","guid",guid);
@@ -351,8 +352,8 @@ Id GameObjectService::save(GameObject const& d, std::optional<Position> place) {
   }
   db.commit(); return entry;
 }
-void GameObjectService::placements(QVector<SpawnEdit> const& edits) {
-  Database db;
+QVector<Id> GameObjectService::placements(QVector<SpawnEdit> const& edits) {
+  Database db; QVector<Id> saved;
   for(auto const& d:edits) {
     require(db.owned("gameobject",d.entry),"Create a Creator object before editing its placements.");
     auto p=d.position; require(std::isfinite(p.x)&&std::isfinite(p.y)&&std::isfinite(p.z)&&std::isfinite(p.orientation),"Invalid object position.");
@@ -367,9 +368,9 @@ void GameObjectService::placements(QVector<SpawnEdit> const& edits) {
       else update(db,"gameobject","guid",guid,f);
     }
     db.snapshot("creator_content","entry",guid);
-    if(d.remove) db.exec("DELETE FROM creator_content WHERE kind='object_spawn' AND entry="+n(guid)); else db.mark("object_spawn",guid);
+    if(d.remove) db.exec("DELETE FROM creator_content WHERE kind='object_spawn' AND entry="+n(guid)); else { db.mark("object_spawn",guid); saved.push_back(guid); }
   }
-  db.commit();
+  db.commit(); return saved;
 }
 Patrol PatrolService::load(Id guid) {
   Database db; auto spawn=one(db,"creature",guid,"guid"); Patrol result;

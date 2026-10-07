@@ -119,6 +119,11 @@ namespace Noggit
 
         float* getChunkTerrainOriginalData(MapChunk* chunk);
 
+        // What the action placed or removed (uid at the time, and enough to put the object back).
+        std::vector<std::pair<unsigned, ObjectInstanceCache>> const& addedObjects() const { return _added_objects_pre; }
+        std::vector<std::pair<unsigned, ObjectInstanceCache>> const& removedObjects() const { return _removed_objects_pre; }
+        std::size_t transformedObjectCount() const { return _transformed_objects_pre.size(); }
+
         // Registrators
         void registerChunkTerrainChange(MapChunk* chunk);
         void registerChunkTextureChange(MapChunk* chunk);
