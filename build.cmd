@@ -38,11 +38,12 @@ if not errorlevel 1 goto :have_msvc
 set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
 if not exist "%VSWHERE%" goto :no_vs
 set "VSINSTALL="
-rem The extra outer quotes survive cmd's quote stripping ("Program Files (x86)" has parentheses).
-for /f "usebackq delims=" %%i in (`""%VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath"`) do set "VSINSTALL=%%i"
+rem Through a file, not for /f: the ")" of "Program Files (x86)" would end a for /f command early.
+"%VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath > "%TEMP%\noggit-build-vs.txt"
+set /p VSINSTALL=<"%TEMP%\noggit-build-vs.txt"
 if not defined VSINSTALL goto :no_vs
 echo Setting up the x64 compiler ...
-call "%VSINSTALL%\VC\Auxiliary\Build\vcvars64.bat" >nul
+call "%VSINSTALL%\VC\Auxiliary\Build\vcvars64.bat" >nul 2>nul
 where cl >nul 2>nul
 if errorlevel 1 goto :no_vs
 :have_msvc
@@ -93,6 +94,8 @@ if errorlevel 1 goto :failed
 rem --- 4. Make the build runnable ---
 rem The SQL build links the MariaDB client: noggit.exe does not start without its DLL beside it.
 copy /y "%MYSQL_ROOT%\lib\x64_release\libmysql.dll" "%BUILD_DIR%\bin\" >nul
+rem Qt needs OpenSSL for HTTPS (the game data download); the runtime bundle carries the matching 1.1 pair.
+if defined RUNTIME_BUNDLE for %%f in (libssl-1_1-x64.dll libcrypto-1_1-x64.dll) do if exist "%RUNTIME_BUNDLE%\mangosd\%%f" copy /y "%RUNTIME_BUNDLE%\mangosd\%%f" "%BUILD_DIR%\bin\" >nul
 rem Noggit looks for its Creator home next to bin: build-ninja\Creator -> .\Creator (your data, kept
 rem across clean builds) whose Runtime links to the prepared local server.
 if not exist "%CREATOR_HOME%" mkdir "%CREATOR_HOME%"
