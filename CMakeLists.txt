@@ -349,7 +349,13 @@ ENDIF()
 # /Zi adds debug info without changing codegen; /DEBUG emits the .pdb and /OPT:REF /OPT:ICF keep
 # the Release optimizations that /DEBUG would otherwise turn off.
 if(MSVC)
-  target_compile_options(noggit PRIVATE $<$<CONFIG:Release>:/Zi>)
+  # sccache (build.cmd) can only cache objects that carry their own debug info (/Z7); /Zi writes into a
+  # shared .pdb it cannot cache. The linker's /DEBUG still produces noggit.pdb either way.
+  if(CMAKE_CXX_COMPILER_LAUNCHER MATCHES "sccache")
+    target_compile_options(noggit PRIVATE $<$<CONFIG:Release>:/Z7>)
+  else()
+    target_compile_options(noggit PRIVATE $<$<CONFIG:Release>:/Zi>)
+  endif()
   target_link_options(noggit PRIVATE $<$<CONFIG:Release>:/DEBUG /OPT:REF /OPT:ICF>)
 endif()
 
