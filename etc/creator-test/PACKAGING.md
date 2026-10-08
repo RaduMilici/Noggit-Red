@@ -30,8 +30,18 @@ After pulling the code, double-click `etc/creator-test/build-windows.cmd`.
 It detects Visual Studio 2019/2022, imports its x64 compiler environment, finds
 Qt5 under `C:/Qt` (or asks for its location), updates Git submodules, downloads
 checksum-verified portable OpenSSH, prepares the server/database, builds Noggit,
-and runs CPack. The resulting ZIP is in `packages`. The window stays open so
-errors remain readable. A failed command stops packaging immediately.
+and runs CPack. Each of the seven steps is numbered in the log with the folder it uses.
+The resulting ZIP is `packages/Noggit-Creator-<version>-Windows-x64.zip`, where
+`<version>` comes from `git describe --tags`: the tag itself (`v1.2.0`) when the
+commit is tagged, otherwise `<last tag>-<commits since>-g<hash>`, plus `-dirty` with
+uncommitted changes. Tag the commit before building a release:
+
+```bat
+git tag -a v1.2.0 -m "Creator 1.2.0"
+git push origin v1.2.0
+```
+
+The window stays open so errors remain readable. A failed command stops packaging immediately.
 
 Install the build prerequisites described above first. The script uses the
 repository’s `etc/creator-test/game-data.json` automatically; no files need to be

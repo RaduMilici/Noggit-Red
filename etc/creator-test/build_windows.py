@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -15,6 +16,30 @@ import zipfile
 ROOT = Path(__file__).resolve().parents[2]
 SSH_URL = 'https://github.com/PowerShell/Win32-OpenSSH/releases/download/10.0.0.0p2-Preview/OpenSSH-Win64.zip'
 SSH_SHA256 = '23f50f3458c4c5d0b12217c6a5ddfde0137210a30fa870e98b29827f7b43aba5'
+
+
+STEPS = 7
+_step = 0
+
+
+def step(title, location=None):
+    # Numbered progress lines, so a long build shows where it is and where things go.
+    global _step
+    _step += 1
+    print('\n' + '=' * 72 + f'\n[{_step}/{STEPS}] {title}', flush=True)
+    if location:
+        print('      ' + str(location), flush=True)
+
+
+def version():
+    # The release name: the tag on this commit ("v1.2.0"), else "<last tag>-<commits since>-g<hash>",
+    # plus "-dirty" when there are uncommitted changes. Without any tag: the short commit hash.
+    try:
+        described = subprocess.check_output(['git', 'describe', '--tags', '--always', '--dirty'],
+                                            cwd=ROOT, text=True).strip()
+    except (OSError, subprocess.CalledProcessError):
+        return 'untagged'
+    return re.sub(r'[^A-Za-z0-9._-]', '-', described) or 'untagged'
 
 
 def run(*command):
@@ -108,20 +133,31 @@ def main():
     if args.jobs < 1:
         parser.error('--jobs must be positive')
     os.chdir(ROOT)
+    release = version()
+    package_name = 'Noggit-Creator-' + release + '-Windows-x64'
+    print('Building Noggit Creator', release, 'from', ROOT, flush=True)
+    if release.endswith('-dirty'):
+        print('WARNING: uncommitted changes are included, so the name ends in -dirty.', flush=True)
+    step('Checking the game-data manifest')
     manifest = args.manifest.resolve()
     if not manifest.is_file():
         raise RuntimeError('Game-data manifest is missing: ' + str(manifest)
                            + '. Update your checkout or supply --manifest with a valid file.')
     from prepare_game_data import validate_manifest
     validate_manifest(json.loads(manifest.read_text(encoding='utf-8')))
+    print('      Manifest:', manifest, flush=True)
+    step('Finding Visual Studio, Qt and build tools')
     installation, generator = visual_studio()
+    print('      Visual Studio:', installation, '(' + generator + ')', flush=True)
     developer_environment(installation)
     for tool in ('git', 'cmake', 'cpack'):
         if not shutil.which(tool):
             raise RuntimeError('Install ' + tool + ' and make it available on PATH, then rerun.')
     qt = qt_directory(args.qt)
+    print('      Qt:', qt, flush=True)
     cache = ROOT / ('build-runtime-cache/windows-vs' + generator.split()[2])
     cache.mkdir(parents=True, exist_ok=True)
+    step('Getting portable OpenSSH', cache / 'OpenSSH-Win64')
     ssh = openssh(cache)
     # New inputs get a separate runtime; never replace a database or reuse a stale seed.
     digest = hashlib.sha256(manifest.read_bytes() + generator.encode() + SSH_SHA256.encode())
@@ -131,7 +167,9 @@ def main():
             digest.update(path.read_bytes())
     runtime = ROOT / 'build-runtime' / ('windows-' + digest.hexdigest()[:16]) / 'Runtime'
     stamp = runtime.parent / 'prepared.ok'
+    step('Updating Git submodules')
     run('git', 'submodule', 'update', '--init', '--recursive')
+    step('Preparing the local server and database', runtime)
     if not stamp.is_file() or not (runtime / 'creator-runtime.json').is_file():
         if runtime.exists():
             raise RuntimeError('Runtime preparation is incomplete; rename this directory and rerun: ' + str(runtime))
@@ -142,6 +180,7 @@ def main():
         print('Reusing prepared Windows server and database:', runtime)
     build = ROOT / ('build-creator-windows-vs' + generator.split()[2])
     server = cache / 'tortoise-source'
+    step('Building Noggit (Release, ' + str(args.jobs) + ' parallel jobs)', build)
     run('cmake', '-S', ROOT, '-B', build, '-G', generator, '-A', 'x64',
         '-DCMAKE_PREFIX_PATH=' + qt.as_posix(), '-DCMAKE_BUILD_TYPE=Release', '-DUSE_SQL=ON',
         '-DMYSQL_INCLUDE_DIR=' + (server / 'dep/windows/include/mysql').as_posix(),
@@ -149,9 +188,21 @@ def main():
         '-DCREATOR_RUNTIME_BUNDLE=' + runtime.as_posix())
     run('cmake', '--build', build, '--config', 'Release', '--target', 'noggit', '--parallel', args.jobs,
         '--', '/p:CL_MPCount=' + str(args.jobs))
-    run('cpack', '--config', build / 'CPackConfig.cmake', '-C', 'Release', '-B', ROOT / 'packages')
-    print('\nDone. The distributable ZIP is in:', ROOT / 'packages')
-    print('Extract it into a fresh folder and run Noggit/noggit.exe to verify first-run setup.')
+    packages = ROOT / 'packages'
+    package = packages / (package_name + '.zip')
+    step('Zipping the release', package)
+    run('cpack', '--config', build / 'CPackConfig.cmake', '-C', 'Release', '-B', packages,
+        '-D', 'CPACK_PACKAGE_FILE_NAME=' + package_name)
+    if not package.is_file():
+        raise RuntimeError('CPack finished but the ZIP is missing: ' + str(package))
+    size = package.stat().st_size / (1024 * 1024)
+    print('\n' + '=' * 72)
+    print('Done:', release)
+    print('  Release ZIP (upload this):', package, f'({size:.0f} MB)')
+    print('  Noggit build folder:      ', build)
+    print('  Prepared server/database: ', runtime)
+    print('  Download cache:           ', cache)
+    print('Extract the ZIP into a fresh folder and run Noggit/noggit.exe to verify first-run setup.')
 
 
 if __name__ == '__main__':
